@@ -45,7 +45,7 @@ class SourceDataEngine:
             output_location: Directory to save processed chunks
             chunk_size: Maximum tokens per chunk (default: 512)
         """
-        from chunk_handler import LLMJudgeChunkHandler
+        from worker.source_engine.chunk_handler import LLMJudgeChunkHandler
 
         # Store output location for later retrieval
         self.output_location = output_location
@@ -332,40 +332,3 @@ def _process_text_file(file_path: Path, chunk_size: int, encoding) -> Generator[
 
     for chunk in chunks:
         yield chunk
-
-
-# Example chunk handler class for reference
-class ExampleChunkHandler:
-    """Example implementation of a chunk handler."""
-
-    def process_with_llm(self, chunk: str) -> str:
-        """
-        Process a chunk with an LLM.
-
-        Args:
-            chunk: The text chunk to process
-
-        Returns:
-            The LLM's response
-        """
-        # This is where you'd call your actual LLM
-        # For example:
-        # return openai.ChatCompletion.create(...)
-        return f"Processed: {chunk[:50]}..."  # Placeholder
-
-
-if __name__ == "__main__":
-    # Example usage
-    handler = ExampleChunkHandler()
-
-    results = process_source_data(
-        seed_location="./input_files",
-        output_location="./output_chunks",
-        chunk_size=512,  # tokens
-        chunk_handler=handler
-    )
-
-    print(f"\nResults map has {len(results)} entries")
-    print("Sample results:")
-    for chunk_id, result in list(results.items())[:3]:
-        print(f"  Chunk {chunk_id}: {result}")

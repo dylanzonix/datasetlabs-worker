@@ -1,22 +1,35 @@
+"""Worker configuration."""
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
 
 
-class Settings(BaseSettings):
+class WorkerSettings(BaseSettings):
+    """Worker configuration from environment variables."""
+
     model_config = SettingsConfigDict(
-        env_file=".env",       # only needed in dev
+        env_file=".env",
         env_file_encoding="utf-8",
-        extra="ignore",
+        case_sensitive=False,
     )
 
-    # ---- App basics ----
-    app_env: str = Field("development", alias="APP_ENV")
-    app_name: str = Field("dataset-engine", alias="APP_NAME")
-    log_level: str = Field("INFO", alias="LOG_LEVEL")
+    # Database
+    database_url: str
 
-    # ---- LLM / AI ----
-    openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
+    # Azure Service Bus
+    azure_service_bus_connection_string: str
+    azure_service_bus_queue_name: str = "jobs"
+
+    # Azure Blob Storage
+    azure_storage_connection_string: str
+    azure_storage_container_name: str = "job-data"
+
+    # OpenAI
+    openai_api_key: str
+
+    # Worker settings
+    max_concurrent_jobs: int = 1
+    heartbeat_interval_seconds: int = 30
+    checkpoint_interval_seconds: int = 60
 
 
-# singleton-style helper
-settings = Settings()
+settings = WorkerSettings()
