@@ -1,0 +1,1101 @@
+{
+    "title": "Swift Programming Language (Apple)",
+    "children": [
+        {
+            "title": "Language Fundamentals",
+            "children": [
+                {
+                    "title": "Basic Syntax and Structure",
+                    "children": [
+                        {
+                            "title": "Variables and Constants",
+                            "children": []
+                        },
+                        {
+                            "title": "Literals and Basic Types",
+                            "children": []
+                        },
+                        {
+                            "title": "Operators and Expressions",
+                            "children": []
+                        },
+                        {
+                            "title": "Statements and Semicolons",
+                            "children": []
+                        },
+                        {
+                            "title": "Comments and Documentation Comments",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Type System Basics",
+                    "children": [
+                        {
+                            "title": "Primitive Types (Int, Double, Bool, String)",
+                            "children": []
+                        },
+                        {
+                            "title": "Type Inference",
+                            "children": []
+                        },
+                        {
+                            "title": "Type Aliases",
+                            "children": []
+                        },
+                        {
+                            "title": "Optionals Overview",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Control Flow",
+                    "children": [
+                        {
+                            "title": "if, guard, and switch",
+                            "children": []
+                        },
+                        {
+                            "title": "for, while, repeat-while Loops",
+                            "children": []
+                        },
+                        {
+                            "title": "Pattern Matching in switch",
+                            "children": []
+                        },
+                        {
+                            "title": "Break, Continue, and Labeled Statements",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Collections Basics",
+                    "children": [
+                        {
+                            "title": "Arrays",
+                            "children": []
+                        },
+                        {
+                            "title": "Dictionaries",
+                            "children": []
+                        },
+                        {
+                            "title": "Sets",
+                            "children": []
+                        },
+                        {
+                            "title": "Collection Mutability (var vs let)",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Functions and Closures (Intro)",
+                    "children": [
+                        {
+                            "title": "Defining and Calling Functions",
+                            "children": []
+                        },
+                        {
+                            "title": "Parameters and Return Values",
+                            "children": []
+                        },
+                        {
+                            "title": "In-Out Parameters",
+                            "children": []
+                        },
+                        {
+                            "title": "Closures Basics",
+                            "children": []
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "title": "Intermediate Language Features",
+            "children": [
+                {
+                    "title": "Optionals and Safety",
+                    "children": [
+                        {
+                            "title": "Optional Binding (if let, guard let)",
+                            "children": []
+                        },
+                        {
+                            "title": "Forced Unwrapping and Its Risks",
+                            "children": []
+                        },
+                        {
+                            "title": "Nil-Coalescing Operator",
+                            "children": []
+                        },
+                        {
+                            "title": "Optional Chaining",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Structs, Classes, and Enums",
+                    "children": [
+                        {
+                            "title": "Structs vs Classes",
+                            "children": []
+                        },
+                        {
+                            "title": "Value Types vs Reference Types",
+                            "children": []
+                        },
+                        {
+                            "title": "Enums with Associated Values",
+                            "children": []
+                        },
+                        {
+                            "title": "Enums with Raw Values",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Properties and Methods",
+                    "children": [
+                        {
+                            "title": "Stored and Computed Properties",
+                            "children": []
+                        },
+                        {
+                            "title": "Property Observers (willSet, didSet)",
+                            "children": []
+                        },
+                        {
+                            "title": "Type Properties and Type Methods",
+                            "children": []
+                        },
+                        {
+                            "title": "Lazy Properties",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Initialization and Deinitialization",
+                    "children": [
+                        {
+                            "title": "Designated and Convenience Initializers",
+                            "children": []
+                        },
+                        {
+                            "title": "Failable Initializers",
+                            "children": []
+                        },
+                        {
+                            "title": "Initializer Delegation",
+                            "children": []
+                        },
+                        {
+                            "title": "Deinitializers in Classes",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Closures and Functional Operations",
+                    "children": [
+                        {
+                            "title": "Closure Syntax Variations",
+                            "children": []
+                        },
+                        {
+                            "title": "Capturing Values",
+                            "children": []
+                        },
+                        {
+                            "title": "Using map, filter, reduce",
+                            "children": []
+                        },
+                        {
+                            "title": "Escaping and Non-Escaping Closures",
+                            "children": []
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "title": "Advanced Language Features",
+            "children": [
+                {
+                    "title": "Protocols and Protocol-Oriented Programming",
+                    "children": [
+                        {
+                            "title": "Defining Protocols",
+                            "children": []
+                        },
+                        {
+                            "title": "Protocol Inheritance and Composition",
+                            "children": []
+                        },
+                        {
+                            "title": "Protocol Extensions",
+                            "children": []
+                        },
+                        {
+                            "title": "Associated Types",
+                            "children": []
+                        },
+                        {
+                            "title": "Protocol-Oriented Design Techniques",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Generics",
+                    "children": [
+                        {
+                            "title": "Generic Functions",
+                            "children": []
+                        },
+                        {
+                            "title": "Generic Types",
+                            "children": []
+                        },
+                        {
+                            "title": "Type Constraints",
+                            "children": []
+                        },
+                        {
+                            "title": "Using where Clauses",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Advanced Enums and Pattern Matching",
+                    "children": [
+                        {
+                            "title": "Recursive Enums",
+                            "children": []
+                        },
+                        {
+                            "title": "Advanced switch Patterns",
+                            "children": []
+                        },
+                        {
+                            "title": "if case and guard case",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Advanced Functions and Operators",
+                    "children": [
+                        {
+                            "title": "Higher-Order Functions",
+                            "children": []
+                        },
+                        {
+                            "title": "Custom Operators",
+                            "children": []
+                        },
+                        {
+                            "title": "Function Types and Currying-style Patterns",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Metaprogramming and Reflection (Where Applicable)",
+                    "children": [
+                        {
+                            "title": "Mirror API Basics",
+                            "children": []
+                        },
+                        {
+                            "title": "Runtime Type Information Usage",
+                            "children": []
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "title": "Concurrency and Asynchronous Programming",
+            "children": [
+                {
+                    "title": "Swift Concurrency Model Overview",
+                    "children": [
+                        {
+                            "title": "Structured Concurrency Concepts",
+                            "children": []
+                        },
+                        {
+                            "title": "Tasks and Task Hierarchies",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "async/await",
+                    "children": [
+                        {
+                            "title": "Declaring async Functions",
+                            "children": []
+                        },
+                        {
+                            "title": "Calling async Functions and Awaiting Results",
+                            "children": []
+                        },
+                        {
+                            "title": "Error Handling with async/await",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Actors and Data Isolation",
+                    "children": [
+                        {
+                            "title": "Defining Actors",
+                            "children": []
+                        },
+                        {
+                            "title": "Actor-Isolated State",
+                            "children": []
+                        },
+                        {
+                            "title": "Main Actor and UI Updates",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Async Sequences and Streams",
+                    "children": [
+                        {
+                            "title": "AsyncSequence Basics",
+                            "children": []
+                        },
+                        {
+                            "title": "Iterating over Async Sequences",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Legacy Concurrency Interop",
+                    "children": [
+                        {
+                            "title": "GCD (DispatchQueue) Interactions",
+                            "children": []
+                        },
+                        {
+                            "title": "OperationQueue and Operations",
+                            "children": []
+                        },
+                        {
+                            "title": "Bridging Callbacks to async/await",
+                            "children": []
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "title": "Memory Management and Performance",
+            "children": [
+                {
+                    "title": "Automatic Reference Counting (ARC)",
+                    "children": [
+                        {
+                            "title": "Strong, Weak, and Unowned References",
+                            "children": []
+                        },
+                        {
+                            "title": "Reference Cycles and Retain Cycles",
+                            "children": []
+                        },
+                        {
+                            "title": "Capture Lists in Closures",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Value Semantics and Copying",
+                    "children": [
+                        {
+                            "title": "Copy-on-Write Collections",
+                            "children": []
+                        },
+                        {
+                            "title": "Structs and Performance Considerations",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Performance Optimization",
+                    "children": [
+                        {
+                            "title": "Measuring Performance",
+                            "children": []
+                        },
+                        {
+                            "title": "Hot Paths and Inlining",
+                            "children": []
+                        },
+                        {
+                            "title": "Algorithmic Complexity in Swift Code",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Low-Level and Unsafe APIs",
+                    "children": [
+                        {
+                            "title": "Unsafe Pointers",
+                            "children": []
+                        },
+                        {
+                            "title": "Buffer Pointers",
+                            "children": []
+                        },
+                        {
+                            "title": "Interacting with C APIs Safely",
+                            "children": []
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "title": "Error Handling and Debugging",
+            "children": [
+                {
+                    "title": "Error Handling Model",
+                    "children": [
+                        {
+                            "title": "throw, throws, and try",
+                            "children": []
+                        },
+                        {
+                            "title": "do-catch Blocks",
+                            "children": []
+                        },
+                        {
+                            "title": "Custom Error Types",
+                            "children": []
+                        },
+                        {
+                            "title": "Converting Errors Between Layers",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Result Type and Error Propagation",
+                    "children": [
+                        {
+                            "title": "Using Result for Asynchronous Operations",
+                            "children": []
+                        },
+                        {
+                            "title": "Mapping and Chaining Results",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Debugging Tools and Techniques",
+                    "children": [
+                        {
+                            "title": "Xcode Breakpoints and LLDB",
+                            "children": []
+                        },
+                        {
+                            "title": "Logging and print Debugging",
+                            "children": []
+                        },
+                        {
+                            "title": "Debugging Crashes and Stack Traces",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Common Bugs and Anti-Patterns",
+                    "children": [
+                        {
+                            "title": "Optional-Related Bugs",
+                            "children": []
+                        },
+                        {
+                            "title": "Concurrency Bugs",
+                            "children": []
+                        },
+                        {
+                            "title": "Memory Leaks and Retain Cycles",
+                            "children": []
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "title": "Standard Library and Collections",
+            "children": [
+                {
+                    "title": "Array, Dictionary, and Set Deep Dive",
+                    "children": [
+                        {
+                            "title": "Advanced Operations on Arrays",
+                            "children": []
+                        },
+                        {
+                            "title": "Dictionaries and Default Values",
+                            "children": []
+                        },
+                        {
+                            "title": "Sets and Membership Operations",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Sequences and Collections Protocols",
+                    "children": [
+                        {
+                            "title": "Sequence and Collection Protocols",
+                            "children": []
+                        },
+                        {
+                            "title": "IteratorProtocol",
+                            "children": []
+                        },
+                        {
+                            "title": "Custom Collections",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Strings and Text Processing",
+                    "children": [
+                        {
+                            "title": "Unicode and Character Views",
+                            "children": []
+                        },
+                        {
+                            "title": "String Indexing and Slicing",
+                            "children": []
+                        },
+                        {
+                            "title": "String Performance Considerations",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Date, Time, and Measurements",
+                    "children": [
+                        {
+                            "title": "Dates and Calendars",
+                            "children": []
+                        },
+                        {
+                            "title": "Formatting Dates",
+                            "children": []
+                        },
+                        {
+                            "title": "Measurement and Units",
+                            "children": []
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "title": "Object-Oriented and Protocol-Oriented Design",
+            "children": [
+                {
+                    "title": "Class Inheritance and Overrides",
+                    "children": [
+                        {
+                            "title": "Subclassing Best Practices",
+                            "children": []
+                        },
+                        {
+                            "title": "Overriding Methods and Properties",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Protocol-Oriented Patterns",
+                    "children": [
+                        {
+                            "title": "Replacing Inheritance with Protocols",
+                            "children": []
+                        },
+                        {
+                            "title": "Default Implementations via Extensions",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Common Design Patterns",
+                    "children": [
+                        {
+                            "title": "Singleton and Its Alternatives",
+                            "children": []
+                        },
+                        {
+                            "title": "Strategy and Delegation",
+                            "children": []
+                        },
+                        {
+                            "title": "Observer and Publisher-Subscriber Styles",
+                            "children": []
+                        },
+                        {
+                            "title": "MVVM, MVC, and Other Architectural Patterns",
+                            "children": []
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "title": "Core Frameworks and Ecosystem",
+            "children": [
+                {
+                    "title": "Foundation Framework",
+                    "children": [
+                        {
+                            "title": "Collections and Utilities in Foundation",
+                            "children": []
+                        },
+                        {
+                            "title": "URL and Data Handling",
+                            "children": []
+                        },
+                        {
+                            "title": "Timers and Run Loops",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Swift Package Manager",
+                    "children": [
+                        {
+                            "title": "Creating Packages",
+                            "children": []
+                        },
+                        {
+                            "title": "Managing Dependencies",
+                            "children": []
+                        },
+                        {
+                            "title": "Targets and Products",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Interoperability",
+                    "children": [
+                        {
+                            "title": "Calling Objective-C from Swift",
+                            "children": []
+                        },
+                        {
+                            "title": "Bridging Headers and Modules",
+                            "children": []
+                        },
+                        {
+                            "title": "C and C++ Interop Basics",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Command-Line and Server-Side Use",
+                    "children": [
+                        {
+                            "title": "Command-Line Tools with Swift",
+                            "children": []
+                        },
+                        {
+                            "title": "Introduction to Server-Side Frameworks",
+                            "children": []
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "title": "User Interface Development (SwiftUI-Focused)",
+            "children": [
+                {
+                    "title": "SwiftUI Basics",
+                    "children": [
+                        {
+                            "title": "Views, Modifiers, and Layout",
+                            "children": []
+                        },
+                        {
+                            "title": "State Management (State, Binding, ObservedObject, EnvironmentObject)",
+                            "children": []
+                        },
+                        {
+                            "title": "Navigation and Presentation",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "SwiftUI Advanced Topics",
+                    "children": [
+                        {
+                            "title": "Custom View Components",
+                            "children": []
+                        },
+                        {
+                            "title": "Animations and Transitions",
+                            "children": []
+                        },
+                        {
+                            "title": "Working with Lists and Grids",
+                            "children": []
+                        },
+                        {
+                            "title": "Interfacing with UIKit/AppKit",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Data Flow and Architecture with SwiftUI",
+                    "children": [
+                        {
+                            "title": "Unidirectional Data Flow Concepts",
+                            "children": []
+                        },
+                        {
+                            "title": "Integrating Networking and Persistence",
+                            "children": []
+                        },
+                        {
+                            "title": "Managing App State",
+                            "children": []
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "title": "UIKit and AppKit Development",
+            "children": [
+                {
+                    "title": "UIKit Fundamentals",
+                    "children": [
+                        {
+                            "title": "View Controllers and Navigation",
+                            "children": []
+                        },
+                        {
+                            "title": "Storyboards, Nibs, and Programmatic UI",
+                            "children": []
+                        },
+                        {
+                            "title": "Auto Layout and Constraints",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "UIKit Advanced Topics",
+                    "children": [
+                        {
+                            "title": "Table Views and Collection Views",
+                            "children": []
+                        },
+                        {
+                            "title": "Gestures and Touch Handling",
+                            "children": []
+                        },
+                        {
+                            "title": "Custom Transitions and Animations",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "AppKit and macOS UI Basics",
+                    "children": [
+                        {
+                            "title": "Windows and View Hierarchies",
+                            "children": []
+                        },
+                        {
+                            "title": "Menus, Toolbars, and macOS UI Patterns",
+                            "children": []
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "title": "Data Persistence and Local Storage",
+            "children": [
+                {
+                    "title": "Codable and Serialization",
+                    "children": [
+                        {
+                            "title": "Encoding and Decoding JSON",
+                            "children": []
+                        },
+                        {
+                            "title": "Nested and Custom Codable Types",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "UserDefaults and Simple Storage",
+                    "children": [
+                        {
+                            "title": "Key-Value Storage Patterns",
+                            "children": []
+                        },
+                        {
+                            "title": "Synchronization and Performance",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "File System Access",
+                    "children": [
+                        {
+                            "title": "Reading and Writing Files",
+                            "children": []
+                        },
+                        {
+                            "title": "Sandboxing and Security Considerations",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Core Data Essentials",
+                    "children": [
+                        {
+                            "title": "Data Model and NSManagedObject",
+                            "children": []
+                        },
+                        {
+                            "title": "Fetching, Saving, and Contexts",
+                            "children": []
+                        },
+                        {
+                            "title": "Relationships and Migrations",
+                            "children": []
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "title": "Networking and Web Services",
+            "children": [
+                {
+                    "title": "URLSession Basics",
+                    "children": [
+                        {
+                            "title": "GET and POST Requests",
+                            "children": []
+                        },
+                        {
+                            "title": "Handling Responses and Errors",
+                            "children": []
+                        },
+                        {
+                            "title": "Background and Download Tasks",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Parsing Remote Data",
+                    "children": [
+                        {
+                            "title": "Decoding JSON APIs",
+                            "children": []
+                        },
+                        {
+                            "title": "Error Handling for Network Layers",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Authentication and Security",
+                    "children": [
+                        {
+                            "title": "Token-Based Authentication",
+                            "children": []
+                        },
+                        {
+                            "title": "Certificates and HTTPS Considerations",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Real-Time and Streaming",
+                    "children": [
+                        {
+                            "title": "WebSockets and Streaming APIs",
+                            "children": []
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "title": "Testing, Tooling, and Project Workflow",
+            "children": [
+                {
+                    "title": "Unit and UI Testing",
+                    "children": [
+                        {
+                            "title": "Unit Tests with XCTest",
+                            "children": []
+                        },
+                        {
+                            "title": "UI Tests and Recording",
+                            "children": []
+                        },
+                        {
+                            "title": "Test Doubles and Mocks",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Continuous Integration and Automation",
+                    "children": [
+                        {
+                            "title": "Setting Up CI Pipelines",
+                            "children": []
+                        },
+                        {
+                            "title": "Running Tests Automatically",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Xcode and IDE Usage",
+                    "children": [
+                        {
+                            "title": "Project Configuration and Schemes",
+                            "children": []
+                        },
+                        {
+                            "title": "Build Settings and Configurations",
+                            "children": []
+                        },
+                        {
+                            "title": "Refactoring Tools",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Code Quality and Style",
+                    "children": [
+                        {
+                            "title": "Linting and Static Analysis",
+                            "children": []
+                        },
+                        {
+                            "title": "Formatting Conventions",
+                            "children": []
+                        },
+                        {
+                            "title": "Code Review Practices",
+                            "children": []
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "title": "Applied Projects and Real-World Scenarios",
+            "children": [
+                {
+                    "title": "Small Apps and Utilities",
+                    "children": [
+                        {
+                            "title": "Simple Data-Driven Apps",
+                            "children": []
+                        },
+                        {
+                            "title": "Command-Line Tools",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "End-to-End App Architecture",
+                    "children": [
+                        {
+                            "title": "Layered Architecture in Apps",
+                            "children": []
+                        },
+                        {
+                            "title": "Handling App Lifecycle Events",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Refactoring Legacy Code",
+                    "children": [
+                        {
+                            "title": "Migrating to New Language Features",
+                            "children": []
+                        },
+                        {
+                            "title": "Reducing Technical Debt",
+                            "children": []
+                        }
+                    ]
+                },
+                {
+                    "title": "Performance and Profiling in Real Apps",
+                    "children": [
+                        {
+                            "title": "Using Profiling Tools",
+                            "children": []
+                        },
+                        {
+                            "title": "Optimizing Critical Paths",
+                            "children": []
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}

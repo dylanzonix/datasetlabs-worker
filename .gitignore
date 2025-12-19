@@ -1,0 +1,98 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Virtual environments
+venv/
+.env/
+.env*/
+.venv*/
+pip-wheel-metadata/
+
+# Distribution / packaging
+build/
+dist/
+downloads/
+.eggs/
+*.egg-info/
+*.egg
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Type checking / static analysis
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+
+# Django stuff
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask / instance folder
+instance/
+.webassets-cache
+
+# Scrapy
+.scrapy/
+
+# Sphinx docs
+docs/_build/
+docs/_autoapi/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+.jupyter/
+
+# VS Code / PyCharm / other IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS / Linux / Windows junk
+.DS_Store
+*.DS_Store
+Thumbs.db
+ehthumbs.db
+$RECYCLE.BIN/
+*.tmp
+
+# Environment variables / secrets
+*.env
+*.env.*
+.env.local
+
+# Poetry
+poetry.lock
+# (if you commit lockfile for apps, remove the line above)
+
+# Pyenv / ASDF
+.python-version
+
+# Docker
+*.log
+repo.ai.txt
