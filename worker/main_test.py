@@ -1,6 +1,6 @@
 """
-Worker entrypoint for processing jobs from Azure Service Bus.
-Updated to work with the projects table schema.
+Simplified worker for testing Azure scaling.
+Just sleeps for 60 seconds per job.
 """
 
 import asyncio
@@ -9,33 +9,22 @@ import logging
 import signal
 import sys
 from datetime import datetime, timezone
-from typing import Optional
 
 from azure.servicebus.aio import ServiceBusClient
-from azure.servicebus import ServiceBusMessage
-from openai import OpenAI
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from worker.config import settings
-from worker.job_processor import JobProcessor
 from worker.logging_setup import setup_logging
 
 logger = logging.getLogger(__name__)
 
 
-class WorkerService:
-    """
-    Main worker service that:
-    1. Connects to Azure Service Bus queue
-    2. Pulls job messages
-    3. Processes jobs using JobProcessor
-    4. Handles graceful shutdown
-    """
+class TestWorkerService:
+    """Minimal worker that processes messages by sleeping for 60s."""
 
     def __init__(self):
         self.running = True
-        self.current_processor: Optional[JobProcessor] = None
 
         # Database connection
         self.engine = create_engine(settings.database_url, pool_pre_ping=True)
@@ -44,15 +33,6 @@ class WorkerService:
         # Azure Service Bus client
         self.service_bus_client = ServiceBusClient.from_connection_string(
             settings.azure_service_bus_connection_string
-        )
-
-        # OpenAI client
-        self.openai_client = OpenAI(api_key=settings.openai_api_key)
-
-        # Job processor
-        self.job_processor = JobProcessor(
-            openai_client=self.openai_client,
-            db_session_factory=self.SessionLocal,
         )
 
         # Setup signal handlers
@@ -64,12 +44,8 @@ class WorkerService:
         logger.info(f"Received signal {signum}, initiating graceful shutdown...")
         self.running = False
 
-        # Signal current job to stop
-        if self.current_processor:
-            self.current_processor.request_stop()
-
     async def process_message(self, message):
-        """Process a single message from the queue."""
+        """Process a single message - just sleep for 60 seconds."""
         project_id = None
         try:
             # Parse message body
@@ -80,7 +56,7 @@ class WorkerService:
                 logger.error("Message missing project_id: %s", body)
                 return
 
-            logger.info(f"Processing project {project_id}")
+            logger.info(f"🚀 Starting test job for project {project_id}")
 
             # Update project status to running
             with self.SessionLocal() as session:
@@ -96,19 +72,40 @@ class WorkerService:
                 )
                 session.commit()
 
-            # Process the job
-            success = await self.job_processor.process_job(project_id, body)
+            # Sleep for 60 seconds (simulating work)
+            for i in range(60):
+                await asyncio.sleep(1)
+                progress = int((i + 1) / 60 * 100)
 
-            # Note: Final status is set in job_processor.process_job()
-            # We only update here if there was an unexpected issue
-            if not success:
-                logger.warning(f"Project {project_id} completed with success=False")
+                # Update progress every 10 seconds
+                if (i + 1) % 10 == 0:
+                    with self.SessionLocal() as session:
+                        session.execute(
+                            text("UPDATE projects SET progress = :progress, updated_at = :now WHERE id = :project_id"),
+                            {"project_id": project_id, "progress": progress, "now": datetime.now(timezone.utc)}
+                        )
+                        session.commit()
+                    logger.info(f"⏳ Project {project_id} progress: {progress}%")
 
-            logger.info(f"Completed project {project_id} with status: {'succeeded' if success else 'failed'}")
+            # Mark as succeeded
+            with self.SessionLocal() as session:
+                session.execute(
+                    text("""
+                        UPDATE projects 
+                        SET status = 'succeeded', 
+                            progress = 100,
+                            finished_at = :now,
+                            updated_at = :now
+                        WHERE id = :project_id
+                    """),
+                    {"project_id": project_id, "now": datetime.now(timezone.utc)}
+                )
+                session.commit()
+
+            logger.info(f"✅ Completed project {project_id}")
 
         except Exception as e:
-            logger.exception(f"Error processing message: {e}")
-            # Update project to failed
+            logger.exception(f"❌ Error processing message: {e}")
             if project_id:
                 with self.SessionLocal() as session:
                     session.execute(
@@ -126,12 +123,12 @@ class WorkerService:
 
     async def run(self):
         """Main worker loop."""
-        logger.info("Worker starting...")
+        logger.info("🔧 Test Worker starting...")
 
         async with self.service_bus_client:
             receiver = self.service_bus_client.get_queue_receiver(
                 queue_name=settings.azure_service_bus_queue_name,
-                max_wait_time=30  # Wait up to 30 seconds for messages
+                max_wait_time=30
             )
 
             async with receiver:
@@ -141,14 +138,12 @@ class WorkerService:
                         messages = await receiver.receive_messages(max_message_count=1, max_wait_time=5)
 
                         if not messages:
-                            # No messages, check if we should keep running
                             if not self.running:
                                 break
                             continue
 
                         for message in messages:
                             if not self.running:
-                                # Don't start new work if shutting down
                                 break
 
                             try:
@@ -158,21 +153,24 @@ class WorkerService:
                             except Exception as e:
                                 logger.exception(f"Failed to process message: {e}")
                                 # Dead letter the message
-                                await receiver.dead_letter_message(message, reason="ProcessingError", error_description=str(e))
+                                await receiver.dead_letter_message(
+                                    message,
+                                    reason="ProcessingError",
+                                    error_description=str(e)
+                                )
 
                     except Exception as e:
                         logger.exception(f"Error in worker loop: {e}")
-                        # Brief pause before retrying
                         await asyncio.sleep(5)
 
-        logger.info("Worker stopped")
+        logger.info("🛑 Test Worker stopped")
 
 
 async def main():
     """Main entry point."""
     setup_logging()
 
-    worker = WorkerService()
+    worker = TestWorkerService()
 
     try:
         await worker.run()

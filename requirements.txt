@@ -30,3 +30,4 @@ tiktoken==0.5.2
 pandas==2.1.4
 unstructured==0.11.6
 python-magic==0.4.27
+psycopg2-binary
