@@ -96,3 +96,5 @@ poetry.lock
 # Docker
 *.log
 repo.ai.txt
+
+dev/
