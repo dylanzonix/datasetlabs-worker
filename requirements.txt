@@ -31,3 +31,7 @@ pandas==2.1.4
 unstructured==0.11.6
 python-magic==0.4.27
 psycopg2-binary
+
+# Vector database support
+pgvector==0.3.6
+numpy==1.26.4
