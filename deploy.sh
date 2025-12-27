@@ -7,6 +7,8 @@
 # - Forces pollingInterval/cooldownPeriod via ARM PATCH (so they never show up as null)
 # - Verifies scaling config via ARM GET
 #
+# NEW: Supports --noop flag to deploy a non-processing worker for local development
+#
 # Expected files:
 #   - Dockerfile in this directory
 #   - .env in this directory (contains AZURE_SERVICE_BUS_CONNECTION_STRING OR enough info to fetch it)
@@ -72,6 +74,9 @@ ARM_API_VERSION="${ARM_API_VERSION:-2025-07-01}"
 AUTO_FETCH_SB_CONN="${AUTO_FETCH_SB_CONN:-1}"
 SB_AUTH_RULE_NAME="${SB_AUTH_RULE_NAME:-RootManageSharedAccessKey}"
 
+# NEW: Noop mode flag
+NOOP_MODE="${NOOP_MODE:-0}"
+
 # ------------------------------------------------------------------------------
 # Parse CLI args (optional)
 # ------------------------------------------------------------------------------
@@ -90,6 +95,7 @@ while [[ $# -gt 0 ]]; do
     --arm-api-version) ARM_API_VERSION="$2"; shift 2 ;;
     --no-auto-fetch-sb-conn) AUTO_FETCH_SB_CONN="0"; shift 1 ;;
     --sb-auth-rule) SB_AUTH_RULE_NAME="$2"; shift 2 ;;
+    --noop) NOOP_MODE="1"; shift 1 ;;
     --help)
       cat <<EOF
 Usage: $0 [options]
@@ -109,6 +115,9 @@ Service Bus scaler:
 KEDA behavior:
   --polling-interval SECS    (default: $POLLING_INTERVAL)
   --cooldown SECS            (default: $COOLDOWN_PERIOD)
+
+Development:
+  --noop                     Deploy in noop mode (worker won't process messages)
 
 Advanced:
   --arm-api-version VERSION  (default: $ARM_API_VERSION)
@@ -166,6 +175,12 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   ENV_VARS_YAML+=$'          value: '"$(yaml_quote "$value")"$'\n'
 done < .env
 
+# NEW: Add WORKER_MODE env var if in noop mode
+if [[ "$NOOP_MODE" == "1" ]]; then
+  ENV_VARS_YAML+=$'        - name: WORKER_MODE\n'
+  ENV_VARS_YAML+=$'          value: "noop"\n'
+fi
+
 # ------------------------------------------------------------------------------
 # Service Bus connection string validation / fetch
 # ------------------------------------------------------------------------------
@@ -199,6 +214,11 @@ fi
 echo ""
 echo "======================================"
 echo "Worker Build & Deploy"
+if [[ "$NOOP_MODE" == "1" ]]; then
+  echo "🔴 MODE: NOOP (worker will NOT process messages)"
+else
+  echo "MODE: NORMAL (worker will process messages)"
+fi
 echo "======================================"
 echo "Resource Group:    $RESOURCE_GROUP"
 echo "App Name:          $CONTAINER_APP_NAME"
@@ -224,7 +244,9 @@ az acr login --name "$REGISTRY_NAME" >/dev/null
 # Step 2: Build Docker image
 # ------------------------------------------------------------------------------
 echo "Step 2/7: Building Docker image..."
-docker build -t "$FULL_IMAGE" .
+# Build from parent directory so we can access both api/ and worker/
+# -f path is relative to current directory, not build context
+docker build -f Dockerfile -t "$FULL_IMAGE" ..
 
 # ------------------------------------------------------------------------------
 # Step 3: Push Docker image
@@ -349,7 +371,13 @@ az containerapp replica list -g "$RESOURCE_GROUP" -n "$CONTAINER_APP_NAME" --rev
 
 echo ""
 echo "======================================"
-echo "✅ Worker deployed successfully!"
+if [[ "$NOOP_MODE" == "1" ]]; then
+  echo "✅ Worker deployed in NOOP mode!"
+  echo "   Worker will NOT process messages from Service Bus"
+  echo "   Local workers can now handle all messages for debugging"
+else
+  echo "✅ Worker deployed successfully!"
+fi
 echo "======================================"
 echo ""
 echo "Monitor:"
