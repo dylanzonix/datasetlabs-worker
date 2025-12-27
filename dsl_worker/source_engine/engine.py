@@ -45,7 +45,7 @@ class SourceDataEngine:
             output_location: Directory to save processed chunks
             chunk_size: Maximum tokens per chunk (default: 512)
         """
-        from worker.source_engine.chunk_handler import LLMJudgeChunkHandler
+        from dsl_worker.source_engine.chunk_handler import LLMJudgeChunkHandler
 
         # Store output location for later retrieval
         self.output_location = output_location

@@ -10,6 +10,7 @@ class WorkerSettings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        extra="ignore",  # Allow extra env vars (e.g., from shared .env with API)
     )
 
     # Database
@@ -19,9 +20,10 @@ class WorkerSettings(BaseSettings):
     azure_service_bus_connection_string: str
     azure_service_bus_queue_name: str = "jobs"
 
-    # Azure Blob Storage
-    azure_storage_connection_string: str
-    azure_storage_container_name: str = "job-data"
+    # Azure Blob Storage (match API's approach)
+    azure_storage_account_name: str
+    azure_storage_account_key: str
+    azure_storage_container_name: str = "datasetlabs"
 
     # OpenAI
     openai_api_key: str
