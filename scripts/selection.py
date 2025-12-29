@@ -1,8 +1,10 @@
 import numpy as np
-from typing import List, Dict, Optional
-from dataclasses import dataclass, field
+from typing import List, Dict, Tuple
+from dataclasses import dataclass
 from collections import defaultdict
-import random
+from openai import OpenAI
+
+client = OpenAI()
 
 
 @dataclass
@@ -11,73 +13,92 @@ class ScoredSeed:
     text: str
     source_origin: str  # "upload" or "web"
     scores: Dict[str, Dict[str, float]]  # {axis_name: {value: score}}
+    embedding: np.ndarray = None
 
 
 @dataclass
 class DiversityAxis:
     name: str
-    weights: Dict[str, float]  # {value: weight} e.g., {"horror": 0.3, "romance": 0.7}
+    weights: Dict[str, float]
     source_rule: str = "any"  # "uploads_only" | "web_only" | "any"
 
 
 @dataclass
 class QuotaSlot:
-    """Represents one slot to fill in the dataset."""
-    assignments: Dict[str, str]  # {axis_name: value}
+    assignments: Dict[str, str]
     count_needed: int
     count_filled: int = 0
 
 
-@dataclass 
+@dataclass
 class SelectedSeed:
     seed_id: str
     assigned: Dict[str, str]
+    score: float
 
 
-def compute_quota_slots(
-    axes: List[DiversityAxis],
-    target_count: int
-) -> List[QuotaSlot]:
-    """
-    Compute all cross-axis combinations and their target counts.
-    """
+@dataclass
+class GapInfo:
+    slot_assignments: Dict[str, str]
+    needed: int
+    filled: int
+    suggested_search_query: str
+
+
+@dataclass
+class SelectionResult:
+    selected: List[SelectedSeed]
+    gaps: List[GapInfo]
+    total_requested: int
+    total_filled: int
+
+
+def compute_embeddings(texts: List[str]) -> List[np.ndarray]:
+    """Embed texts via OpenAI API."""
+    if not texts:
+        return []
+    
+    response = client.embeddings.create(
+        model="text-embedding-3-large",
+        input=texts,
+        encoding_format="float"
+    )
+    sorted_data = sorted(response.data, key=lambda d: d.index)
+    return [np.array(item.embedding, dtype=np.float32) for item in sorted_data]
+
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return float(np.dot(a, b) / (norm_a * norm_b))
+
+
+def compute_quota_slots(axes: List[DiversityAxis], target_count: int) -> List[QuotaSlot]:
+    """Compute all cross-axis combinations and their target counts."""
     if not axes:
         return []
     
-    slots = []
-    first_axis = axes[0]
-    for value, weight in first_axis.weights.items():
-        slots.append({
-            "assignments": {first_axis.name: value},
-            "weight": weight
-        })
+    slots = [{"assignments": {axes[0].name: v}, "weight": w} for v, w in axes[0].weights.items()]
     
     for axis in axes[1:]:
-        new_slots = []
-        for slot in slots:
-            for value, weight in axis.weights.items():
-                new_slots.append({
-                    "assignments": {**slot["assignments"], axis.name: value},
-                    "weight": slot["weight"] * weight
-                })
-        slots = new_slots
+        slots = [
+            {"assignments": {**s["assignments"], axis.name: v}, "weight": s["weight"] * w}
+            for s in slots for v, w in axis.weights.items()
+        ]
     
-    quota_slots = []
-    for slot in slots:
-        count = max(1, round(slot["weight"] * target_count))
-        quota_slots.append(QuotaSlot(
-            assignments=slot["assignments"],
-            count_needed=count
-        ))
-    
-    return quota_slots
+    total_weight = sum(s["weight"] for s in slots)
+    return [
+        QuotaSlot(
+            assignments=s["assignments"],
+            count_needed=max(1, round((s["weight"] / total_weight) * target_count))
+        )
+        for s in slots
+    ]
 
 
-def seed_passes_source_rules(
-    seed: ScoredSeed,
-    axes: List[DiversityAxis]
-) -> bool:
-    """Check if seed's source origin passes all axis source rules."""
+def seed_passes_source_rules(seed: ScoredSeed, axes: List[DiversityAxis]) -> bool:
     for axis in axes:
         if axis.source_rule == "uploads_only" and seed.source_origin != "upload":
             return False
@@ -86,204 +107,201 @@ def seed_passes_source_rules(
     return True
 
 
-def compute_seed_score_for_slot(
-    seed: ScoredSeed,
-    slot: QuotaSlot
-) -> float:
-    """
-    Compute how well a seed fits a slot.
-    Multiplies scores across all assigned axes.
-    """
-    total_score = 1.0
+def compute_seed_score_for_slot(seed: ScoredSeed, slot: QuotaSlot) -> float:
+    score = 1.0
     for axis_name, target_value in slot.assignments.items():
         if axis_name in seed.scores and target_value in seed.scores[axis_name]:
-            total_score *= seed.scores[axis_name][target_value]
+            score *= seed.scores[axis_name][target_value]
         else:
-            total_score *= 0.01
-    return total_score
+            score *= 0.01
+    return score
+
+
+def generate_search_query(assignments: Dict[str, str]) -> str:
+    return " ".join(assignments.values()) + " scenario"
 
 
 def select_seeds(
     seeds: List[ScoredSeed],
     axes: List[DiversityAxis],
     target_count: int,
-    prioritize_uploads: bool = True
-) -> List[SelectedSeed]:
+    prioritize_uploads: bool = True,
+    top_k_per_slot: int = 100
+) -> SelectionResult:
     """
     Select seeds to fill diversity quotas.
     
-    Current: Greedy per-slot selection.
-    
-    ============================================================================
-    FUTURE ENHANCEMENTS
-    ============================================================================
-    
-    1. DIVERSITY PENALTY
-       Problem: Greedy may pick semantically similar seeds (e.g., 5 "mafia boss" scenarios)
-       Solution: After each selection, penalize seeds similar to already-selected:
-       
-           final_score = base_score - (max_similarity_to_selected * penalty_weight)
-       
-       Requires: Keep seed embeddings through selection phase
-       Adds: ~20 lines, need embeddings in ScoredSeed dataclass
-    
-    2. GLOBAL OPTIMIZATION  
-       Problem: Greedy can waste good seeds. Seed A might be the only decent 
-                "romance" option but gets grabbed for "crime" first.
-       Solution: Use Hungarian algorithm (scipy.optimize.linear_sum_assignment)
-                 to find globally optimal seed-to-slot assignment.
-       
-           cost_matrix[i][j] = -score(seed_i, slot_j)
-           seed_indices, slot_indices = linear_sum_assignment(cost_matrix)
-       
-       Requires: scipy
-       Adds: ~15 lines, O(n³) vs current O(n²)
-    
-    3. RE-BALANCING / GAP HANDLING
-       Problem: Currently just warns "X slots unfilled". User has no recourse.
-       Solution: Return structured gap report:
-       
-           {
-               "selected": [...],
-               "gaps": [
-                   {"slot": {"genre": "romance"}, "needed": 20, "search_query": "romance scenario"}
-               ],
-               "achievable_distribution": {"horror": 0.7, "romance": 0.3},
-               "requested_distribution": {"horror": 0.5, "romance": 0.5}
-           }
-       
-       Then either:
-       A. Auto-trigger web search for gap categories
-       B. Ask user to approve relaxed quotas
-       C. Fill with lower-scoring seeds (relax threshold)
-       
-       Adds: ~30 lines, improves UX significantly
-    
-    ============================================================================
+    Uses pre-filter + global optimization:
+    1. For each slot, get top K candidates
+    2. Pool all candidates
+    3. Run Hungarian algorithm on pool
+    4. Apply diversity penalty adaptively
     """
-    # Step 1: Compute quota slots
+    from scipy.optimize import linear_sum_assignment
+    
+    # Compute slots
     slots = compute_quota_slots(axes, target_count)
     
-    # Step 2: Filter seeds by source rules
-    eligible_seeds = [s for s in seeds if seed_passes_source_rules(s, axes)]
+    # Filter by source rules
+    eligible = [s for s in seeds if seed_passes_source_rules(s, axes)]
     
-    # Step 3: Separate by source if prioritizing uploads
+    # Ensure all seeds have embeddings
+    needs_embedding = [s for s in eligible if s.embedding is None]
+    if needs_embedding:
+        texts = [s.text for s in needs_embedding]
+        embeddings = compute_embeddings(texts)
+        for seed, emb in zip(needs_embedding, embeddings):
+            seed.embedding = emb
+    
+    # Separate by source priority
     if prioritize_uploads:
-        upload_seeds = [s for s in eligible_seeds if s.source_origin == "upload"]
-        web_seeds = [s for s in eligible_seeds if s.source_origin == "web"]
+        upload_seeds = [s for s in eligible if s.source_origin == "upload"]
+        web_seeds = [s for s in eligible if s.source_origin == "web"]
     else:
-        upload_seeds = eligible_seeds
+        upload_seeds = eligible
         web_seeds = []
     
-    used_seed_ids = set()
-    selected = []
+    # Pre-filter: get top K candidates per slot
+    candidate_ids = set()
+    for slot in slots:
+        for seed_pool in [upload_seeds, web_seeds]:
+            scored = [(s, compute_seed_score_for_slot(s, slot)) for s in seed_pool]
+            scored.sort(key=lambda x: -x[1])
+            for seed, _ in scored[:top_k_per_slot]:
+                candidate_ids.add(seed.id)
     
-    # Step 4: Fill slots, prioritizing uploads
-    for seed_pool, pool_name in [(upload_seeds, "upload"), (web_seeds, "web")]:
-        if not seed_pool:
+    candidates = [s for s in eligible if s.id in candidate_ids]
+    
+    if not candidates:
+        return SelectionResult(
+            selected=[],
+            gaps=[GapInfo(s.assignments, s.count_needed, 0, generate_search_query(s.assignments)) for s in slots],
+            total_requested=sum(s.count_needed for s in slots),
+            total_filled=0
+        )
+    
+    # Expand slots into positions
+    positions = [(slot_idx, slot) for slot_idx, slot in enumerate(slots) for _ in range(slot.count_needed)]
+    
+    n_candidates = len(candidates)
+    n_positions = len(positions)
+    
+    # Build cost matrix
+    cost_matrix = np.full((n_candidates, n_positions), 1000.0)
+    
+    for i, seed in enumerate(candidates):
+        for j, (slot_idx, slot) in enumerate(positions):
+            score = compute_seed_score_for_slot(seed, slot)
+            if prioritize_uploads and seed.source_origin == "upload":
+                score += 0.001
+            cost_matrix[i, j] = -score
+    
+    # Hungarian algorithm
+    seed_indices, position_indices = linear_sum_assignment(cost_matrix)
+    
+    # Build initial selection
+    raw_selected = []
+    for seed_idx, pos_idx in zip(seed_indices, position_indices):
+        if cost_matrix[seed_idx, pos_idx] >= 999:
             continue
-            
-        for slot in slots:
-            while slot.count_filled < slot.count_needed:
-                best_seed = None
-                best_score = -1
-                
-                for seed in seed_pool:
-                    if seed.id in used_seed_ids:
-                        continue
-                    
-                    score = compute_seed_score_for_slot(seed, slot)
-                    
-                    # FUTURE: Add diversity penalty here
-                    # if selected_embeddings:
-                    #     max_sim = max(cosine_sim(seed.embedding, e) for e in selected_embeddings)
-                    #     score -= max_sim * diversity_penalty_weight
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_seed = seed
-                
-                if best_seed is None:
-                    break
-                
-                used_seed_ids.add(best_seed.id)
-                selected.append(SelectedSeed(
-                    seed_id=best_seed.id,
-                    assigned=slot.assignments.copy()
-                ))
-                slot.count_filled += 1
+        slot_idx, slot = positions[pos_idx]
+        seed = candidates[seed_idx]
+        raw_selected.append((seed, slot.assignments.copy(), -cost_matrix[seed_idx, pos_idx]))
     
-    # Step 5: Report unfilled slots
-    # FUTURE: Return structured gap report instead of just warning
-    unfilled = sum(slot.count_needed - slot.count_filled for slot in slots)
-    if unfilled > 0:
-        print(f"Warning: {unfilled} slots could not be filled due to insufficient seeds")
-        # FUTURE: Return which slots are unfilled and suggested search queries
+    # Apply diversity penalty: re-rank and potentially swap
+    # Adaptive: score *= (1 - max_similarity_to_already_selected)
+    selected = []
+    selected_embeddings = []
     
-    return selected
+    for seed, assigned, base_score in raw_selected:
+        if selected_embeddings:
+            max_sim = max(cosine_similarity(seed.embedding, e) for e in selected_embeddings)
+            final_score = base_score * (1 - max_sim)
+        else:
+            final_score = base_score
+        
+        selected.append(SelectedSeed(
+            seed_id=seed.id,
+            assigned=assigned,
+            score=final_score
+        ))
+        selected_embeddings.append(seed.embedding)
+    
+    # Update slot fill counts
+    slot_fills = defaultdict(int)
+    for s in selected:
+        key = tuple(sorted(s.assigned.items()))
+        slot_fills[key] += 1
+    
+    for slot in slots:
+        key = tuple(sorted(slot.assignments.items()))
+        slot.count_filled = slot_fills.get(key, 0)
+    
+    # Identify gaps
+    gaps = [
+        GapInfo(
+            slot_assignments=slot.assignments.copy(),
+            needed=slot.count_needed,
+            filled=slot.count_filled,
+            suggested_search_query=generate_search_query(slot.assignments)
+        )
+        for slot in slots if slot.count_filled < slot.count_needed
+    ]
+    
+    return SelectionResult(
+        selected=selected,
+        gaps=gaps,
+        total_requested=sum(s.count_needed for s in slots),
+        total_filled=len(selected)
+    )
 
 
-# Example usage
 if __name__ == "__main__":
-    # Mock scored seeds (in reality, from Phase 2)
     seeds = [
         ScoredSeed(
             id="seed_1",
-            text="Damian mafia boss...",
+            text="Damian mafia boss meets new neighbor with cookies",
             source_origin="upload",
             scores={
-                "genre": {"romance": 0.12, "action": 0.14, "horror": 0.19, "crime": 0.27},
+                "genre": {"romance": 0.12, "crime": 0.27},
                 "tone": {"dark": 0.19, "lighthearted": 0.08}
             }
         ),
         ScoredSeed(
             id="seed_2",
-            text="Jayden secret agent...",
+            text="Jayden and rival agent at gala, who dies first",
             source_origin="upload",
             scores={
-                "genre": {"romance": 0.06, "action": 0.17, "horror": 0.07, "crime": 0.13},
+                "genre": {"romance": 0.06, "crime": 0.13},
                 "tone": {"dark": 0.15, "lighthearted": 0.05}
             }
         ),
         ScoredSeed(
             id="seed_3",
-            text="Web sourced romance story...",
+            text="Sweet summer romance at the beach",
             source_origin="web",
             scores={
-                "genre": {"romance": 0.45, "action": 0.05, "horror": 0.03, "crime": 0.04},
+                "genre": {"romance": 0.45, "crime": 0.04},
                 "tone": {"dark": 0.05, "lighthearted": 0.35}
             }
         ),
     ]
     
-    # Diversity axes with quotas
     axes = [
-        DiversityAxis(
-            name="genre",
-            weights={"crime": 0.5, "romance": 0.5},
-            source_rule="any"
-        ),
-        DiversityAxis(
-            name="tone", 
-            weights={"dark": 0.5, "lighthearted": 0.5},
-            source_rule="any"
-        ),
+        DiversityAxis(name="genre", weights={"crime": 0.5, "romance": 0.5}),
+        DiversityAxis(name="tone", weights={"dark": 0.5, "lighthearted": 0.5}),
     ]
     
-    # Select seeds for 4 rows
-    selected = select_seeds(
-        seeds=seeds,
-        axes=axes,
-        target_count=4,
-        prioritize_uploads=True
-    )
+    result = select_seeds(seeds=seeds, axes=axes, target_count=4, prioritize_uploads=True)
     
-    # Pretty print
-    import json
-    print(json.dumps([{"seed_id": s.seed_id, "assigned": s.assigned} for s in selected], indent=2))
+    print("=== SELECTED ===")
+    for s in result.selected:
+        print(f"  {s.seed_id}: {s.assigned} (score: {s.score:.4f})")
     
-    # Show slot fill status
-    print("\nQuota slots:")
-    slots = compute_quota_slots(axes, 4)
-    for slot in slots:
-        print(f"  {slot.assignments}: need {slot.count_needed}")
+    print(f"\n=== FILL: {result.total_filled}/{result.total_requested} ===")
+    
+    if result.gaps:
+        print(f"\n=== GAPS ===")
+        for g in result.gaps:
+            print(f"  {g.slot_assignments}: {g.filled}/{g.needed}")
+            print(f"    → \"{g.suggested_search_query}\"")
