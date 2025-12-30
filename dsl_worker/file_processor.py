@@ -5,8 +5,11 @@ import uuid
 from pathlib import Path
 
 from azure.storage.blob import BlobServiceClient
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 import numpy as np
+
+from dsl_api.models import RagChunk
 
 logger = logging.getLogger(__name__)
 
@@ -256,67 +259,30 @@ class FileProcessor:
             embeddings: List[np.ndarray],
             existing_indices: set = None
     ) -> int:
-        """
-        Store chunks and embeddings in the database.
-
-        Skips chunks that already exist (based on chunk_idx).
-
-        Args:
-            project_id: Project UUID
-            file_id: File UUID
-            chunks: List of text chunks
-            embeddings: List of embedding vectors (numpy arrays)
-            existing_indices: Set of chunk indices to skip (for resume)
-
-        Returns:
-            Number of chunks stored
-        """
-        from dsl_api.models.rag_chunk import RagChunk
-
         if existing_indices is None:
             existing_indices = set()
 
-        stored_count = 0
+        rows = []
+        for idx, (text, embedding) in enumerate(zip(chunks, embeddings)):
+            if idx in existing_indices:
+                continue
 
-        try:
-            # Prepare batch insert
-            chunk_objects = []
+            rows.append({
+                "id": uuid.uuid4(),
+                "project_id": project_id,
+                "file_id": file_id,
+                "chunk_idx": idx,
+                "text": text,
+                "chunk_metadata": {"chunk_idx": idx, "total_chunks": len(chunks)},
+                "embedding": embedding.tolist(),
+            })
 
-            for idx, (text, embedding) in enumerate(zip(chunks, embeddings)):
-                # Skip if already exists
-                if idx in existing_indices:
-                    logger.debug(f"Skipping existing chunk {idx}")
-                    continue
+        if rows:
+            stmt = insert(RagChunk).values(rows)
+            self.db.execute(stmt)
+            self.db.commit()
 
-                chunk_obj = RagChunk(
-                    id=uuid.uuid4(),
-                    project_id=project_id,
-                    file_id=file_id,
-                    chunk_idx=idx,
-                    text=text,
-                    chunk_metadata={
-                        "chunk_idx": idx,
-                        "total_chunks": len(chunks)
-                    },
-                    embedding=embedding  # pgvector handles numpy array automatically
-                )
-                chunk_objects.append(chunk_obj)
-
-            if chunk_objects:
-                # Bulk insert
-                self.db.bulk_save_objects(chunk_objects)
-                self.db.commit()
-                stored_count = len(chunk_objects)
-                logger.info(f"Stored {stored_count} new chunks to database")
-            else:
-                logger.info("No new chunks to store (all already exist)")
-
-        except Exception as e:
-            logger.error(f"Failed to store chunks: {e}", exc_info=True)
-            self.db.rollback()
-            raise
-
-        return stored_count
+        return len(rows)
 
     async def process_file(self, project_file) -> bool:
         """
