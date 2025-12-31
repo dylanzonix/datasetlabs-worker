@@ -1,5 +1,10 @@
 """
 Base class for processing phases in the orchestrator.
+
+Key design decisions:
+- execute_once() processes one unit of work (phases determine batch size internally)
+- Status tracking only matters up to seed_scoring (assignment/generation restart from scratch)
+- Phases are responsible for their own resume logic
 """
 
 import logging
@@ -21,11 +26,12 @@ class Phase(ABC):
 
     Each phase implements:
     - should_run(): Decide if this phase should execute now
-    - execute_batch(): Process one batch of work
+    - execute_once(): Process one unit of work (batch size determined internally)
     - is_complete(): Check if this phase is fully done
 
-    Phases can run sequentially or concurrently depending on their
-    should_run() logic and the orchestrator's gather() call.
+    Resume semantics:
+    - file_processing, seed_extraction, seed_scoring: Resume from where we left off
+    - seed_assignment, generation: Always start fresh (ephemeral state)
     """
 
     def __init__(
@@ -53,23 +59,26 @@ class Phase(ABC):
         - Is there work available for this phase?
         - Are dependencies complete? (for sequential phases)
         - Is preview mode active? (for eager phases)
-        - Does config invalidation require re-running?
 
         Returns:
-            True if execute_batch() should be called
+            True if execute_once() should be called
         """
         pass
 
     @abstractmethod
-    async def execute_batch(self, batch_size: int = 10) -> int:
+    async def execute_once(self) -> bool:
         """
-        Execute one batch of work for this phase.
+        Execute one unit of work for this phase.
 
-        Args:
-            batch_size: Maximum number of items to process
+        The phase determines internally how much work constitutes "one unit":
+        - For file processing: one file
+        - For seed extraction: one chunk (or a small batch)
+        - For seed scoring: a batch of seeds
+        - For assignment: all seeds at once (algorithm requirement)
+        - For generation: one sample
 
         Returns:
-            Number of items actually processed (0 if no work available)
+            True if work was done, False if no work available
         """
         pass
 
