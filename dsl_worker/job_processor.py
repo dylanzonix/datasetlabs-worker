@@ -68,7 +68,7 @@ class JobProcessor:
         run_id_str = message_body.get("run_id")
 
         if not project_id_str or not run_id_str:
-            logger.error(f"Invalid message: missing project_id or run_id")
+            logger.error("Invalid message: missing project_id or run_id")
             return False
 
         project_id = UUID(project_id_str)
@@ -83,20 +83,19 @@ class JobProcessor:
                 logger.error(f"Project not found: {project_id}")
                 return False
 
-            # Check run_id matches
+            # Check run_id matches - if not, this is a stale message
             if project.current_run_id != run_id:
-                logger.warning(f"Stale message (run mismatch), ignoring")
+                logger.warning("Stale message (run mismatch), ignoring")
                 return True
 
             logger.info(f"Project: {project.name}")
             logger.info(f"  Status: {project.status}")
             logger.info(f"  Target: {project.num_samples} samples")
 
-            # Initialize state
-            state = ProjectState(db, project_id, run_id)
+            # Initialize state (no run_id needed - queries don't filter by it)
+            state = ProjectState(db, project_id)
 
             # Create phases
-            # Note: assignment_phase is passed to generation_phase for coordination
             file_processing = FileProcessingPhase(
                 'file_processing', state, db,
                 self.openai_client, self.blob_service_client
@@ -163,7 +162,7 @@ class JobProcessor:
                         await asyncio.sleep(1)
                         continue
 
-                # Log active phases
+                # Log active phases periodically
                 if iteration % 100 == 1:
                     logger.info(f"Iteration {iteration}: Active={[p.name for p in active]}")
 

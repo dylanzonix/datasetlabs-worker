@@ -15,7 +15,6 @@ import logging
 import numpy as np
 from typing import List, Dict, Tuple
 from dataclasses import dataclass
-from collections import defaultdict
 from scipy.optimize import linear_sum_assignment
 
 from dsl_worker.phases.base import Phase
@@ -44,7 +43,7 @@ class SeedAssignmentPhase(Phase):
     """
     Assign seeds to diversity slots.
 
-    Uses Jonker-Volgenant algorithm for optimal assignment.
+    Uses Jonker-Volgenant (Hungarian) algorithm for optimal assignment.
     This phase is ephemeral - results are computed fresh each time.
 
     One execute_once() processes ALL seeds at once (algorithm requirement).
@@ -56,22 +55,29 @@ class SeedAssignmentPhase(Phase):
         self._assigned_seeds: List[AssignedSeed] = []
 
     def should_run(self) -> bool:
-        """Run when scoring is complete and assignment not done yet."""
+        """
+        Run when scoring is complete and assignment not done yet.
+
+        Flow control:
+        - Preview mode: run as soon as any seeds are scored
+        - Normal mode: wait for scoring to complete
+        """
         if self._assignment_done:
             return False
 
-        # Need scored seeds to assign
-        seeds_scored = self.state.stats.get('seeds_scored', 0)
-        if seeds_scored == 0:
+        # Need at least some scored seeds to assign
+        if self.state.seeds_scored == 0:
             return False
 
-        # In preview mode, run as soon as any seeds are scored
+        # Preview mode: assign as soon as any scored
         if self.state.preview_mode:
             return True
 
         # Normal mode: wait for scoring to complete
-        seeds_extracted = self.state.stats.get('seeds_extracted', 0)
-        return seeds_scored >= seeds_extracted
+        if self.state.has_unscored_seeds():
+            return False
+
+        return True
 
     async def execute_once(self) -> bool:
         """Run assignment on ALL scored seeds."""
@@ -117,7 +123,7 @@ class SeedAssignmentPhase(Phase):
                     score = self._compute_slot_score(seed, slot)
                     cost_matrix[i, j] = -score  # Negate for minimization
 
-            # Run Jonker–Volgenant algorithm
+            # Run Jonker-Volgenant algorithm
             seed_indices, pos_indices = linear_sum_assignment(cost_matrix)
 
             # Build assigned seeds list
@@ -150,8 +156,11 @@ class SeedAssignmentPhase(Phase):
             return []
 
         return [
-            {"name": name, "weights": weights}
-            for name, weights in self.state.diversity_spec.items()
+            {
+                "name": axis.get("name"),
+                "weights": {v.get("value"): v.get("weight", 1.0) for v in axis.get("values", [])}
+            }
+            for axis in self.state.diversity_spec
         ]
 
     def _compute_slots(self, axes: List[Dict], target_count: int) -> List[QuotaSlot]:

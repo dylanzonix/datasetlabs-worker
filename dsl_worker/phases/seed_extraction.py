@@ -8,7 +8,7 @@ Resume logic:
 - Checks which chunks already have seeds
 - Only processes chunks without seeds
 """
-
+import asyncio
 import logging
 import json
 import uuid
@@ -46,26 +46,33 @@ class SeedExtractionPhase(Phase):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.batch_size = 5  # Process 5 chunks per iteration
+        self.batch_size = 20  # Process 5 chunks per iteration
 
     def should_run(self) -> bool:
-        """Run if there are chunks without seeds."""
-        chunks_total = self.state.stats.get('chunks_total', 0)
-        seeds_extracted = self.state.stats.get('seeds_extracted', 0)
+        """
+        Run if there are chunks without seeds.
 
-        if chunks_total == 0:
+        Flow control:
+        - Preview mode: run eagerly whenever chunks are available
+        - Normal mode: wait for file processing to complete first
+        """
+        # No chunks = nothing to extract from
+        if self.state.chunks_total == 0:
             return False
 
-        # In preview mode, extract eagerly
+        # Check if there's actual work to do
+        if not self.state.has_chunks_without_seeds():
+            return False
+
+        # Preview mode: extract eagerly
         if self.state.preview_mode:
-            return seeds_extracted < chunks_total
+            return True
 
-        # Normal mode: wait for all files to be processed first
-        files_total = self.state.stats.get('files_total', 0)
-        files_processed = self.state.stats.get('files_processed', 0)
-        files_complete = files_total == 0 or files_processed >= files_total
+        # Normal mode: wait for all files to be processed
+        if self.state.has_unprocessed_files():
+            return False
 
-        return files_complete and seeds_extracted < chunks_total
+        return True
 
     async def execute_once(self) -> bool:
         """Extract seeds from a batch of chunks."""
@@ -75,33 +82,37 @@ class SeedExtractionPhase(Phase):
 
         logger.info(f"[{self.name}] Extracting seeds from {len(chunks)} chunks")
 
+        # Fire all requests concurrently
+        results = await asyncio.gather(
+            *[self._extract_seeds_from_chunk(chunk) for chunk in chunks],
+            return_exceptions=True
+        )
+
         extracted_count = 0
-        for chunk in chunks:
-            try:
-                seed_texts = await self._extract_seeds_from_chunk(chunk)
-
-                for seed_text in seed_texts:
-                    seed = ProjectSeed(
-                        id=uuid.uuid4(),
-                        project_id=self.state.project_id,
-                        run_id=self.state.run_id,
-                        chunk_id=chunk.id,
-                        file_id=chunk.file_id,
-                        text=seed_text,
-                        extraction_metadata={
-                            'extraction_method': 'llm',
-                            'chunk_idx': chunk.chunk_idx,
-                            'extracted_at': datetime.now(timezone.utc).isoformat()
-                        }
-                    )
-                    self.db.add(seed)
-
-                extracted_count += len(seed_texts)
-                logger.debug(f"Extracted {len(seed_texts)} seeds from chunk {chunk.id}")
-
-            except Exception as e:
-                logger.error(f"Failed to extract seeds from chunk {chunk.id}: {e}")
+        for chunk, result in zip(chunks, results):
+            if isinstance(result, Exception):
+                logger.error(f"Failed to extract seeds from chunk {chunk.id}: {result}")
                 continue
+
+            seed_texts = result
+            for seed_text in seed_texts:
+                seed = ProjectSeed(
+                    id=uuid.uuid4(),
+                    project_id=self.state.project_id,
+                    run_id=self.state.run_id,
+                    chunk_id=chunk.id,
+                    file_id=chunk.file_id,
+                    text=seed_text,
+                    extraction_metadata={
+                        'extraction_method': 'llm',
+                        'chunk_idx': chunk.chunk_idx,
+                        'extracted_at': datetime.now(timezone.utc).isoformat()
+                    }
+                )
+                self.db.add(seed)
+
+            extracted_count += len(seed_texts)
+            logger.debug(f"Extracted {len(seed_texts)} seeds from chunk {chunk.id}")
 
         self.db.commit()
         logger.info(f"[{self.name}] Extracted {extracted_count} seeds from {len(chunks)} chunks")
@@ -109,52 +120,24 @@ class SeedExtractionPhase(Phase):
 
     async def _extract_seeds_from_chunk(self, chunk: ProjectRagChunk) -> List[str]:
         """Use LLM to extract seeds from a chunk."""
-        system_prompt = """You are a data extraction assistant. Your job is to identify discrete, self-contained pieces of content that can serve as seeds for generating synthetic data.
-
-Given a chunk of source data, identify the boundaries of each seed within the text. Each seed should be:
-- Self-contained and meaningful on its own
-- Suitable as a starting point for generating a complete data sample
-- Clearly demarcated by a start and end phrase from the original text
-
-Return a JSON object with this structure:
-{
-    "seeds": [
-        {"start": "first few words of seed 1", "end": "last few words of seed 1"},
-        {"start": "first few words of seed 2", "end": "last few words of seed 2"}
-    ]
-}
-
-If the entire chunk is one cohesive unit, return it as a single seed.
-If no valid seeds can be extracted, return {"seeds": []}.
-
-Important: The start and end strings must be EXACT substrings from the chunk text."""
-
-        user_prompt = f"""Extract seeds from this chunk:
-
-<chunk>
-{chunk.text}
-</chunk>
-
-Row generation instructions (context for what makes a good seed):
-{self.state.generation_prompt}
-
-Column schema:
-{self._format_column_schema()}
-
-Return JSON with seed boundaries."""
-
         try:
-            response = await self.openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.3
+            response = await asyncio.to_thread(
+                self.openai_client.responses.create,
+                prompt={
+                    "id": "pmpt_69508e29f514819693d017e0848e223406fd27a87843182b",
+                    "version": "5",
+                    "variables": {
+                        "row_instructions": self.state.generation_prompt,
+                        "column_schema": self._format_column_schema(),
+                        "source_chunk": chunk.text
+                    }
+                },
+                input=[],
+                reasoning={"summary": "auto"},
+                store=True,
             )
 
-            raw_output = response.choices[0].message.content
+            raw_output = response.output_text
             return self._process_extraction_response(raw_output, chunk.text)
 
         except Exception as e:
@@ -217,7 +200,5 @@ Return JSON with seed boundaries."""
         return chunk[start_idx:end_idx + len(marker.end)]
 
     def is_complete(self) -> bool:
-        """Complete when all chunks have been processed into seeds."""
-        # We check if there are any chunks without seeds
-        chunks_without_seeds = self.state.get_chunks_without_seeds(limit=1)
-        return len(chunks_without_seeds) == 0
+        """Complete when all chunks have seeds."""
+        return not self.state.has_chunks_without_seeds()

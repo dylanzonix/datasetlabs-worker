@@ -7,7 +7,7 @@ Stores results in project_seeds.scores column.
 Resume logic:
 - Checks which seeds don't have scored_at set
 - Only processes unscored seeds
-- If diversity_spec changes, all seeds are invalidated (scores cleared)
+- If diversity_spec changes, all seeds are invalidated (scores cleared by ProjectState)
 """
 
 import logging
@@ -36,23 +36,22 @@ class SeedScoringPhase(Phase):
         self._axis_embeddings_cache = None  # Cache embeddings for axis values
 
     def should_run(self) -> bool:
-        """Run if there are unscored seeds."""
-        seeds_extracted = self.state.stats.get('seeds_extracted', 0)
-        seeds_scored = self.state.stats.get('seeds_scored', 0)
+        """
+        Run if there are unscored seeds.
 
-        if seeds_extracted == 0:
+        Flow control:
+        - Preview mode: score eagerly whenever seeds are available
+        - Normal mode: wait for extraction to complete first
+        """
+        # No seeds = nothing to score
+        if self.state.seeds_extracted == 0:
             return False
 
-        # In preview mode, score eagerly
-        if self.state.preview_mode:
-            return seeds_scored < seeds_extracted
+        # Check if there's actual work to do
+        if not self.state.has_unscored_seeds():
+            return False
 
-        # Normal mode: wait for all extraction to complete
-        chunks_total = self.state.stats.get('chunks_total', 0)
-        # Extraction is complete if we have seeds and no unprocessed chunks
-        extraction_complete = chunks_total > 0 and seeds_extracted > 0
-
-        return extraction_complete and seeds_scored < seeds_extracted
+        return True
 
     async def execute_once(self) -> bool:
         """Score a batch of seeds."""
@@ -112,11 +111,18 @@ class SeedScoringPhase(Phase):
             return []
 
         axes = []
-        for axis_name, value_weights in self.state.diversity_spec.items():
+        for axis in self.state.diversity_spec:
+            axis_name = axis.get("name")
+            value_objs = axis.get("values", [])
+
+            # Extract value names and build weights dict
+            values = [v.get("value") for v in value_objs]
+            weights = {v.get("value"): v.get("weight", 1.0) for v in value_objs}
+
             axes.append({
                 "name": axis_name,
-                "values": list(value_weights.keys()),
-                "weights": value_weights
+                "values": values,
+                "weights": weights
             })
 
         return axes
@@ -164,7 +170,4 @@ class SeedScoringPhase(Phase):
 
     def is_complete(self) -> bool:
         """Complete when all seeds are scored."""
-        seeds_extracted = self.state.stats.get('seeds_extracted', 0)
-        seeds_scored = self.state.stats.get('seeds_scored', 0)
-
-        return seeds_extracted > 0 and seeds_scored >= seeds_extracted
+        return not self.state.has_unscored_seeds()

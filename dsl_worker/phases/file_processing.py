@@ -7,12 +7,12 @@ Stores results in project_rag_chunks table.
 Resume logic:
 - Checks which files already have chunks
 - Only processes files without chunks
+- Atomic: either all chunks for a file are stored, or none
 """
 
 import logging
 import uuid
-from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 from sqlalchemy.dialects.postgresql import insert
@@ -30,17 +30,15 @@ class FileProcessingPhase(Phase):
     Process files: chunk and embed.
 
     One execute_once() call processes ONE file completely.
+    This ensures atomicity - either all chunks for a file exist, or none.
     """
 
     def should_run(self) -> bool:
         """Run if there are unprocessed files."""
-        total = self.state.stats.get('files_total', 0)
-        processed = self.state.stats.get('files_processed', 0)
-        return total > 0 and processed < total
+        return self.state.has_unprocessed_files()
 
     async def execute_once(self) -> bool:
         """Process ONE file completely (chunk + embed)."""
-        # Get one unprocessed file
         files = self.state.get_unprocessed_files(limit=1)
         if not files:
             return False
@@ -60,7 +58,9 @@ class FileProcessingPhase(Phase):
             chunks = self._chunk_content(content, file.filename, file.content_type)
             if not chunks:
                 logger.warning(f"No chunks extracted from {file.filename}")
-                return True  # Still counts as processed
+                # Store a single empty-ish chunk to mark file as processed
+                # This prevents infinite retry on files that legitimately produce no chunks
+                chunks = ["[Empty or unparseable file]"]
 
             logger.info(f"Created {len(chunks)} chunks from {file.filename}")
 
@@ -70,8 +70,8 @@ class FileProcessingPhase(Phase):
                 logger.error(f"Embedding count mismatch: {len(embeddings)} vs {len(chunks)} chunks")
                 return False
 
-            # Store chunks with embeddings
-            await self._store_chunks(file, chunks, embeddings)
+            # Store chunks with embeddings (bulk insert for performance)
+            self._store_chunks(file, chunks, embeddings)
 
             logger.info(f"Successfully processed {file.filename}: {len(chunks)} chunks stored")
             return True
@@ -120,13 +120,18 @@ class FileProcessingPhase(Phase):
 
         return embeddings
 
-    async def _store_chunks(
+    def _store_chunks(
             self,
             file: ProjectFile,
             chunks: List[str],
             embeddings: List[np.ndarray]
     ) -> int:
-        """Store chunks with embeddings in database."""
+        """
+        Store chunks with embeddings in database.
+
+        Uses bulk insert for performance. This is significantly faster than
+        creating ORM objects one by one for large files.
+        """
         rows = []
         for idx, (text, embedding) in enumerate(zip(chunks, embeddings)):
             rows.append({
@@ -152,6 +157,4 @@ class FileProcessingPhase(Phase):
 
     def is_complete(self) -> bool:
         """Complete when all files have been processed."""
-        total = self.state.stats.get('files_total', 0)
-        processed = self.state.stats.get('files_processed', 0)
-        return total == 0 or processed >= total
+        return not self.state.has_unprocessed_files()

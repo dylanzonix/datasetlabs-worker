@@ -59,7 +59,7 @@ You have access to tools to help you gather information. Use them if needed. Whe
 </column_schema>
 
 ## Seed
-This is your starting point – source material to build from:
+This is your starting point - source material to build from:
 <seed>
 {seed}
 </seed>
@@ -128,12 +128,11 @@ Use the tools to gather what you need, then call generate_row when ready. You ma
             return False
 
         assigned_seeds = self.assignment_phase.get_assigned_seeds()
-        samples_generated = self.state.stats.get('samples_generated', 0)
+        if not assigned_seeds:
+            return False
 
-        # Generate up to num_samples or number of assigned seeds
-        target = min(self.state.num_samples, len(assigned_seeds))
-
-        return samples_generated < target
+        # Generate until we hit num_samples (cycling through seeds if needed)
+        return self.state.samples_generated < self.state.num_samples
 
     async def execute_once(self) -> bool:
         """Generate ONE sample."""
@@ -141,18 +140,17 @@ Use the tools to gather what you need, then call generate_row when ready. You ma
         if not assigned_seeds:
             return False
 
-        # Get current sample count
-        samples_generated = self.state.stats.get('samples_generated', 0)
-        target = min(self.state.num_samples, len(assigned_seeds))
+        samples_generated = self.state.samples_generated
+        target = self.state.num_samples
 
         if samples_generated >= target:
             return False
 
-        # Find which seed to use (cycle through if needed)
+        # Cycle through seeds if we have fewer seeds than target samples
         seed_idx = samples_generated % len(assigned_seeds)
         assigned_seed = assigned_seeds[seed_idx]
 
-        logger.info(f"[{self.name}] Generating sample {samples_generated + 1}/{target}")
+        logger.info(f"[{self.name}] Generating sample {samples_generated + 1}/{target} (seed {seed_idx + 1}/{len(assigned_seeds)})")
 
         try:
             # Generate the sample
@@ -162,10 +160,7 @@ Use the tools to gather what you need, then call generate_row when ready. You ma
                 # Get next sequence number
                 max_seq = (
                     self.db.query(sql_func.max(Sample.seq))
-                    .filter(
-                        Sample.project_id == self.state.project_id,
-                        Sample.run_id == self.state.run_id
-                    )
+                    .filter(Sample.project_id == self.state.project_id)
                     .scalar() or 0
                 )
 
@@ -176,7 +171,7 @@ Use the tools to gather what you need, then call generate_row when ready. You ma
                     run_id=self.state.run_id,
                     seq=max_seq + 1,
                     row=sample_data,
-                    axes=assigned_seed.diversity_assignments
+                    tags=assigned_seed.diversity_assignments
                 )
                 self.db.add(sample)
                 self.db.commit()
@@ -267,11 +262,7 @@ Use the tools to gather what you need, then call generate_row when ready. You ma
             )
             query_embedding = response.data[0].embedding
 
-            # Vector search using pgvector
-            # Note: This uses cosine distance via the index
-            from pgvector.sqlalchemy import Vector
-            from sqlalchemy import cast
-
+            # Vector search using pgvector cosine distance
             results = (
                 self.db.query(ProjectRagChunk)
                 .filter(ProjectRagChunk.project_id == self.state.project_id)
@@ -314,10 +305,10 @@ Use the tools to gather what you need, then call generate_row when ready. You ma
             return False
 
         assigned_seeds = self.assignment_phase.get_assigned_seeds()
-        samples_generated = self.state.stats.get('samples_generated', 0)
+        if not assigned_seeds:
+            return False
 
-        target = min(self.state.num_samples, len(assigned_seeds))
-        return samples_generated >= target
+        return self.state.samples_generated >= self.state.num_samples
 
     def reset(self):
         """Reset generation state (for fresh start on resume)."""

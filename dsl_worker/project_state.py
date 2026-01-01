@@ -8,8 +8,10 @@ Key design:
 """
 
 import logging
+import json
+import hashlib
 from datetime import datetime, timezone
-from typing import Dict, Optional, Set
+from typing import Optional, Set, List
 from uuid import UUID
 
 from sqlalchemy import func as sql_func, desc
@@ -40,10 +42,9 @@ class ProjectState:
     - Generation: always start fresh (uses current assigned seeds)
     """
 
-    def __init__(self, db: Session, project_id: UUID, run_id: UUID):
+    def __init__(self, db: Session, project_id: UUID):
         self.db = db
         self.project_id = project_id
-        self.run_id = run_id
 
         # State flags
         self.paused = False
@@ -53,8 +54,13 @@ class ProjectState:
         self._last_diversity_spec_hash: Optional[str] = None
         self._last_file_ids: Set[UUID] = set()
 
-        # Progress statistics (persistent phases only)
-        self.stats: Dict[str, int] = {}
+        # Progress statistics - explicit attributes for easy navigation
+        self.files_total = 0
+        self.files_processed = 0
+        self.chunks_total = 0
+        self.seeds_extracted = 0
+        self.seeds_scored = 0
+        self.samples_generated = 0
 
         # Project metadata
         self.num_samples = 0
@@ -62,6 +68,7 @@ class ProjectState:
         self.columns = []
         self.diversity_spec = None
         self.use_internet = False
+        self.run_id: Optional[UUID] = None
 
         # Initial refresh
         self.refresh()
@@ -70,7 +77,7 @@ class ProjectState:
         """
         Poll database for latest state.
 
-        Should be called frequently by the orchestrator (every 1-2 seconds).
+        Should be called frequently by the orchestrator (every iteration).
         """
         project = self.db.query(Project).filter(Project.id == self.project_id).first()
         if not project:
@@ -78,7 +85,7 @@ class ProjectState:
             return
 
         # Update flags
-        self.paused = self._check_pause_request()
+        self.paused = self._check_pause_requested()
         self.preview_mode = getattr(project, 'preview_mode', False)
 
         # Update project metadata
@@ -87,37 +94,33 @@ class ProjectState:
         self.columns = project.columns or []
         self.diversity_spec = project.diversity_spec
         self.use_internet = project.use_internet
+        self.run_id = project.current_run_id
 
         # Check for config changes that require invalidation
         self._check_config_changes()
 
-        # Update progress statistics (persistent phases only)
-        self.stats = {
-            # File processing
-            'files_total': self._count_total_files(),
-            'files_processed': self._count_processed_files(),
+        # Update progress statistics
+        self.files_total = self._count_total_files()
+        self.files_processed = self._count_processed_files()
+        self.chunks_total = self._count_total_chunks()
+        self.seeds_extracted = self._count_seeds()
+        self.seeds_scored = self._count_scored_seeds()
+        self.samples_generated = self._count_samples_generated()
 
-            # Chunking (part of file processing)
-            'chunks_total': self._count_total_chunks(),
-
-            # Seed extraction
-            'seeds_extracted': self._count_seeds(),
-
-            # Seed scoring
-            'seeds_scored': self._count_scored_seeds(),
-
-            # Generation (for progress display, but not for resume)
-            'samples_generated': self._count_samples_generated(),
-        }
-
-        logger.debug(f"State refresh: paused={self.paused}, stats={self.stats}")
+        logger.debug(
+            f"State refresh: paused={self.paused}, "
+            f"files={self.files_processed}/{self.files_total}, "
+            f"chunks={self.chunks_total}, "
+            f"seeds={self.seeds_scored}/{self.seeds_extracted}, "
+            f"samples={self.samples_generated}"
+        )
 
     def _check_config_changes(self):
         """
         Detect config changes that require invalidation.
 
         - If diversity_spec changes: invalidate seed scores (re-score with new axes)
-        - If files are deleted: cascade soft-delete to affected seeds
+        - If files are deleted: delete chunks and soft-delete seeds
         """
         # Check diversity spec changes
         current_hash = self._hash_diversity_spec()
@@ -130,14 +133,13 @@ class ProjectState:
         current_file_ids = self._get_active_file_ids()
         deleted_files = self._last_file_ids - current_file_ids
         if deleted_files:
-            logger.info(f"Files deleted: {deleted_files}, soft-deleting affected seeds")
+            logger.info(f"Files deleted: {deleted_files}, cleaning up chunks and seeds")
+            self._delete_chunks_for_files(deleted_files)
             self._soft_delete_seeds_for_files(deleted_files)
         self._last_file_ids = current_file_ids
 
     def _hash_diversity_spec(self) -> str:
         """Create a hash of diversity spec for change detection."""
-        import json
-        import hashlib
         if not self.diversity_spec:
             return ""
         serialized = json.dumps(self.diversity_spec, sort_keys=True)
@@ -157,7 +159,7 @@ class ProjectState:
         return {f.id for f in files}
 
     def _invalidate_seed_scores(self):
-        """Clear scores and scored_at for all seeds in this run."""
+        """Clear scores and scored_at for all seeds."""
         self.db.query(ProjectSeed).filter(
             ProjectSeed.project_id == self.project_id,
             ProjectSeed.deleted_at.is_(None)
@@ -165,6 +167,14 @@ class ProjectState:
             ProjectSeed.scores: None,
             ProjectSeed.scored_at: None
         }, synchronize_session=False)
+        self.db.commit()
+
+    def _delete_chunks_for_files(self, file_ids: Set[UUID]):
+        """Hard delete chunks from deleted files."""
+        self.db.query(ProjectRagChunk).filter(
+            ProjectRagChunk.project_id == self.project_id,
+            ProjectRagChunk.file_id.in_(file_ids)
+        ).delete(synchronize_session=False)
         self.db.commit()
 
     def _soft_delete_seeds_for_files(self, file_ids: Set[UUID]):
@@ -179,19 +189,19 @@ class ProjectState:
         }, synchronize_session=False)
         self.db.commit()
 
-    def _check_pause_request(self) -> bool:
+    def _check_pause_requested(self) -> bool:
         """
         Check if there's a pending pause request.
 
         Returns True if:
-        - There's a pause_request event for this run
+        - There's a pause_requested event for this project
         - AND no corresponding paused event after it
         """
         pause_request = (
             self.db.query(ProjectEvent)
             .filter(
                 ProjectEvent.project_id == self.project_id,
-                ProjectEvent.event_type == "pause_request"
+                ProjectEvent.event_type == "pause_requested"
             )
             .order_by(desc(ProjectEvent.created_at))
             .first()
@@ -212,7 +222,7 @@ class ProjectState:
 
         return paused_event is None
 
-    # ---- Progress tracking methods ----
+    # ---- Progress counting methods ----
 
     def _count_total_files(self) -> int:
         """Count total uploaded (non-deleted) files for this project."""
@@ -228,7 +238,6 @@ class ProjectState:
 
     def _count_processed_files(self) -> int:
         """Count files that have chunks (fully processed)."""
-        # A file is processed if it has at least one chunk
         subq = (
             self.db.query(ProjectRagChunk.file_id)
             .filter(ProjectRagChunk.project_id == self.project_id)
@@ -254,7 +263,7 @@ class ProjectState:
         )
 
     def _count_seeds(self) -> int:
-        """Count non-deleted seeds for this run."""
+        """Count non-deleted seeds."""
         return (
             self.db.query(sql_func.count(ProjectSeed.id))
             .filter(
@@ -277,18 +286,17 @@ class ProjectState:
         )
 
     def _count_samples_generated(self) -> int:
-        """Count generated samples (for display only, not resume logic)."""
+        """Count generated samples (for display only)."""
         return (
             self.db.query(sql_func.count(Sample.id))
-            .filter(
-                Sample.project_id == self.project_id,
-            )
+            .filter(Sample.project_id == self.project_id)
             .scalar() or 0
         )
 
-    def get_unprocessed_files(self, limit: int = 1):
+    # ---- Work availability queries (used by phases for flow control) ----
+
+    def get_unprocessed_files(self, limit: int = 1) -> List[ProjectFile]:
         """Get files that don't have chunks yet."""
-        # Subquery: file IDs that have chunks
         processed_file_ids = (
             self.db.query(ProjectRagChunk.file_id)
             .filter(ProjectRagChunk.project_id == self.project_id)
@@ -307,9 +315,8 @@ class ProjectState:
             .all()
         )
 
-    def get_chunks_without_seeds(self, limit: int = 10):
+    def get_chunks_without_seeds(self, limit: int = 10) -> List[ProjectRagChunk]:
         """Get chunks that haven't been extracted into seeds yet."""
-        # Subquery: chunk IDs that already have seeds
         extracted_chunk_ids = (
             self.db.query(ProjectSeed.chunk_id)
             .filter(
@@ -329,7 +336,7 @@ class ProjectState:
             .all()
         )
 
-    def get_unscored_seeds(self, limit: int = 20):
+    def get_unscored_seeds(self, limit: int = 20) -> List[ProjectSeed]:
         """Get seeds that haven't been scored yet."""
         return (
             self.db.query(ProjectSeed)
@@ -342,7 +349,7 @@ class ProjectState:
             .all()
         )
 
-    def get_scored_seeds(self):
+    def get_scored_seeds(self) -> List[ProjectSeed]:
         """Get all scored (non-deleted) seeds for assignment."""
         return (
             self.db.query(ProjectSeed)
@@ -353,3 +360,17 @@ class ProjectState:
             )
             .all()
         )
+
+    # ---- Boolean helpers for flow control ----
+
+    def has_unprocessed_files(self) -> bool:
+        """Check if there are files without chunks."""
+        return len(self.get_unprocessed_files(limit=1)) > 0
+
+    def has_chunks_without_seeds(self) -> bool:
+        """Check if there are chunks without seeds."""
+        return len(self.get_chunks_without_seeds(limit=1)) > 0
+
+    def has_unscored_seeds(self) -> bool:
+        """Check if there are unscored seeds."""
+        return len(self.get_unscored_seeds(limit=1)) > 0
