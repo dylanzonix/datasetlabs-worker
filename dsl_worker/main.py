@@ -17,7 +17,6 @@ from sqlalchemy.orm import sessionmaker, Session
 from dsl_worker.config import settings
 from dsl_worker.job_processor import JobProcessor
 from dsl_worker.logging_setup import setup_logging
-from dsl_worker.synthetic_data_engine import SyntheticDataEngine
 from dsl_api.models.project import Project
 
 logger = logging.getLogger(__name__)
@@ -66,17 +65,11 @@ class WorkerService:
         # OpenAI client (use AsyncOpenAI)
         self.openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
 
-        # Synthetic data engine
-        self.synthetic_data_engine = SyntheticDataEngine(
-            openai_client=self.openai_client
-        )
-
         # Job processor
         self.job_processor = JobProcessor(
             db_session_factory=self.SessionLocal,
             openai_client=self.openai_client,
             blob_service_client=self.blob_service_client,
-            synthetic_data_engine=self.synthetic_data_engine,
         )
 
         # Setup signal handlers

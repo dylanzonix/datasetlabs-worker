@@ -1,154 +1,257 @@
+"""
+Job processor orchestrator.
+
+Executes phases with pause/resume support.
+
+Key design:
+- Persistent phases (file_processing, seed_extraction, seed_scoring) resume from where they left off
+- Ephemeral phases (seed_assignment, generation) start fresh on each run
+- Pause/resume is handled by database state, not in-memory state
+"""
+
+import asyncio
 import logging
 from typing import Any, Dict
 from uuid import UUID
+from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 from openai import AsyncOpenAI
 from azure.storage.blob import BlobServiceClient
 
-from dsl_api.azure.service_bus import ProjectPoke
-from dsl_worker.file_processor import FileProcessor
-from dsl_worker.synthetic_data_engine import SyntheticDataEngine
 from dsl_api.models.project import Project
+from dsl_api.models.project_event import ProjectEvent
+
+from dsl_worker.project_state import ProjectState
+from dsl_worker.phases import (
+    FileProcessingPhase,
+    SeedExtractionPhase,
+    SeedScoringPhase,
+    SeedAssignmentPhase,
+    GenerationPhase,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class JobProcessor:
     """
-    Processes dataset generation jobs.
+    Orchestrates dataset generation using phases.
 
-    Main workflow:
-    1. Load project from database
-    2. Process uploaded files (if any)
-    3. Generate synthetic data based on project config
-    4. Export results
+    Processes work from each active phase in a loop.
+    Handles pause requests by immediately stopping and cleaning up.
     """
 
     def __init__(
-            self,
-            db_session_factory,
-            openai_client: AsyncOpenAI,
-            blob_service_client: BlobServiceClient,
-            synthetic_data_engine: SyntheticDataEngine,
+        self,
+        db_session_factory,
+        openai_client: AsyncOpenAI,
+        blob_service_client: BlobServiceClient,
     ):
         self.SessionLocal = db_session_factory
         self.openai_client = openai_client
         self.blob_service_client = blob_service_client
-        self.synthetic_data_engine = synthetic_data_engine
         self.should_stop = False
 
     def request_stop(self):
-        """Request graceful stop of current job."""
-        logger.info("Stop requested for current job")
+        """Request graceful stop (SIGTERM/SIGINT)."""
+        logger.info("Stop requested")
         self.should_stop = True
 
     async def process_job(self, message_body: Dict[str, Any]) -> bool:
         """
-        Process a single job from the queue.
+        Process a job using the phase orchestrator.
 
-        Args:
-            message_body: ProjectPoke message containing project_id and run_id
-
-        Returns:
-            True if job completed successfully, False otherwise
+        Returns True if job completed or paused successfully.
         """
-        try:
-            poke = ProjectPoke.from_dict(message_body)
-        except (KeyError, ValueError) as e:
-            logger.error(f"Invalid message format: {e}")
+        project_id_str = message_body.get("project_id")
+        run_id_str = message_body.get("run_id")
+
+        if not project_id_str or not run_id_str:
+            logger.error("Invalid message: missing project_id or run_id")
             return False
 
-        logger.info(f"Starting job for project {poke.project_id}, run {poke.run_id}")
+        project_id = UUID(project_id_str)
+        run_id = UUID(run_id_str)
+
+        logger.info(f"🚀 Starting orchestrator: project={project_id}, run={run_id}")
 
         db: Session = self.SessionLocal()
         try:
-            # Load project
-            project = db.query(Project).filter(Project.id == poke.project_id).first()
+            project = db.query(Project).filter(Project.id == project_id).first()
             if not project:
-                logger.error(f"Project {poke.project_id} not found")
+                logger.error(f"Project not found: {project_id}")
                 return False
 
-            # Verify run_id matches current_run_id
-            if project.current_run_id != poke.run_id:
-                logger.warning(
-                    f"Run ID mismatch for project {poke.project_id}: "
-                    f"message has {poke.run_id}, project has {project.current_run_id}. "
-                    f"This is a stale message, ignoring."
-                )
-                return True  # Return True to acknowledge and discard the message
+            # Check run_id matches - if not, this is a stale message
+            if project.current_run_id != run_id:
+                logger.warning("Stale message (run mismatch), ignoring")
+                return True
 
-            logger.info(f"Processing project: {project.name} (run {poke.run_id})")
-            logger.info(f"  Samples to generate: {project.num_samples}")
-            logger.info(f"  Generation prompt: {project.generation_prompt[:100]}...")
+            logger.info(f"Project: {project.name}")
+            logger.info(f"  Status: {project.status}")
+            logger.info(f"  Target: {project.num_samples} samples")
 
-            # Step 1: Process uploaded files (if any)
-            file_processor = FileProcessor(
-                blob_service_client=self.blob_service_client,
-                openai_client=self.openai_client,
-                db_session=db
+            # Initialize state (no run_id needed - queries don't filter by it)
+            state = ProjectState(db, project_id)
+
+            # Create phases
+            file_processing = FileProcessingPhase(
+                'file_processing', state, db,
+                self.openai_client, self.blob_service_client
+            )
+            seed_extraction = SeedExtractionPhase(
+                'seed_extraction', state, db, self.openai_client
+            )
+            seed_scoring = SeedScoringPhase(
+                'seed_scoring', state, db, self.openai_client
+            )
+            seed_assignment = SeedAssignmentPhase(
+                'seed_assignment', state, db, self.openai_client
+            )
+            generation = GenerationPhase(
+                'generation', state, db, self.openai_client,
+                assignment_phase=seed_assignment
             )
 
-            logger.info("=" * 60)
-            logger.info("STEP 1: Processing uploaded files")
-            logger.info("=" * 60)
+            phases = [
+                file_processing,
+                seed_extraction,
+                seed_scoring,
+                seed_assignment,
+                generation,
+            ]
 
-            file_stats = await file_processor.process_all_files(poke.project_id)
+            # Emit RUNNING event
+            self._emit_event(db, project, "running", "Worker started")
 
-            logger.info(f"File processing results:")
-            logger.info(f"  Total files: {file_stats['total']}")
-            logger.info(f"  Succeeded: {file_stats['succeeded']}")
-            logger.info(f"  Failed: {file_stats['failed']}")
+            # Main loop
+            iteration = 0
+            while True:
+                iteration += 1
 
-            # If we had files but they all failed, maybe fail the job?
-            if file_stats['total'] > 0 and file_stats['succeeded'] == 0:
-                logger.error("All file processing failed, aborting job")
-                project.status = "failed"
-                project.error = "Failed to process uploaded files"
+                # Refresh state from database
+                state.refresh()
+
+                # Check for pause
+                if state.paused:
+                    logger.info("⏸️  Pause detected")
+                    self._handle_pause(db, project)
+                    return True
+
+                # Check for external stop
+                if self.should_stop:
+                    logger.info("⏸️  Stop signal received")
+                    project.status = "paused"
+                    self._emit_event(db, project, "paused", "Stopped by signal")
+                    db.commit()
+                    return False
+
+                # Find active phases
+                active = [p for p in phases if p.should_run()]
+
+                if not active:
+                    # Check if all complete
+                    if all(p.is_complete() for p in phases):
+                        logger.info("✅ All phases complete")
+                        self._handle_completion(db, project)
+                        return True
+                    else:
+                        # No work but not complete - wait
+                        logger.debug(f"Iteration {iteration}: No active phases, waiting")
+                        await asyncio.sleep(1)
+                        continue
+
+                # Log active phases periodically
+                if iteration % 100 == 1:
+                    logger.info(f"Iteration {iteration}: Active={[p.name for p in active]}")
+
+                # Execute ONE unit from EACH active phase concurrently
+                tasks = [p.execute_once() for p in active]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Check for errors
+                for i, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        logger.error(f"❌ Error in {active[i].name}: {result}")
+                        raise result
+
+                # Commit after each iteration
                 db.commit()
-                return False
 
-            # Check for stop signal
-            if self.should_stop:
-                logger.info("Stop requested, aborting job")
-                project.status = "paused"
-                db.commit()
-                return False
-
-            # TODO: Step 2: Generate synthetic data
-            logger.info("=" * 60)
-            logger.info("STEP 2: Generating synthetic data")
-            logger.info("=" * 60)
-            logger.info("TODO: Implement synthetic data generation")
-
-            # TODO: Step 3: Export results
-            logger.info("=" * 60)
-            logger.info("STEP 3: Exporting results")
-            logger.info("=" * 60)
-            logger.info("TODO: Implement export")
-
-            # Mark as succeeded for now
-            project.status = "succeeded"
-            project.generated_count = project.num_samples
-            db.commit()
-
-            logger.info(f"Job completed for project {poke.project_id}")
-            return True
+                # Brief sleep to avoid tight loop
+                await asyncio.sleep(0.01)
 
         except Exception as e:
-            logger.exception(f"Error processing job for project {poke.project_id}: {e}")
+            logger.exception(f"❌ Orchestrator error: {e}")
 
-            # Try to update project status
             try:
-                project = db.query(Project).filter(Project.id == poke.project_id).first()
+                project = db.query(Project).filter(Project.id == project_id).first()
                 if project:
                     project.status = "failed"
                     project.error = str(e)
+                    project.finished_at = datetime.now(timezone.utc)
+                    self._emit_event(db, project, "failed", "Error", {"error": str(e)})
                     db.commit()
-            except Exception as db_error:
-                logger.error(f"Failed to update project status: {db_error}")
+            except Exception as db_err:
+                logger.error(f"Failed to update status: {db_err}")
 
             return False
 
         finally:
             db.close()
+
+    def _emit_event(
+        self,
+        db: Session,
+        project: Project,
+        event_type: str,
+        message: str,
+        details: dict = None
+    ) -> None:
+        """Emit project event."""
+        event = ProjectEvent(
+            project_id=project.id,
+            run_id=project.current_run_id,
+            event_type=event_type,
+            message=message,
+            details=details or {}
+        )
+        db.add(event)
+        db.commit()
+
+    def _handle_pause(self, db: Session, project: Project) -> None:
+        """Handle pause: update status, emit event."""
+        logger.info(f"Pausing project {project.id}")
+
+        project.status = "paused"
+
+        self._emit_event(
+            db, project, "paused",
+            "Worker paused",
+            {
+                "paused_at": datetime.now(timezone.utc).isoformat(),
+                "generated_count": project.generated_count
+            }
+        )
+
+        db.commit()
+        logger.info("✅ Paused successfully")
+
+    def _handle_completion(self, db: Session, project: Project) -> None:
+        """Handle successful completion."""
+        logger.info(f"Project {project.id} completed")
+
+        project.status = "succeeded"
+        project.finished_at = datetime.now(timezone.utc)
+
+        self._emit_event(
+            db, project, "completed",
+            "Generation complete",
+            {
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "generated_count": project.generated_count
+            }
+        )
+
+        db.commit()
