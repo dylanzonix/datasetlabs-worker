@@ -121,8 +121,7 @@ class SeedExtractionPhase(Phase):
     async def _extract_seeds_from_chunk(self, chunk: ProjectRagChunk) -> List[str]:
         """Use LLM to extract seeds from a chunk."""
         try:
-            response = await asyncio.to_thread(
-                self.openai_client.responses.create,
+            response = await self.openai_client.responses.create(
                 prompt={
                     "id": "pmpt_69508e29f514819693d017e0848e223406fd27a87843182b",
                     "version": "5",
@@ -142,7 +141,6 @@ class SeedExtractionPhase(Phase):
 
         except Exception as e:
             logger.error(f"LLM extraction failed: {e}")
-            # Fallback: treat entire chunk as one seed
             return [chunk.text]
 
     def _format_column_schema(self) -> str:
