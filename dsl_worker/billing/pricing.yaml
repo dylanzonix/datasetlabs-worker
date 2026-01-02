@@ -1,0 +1,38 @@
+# OpenAI model pricing
+# Prices in USD per token
+
+models:
+  # Embedding models
+  text-embedding-3-large:
+    input: 0.00000013    # $0.13 / 1M tokens
+    output: 0.0
+
+  text-embedding-3-small:
+    input: 0.00000002    # $0.02 / 1M tokens
+    output: 0.0
+
+  # Chat models
+  gpt-4o:
+    input: 0.0000025     # $2.50 / 1M tokens
+    output: 0.000010     # $10.00 / 1M tokens
+
+  gpt-4o-mini:
+    input: 0.00000015    # $0.15 / 1M tokens
+    output: 0.0000006    # $0.60 / 1M tokens
+
+  gpt-4-turbo:
+    input: 0.00001       # $10.00 / 1M tokens
+    output: 0.00003      # $30.00 / 1M tokens
+
+  gpt-3.5-turbo:
+    input: 0.0000005     # $0.50 / 1M tokens
+    output: 0.0000015    # $1.50 / 1M tokens
+
+  # o1 models (reasoning)
+  o1:
+    input: 0.000015      # $15.00 / 1M tokens
+    output: 0.000060     # $60.00 / 1M tokens
+
+  o1-mini:
+    input: 0.000003      # $3.00 / 1M tokens
+    output: 0.000012     # $12.00 / 1M tokens

@@ -1,17 +1,20 @@
 """
 Job processor orchestrator.
 
-Executes phases with pause/resume support.
+Executes phases with pause/resume support and cost tracking.
 
 Key design:
 - Persistent phases (file_processing, seed_extraction, seed_scoring) resume from where they left off
 - Ephemeral phases (seed_assignment, generation) start fresh on each run
 - Pause/resume is handled by database state, not in-memory state
+- Cost tracking with periodic charging to user balance
+- Force-stop when balance depleted or spend limit exceeded
+- Only one project can run at a time per user
 """
 
 import asyncio
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from uuid import UUID
 from datetime import datetime, timezone
 
@@ -22,8 +25,11 @@ from azure.storage.blob import BlobServiceClient
 from dsl_api.models.project import Project
 from dsl_api.models.project_event import ProjectEvent
 
+from dsl_worker.config import settings
 from dsl_worker.project_state import ProjectState
+from dsl_worker.billing import TrackedOpenAIClient, CostTracker
 from dsl_worker.phases import (
+    PhaseResult,
     FileProcessingPhase,
     SeedExtractionPhase,
     SeedScoringPhase,
@@ -40,6 +46,8 @@ class JobProcessor:
 
     Processes work from each active phase in a loop.
     Handles pause requests by immediately stopping and cleaning up.
+    Tracks costs and charges user balance periodically.
+    Force-stops projects when balance is depleted or spend limit exceeded.
     """
 
     def __init__(
@@ -49,7 +57,7 @@ class JobProcessor:
         blob_service_client: BlobServiceClient,
     ):
         self.SessionLocal = db_session_factory
-        self.openai_client = openai_client
+        self.raw_openai_client = openai_client
         self.blob_service_client = blob_service_client
         self.should_stop = False
 
@@ -88,9 +96,55 @@ class JobProcessor:
                 logger.warning("Stale message (run mismatch), ignoring")
                 return True
 
+            # NOW we can set status to running (after confirming message is valid)
+            # This prevents stale messages from incorrectly setting status to running
+            project.status = "running"
+            project.started_at = datetime.now(timezone.utc)
+            project.updated_at = datetime.now(timezone.utc)
+            db.commit()
+
+            # Check if another project is already running for this user
+            running_project = (
+                db.query(Project)
+                .filter(
+                    Project.user_id == project.user_id,
+                    Project.status == "running",
+                    Project.id != project_id,
+                )
+                .first()
+            )
+            if running_project:
+                logger.warning(
+                    f"User {project.user_id} already has running project {running_project.id}, "
+                    f"cannot start {project_id}"
+                )
+                # Return False to keep message in queue for retry
+                return False
+
             logger.info(f"Project: {project.name}")
             logger.info(f"  Status: {project.status}")
             logger.info(f"  Target: {project.num_samples} samples")
+
+            # Create tracked OpenAI client
+            tracked_client = TrackedOpenAIClient(self.raw_openai_client)
+
+            # Create cost tracker with spend limit
+            cost_tracker = CostTracker(
+                db=db,
+                user_id=project.user_id,
+                project_id=project_id,
+                margin_multiplier=settings.billing_margin_multiplier,
+                charge_threshold_cents=settings.billing_charge_threshold_cents,
+                charge_interval_seconds=settings.billing_charge_interval_seconds,
+                spend_limit_cents=project.spend_limit_cents,
+            )
+
+            # Check initial balance and spend limit
+            can_continue, stop_reason = cost_tracker.check_balance_and_charge()
+            if not can_continue:
+                logger.warning(f"Cannot start project: {stop_reason}")
+                self._handle_force_stop(db, project, cost_tracker, stop_reason)
+                return False
 
             # Initialize state (no run_id needed - queries don't filter by it)
             state = ProjectState(db, project_id)
@@ -98,19 +152,19 @@ class JobProcessor:
             # Create phases
             file_processing = FileProcessingPhase(
                 'file_processing', state, db,
-                self.openai_client, self.blob_service_client
+                tracked_client, self.blob_service_client
             )
             seed_extraction = SeedExtractionPhase(
-                'seed_extraction', state, db, self.openai_client
+                'seed_extraction', state, db, tracked_client
             )
             seed_scoring = SeedScoringPhase(
-                'seed_scoring', state, db, self.openai_client
+                'seed_scoring', state, db, tracked_client
             )
             seed_assignment = SeedAssignmentPhase(
-                'seed_assignment', state, db, self.openai_client
+                'seed_assignment', state, db, tracked_client
             )
             generation = GenerationPhase(
-                'generation', state, db, self.openai_client,
+                'generation', state, db, tracked_client,
                 assignment_phase=seed_assignment
             )
 
@@ -136,15 +190,20 @@ class JobProcessor:
                 # Check for pause
                 if state.paused:
                     logger.info("⏸️  Pause detected")
-                    self._handle_pause(db, project)
+                    self._handle_pause(db, project, cost_tracker)
                     return True
 
                 # Check for external stop
                 if self.should_stop:
                     logger.info("⏸️  Stop signal received")
-                    project.status = "paused"
-                    self._emit_event(db, project, "paused", "Stopped by signal")
-                    db.commit()
+                    self._handle_pause(db, project, cost_tracker, "Stopped by signal")
+                    return False
+
+                # Check balance and charge if needed
+                can_continue, stop_reason = cost_tracker.check_balance_and_charge()
+                if not can_continue:
+                    logger.warning(f"💸 Stopping: {stop_reason}")
+                    self._handle_force_stop(db, project, cost_tracker, stop_reason)
                     return False
 
                 # Find active phases
@@ -154,12 +213,17 @@ class JobProcessor:
                     # Check if all complete
                     if all(p.is_complete() for p in phases):
                         logger.info("✅ All phases complete")
-                        self._handle_completion(db, project)
+                        self._handle_completion(db, project, cost_tracker)
                         return True
                     else:
-                        # No work but not complete - wait
+                        # No work but not complete - wait with stop check
                         logger.debug(f"Iteration {iteration}: No active phases, waiting")
-                        await asyncio.sleep(1)
+                        for _ in range(10):  # 10 x 0.1s = 1s total
+                            if self.should_stop:
+                                logger.info("⏸️  Stop signal received during wait")
+                                self._handle_pause(db, project, cost_tracker, "Stopped by signal")
+                                return False
+                            await asyncio.sleep(0.1)
                         continue
 
                 # Log active phases periodically
@@ -168,13 +232,34 @@ class JobProcessor:
 
                 # Execute ONE unit from EACH active phase concurrently
                 tasks = [p.execute_once() for p in active]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                # Check for errors
+                try:
+                    # Use wait_for with timeout to allow checking should_stop
+                    results = await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        timeout=60.0
+                    )
+                except asyncio.TimeoutError:
+                    # Timeout hit - check if we should stop
+                    logger.warning("Phase execution timeout (60s)")
+                    if self.should_stop:
+                        logger.info("⏸️  Stop signal received during timeout")
+                        self._handle_pause(db, project, cost_tracker, "Stopped by signal")
+                        return False
+                    continue
+
+                # Process results and track costs
                 for i, result in enumerate(results):
                     if isinstance(result, Exception):
                         logger.error(f"❌ Error in {active[i].name}: {result}")
                         raise result
+
+                    # Track cost from this phase
+                    if isinstance(result, PhaseResult) and result.cost_usd > 0:
+                        cost_tracker.add_cost(
+                            phase=active[i].name,
+                            cost_usd=result.cost_usd,
+                        )
 
                 # Commit after each iteration
                 db.commit()
@@ -220,38 +305,128 @@ class JobProcessor:
         db.add(event)
         db.commit()
 
-    def _handle_pause(self, db: Session, project: Project) -> None:
-        """Handle pause: update status, emit event."""
+    def _handle_pause(
+        self,
+        db: Session,
+        project: Project,
+        cost_tracker: CostTracker,
+        message: str = "Worker paused"
+    ) -> None:
+        """Handle pause: update status, charge remaining costs, emit event."""
         logger.info(f"Pausing project {project.id}")
+
+        # Charge any remaining costs
+        cost_tracker.charge_remaining()
 
         project.status = "paused"
 
+        summary = cost_tracker.get_summary()
         self._emit_event(
             db, project, "paused",
-            "Worker paused",
+            message,
             {
                 "paused_at": datetime.now(timezone.utc).isoformat(),
-                "generated_count": project.generated_count
+                "generated_count": project.generated_count,
+                "total_cost_cents": summary["total_costs_cents"],
+                "preprocessing_cost_cents": summary["preprocessing_costs_cents"],
+                "generation_cost_cents": summary["generation_costs_cents"],
             }
         )
 
         db.commit()
         logger.info("✅ Paused successfully")
 
-    def _handle_completion(self, db: Session, project: Project) -> None:
+    def _handle_completion(
+        self,
+        db: Session,
+        project: Project,
+        cost_tracker: CostTracker
+    ) -> None:
         """Handle successful completion."""
         logger.info(f"Project {project.id} completed")
+
+        # Charge any remaining costs
+        cost_tracker.charge_remaining()
 
         project.status = "succeeded"
         project.finished_at = datetime.now(timezone.utc)
 
+        summary = cost_tracker.get_summary()
         self._emit_event(
             db, project, "completed",
             "Generation complete",
             {
                 "completed_at": datetime.now(timezone.utc).isoformat(),
-                "generated_count": project.generated_count
+                "generated_count": project.generated_count,
+                "total_cost_cents": summary["total_costs_cents"],
+                "preprocessing_cost_cents": summary["preprocessing_costs_cents"],
+                "generation_cost_cents": summary["generation_costs_cents"],
+                "cumulative_project_spend_cents": summary["cumulative_project_spend_cents"],
             }
         )
 
         db.commit()
+        logger.info(
+            f"✅ Completed: {summary['total_costs_cents']}¢ total "
+            f"(preprocessing: {summary['preprocessing_costs_cents']}¢, "
+            f"generation: {summary['generation_costs_cents']}¢), "
+            f"balance: {summary['user_balance_cents']}¢"
+        )
+
+    def _handle_force_stop(
+        self,
+        db: Session,
+        project: Project,
+        cost_tracker: CostTracker,
+        reason: str
+    ) -> None:
+        """
+        Handle force-stop due to balance depletion or spend limit exceeded.
+
+        Uses 'failed' status with descriptive error message.
+        """
+        logger.warning(f"Force-stopping project {project.id}: {reason}")
+
+        # Charge any remaining costs
+        cost_tracker.charge_remaining()
+
+        # Build error message
+        if reason == "insufficient_balance":
+            error_msg = "Insufficient balance to continue generation"
+        elif reason == "spend_limit_exceeded":
+            limit = project.spend_limit_cents
+            error_msg = f"Project spend limit of ${limit / 100:.2f} exceeded" if limit else "Spend limit exceeded"
+        else:
+            error_msg = f"Force-stopped: {reason}"
+
+        # Update project
+        project.status = "failed"
+        project.error = error_msg
+        project.finished_at = datetime.now(timezone.utc)
+
+        # Build event details
+        summary = cost_tracker.get_summary()
+        details = {
+            "reason": reason,
+            "stopped_at": datetime.now(timezone.utc).isoformat(),
+            "generated_count": project.generated_count,
+            "total_cost_cents": summary["total_costs_cents"],
+            "preprocessing_cost_cents": summary["preprocessing_costs_cents"],
+            "generation_cost_cents": summary["generation_costs_cents"],
+            "cumulative_project_spend_cents": summary["cumulative_project_spend_cents"],
+            "final_balance_cents": summary["user_balance_cents"],
+        }
+
+        # Add spend limit info if relevant
+        if project.spend_limit_cents is not None:
+            details["spend_limit_cents"] = project.spend_limit_cents
+            details["remaining_budget_cents"] = summary.get("remaining_budget_cents", 0)
+
+        self._emit_event(db, project, "failed", error_msg, details)
+
+        db.commit()
+        logger.info(
+            f"🛑 Force-stopped: {reason} "
+            f"(preprocessing: {summary['preprocessing_costs_cents']}¢, "
+            f"generation: {summary['generation_costs_cents']}¢)"
+        )
