@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import func as sql_func
 
-from dsl_worker.phases.base import Phase
+from dsl_worker.phases.base import Phase, PhaseResult
 from dsl_worker.phases.seed_assignment import SeedAssignmentPhase, AssignedSeed
 from dsl_api.models.sample import Sample
 from dsl_api.models.project_rag_chunk import ProjectRagChunk
@@ -72,6 +72,30 @@ The row should have this flavor:
 
 ## Your Task
 Use the tools to gather what you need, then call generate_row when ready. You may call generate_row immediately if the seed is sufficient."""
+
+        # System prompt for no-seed generation
+        self.system_prompt_no_seed_template = """You are a dataset row generator. Your job is to generate a single row for a dataset.
+
+You have access to tools to help you gather information. Use them if needed. When you have everything you need, call generate_row with the final content.
+
+## Row Instructions
+<row_instructions>
+{row_instructions}
+</row_instructions>
+
+## Column Schema
+<column_schema>
+{column_schema}
+</column_schema>
+
+## Diversity Targets
+The row should have this flavor:
+<diversity_targets>
+{diversity_targets}
+</diversity_targets>
+
+## Your Task
+Generate a creative and diverse row based on the instructions and schema above. Use tools to gather information if helpful, then call generate_row when ready."""
 
         # Tools for the agent
         self.tools = [
@@ -127,34 +151,32 @@ Use the tools to gather what you need, then call generate_row when ready. You ma
         if not self.assignment_phase or not self.assignment_phase.is_complete():
             return False
 
-        assigned_seeds = self.assignment_phase.get_assigned_seeds()
-        if not assigned_seeds:
-            return False
-
-        # Generate until we hit num_samples (cycling through seeds if needed)
+        # Generate until we hit num_samples
         return self.state.samples_generated < self.state.num_samples
 
-    async def execute_once(self) -> bool:
+    async def execute_once(self) -> PhaseResult:
         """Generate ONE sample."""
         assigned_seeds = self.assignment_phase.get_assigned_seeds()
-        if not assigned_seeds:
-            return False
 
         samples_generated = self.state.samples_generated
         target = self.state.num_samples
 
         if samples_generated >= target:
-            return False
+            return PhaseResult.no_work()
 
-        # Cycle through seeds if we have fewer seeds than target samples
-        seed_idx = samples_generated % len(assigned_seeds)
-        assigned_seed = assigned_seeds[seed_idx]
-
-        logger.info(f"[{self.name}] Generating sample {samples_generated + 1}/{target} (seed {seed_idx + 1}/{len(assigned_seeds)})")
+        # Handle no-seed case: create synthetic empty seed
+        if not assigned_seeds:
+            assigned_seed = self._create_synthetic_seed(samples_generated)
+            logger.info(f"[{self.name}] Generating sample {samples_generated + 1}/{target} (no source seeds)")
+        else:
+            # Cycle through seeds if we have fewer seeds than target samples
+            seed_idx = samples_generated % len(assigned_seeds)
+            assigned_seed = assigned_seeds[seed_idx]
+            logger.info(f"[{self.name}] Generating sample {samples_generated + 1}/{target} (seed {seed_idx + 1}/{len(assigned_seeds)})")
 
         try:
-            # Generate the sample
-            sample_data = await self._generate_sample(assigned_seed)
+            # Generate the sample (with cost tracking)
+            sample_data, cost_usd = await self._generate_sample(assigned_seed)
 
             if sample_data:
                 # Get next sequence number
@@ -177,37 +199,87 @@ Use the tools to gather what you need, then call generate_row when ready. You ma
                 self.db.commit()
 
                 logger.info(f"[{self.name}] Generated sample {max_seq + 1}")
-                return True
+                return PhaseResult.work_done(cost_usd=cost_usd)
 
             logger.warning(f"[{self.name}] Failed to generate sample from seed {assigned_seed.seed_id}")
-            return False
+            return PhaseResult(did_work=False, cost_usd=cost_usd)
 
         except Exception as e:
             logger.error(f"[{self.name}] Generation error: {e}", exc_info=True)
-            return False
+            return PhaseResult.no_work()
 
-    async def _generate_sample(self, assigned_seed: AssignedSeed) -> Optional[Dict]:
-        """Generate a single sample using the agentic approach."""
-        # Build system prompt
-        system_prompt = self.system_prompt_template.format(
-            row_instructions=self.state.generation_prompt,
-            column_schema=self._format_column_schema(),
-            seed=assigned_seed.seed_text,
-            diversity_targets=json.dumps(assigned_seed.diversity_assignments, indent=2)
+    def _create_synthetic_seed(self, sample_index: int) -> AssignedSeed:
+        """Create a synthetic seed for generation when no source files exist."""
+        # If there's a diversity spec, cycle through combinations
+        diversity_assignments = {}
+        if self.state.diversity_spec:
+            diversity_assignments = self._get_diversity_assignment_for_index(sample_index)
+
+        return AssignedSeed(
+            seed_id=f"synthetic-{sample_index}",
+            seed_text="",  # Empty seed - generation from scratch
+            diversity_assignments=diversity_assignments,
+            score=1.0
         )
+
+    def _get_diversity_assignment_for_index(self, index: int) -> Dict[str, str]:
+        """
+        Get a diversity assignment for a given index.
+        Cycles through all combinations based on index.
+        """
+        if not self.state.diversity_spec:
+            return {}
+
+        assignments = {}
+        remaining_index = index
+
+        for axis in self.state.diversity_spec:
+            axis_name = axis.get("name")
+            values = [v.get("value") for v in axis.get("values", [])]
+            if values:
+                value_idx = remaining_index % len(values)
+                assignments[axis_name] = values[value_idx]
+                remaining_index //= len(values)
+
+        return assignments
+
+    async def _generate_sample(self, assigned_seed: AssignedSeed) -> tuple[Optional[Dict], float]:
+        """
+        Generate a single sample using the agentic approach.
+
+        Returns:
+            Tuple of (sample_data, cost_usd)
+        """
+        total_cost_usd = 0.0
+
+        # Choose prompt based on whether we have a seed
+        if assigned_seed.seed_text:
+            system_prompt = self.system_prompt_template.format(
+                row_instructions=self.state.generation_prompt,
+                column_schema=self._format_column_schema(),
+                seed=assigned_seed.seed_text,
+                diversity_targets=json.dumps(assigned_seed.diversity_assignments, indent=2)
+            )
+        else:
+            system_prompt = self.system_prompt_no_seed_template.format(
+                row_instructions=self.state.generation_prompt,
+                column_schema=self._format_column_schema(),
+                diversity_targets=json.dumps(assigned_seed.diversity_assignments, indent=2)
+            )
 
         messages = [{"role": "system", "content": system_prompt}]
         max_iterations = 10
 
         for i in range(max_iterations):
-            response = await self.openai_client.chat.completions.create(
+            result = await self.openai_client.chat_completion(
                 model="gpt-4o",
                 messages=messages,
                 tools=self.tools,
                 tool_choice="auto"
             )
 
-            message = response.choices[0].message
+            total_cost_usd += result.cost.total_cost_usd
+            message = result.response.choices[0].message
             messages.append(message.model_dump())
 
             if message.tool_calls:
@@ -219,15 +291,16 @@ Use the tools to gather what you need, then call generate_row when ready. You ma
 
                     # Handle generate_row (final output)
                     if name == "generate_row":
-                        return args.get("row", args)
+                        return args.get("row", args), total_cost_usd
 
                     # Handle other tools
-                    result = await self._handle_tool_call(name, args)
+                    tool_result, tool_cost = await self._handle_tool_call(name, args)
+                    total_cost_usd += tool_cost
 
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": result
+                        "content": tool_result
                     })
             else:
                 # No tool call - agent finished without generating
@@ -235,60 +308,87 @@ Use the tools to gather what you need, then call generate_row when ready. You ma
                 break
 
         logger.error("Agent exceeded max iterations")
-        return None
+        return None, total_cost_usd
 
-    async def _handle_tool_call(self, name: str, args: Dict) -> str:
-        """Handle tool calls from the agent."""
+    async def _handle_tool_call(self, name: str, args: Dict) -> tuple[str, float]:
+        """
+        Handle tool calls from the agent.
+
+        Returns:
+            Tuple of (result_string, cost_usd)
+        """
         if name == "rag_search":
-            query = args.get("query", "")
-            results = await self._rag_search(query)
-            return json.dumps({"results": results})
-
+            return await self._rag_search(args.get("query", ""))
         elif name == "web_search":
-            if not self.state.use_internet:
-                return json.dumps({"error": "Web search disabled for this project"})
-            # TODO: Implement actual web search
-            return json.dumps({"results": []})
+            return await self._web_search(args.get("query", ""))
+        else:
+            return f"Unknown tool: {name}", 0.0
 
-        return json.dumps({})
+    async def _rag_search(self, query: str) -> tuple[str, float]:
+        """
+        Search RAG chunks for relevant content.
 
-    async def _rag_search(self, query: str, top_k: int = 5) -> List[Dict]:
-        """Search for relevant chunks using vector similarity."""
+        Returns:
+            Tuple of (result_string, cost_usd)
+        """
         try:
-            # Get query embedding
-            response = await self.openai_client.embeddings.create(
-                model="text-embedding-3-large",
-                input=query
+            # Get embedding for query
+            result = await self.openai_client.create_embeddings(
+                model="text-embedding-3-small",
+                input=[query],
             )
-            query_embedding = response.data[0].embedding
+            cost_usd = result.cost.total_cost_usd
+            query_embedding = result.response.data[0].embedding
 
-            # Vector search using pgvector cosine distance
-            results = (
-                self.db.query(ProjectRagChunk)
-                .filter(ProjectRagChunk.project_id == self.state.project_id)
-                .order_by(
-                    ProjectRagChunk.embedding.cosine_distance(query_embedding)
-                )
-                .limit(top_k)
-                .all()
-            )
+            # Convert embedding list to pgvector string format
+            embedding_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
 
-            return [
+            # Search chunks using pgvector
+            # Use CAST() instead of :: to avoid SQLAlchemy parameter parsing issues
+            from sqlalchemy import text
+
+            db_result = self.db.execute(
+                text("""
+                    SELECT text, 1 - (embedding <=> CAST(:embedding AS vector)) as similarity
+                    FROM project_rag_chunks
+                    WHERE project_id = :project_id
+                    ORDER BY embedding <=> CAST(:embedding AS vector)
+                    LIMIT 3
+                """),
                 {
-                    "text": chunk.text[:1000],  # Truncate for context window
-                    "chunk_id": str(chunk.id)
+                    "embedding": embedding_str,
+                    "project_id": str(self.state.project_id)
                 }
-                for chunk in results
-            ]
+            )
+
+            chunks = db_result.fetchall()
+            if not chunks:
+                return "No relevant content found", cost_usd
+
+            results = []
+            for chunk in chunks:
+                results.append(f"[Similarity: {chunk.similarity:.3f}]\n{chunk.text}")
+
+            return "\n\n---\n\n".join(results), cost_usd
 
         except Exception as e:
             logger.error(f"RAG search failed: {e}")
-            return []
+            return f"Search failed: {e}", 0.0
+
+    async def _web_search(self, query: str) -> tuple[str, float]:
+        """
+        Placeholder for web search.
+
+        Returns:
+            Tuple of (result_string, cost_usd)
+        """
+        # TODO: Implement actual web search
+        return f"Web search not implemented yet. Query was: {query}", 0.0
 
     def _format_column_schema(self) -> str:
         """Format the column schema for the LLM prompt."""
         if not self.state.columns:
-            return "No specific schema defined"
+            return "No specific schema defined - generate appropriate fields"
 
         lines = []
         for col in self.state.columns:
@@ -300,16 +400,5 @@ Use the tools to gather what you need, then call generate_row when ready. You ma
         return "\n".join(lines)
 
     def is_complete(self) -> bool:
-        """Complete when we've generated target number of samples."""
-        if not self.assignment_phase or not self.assignment_phase.is_complete():
-            return False
-
-        assigned_seeds = self.assignment_phase.get_assigned_seeds()
-        if not assigned_seeds:
-            return False
-
+        """Complete when we've generated the target number of samples."""
         return self.state.samples_generated >= self.state.num_samples
-
-    def reset(self):
-        """Reset generation state (for fresh start on resume)."""
-        self._current_index = 0

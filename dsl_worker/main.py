@@ -1,76 +1,87 @@
+"""
+Worker service main loop.
+
+Handles:
+1. Connecting to Azure Service Bus
+2. Receiving messages from queue
+3. Dispatching to job processor
+4. Graceful shutdown
+"""
+
 import asyncio
 import json
 import logging
-import os
 import signal
 import sys
 from datetime import datetime, timezone
-from typing import Optional
 from uuid import UUID
 
+from sqlalchemy.orm import Session
+from openai import AsyncOpenAI
 from azure.servicebus.aio import ServiceBusClient
 from azure.storage.blob import BlobServiceClient
-from openai import AsyncOpenAI
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, Session
+
+from dsl_api.db import SessionLocal
+from dsl_api.models.project import Project
 
 from dsl_worker.config import settings
 from dsl_worker.job_processor import JobProcessor
-from dsl_worker.logging_setup import setup_logging
-from dsl_api.models.project import Project
 
 logger = logging.getLogger(__name__)
 
 
+def setup_logging():
+    """Configure logging for worker."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    # Reduce noise from Azure SDK
+    logging.getLogger("azure").setLevel(logging.WARNING)
+    logging.getLogger("azure.servicebus").setLevel(logging.INFO)
+
+
 class WorkerService:
     """
-    Background worker service that:
-    1. Connects to Azure Service Bus
-    2. Polls for job messages
-    3. Processes jobs using JobProcessor
-    4. Handles graceful shutdown
+    Main worker service.
 
-    Supports "noop mode" via WORKER_MODE=noop environment variable.
-    In noop mode, the worker starts successfully but never processes messages,
-    allowing local workers to handle all Service Bus messages for debugging.
+    Responsibilities:
+    1. Connects to Azure Service Bus
+    2. Receives job messages
+    3. Dispatches to JobProcessor
+    4. Handles graceful shutdown
     """
 
-    def __init__(self):
+    def __init__(self, noop_mode: bool = False):
+        self.noop_mode = noop_mode
         self.running = True
-        self.current_processor: Optional[JobProcessor] = None
-        self.noop_mode = os.getenv("WORKER_MODE", "").lower() == "noop"
+        self.current_processor: JobProcessor | None = None
 
-        if self.noop_mode:
-            logger.info("🔴 NOOP MODE ENABLED - Worker will not process any messages")
-            logger.info("Worker will idle indefinitely for Azure health checks")
-            # Skip all service initialization in noop mode
-            return
-
-        # Database connection
-        self.engine = create_engine(settings.database_url, pool_pre_ping=True)
-        self.SessionLocal = sessionmaker(bind=self.engine)
+        # Database session factory
+        self.SessionLocal = SessionLocal
 
         # Azure Service Bus client
         self.service_bus_client = ServiceBusClient.from_connection_string(
             settings.azure_service_bus_connection_string
         )
 
-        # Azure Blob Storage client
-        account_url = f"https://{settings.azure_storage_account_name}.blob.core.windows.net"
-        self.blob_service_client = BlobServiceClient(
-            account_url=account_url,
-            credential=settings.azure_storage_account_key
-        )
+        # OpenAI client
+        openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
 
-        # OpenAI client (use AsyncOpenAI)
-        self.openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
+        # Blob storage client
+        blob_service_client = BlobServiceClient(
+            account_url=f"https://{settings.azure_storage_account_name}.blob.core.windows.net",
+            credential=settings.azure_storage_account_key,
+        )
 
         # Job processor
         self.job_processor = JobProcessor(
             db_session_factory=self.SessionLocal,
-            openai_client=self.openai_client,
-            blob_service_client=self.blob_service_client,
+            openai_client=openai_client,
+            blob_service_client=blob_service_client,
         )
+        self.current_processor = self.job_processor
 
         # Setup signal handlers
         signal.signal(signal.SIGTERM, self._handle_shutdown)
@@ -100,30 +111,18 @@ class WorkerService:
             project_id = UUID(project_id_str)
             logger.info(f"Processing project {project_id}")
 
-            # Update project status to running using ORM
-            db: Session = self.SessionLocal()
-            try:
-                project = db.query(Project).filter(Project.id == project_id).first()
-                if project:
-                    project.status = "running"
-                    project.started_at = datetime.now(timezone.utc)
-                    project.updated_at = datetime.now(timezone.utc)
-                    db.commit()
-                else:
-                    logger.error(f"Project {project_id} not found")
-                    return
-            finally:
-                db.close()
+            # NOTE: We do NOT set status to "running" here anymore.
+            # The job_processor will set it after validating the message is not stale.
+            # This prevents stale messages from incorrectly flipping status to "running".
 
             # Process the job
             success = await self.job_processor.process_job(body)
 
-            # Note: Final status is set in job_processor.process_job()
-            # We only update here if there was an unexpected issue
-            if not success:
-                logger.warning(f"Project {project_id} completed with success=False")
-
-            logger.info(f"Completed project {project_id} with status: {'succeeded' if success else 'failed'}")
+            # Log result (status is already set correctly by job_processor)
+            if success:
+                logger.info(f"Completed processing project {project_id}")
+            else:
+                logger.warning(f"Project {project_id} processing returned False")
 
         except Exception as e:
             logger.exception(f"Error processing message: {e}")

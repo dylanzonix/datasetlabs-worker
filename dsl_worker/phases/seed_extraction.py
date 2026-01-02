@@ -12,15 +12,21 @@ import asyncio
 import logging
 import json
 import uuid
-from typing import List
+from typing import List, Tuple
 from datetime import datetime, timezone
+
+import tiktoken
 from pydantic import BaseModel, ValidationError
 
-from dsl_worker.phases.base import Phase
+from dsl_worker.phases.base import Phase, PhaseResult
+from dsl_worker.chunker import chunk_text_by_tokens
 from dsl_api.models.project_rag_chunk import ProjectRagChunk
 from dsl_api.models.project_seed import ProjectSeed
 
 logger = logging.getLogger(__name__)
+
+# Max tokens for a seed (fallback chunking threshold)
+MAX_SEED_TOKENS = 4096
 
 
 class SeedMarker(BaseModel):
@@ -46,39 +52,30 @@ class SeedExtractionPhase(Phase):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.batch_size = 20  # Process 5 chunks per iteration
+        self.batch_size = 20  # Process 20 chunks per iteration
+        try:
+            self._encoding = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            self._encoding = None
 
     def should_run(self) -> bool:
         """
         Run if there are chunks without seeds.
 
-        Flow control:
-        - Preview mode: run eagerly whenever chunks are available
-        - Normal mode: wait for file processing to complete first
+        Runs eagerly - doesn't wait for file processing to complete.
         """
         # No chunks = nothing to extract from
         if self.state.chunks_total == 0:
             return False
 
         # Check if there's actual work to do
-        if not self.state.has_chunks_without_seeds():
-            return False
+        return self.state.has_chunks_without_seeds()
 
-        # Preview mode: extract eagerly
-        if self.state.preview_mode:
-            return True
-
-        # Normal mode: wait for all files to be processed
-        if self.state.has_unprocessed_files():
-            return False
-
-        return True
-
-    async def execute_once(self) -> bool:
+    async def execute_once(self) -> PhaseResult:
         """Extract seeds from a batch of chunks."""
         chunks = self.state.get_chunks_without_seeds(limit=self.batch_size)
         if not chunks:
-            return False
+            return PhaseResult.no_work()
 
         logger.info(f"[{self.name}] Extracting seeds from {len(chunks)} chunks")
 
@@ -89,12 +86,16 @@ class SeedExtractionPhase(Phase):
         )
 
         extracted_count = 0
+        total_cost_usd = 0.0
+
         for chunk, result in zip(chunks, results):
             if isinstance(result, Exception):
                 logger.error(f"Failed to extract seeds from chunk {chunk.id}: {result}")
                 continue
 
-            seed_texts = result
+            seed_texts, cost_usd = result
+            total_cost_usd += cost_usd
+
             for seed_text in seed_texts:
                 seed = ProjectSeed(
                     id=uuid.uuid4(),
@@ -116,12 +117,17 @@ class SeedExtractionPhase(Phase):
 
         self.db.commit()
         logger.info(f"[{self.name}] Extracted {extracted_count} seeds from {len(chunks)} chunks")
-        return True
+        return PhaseResult.work_done(cost_usd=total_cost_usd)
 
-    async def _extract_seeds_from_chunk(self, chunk: ProjectRagChunk) -> List[str]:
-        """Use LLM to extract seeds from a chunk."""
+    async def _extract_seeds_from_chunk(self, chunk: ProjectRagChunk) -> Tuple[List[str], float]:
+        """
+        Use LLM to extract seeds from a chunk.
+
+        Returns:
+            Tuple of (seed_texts, cost_usd)
+        """
         try:
-            response = await self.openai_client.responses.create(
+            response, cost = await self.openai_client.responses_create(
                 prompt={
                     "id": "pmpt_69508e29f514819693d017e0848e223406fd27a87843182b",
                     "version": "5",
@@ -132,16 +138,18 @@ class SeedExtractionPhase(Phase):
                     }
                 },
                 input=[],
+                model="o1",
                 reasoning={"summary": "auto"},
                 store=True,
             )
 
             raw_output = response.output_text
-            return self._process_extraction_response(raw_output, chunk.text)
+            seeds = self._process_extraction_response(raw_output, chunk.text)
+            return seeds, cost.total_cost_usd
 
         except Exception as e:
             logger.error(f"LLM extraction failed: {e}")
-            return [chunk.text]
+            return self._fallback_chunk(chunk.text), 0.0
 
     def _format_column_schema(self) -> str:
         """Format the column schema for the LLM prompt."""
@@ -163,27 +171,28 @@ class SeedExtractionPhase(Phase):
             data = json.loads(raw_response)
         except json.JSONDecodeError as e:
             logger.error(f"JSON parse error in seed extraction: {e}")
-            return [chunk_text]  # Fallback
+            return self._fallback_chunk(chunk_text)
 
         try:
             response = ExtractionResponse(**data)
         except ValidationError as e:
             logger.error(f"Validation error in seed extraction: {e}")
-            return [chunk_text]  # Fallback
+            return self._fallback_chunk(chunk_text)
 
         if not response.seeds:
-            # No seeds found, use entire chunk
-            return [chunk_text]
+            # No seeds found, use entire chunk (with fallback splitting)
+            return self._fallback_chunk(chunk_text)
 
         extracted_seeds = []
         for marker in response.seeds:
             seed_text = self._extract_seed_text(chunk_text, marker)
             if seed_text:
-                extracted_seeds.append(seed_text)
+                # Apply size limit to extracted seeds too
+                extracted_seeds.extend(self._ensure_size_limit(seed_text))
             else:
                 logger.warning(f"Could not locate seed with start='{marker.start[:30]}...'")
 
-        return extracted_seeds if extracted_seeds else [chunk_text]
+        return extracted_seeds if extracted_seeds else self._fallback_chunk(chunk_text)
 
     def _extract_seed_text(self, chunk: str, marker: SeedMarker) -> str | None:
         """Find the continuous span between start and end markers."""
@@ -196,6 +205,41 @@ class SeedExtractionPhase(Phase):
             return None
 
         return chunk[start_idx:end_idx + len(marker.end)]
+
+    def _fallback_chunk(self, text: str) -> List[str]:
+        """
+        Fallback: return chunk as seed(s), splitting if too large.
+
+        If the text exceeds MAX_SEED_TOKENS, split it using token-based chunking.
+        """
+        return self._ensure_size_limit(text)
+
+    def _ensure_size_limit(self, text: str) -> List[str]:
+        """
+        Ensure text fits within MAX_SEED_TOKENS, splitting if necessary.
+        """
+        token_count = self._count_tokens(text)
+
+        if token_count <= MAX_SEED_TOKENS:
+            return [text]
+
+        # Text is too large, split it
+        logger.warning(
+            f"Seed text exceeds {MAX_SEED_TOKENS} tokens ({token_count} tokens), "
+            f"splitting by tokens"
+        )
+        return chunk_text_by_tokens(
+            text.encode('utf-8'),
+            chunk_size=MAX_SEED_TOKENS,
+            overlap=200
+        )
+
+    def _count_tokens(self, text: str) -> int:
+        """Count tokens in text."""
+        if self._encoding is None:
+            # Fallback: rough estimate (4 chars per token)
+            return len(text) // 4
+        return len(self._encoding.encode(text))
 
     def is_complete(self) -> bool:
         """Complete when all chunks have seeds."""

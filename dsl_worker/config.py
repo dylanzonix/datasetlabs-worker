@@ -33,5 +33,10 @@ class WorkerSettings(BaseSettings):
     heartbeat_interval_seconds: int = 30
     checkpoint_interval_seconds: int = 60
 
+    # Billing settings
+    billing_margin_multiplier: float = 2.0  # 2x = 100% margin (charge $2 for $1 cost)
+    billing_charge_threshold_cents: int = 1000  # $10 - charge when accumulated
+    billing_charge_interval_seconds: int = 60  # Charge at least every 60 seconds
+
 
 settings = WorkerSettings()

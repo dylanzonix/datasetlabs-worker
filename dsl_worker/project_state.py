@@ -50,6 +50,9 @@ class ProjectState:
         self.paused = False
         self.preview_mode = False
 
+        # Cost controls
+        self.spend_limit_cents: Optional[int] = None
+
         # Config tracking for invalidation
         self._last_diversity_spec_hash: Optional[str] = None
         self._last_file_ids: Set[UUID] = set()
@@ -86,7 +89,10 @@ class ProjectState:
 
         # Update flags
         self.paused = self._check_pause_requested()
-        self.preview_mode = getattr(project, 'preview_mode', False)
+        self.preview_mode = project.preview_mode
+
+        # Update cost controls
+        self.spend_limit_cents = project.spend_limit_cents
 
         # Update project metadata
         self.num_samples = project.num_samples

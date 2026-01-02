@@ -17,7 +17,7 @@ from typing import List
 import numpy as np
 from sqlalchemy.dialects.postgresql import insert
 
-from dsl_worker.phases.base import Phase
+from dsl_worker.phases.base import Phase, PhaseResult
 from dsl_worker.chunker import chunk_csv, chunk_jsonl, chunk_json_array, chunk_text_by_tokens
 from dsl_api.models.project_file import ProjectFile
 from dsl_api.models.project_rag_chunk import ProjectRagChunk
@@ -37,14 +37,16 @@ class FileProcessingPhase(Phase):
         """Run if there are unprocessed files."""
         return self.state.has_unprocessed_files()
 
-    async def execute_once(self) -> bool:
+    async def execute_once(self) -> PhaseResult:
         """Process ONE file completely (chunk + embed)."""
         files = self.state.get_unprocessed_files(limit=1)
         if not files:
-            return False
+            return PhaseResult.no_work()
 
         file = files[0]
         logger.info(f"Processing file: {file.filename} ({file.size_bytes} bytes)")
+
+        total_cost_usd = 0.0
 
         try:
             # Download from blob storage
@@ -64,21 +66,23 @@ class FileProcessingPhase(Phase):
 
             logger.info(f"Created {len(chunks)} chunks from {file.filename}")
 
-            # Compute embeddings in batches
-            embeddings = await self._compute_embeddings_batched(chunks)
+            # Compute embeddings in batches (with cost tracking)
+            embeddings, embedding_cost = await self._compute_embeddings_batched(chunks)
+            total_cost_usd += embedding_cost
+
             if len(embeddings) != len(chunks):
                 logger.error(f"Embedding count mismatch: {len(embeddings)} vs {len(chunks)} chunks")
-                return False
+                return PhaseResult.no_work()
 
             # Store chunks with embeddings (bulk insert for performance)
             self._store_chunks(file, chunks, embeddings)
 
             logger.info(f"Successfully processed {file.filename}: {len(chunks)} chunks stored")
-            return True
+            return PhaseResult.work_done(cost_usd=total_cost_usd)
 
         except Exception as e:
             logger.error(f"File processing failed for {file.filename}: {e}", exc_info=True)
-            return False
+            return PhaseResult.no_work()
 
     def _chunk_content(self, content: bytes, filename: str, content_type: str) -> List[str]:
         """Chunk content based on file type."""
@@ -98,27 +102,35 @@ class FileProcessingPhase(Phase):
             self,
             chunks: List[str],
             batch_size: int = 100
-    ) -> List[np.ndarray]:
-        """Compute embeddings in batches to avoid API limits."""
+    ) -> tuple[List[np.ndarray], float]:
+        """
+        Compute embeddings in batches to avoid API limits.
+
+        Returns:
+            Tuple of (embeddings, total_cost_usd)
+        """
         embeddings = []
+        total_cost_usd = 0.0
 
         for i in range(0, len(chunks), batch_size):
             batch = chunks[i:i + batch_size]
 
-            response = await self.openai_client.embeddings.create(
+            result = await self.openai_client.create_embeddings(
                 model="text-embedding-3-large",
                 input=batch,
-                encoding_format="float"
             )
 
+            # Track cost
+            total_cost_usd += result.cost.total_cost_usd
+
             # Sort by index to maintain order
-            sorted_data = sorted(response.data, key=lambda d: d.index)
+            sorted_data = sorted(result.response.data, key=lambda d: d.index)
             batch_embeddings = [np.array(item.embedding, dtype=np.float32) for item in sorted_data]
             embeddings.extend(batch_embeddings)
 
             logger.debug(f"Computed embeddings for batch {i // batch_size + 1}")
 
-        return embeddings
+        return embeddings, total_cost_usd
 
     def _store_chunks(
             self,

@@ -5,19 +5,44 @@ Key design decisions:
 - execute_once() processes one unit of work (phases determine batch size internally)
 - Status tracking only matters up to seed_scoring (assignment/generation restart from scratch)
 - Phases are responsible for their own resume logic
+- All phases return PhaseResult with cost tracking
 """
 
 import logging
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Optional
 
 from sqlalchemy.orm import Session
-from openai import AsyncOpenAI
 from azure.storage.blob import BlobServiceClient
 
 from dsl_worker.project_state import ProjectState
+from dsl_worker.billing import TrackedOpenAIClient
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PhaseResult:
+    """
+    Result of a phase execution.
+
+    Attributes:
+        did_work: Whether any work was done
+        cost_usd: Cost incurred in USD (before margin - margin applied by CostTracker)
+    """
+    did_work: bool
+    cost_usd: float = 0.0
+
+    @staticmethod
+    def no_work() -> "PhaseResult":
+        """Create a result indicating no work was done."""
+        return PhaseResult(did_work=False, cost_usd=0.0)
+
+    @staticmethod
+    def work_done(cost_usd: float = 0.0) -> "PhaseResult":
+        """Create a result indicating work was done."""
+        return PhaseResult(did_work=True, cost_usd=cost_usd)
 
 
 class Phase(ABC):
@@ -39,7 +64,7 @@ class Phase(ABC):
             name: str,
             state: ProjectState,
             db: Session,
-            openai_client: Optional[AsyncOpenAI] = None,
+            openai_client: Optional[TrackedOpenAIClient] = None,
             blob_service_client: Optional[BlobServiceClient] = None,
     ):
         self.name = name
@@ -66,7 +91,7 @@ class Phase(ABC):
         pass
 
     @abstractmethod
-    async def execute_once(self) -> bool:
+    async def execute_once(self) -> PhaseResult:
         """
         Execute one unit of work for this phase.
 
@@ -78,7 +103,7 @@ class Phase(ABC):
         - For generation: one sample
 
         Returns:
-            True if work was done, False if no work available
+            PhaseResult with did_work flag and cost_cents
         """
         pass
 
@@ -91,16 +116,3 @@ class Phase(ABC):
             True if no more work remains for this phase
         """
         pass
-
-    def get_progress(self) -> dict:
-        """
-        Get progress information for this phase.
-
-        Returns:
-            Dictionary with progress metrics
-        """
-        return {
-            "phase": self.name,
-            "complete": self.is_complete(),
-            "should_run": self.should_run(),
-        }
