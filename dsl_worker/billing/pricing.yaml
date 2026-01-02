@@ -36,3 +36,8 @@ models:
   o1-mini:
     input: 0.000003      # $3.00 / 1M tokens
     output: 0.000012     # $12.00 / 1M tokens
+
+  # GPT 5
+  gpt-5.2:
+    input: 0.00000175    # $1.75 / 1M tokens
+    output: 0.000014     # $14.00 / 1M tokens
