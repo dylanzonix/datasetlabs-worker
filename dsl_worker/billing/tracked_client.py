@@ -6,7 +6,7 @@ Wraps the AsyncOpenAI client and returns cost information alongside responses.
 
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Any, Dict
+from typing import List, Optional, Any, Dict, Tuple
 
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletion
@@ -136,32 +136,47 @@ class TrackedOpenAIClient:
 
     async def responses_create(
         self,
-        prompt: Dict[str, Any],
+        model: str,
         input: List[Any],
-        model: str = "o1",
+        prompt: Optional[Dict[str, Any]] = None,
+        tools: Optional[List[Dict]] = None,
         **kwargs,
-    ) -> Any:
+    ) -> Tuple[Any, UsageCost]:
         """
-        Create a response using the responses API (for prompt management).
-
-        Note: This is a special API that may have different cost tracking.
-        For now, we estimate based on the model.
-
+        Create a response using the Responses API.
+        
+        Supports both:
+        - Stored prompts (with prompt parameter)
+        - Direct tool-calling (with tools parameter)
+        
+        Args:
+            model: Model to use (e.g., "gpt-4o", "o1")
+            input: List of input messages/items
+            prompt: Optional stored prompt config
+            tools: Optional list of tool definitions
+            **kwargs: Additional parameters (max_output_tokens, reasoning, etc.)
+        
         Returns:
             Tuple of (response, cost)
         """
-        response = await self._client.responses.create(
-            prompt=prompt,
-            input=input,
-            model=model,
+        create_kwargs = {
+            "model": model,
+            "input": input,
             **kwargs,
-        )
+        }
+        
+        if prompt is not None:
+            create_kwargs["prompt"] = prompt
+        
+        if tools is not None:
+            create_kwargs["tools"] = tools
+        
+        response = await self._client.responses.create(**create_kwargs)
 
-        # The responses API doesn't always return token counts directly
-        # We need to extract from response.usage if available
+        # Extract token usage
         input_tokens = 0
         output_tokens = 0
-
+        
         if hasattr(response, 'usage') and response.usage:
             input_tokens = getattr(response.usage, 'input_tokens', 0)
             output_tokens = getattr(response.usage, 'output_tokens', 0)

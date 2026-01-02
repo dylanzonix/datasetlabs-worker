@@ -8,6 +8,7 @@ Resume logic:
 - Checks which chunks already have seeds
 - Only processes chunks without seeds
 """
+
 import asyncio
 import logging
 import json
@@ -31,12 +32,14 @@ MAX_SEED_TOKENS = 4096
 
 class SeedMarker(BaseModel):
     """Marker for seed boundaries in chunk text."""
+
     start: str
     end: str
 
 
 class ExtractionResponse(BaseModel):
     """Expected response format from LLM."""
+
     seeds: List[SeedMarker]
 
 
@@ -82,7 +85,7 @@ class SeedExtractionPhase(Phase):
         # Fire all requests concurrently
         results = await asyncio.gather(
             *[self._extract_seeds_from_chunk(chunk) for chunk in chunks],
-            return_exceptions=True
+            return_exceptions=True,
         )
 
         extracted_count = 0
@@ -105,10 +108,10 @@ class SeedExtractionPhase(Phase):
                     file_id=chunk.file_id,
                     text=seed_text,
                     extraction_metadata={
-                        'extraction_method': 'llm',
-                        'chunk_idx': chunk.chunk_idx,
-                        'extracted_at': datetime.now(timezone.utc).isoformat()
-                    }
+                        "extraction_method": "llm",
+                        "chunk_idx": chunk.chunk_idx,
+                        "extracted_at": datetime.now(timezone.utc).isoformat(),
+                    },
                 )
                 self.db.add(seed)
 
@@ -116,10 +119,14 @@ class SeedExtractionPhase(Phase):
             logger.debug(f"Extracted {len(seed_texts)} seeds from chunk {chunk.id}")
 
         self.db.commit()
-        logger.info(f"[{self.name}] Extracted {extracted_count} seeds from {len(chunks)} chunks")
+        logger.info(
+            f"[{self.name}] Extracted {extracted_count} seeds from {len(chunks)} chunks"
+        )
         return PhaseResult.work_done(cost_usd=total_cost_usd)
 
-    async def _extract_seeds_from_chunk(self, chunk: ProjectRagChunk) -> Tuple[List[str], float]:
+    async def _extract_seeds_from_chunk(
+        self, chunk: ProjectRagChunk
+    ) -> Tuple[List[str], float]:
         """
         Use LLM to extract seeds from a chunk.
 
@@ -128,17 +135,17 @@ class SeedExtractionPhase(Phase):
         """
         try:
             response, cost = await self.openai_client.responses_create(
+                model="o1",
+                input=[],
                 prompt={
                     "id": "pmpt_69508e29f514819693d017e0848e223406fd27a87843182b",
                     "version": "5",
                     "variables": {
                         "row_instructions": self.state.generation_prompt,
                         "column_schema": self._format_column_schema(),
-                        "source_chunk": chunk.text
-                    }
+                        "source_chunk": chunk.text,
+                    },
                 },
-                input=[],
-                model="o1",
                 reasoning={"summary": "auto"},
                 store=True,
             )
@@ -158,14 +165,16 @@ class SeedExtractionPhase(Phase):
 
         lines = []
         for col in self.state.columns:
-            col_name = col.get('name', 'unknown')
-            col_type = col.get('type', 'string')
-            col_desc = col.get('description', '')
+            col_name = col.get("name", "unknown")
+            col_type = col.get("type", "string")
+            col_desc = col.get("description", "")
             lines.append(f"{col_name} ({col_type}): {col_desc}")
 
         return "\n".join(lines)
 
-    def _process_extraction_response(self, raw_response: str, chunk_text: str) -> List[str]:
+    def _process_extraction_response(
+        self, raw_response: str, chunk_text: str
+    ) -> List[str]:
         """Validate LLM response and extract seed texts from chunk."""
         try:
             data = json.loads(raw_response)
@@ -190,7 +199,9 @@ class SeedExtractionPhase(Phase):
                 # Apply size limit to extracted seeds too
                 extracted_seeds.extend(self._ensure_size_limit(seed_text))
             else:
-                logger.warning(f"Could not locate seed with start='{marker.start[:30]}...'")
+                logger.warning(
+                    f"Could not locate seed with start='{marker.start[:30]}...'"
+                )
 
         return extracted_seeds if extracted_seeds else self._fallback_chunk(chunk_text)
 
@@ -204,7 +215,7 @@ class SeedExtractionPhase(Phase):
         if end_idx == -1:
             return None
 
-        return chunk[start_idx:end_idx + len(marker.end)]
+        return chunk[start_idx : end_idx + len(marker.end)]
 
     def _fallback_chunk(self, text: str) -> List[str]:
         """
@@ -229,9 +240,7 @@ class SeedExtractionPhase(Phase):
             f"splitting by tokens"
         )
         return chunk_text_by_tokens(
-            text.encode('utf-8'),
-            chunk_size=MAX_SEED_TOKENS,
-            overlap=200
+            text.encode("utf-8"), chunk_size=MAX_SEED_TOKENS, overlap=200
         )
 
     def _count_tokens(self, text: str) -> int:
