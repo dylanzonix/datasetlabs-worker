@@ -96,6 +96,17 @@ class JobProcessor:
                 logger.warning("Stale message (run mismatch), ignoring")
                 return True
 
+            # Check if project is paused - if so, this is a stale message from before the pause
+            # The user must explicitly resume (which sends a new message)
+            if project.status == "paused":
+                logger.warning("Stale message (project is paused), ignoring")
+                return True
+
+            # Also reject if already succeeded/failed - no need to reprocess
+            if project.status == "failed":
+                logger.warning(f"Stale message (project is {project.status}), ignoring")
+                return True
+
             # NOW we can set status to running (after confirming message is valid)
             # This prevents stale messages from incorrectly setting status to running
             project.status = "running"

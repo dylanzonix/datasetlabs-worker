@@ -5,7 +5,7 @@ Handles:
 - Accumulating costs from API calls (categorized as preprocessing or generation)
 - Charging to user balance at intervals
 - Checking if user has sufficient balance
-- Enforcing project spend limits
+- Enforcing project spend limits (dynamically updated)
 """
 
 import logging
@@ -67,7 +67,7 @@ class CostTracker:
     - Charges are also append-only
     - Current uncharged = sum(costs) - sum(charges)
     - Charges occur every interval OR when threshold reached
-    - Enforces project spend limits (cumulative across all runs)
+    - Enforces project spend limits (dynamically fetched from DB)
     - Costs are categorized as preprocessing or generation
 
     Args:
@@ -77,7 +77,7 @@ class CostTracker:
         margin_multiplier: Multiply raw costs by this (e.g., 2.0 for 100% margin)
         charge_threshold_cents: Charge when accumulated costs reach this (e.g., 1000 = $10)
         charge_interval_seconds: Charge at least this often (e.g., 60 = 1 minute)
-        spend_limit_cents: Maximum cumulative spend for this project (None = no limit)
+        spend_limit_cents: Initial spend limit (will be refreshed from DB dynamically)
     """
 
     def __init__(
@@ -96,7 +96,11 @@ class CostTracker:
         self.margin_multiplier = margin_multiplier
         self.charge_threshold_cents = charge_threshold_cents
         self.charge_interval_seconds = charge_interval_seconds
-        self.spend_limit_cents = spend_limit_cents
+
+        # Cache for spend limit (refreshed periodically)
+        self._spend_limit_cache: Optional[int] = spend_limit_cents
+        self._spend_limit_cache_time: datetime = datetime.now(timezone.utc)
+        self._spend_limit_cache_ttl_seconds: float = 5.0  # Refresh every 5 seconds
 
         # Append-only lists
         self._costs: List[CostEntry] = []
@@ -124,6 +128,41 @@ class CostTracker:
         )
         return abs(result) if result else 0
 
+    def _get_current_spend_limit(self) -> Optional[int]:
+        """
+        Fetch current spend limit from database with short TTL cache.
+
+        This allows dynamic updates while project is running - user can
+        lower the spend limit and the worker will pause accordingly.
+        """
+        now = datetime.now(timezone.utc)
+        age = (now - self._spend_limit_cache_time).total_seconds()
+
+        if age < self._spend_limit_cache_ttl_seconds:
+            return self._spend_limit_cache
+
+        # Refresh from DB
+        from dsl_api.models.project import Project
+
+        project = self.db.query(Project).filter(Project.id == self.project_id).first()
+        if project:
+            old_limit = self._spend_limit_cache
+            self._spend_limit_cache = project.spend_limit_cents
+
+            # Log if limit changed
+            if old_limit != self._spend_limit_cache:
+                logger.info(
+                    f"Spend limit updated: {old_limit}¢ -> {self._spend_limit_cache}¢"
+                )
+
+        self._spend_limit_cache_time = now
+        return self._spend_limit_cache
+
+    @property
+    def spend_limit_cents(self) -> Optional[int]:
+        """Current spend limit (fetched fresh from DB with caching)."""
+        return self._get_current_spend_limit()
+
     @property
     def cumulative_spend_cents(self) -> int:
         """Total spend on this project including current run."""
@@ -135,19 +174,21 @@ class CostTracker:
         Remaining budget for this project.
         Returns None if no spend limit is set.
         """
-        if self.spend_limit_cents is None:
+        limit = self.spend_limit_cents  # Dynamically fetched
+        if limit is None:
             return None
-        return max(0, self.spend_limit_cents - self.cumulative_spend_cents)
+        return max(0, limit - self.cumulative_spend_cents)
 
     def would_exceed_spend_limit(self, additional_cents: int) -> bool:
         """
         Check if spending additional_cents would exceed the spend limit.
         Returns False if no limit is set.
         """
-        if self.spend_limit_cents is None:
+        limit = self.spend_limit_cents  # Dynamically fetched
+        if limit is None:
             return False
         projected = self.cumulative_spend_cents + self.uncharged_cents + additional_cents
-        return projected > self.spend_limit_cents
+        return projected > limit
 
     def add_cost(self, phase: str, cost_usd: float, description: str = "") -> None:
         """
@@ -328,11 +369,14 @@ class CostTracker:
         Returns True if:
         - No spend limit is set, OR
         - Cumulative spend (including uncharged) is within limit
+
+        Note: spend_limit_cents is fetched dynamically from DB.
         """
-        if self.spend_limit_cents is None:
+        limit = self.spend_limit_cents  # Dynamically fetched
+        if limit is None:
             return True
         projected_spend = self.cumulative_spend_cents + self.uncharged_cents
-        return projected_spend <= self.spend_limit_cents
+        return projected_spend <= limit
 
     def check_balance_and_charge(self) -> tuple[bool, Optional[str]]:
         """
@@ -346,7 +390,7 @@ class CostTracker:
         # First, charge any accumulated costs
         self.charge_if_needed()
 
-        # Check spend limit
+        # Check spend limit (dynamically fetched from DB)
         if not self.is_within_spend_limit():
             return False, "spend_limit_exceeded"
 
@@ -358,6 +402,8 @@ class CostTracker:
 
     def get_summary(self) -> dict:
         """Get a summary of costs and charges."""
+        limit = self.spend_limit_cents  # Dynamically fetched
+
         summary = {
             "total_costs_cents": self.total_costs_cents,
             "preprocessing_costs_cents": self.preprocessing_costs_cents(),
@@ -371,8 +417,8 @@ class CostTracker:
         }
 
         # Add spend limit info if set
-        if self.spend_limit_cents is not None:
-            summary["spend_limit_cents"] = self.spend_limit_cents
+        if limit is not None:
+            summary["spend_limit_cents"] = limit
             summary["remaining_budget_cents"] = self.remaining_budget_cents
 
         return summary
