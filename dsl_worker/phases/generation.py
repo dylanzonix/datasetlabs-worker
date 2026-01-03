@@ -91,14 +91,14 @@ class GenerationPhase(Phase):
             )
 
         try:
-            sample_data = await self._generate_sample(assigned_seed)
+            sample_data, cost_usd = await self._generate_sample(assigned_seed)
 
             if sample_data:
                 max_seq = (
-                    self.db.query(sql_func.max(Sample.seq))
-                    .filter(Sample.project_id == self.state.project_id)
-                    .scalar()
-                    or 0
+                        self.db.query(sql_func.max(Sample.seq))
+                        .filter(Sample.project_id == self.state.project_id)
+                        .scalar()
+                        or 0
                 )
 
                 sample = Sample(
@@ -112,13 +112,14 @@ class GenerationPhase(Phase):
                 self.db.add(sample)
                 self.db.commit()
 
-                logger.info(f"[{self.name}] Generated sample {max_seq + 1}")
-                return PhaseResult.work_done()
+                logger.info(f"[{self.name}] Generated sample {max_seq + 1} (cost: ${cost_usd:.4f})")
+                return PhaseResult.work_done(cost_usd=cost_usd)
 
             logger.warning(
                 f"[{self.name}] Failed to generate sample from seed {assigned_seed.seed_id}"
             )
-            return PhaseResult.no_work()
+            # Return cost even on failure - we still spent money on API calls
+            return PhaseResult.work_done(cost_usd=cost_usd) if cost_usd > 0 else PhaseResult.no_work()
 
         except Exception as e:
             logger.error(f"[{self.name}] Generation error: {e}", exc_info=True)
@@ -132,17 +133,21 @@ class GenerationPhase(Phase):
     # Sample generation
     # =========================================================================
 
-    async def _generate_sample(self, assigned_seed: AssignedSeed) -> Optional[Dict]:
-        """Generate a single sample using the agentic approach."""
+    async def _generate_sample(self, assigned_seed: AssignedSeed) -> tuple[Optional[Dict], float]:
+        """
+        Generate a single sample using the agentic approach.
 
-        # Reset row state
+        Returns:
+            Tuple of (sample_data, total_cost_usd)
+            sample_data is None if generation failed
+        """
+        # Reset state for this sample
         self._current_row = {}
         self._row_submitted = False
+        self._generation_cost_usd = 0.0  # Track cost for this sample
 
-        # Build input
         system_prompt = self._build_system_prompt(assigned_seed)
         input_items = [{"role": "system", "content": system_prompt}]
-
         tools = self._build_tools()
 
         for iteration in range(self.max_iterations):
@@ -155,15 +160,14 @@ class GenerationPhase(Phase):
                     tools=tools,
                     max_output_tokens=100_000,
                 )
+                self._generation_cost_usd += cost.total_cost_usd
             except Exception as e:
                 logger.error(f"OpenAI API error: {e}")
-                return None
+                return None, self._generation_cost_usd
 
-            # Process response output
             has_tool_calls = False
 
             for output_item in response.output:
-                # Handle text output
                 if output_item.type == "message":
                     input_items.append(
                         {
@@ -176,7 +180,6 @@ class GenerationPhase(Phase):
                         }
                     )
 
-                # Handle function calls
                 elif output_item.type == "function_call":
                     has_tool_calls = True
 
@@ -186,10 +189,8 @@ class GenerationPhase(Phase):
 
                     logger.debug(f"Tool call: {name}({args})")
 
-                    # Execute tool
                     result = await self._handle_tool_call(name, args)
 
-                    # Add function call and result to input
                     input_items.append(
                         {
                             "type": "function_call",
@@ -206,12 +207,10 @@ class GenerationPhase(Phase):
                         }
                     )
 
-                    # Check if row was submitted
                     if self._row_submitted:
                         logger.info(f"Row submitted after {iteration + 1} iterations")
-                        return self._current_row
+                        return self._current_row, self._generation_cost_usd
 
-            # No tool calls = agent is done (but didn't submit)
             if not has_tool_calls:
                 logger.warning("Agent finished without submitting row")
                 break
@@ -219,7 +218,7 @@ class GenerationPhase(Phase):
         logger.error(
             f"Agent exceeded {self.max_iterations} iterations without submitting"
         )
-        return None
+        return None, self._generation_cost_usd
 
     # =========================================================================
     # System prompt
@@ -446,13 +445,11 @@ Build a high-quality, accurate row that follows the instructions and schema."""
             )
 
         else:
-            # int, float, bool, enum, dict - just set
             self._current_row[column] = content
             return json.dumps({"success": True, "column": column})
 
     def _handle_submit_row(self) -> str:
         """Validate and submit the row."""
-        # Check required columns
         missing = self._get_missing_columns()
         if missing:
             return json.dumps(
@@ -463,7 +460,6 @@ Build a high-quality, accurate row that follows the instructions and schema."""
                 }
             )
 
-        # Type validation
         errors = self._validate_column_types()
         if errors:
             return json.dumps({"error": "Validation failed", "errors": errors})
@@ -474,15 +470,16 @@ Build a high-quality, accurate row that follows the instructions and schema."""
     async def _handle_rag_search(self, query: str) -> str:
         """Search uploaded docs via pgvector."""
         try:
-            # Get embedding
-            embed_response = self.openai_client.embeddings.create(
+            # Use tracked client for embeddings
+            embed_response, embed_cost = await self.openai_client.embeddings_create(
                 model="text-embedding-3-large",
                 input=[query],
             )
+            self._generation_cost_usd += embed_cost.total_cost_usd
+
             query_embedding = embed_response.data[0].embedding
             embedding_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
 
-            # Vector search
             result = self.db.execute(
                 text(
                     """
@@ -506,7 +503,7 @@ Build a high-quality, accurate row that follows the instructions and schema."""
             for chunk in chunks:
                 results.append(
                     {
-                        "text": chunk.text[:2000],  # Truncate long chunks
+                        "text": chunk.text[:2000],
                         "similarity": round(chunk.similarity, 3),
                     }
                 )
@@ -565,7 +562,6 @@ Build a high-quality, accurate row that follows the instructions and schema."""
 
             if response.status_code == 200:
                 content = response.content.decode("utf-8", errors="ignore")
-                # Truncate to avoid context overflow
                 if len(content) > 15000:
                     content = content[:15000] + "\n\n[Content truncated...]"
                 return json.dumps({"url": url, "content": content})
