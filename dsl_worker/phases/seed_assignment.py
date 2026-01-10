@@ -1,22 +1,28 @@
 """
-Phase: Seed Assignment
+Phase: Seed Assignment (Streaming)
 
 Assigns seeds to diversity slots using Jonker-Volgenant algorithm.
-This phase is EPHEMERAL - it runs fresh on every start/resume.
+Supports streaming - can assign in batches as seeds become available.
 
 Key design:
-- Does NOT persist assignment state to database
-- Computes assignments in memory from scored seeds
-- Passes assignments to generation phase via shared state
-- Algorithm requires seeing ALL candidates, so execute_once() does everything
-- No API calls, so no costs
+- Can run incrementally (batch_mode=True) or wait for all seeds (batch_mode=False)
+- Tracks which seeds have been assigned
+- Generation can start as soon as first batch is assigned
+- Re-assigns when new batches arrive for better global optimization
+
+Resume behavior:
+- Assignment state is ephemeral (not persisted)
+- On resume, re-computes from scored seeds
 """
 
 import logging
+import hashlib
+import json
 import numpy as np
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Set, Optional
 from dataclasses import dataclass
 from scipy.optimize import linear_sum_assignment
+from uuid import UUID
 
 from dsl_worker.phases.base import Phase, PhaseResult
 from dsl_api.models.project_seed import ProjectSeed
@@ -45,55 +51,114 @@ class SeedAssignmentPhase(Phase):
     Assign seeds to diversity slots.
 
     Uses Jonker-Volgenant (Hungarian) algorithm for optimal assignment.
-    This phase is ephemeral - results are computed fresh each time.
 
-    One execute_once() processes ALL seeds at once (algorithm requirement).
+    Modes:
+    - streaming (batch_mode=True): Assign in batches as seeds become available
+    - complete (batch_mode=False): Wait for all seeds before assigning
+
+    The streaming mode allows generation to start earlier at the cost of
+    potentially suboptimal assignments (since we don't see all candidates).
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self,
+        *args,
+        batch_mode: bool = False,  # Set True for streaming
+        batch_threshold: int = 100,  # Min seeds before first batch assignment
+        **kwargs
+    ):
         super().__init__(*args, **kwargs)
-        self._assignment_done = False
+        self.batch_mode = batch_mode
+        self.batch_threshold = batch_threshold
+
+        # Assignment state
         self._assigned_seeds: List[AssignedSeed] = []
+        self._assigned_seed_ids: Set[str] = set()
+        self._last_scored_count: int = 0
+        self._assignment_complete: bool = False
+
+        # For detecting when we need to re-assign
+        self._last_seed_hash: str = ""
 
     def should_run(self) -> bool:
         """
-        Run when scoring is complete and assignment not done yet.
+        Determine if assignment should run.
 
         Flow control:
-        - If no seeds exist and scoring is complete: mark done, skip to generation
+        - If no seeds exist and all preprocessing complete: mark done
         - Preview mode: run as soon as any seeds are scored
-        - Normal mode: wait for scoring to complete
+        - Batch mode: run when batch_threshold new seeds are scored
+        - Normal mode: wait for ALL preprocessing to complete
         """
-        if self._assignment_done:
+        if self._assignment_complete:
+            # Check if we need to re-assign (new seeds scored since last run)
+            if self.batch_mode and self._should_reassign():
+                return True
             return False
 
-        # Handle no-files/no-seeds case:
-        # If there are no seeds AND no unscored seeds (meaning file processing is done
-        # but produced nothing), mark assignment as complete so generation can proceed.
+        # Handle no-files/no-seeds case
         if self.state.seeds_scored == 0 and not self.state.has_unscored_seeds():
-            # Check if file processing is also complete (no unprocessed files)
-            if not self.state.has_unprocessed_files():
+            if not self.state.has_unprocessed_files() and not self.state.has_chunks_without_seeds():
                 logger.info("No seeds available (no files or empty files), marking assignment complete")
-                self._assignment_done = True
-                self._assigned_seeds = []  # Empty list - generation will create synthetic seeds
+                self._assignment_complete = True
+                self._assigned_seeds = []
                 return False
 
-        # Need at least some scored seeds to assign
+        # Need at least some scored seeds
         if self.state.seeds_scored == 0:
             return False
 
-        # Preview mode: assign as soon as any scored
+        # Preview mode: assign immediately
         if self.state.preview_mode:
             return True
 
-        # Normal mode: wait for scoring to complete
+        # Batch mode: assign when we have enough new seeds
+        if self.batch_mode:
+            new_seeds = self.state.seeds_scored - self._last_scored_count
+            if new_seeds >= self.batch_threshold or self._preprocessing_complete():
+                return True
+            return False
+
+        # Normal mode: wait for ALL preprocessing to complete
+        # This is crucial for resume scenarios with new files
+        if self.state.has_unprocessed_files():
+            return False
+
+        if self.state.has_chunks_without_seeds():
+            return False
+
         if self.state.has_unscored_seeds():
             return False
 
         return True
 
+    def _preprocessing_complete(self) -> bool:
+        """Check if all preprocessing phases are done."""
+        return (
+            not self.state.has_unprocessed_files() and
+            not self.state.has_chunks_without_seeds() and
+            not self.state.has_unscored_seeds()
+        )
+
+    def _should_reassign(self) -> bool:
+        """Check if we should re-run assignment (new seeds available)."""
+        if not self.batch_mode:
+            return False
+
+        current_count = self.state.seeds_scored
+        new_seeds = current_count - self._last_scored_count
+
+        # Re-assign if significant new seeds or preprocessing complete
+        if new_seeds >= self.batch_threshold:
+            return True
+
+        if self._preprocessing_complete() and new_seeds > 0:
+            return True
+
+        return False
+
     async def execute_once(self) -> PhaseResult:
-        """Run assignment on ALL scored seeds."""
+        """Run assignment on scored seeds."""
         seeds = self.state.get_scored_seeds()
         if not seeds:
             return PhaseResult.no_work()
@@ -101,67 +166,79 @@ class SeedAssignmentPhase(Phase):
         logger.info(f"[{self.name}] Assigning {len(seeds)} seeds to diversity slots")
 
         try:
-            axes = self._parse_axes()
-            slots = self._compute_slots(axes, self.state.num_samples)
+            # Run the assignment algorithm
+            assigned = self._run_assignment(seeds)
 
-            if not slots:
-                # No diversity spec, assign all seeds to default
-                self._assigned_seeds = [
-                    AssignedSeed(
-                        seed_id=str(seed.id),
-                        seed_text=seed.text,
-                        diversity_assignments={},
-                        score=1.0
-                    )
-                    for seed in seeds
-                ]
-                self._assignment_done = True
-                logger.info(f"No diversity spec, assigned all {len(seeds)} seeds to default")
-                return PhaseResult.work_done(cost_usd=0.0)
+            # Update state
+            self._assigned_seeds = assigned
+            self._assigned_seed_ids = {s.seed_id for s in assigned}
+            self._last_scored_count = self.state.seeds_scored
 
-            # Build position list (expand slots by count_needed)
-            positions: List[Tuple[int, QuotaSlot]] = []
-            for slot_idx, slot in enumerate(slots):
-                for _ in range(slot.count_needed):
-                    positions.append((slot_idx, slot))
+            # Mark complete if preprocessing is done
+            if self._preprocessing_complete():
+                self._assignment_complete = True
 
-            # Build cost matrix: seeds x positions
-            n_seeds = len(seeds)
-            n_positions = len(positions)
-
-            cost_matrix = np.full((n_seeds, n_positions), 1000.0)
-
-            for i, seed in enumerate(seeds):
-                for j, (slot_idx, slot) in enumerate(positions):
-                    score = self._compute_slot_score(seed, slot)
-                    cost_matrix[i, j] = -score  # Negate for minimization
-
-            # Run Jonker-Volgenant algorithm
-            seed_indices, pos_indices = linear_sum_assignment(cost_matrix)
-
-            # Build assigned seeds list
-            self._assigned_seeds = []
-            for seed_idx, pos_idx in zip(seed_indices, pos_indices):
-                if cost_matrix[seed_idx, pos_idx] >= 999:
-                    continue  # Skip unassigned
-
-                seed = seeds[seed_idx]
-                _, slot = positions[pos_idx]
-
-                self._assigned_seeds.append(AssignedSeed(
-                    seed_id=str(seed.id),
-                    seed_text=seed.text,
-                    diversity_assignments=slot.assignments.copy(),
-                    score=-cost_matrix[seed_idx, pos_idx]
-                ))
-
-            self._assignment_done = True
-            logger.info(f"[{self.name}] Assigned {len(self._assigned_seeds)} seeds to diversity slots")
+            logger.info(f"[{self.name}] Assigned {len(assigned)} seeds to diversity slots")
             return PhaseResult.work_done(cost_usd=0.0)
 
         except Exception as e:
             logger.error(f"Assignment failed: {e}", exc_info=True)
             return PhaseResult.no_work()
+
+    def _run_assignment(self, seeds: List[ProjectSeed]) -> List[AssignedSeed]:
+        """Run the Jonker-Volgenant assignment algorithm."""
+        axes = self._parse_axes()
+        slots = self._compute_slots(axes, self.state.num_samples)
+
+        if not slots:
+            # No diversity spec - assign all seeds to default
+            return [
+                AssignedSeed(
+                    seed_id=str(seed.id),
+                    seed_text=seed.text,
+                    diversity_assignments={},
+                    score=1.0
+                )
+                for seed in seeds
+            ]
+
+        # Build position list (expand slots by count_needed)
+        positions: List[Tuple[int, QuotaSlot]] = []
+        for slot_idx, slot in enumerate(slots):
+            for _ in range(slot.count_needed):
+                positions.append((slot_idx, slot))
+
+        # Build cost matrix: seeds x positions
+        n_seeds = len(seeds)
+        n_positions = len(positions)
+
+        cost_matrix = np.full((n_seeds, n_positions), 1000.0)
+
+        for i, seed in enumerate(seeds):
+            for j, (slot_idx, slot) in enumerate(positions):
+                score = self._compute_slot_score(seed, slot)
+                cost_matrix[i, j] = -score  # Negate for minimization
+
+        # Run Jonker-Volgenant algorithm
+        seed_indices, pos_indices = linear_sum_assignment(cost_matrix)
+
+        # Build assigned seeds list
+        assigned = []
+        for seed_idx, pos_idx in zip(seed_indices, pos_indices):
+            if cost_matrix[seed_idx, pos_idx] >= 999:
+                continue  # Skip unassigned
+
+            seed = seeds[seed_idx]
+            _, slot = positions[pos_idx]
+
+            assigned.append(AssignedSeed(
+                seed_id=str(seed.id),
+                seed_text=seed.text,
+                diversity_assignments=slot.assignments.copy(),
+                score=-cost_matrix[seed_idx, pos_idx]
+            ))
+
+        return assigned
 
     def _parse_axes(self) -> List[Dict]:
         """Parse diversity axes from config."""
@@ -226,11 +303,27 @@ class SeedAssignmentPhase(Phase):
         """Get the assigned seeds for generation phase."""
         return self._assigned_seeds
 
+    def get_assigned_count(self) -> int:
+        """Get count of assigned seeds."""
+        return len(self._assigned_seeds)
+
     def is_complete(self) -> bool:
-        """Complete when assignment has been done."""
-        return self._assignment_done
+        """
+        Complete when:
+        - Batch mode: Have at least one batch assigned
+        - Normal mode: Assignment has run on all seeds
+        """
+        if self.batch_mode:
+            # In batch mode, complete once we have ANY assigned seeds
+            # (generation can proceed while we continue assigning)
+            return len(self._assigned_seeds) > 0 or self._assignment_complete
+
+        return self._assignment_complete
 
     def reset(self):
         """Reset assignment state (for fresh start on resume)."""
-        self._assignment_done = False
         self._assigned_seeds = []
+        self._assigned_seed_ids = set()
+        self._last_scored_count = 0
+        self._assignment_complete = False
+        self._last_seed_hash = ""

@@ -4,14 +4,25 @@ Phase: Seed Extraction
 Extracts seeds from embedded chunks using LLM-based extraction.
 Stores results in project_seeds table.
 
+VERSION SEMANTICS:
+- Seeds are scoped to a specific version_id
+- When a new version is created, seeds are extracted fresh
+- This ensures config changes (prompt, columns) result in fresh seeds
+
 Resume logic:
-- Checks which chunks already have seeds
+- Checks which chunks already have seeds FOR THIS VERSION
 - Only processes chunks without seeds
+
+Passthrough mode (EXTRACTION_PASSTHROUGH=true):
+- Skips LLM extraction entirely
+- Uses whole chunk as seed (with size limits)
+- Much faster and cheaper for testing
 """
 
 import asyncio
 import logging
 import json
+import os
 import uuid
 from typing import List, Tuple
 from datetime import datetime, timezone
@@ -28,6 +39,12 @@ logger = logging.getLogger(__name__)
 
 # Max tokens for a seed (fallback chunking threshold)
 MAX_SEED_TOKENS = 4096
+
+# Timeout for a single extraction request (seconds)
+EXTRACTION_TIMEOUT = 120.0
+
+# Passthrough mode - skip LLM extraction, use chunks directly as seeds
+EXTRACTION_PASSTHROUGH = os.getenv("EXTRACTION_PASSTHROUGH", "").lower() in ("true", "1", "yes")
 
 
 class SeedMarker(BaseModel):
@@ -50,20 +67,32 @@ class SeedExtractionPhase(Phase):
     Seeds are sub-chunks that can be used directly for sample generation.
     Uses LLM to identify seed boundaries within chunks.
 
-    One execute_once() processes a small batch of chunks.
+    Seeds are scoped to the current version_id - a new version means
+    re-extracting seeds from scratch, even if the same chunks exist.
+
+    Uses a semaphore-based pool for continuous processing - when one request
+    finishes, another starts immediately without waiting for the whole batch.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, parallel_extractions: int = 10, **kwargs):
         super().__init__(*args, **kwargs)
-        self.batch_size = 20  # Process 20 chunks per iteration
+        self.parallel_extractions = parallel_extractions
+        self._semaphore = asyncio.Semaphore(parallel_extractions)
+
+        # Larger batches in passthrough mode since there's no LLM bottleneck
+        self.batch_size = 500 if EXTRACTION_PASSTHROUGH else 50
+
         try:
             self._encoding = tiktoken.get_encoding("cl100k_base")
         except Exception:
             self._encoding = None
 
+        if EXTRACTION_PASSTHROUGH:
+            logger.info(f"[{self.name}] ⚡ Passthrough mode enabled - skipping LLM extraction")
+
     def should_run(self) -> bool:
         """
-        Run if there are chunks without seeds.
+        Run if there are chunks without seeds for this version.
 
         Runs eagerly - doesn't wait for file processing to complete.
         """
@@ -71,22 +100,30 @@ class SeedExtractionPhase(Phase):
         if self.state.chunks_total == 0:
             return False
 
-        # Check if there's actual work to do
+        # Check if there's actual work to do for this version
         return self.state.has_chunks_without_seeds()
 
     async def execute_once(self) -> PhaseResult:
-        """Extract seeds from a batch of chunks."""
+        """Extract seeds from a batch of chunks using concurrent pool."""
         chunks = self.state.get_chunks_without_seeds(limit=self.batch_size)
         if not chunks:
             return PhaseResult.no_work()
 
-        logger.info(f"[{self.name}] Extracting seeds from {len(chunks)} chunks")
+        # Passthrough mode - skip LLM, use chunks directly as seeds
+        if EXTRACTION_PASSTHROUGH:
+            return self._passthrough_extract(chunks)
 
-        # Fire all requests concurrently
-        results = await asyncio.gather(
-            *[self._extract_seeds_from_chunk(chunk) for chunk in chunks],
-            return_exceptions=True,
-        )
+        logger.info(f"[{self.name}] Extracting seeds from {len(chunks)} chunks (max {self.parallel_extractions} concurrent)")
+
+        # Create tasks - each will acquire semaphore independently
+        tasks = [
+            self._extract_with_semaphore(chunk)
+            for chunk in chunks
+        ]
+
+        # Run all tasks - semaphore ensures only N run concurrently
+        # When one finishes, another starts immediately
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
         extracted_count = 0
         total_cost_usd = 0.0
@@ -94,16 +131,19 @@ class SeedExtractionPhase(Phase):
         for chunk, result in zip(chunks, results):
             if isinstance(result, Exception):
                 logger.error(f"Failed to extract seeds from chunk {chunk.id}: {result}")
-                continue
+                # On exception, use fallback
+                seed_texts = self._fallback_chunk(chunk.text)
+                cost_usd = 0.0
+            else:
+                seed_texts, cost_usd = result
 
-            seed_texts, cost_usd = result
             total_cost_usd += cost_usd
 
             for seed_text in seed_texts:
                 seed = ProjectSeed(
                     id=uuid.uuid4(),
                     project_id=self.state.project_id,
-                    run_id=self.state.run_id,
+                    version_id=self.state.version_id,  # Scoped to version
                     chunk_id=chunk.id,
                     file_id=chunk.file_id,
                     text=seed_text,
@@ -116,13 +156,70 @@ class SeedExtractionPhase(Phase):
                 self.db.add(seed)
 
             extracted_count += len(seed_texts)
-            logger.debug(f"Extracted {len(seed_texts)} seeds from chunk {chunk.id}")
 
         self.db.commit()
         logger.info(
             f"[{self.name}] Extracted {extracted_count} seeds from {len(chunks)} chunks"
         )
         return PhaseResult.work_done(cost_usd=total_cost_usd)
+
+    def _passthrough_extract(self, chunks: List[ProjectRagChunk]) -> PhaseResult:
+        """
+        Passthrough mode: use chunks directly as seeds without LLM.
+
+        Much faster and cheaper - useful for testing.
+        Still respects MAX_SEED_TOKENS limit (splits if needed).
+        """
+        logger.info(f"[{self.name}] Passthrough mode: converting {len(chunks)} chunks to seeds directly")
+
+        extracted_count = 0
+
+        for chunk in chunks:
+            # Apply size limits (split if too large)
+            seed_texts = self._ensure_size_limit(chunk.text)
+
+            for seed_text in seed_texts:
+                seed = ProjectSeed(
+                    id=uuid.uuid4(),
+                    project_id=self.state.project_id,
+                    version_id=self.state.version_id,  # Scoped to version
+                    chunk_id=chunk.id,
+                    file_id=chunk.file_id,
+                    text=seed_text,
+                    extraction_metadata={
+                        "extraction_method": "passthrough",
+                        "chunk_idx": chunk.chunk_idx,
+                        "extracted_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+                self.db.add(seed)
+
+            extracted_count += len(seed_texts)
+
+        self.db.commit()
+        logger.info(f"[{self.name}] Passthrough: created {extracted_count} seeds from {len(chunks)} chunks")
+
+        return PhaseResult.work_done(cost_usd=0.0)
+
+    async def _extract_with_semaphore(
+        self, chunk: ProjectRagChunk
+    ) -> Tuple[List[str], float]:
+        """
+        Extract seeds with semaphore-controlled concurrency and timeout.
+
+        On timeout, falls back to using the whole chunk as seed(s).
+        """
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._extract_seeds_from_chunk(chunk),
+                    timeout=EXTRACTION_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"Seed extraction timed out for chunk {chunk.id} after {EXTRACTION_TIMEOUT}s, using fallback"
+                )
+                return self._fallback_chunk(chunk.text), 0.0
 
     async def _extract_seeds_from_chunk(
         self, chunk: ProjectRagChunk
@@ -135,7 +232,7 @@ class SeedExtractionPhase(Phase):
         """
         try:
             response, cost = await self.openai_client.responses_create(
-                model="o1",
+                model="gpt-5-nano",
                 input=[],
                 prompt={
                     "id": "pmpt_69508e29f514819693d017e0848e223406fd27a87843182b",
@@ -248,8 +345,33 @@ class SeedExtractionPhase(Phase):
         if self._encoding is None:
             # Fallback: rough estimate (4 chars per token)
             return len(text) // 4
-        return len(self._encoding.encode(text))
+
+        try:
+            return len(self._encoding.encode(text))
+        except Exception:
+            return len(text) // 4
 
     def is_complete(self) -> bool:
-        """Complete when all chunks have seeds."""
+        """Complete when all chunks have seeds for this version."""
         return not self.state.has_chunks_without_seeds()
+
+    def get_status(self) -> "PhaseStatus":
+        """Get current progress of seed extraction."""
+        from dsl_worker.phases.base import PhaseStatus
+
+        if self.is_complete():
+            status = "complete"
+        elif self.should_run():
+            status = "active"
+        else:
+            status = "pending"
+
+        progress = f"{self.state.seeds_extracted} seeds from {self.state.chunks_total} chunks"
+        if EXTRACTION_PASSTHROUGH:
+            progress += " [passthrough]"
+
+        return PhaseStatus(
+            phase_name=self.name,
+            status=status,
+            progress=progress
+        )
