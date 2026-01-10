@@ -286,7 +286,7 @@ def chunk_text_by_tokens(
     Returns:
         List of text chunks
     """
-    text = content.decode('utf-8', errors='ignore')
+    text = content.decode('utf-8', errors='ignore').replace('\x00', '')
 
     try:
         encoding = tiktoken.get_encoding(encoding_name)

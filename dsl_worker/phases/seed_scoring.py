@@ -156,7 +156,7 @@ class SeedScoringPhase(Phase):
     async def _compute_embeddings(
             self,
             texts: List[str],
-            model: str = "text-embedding-3-large"
+            model: str = "text-embedding-3-small"
     ) -> Tuple[List[np.ndarray], float]:
         """
         Embed a list of texts using OpenAI API.

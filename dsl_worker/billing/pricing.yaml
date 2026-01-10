@@ -41,3 +41,7 @@ models:
   gpt-5.2:
     input: 0.00000175    # $1.75 / 1M tokens
     output: 0.000014     # $14.00 / 1M tokens
+
+  gpt-5-nano:
+    input: 0.00000005    # $0.05 / 1M tokens
+    output: 0.0000004    # $0.40 / 1M tokens

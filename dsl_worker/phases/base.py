@@ -1,11 +1,10 @@
 """
-Base class for processing phases in the orchestrator.
+Phase base classes.
 
-Key design decisions:
-- execute_once() processes one unit of work (phases determine batch size internally)
-- Status tracking only matters up to seed_scoring (assignment/generation restart from scratch)
-- Phases are responsible for their own resume logic
-- All phases return PhaseResult with cost tracking
+Provides:
+- PhaseResult: Result of a phase execution
+- PhaseStatus: Status of a phase for logging
+- Phase: Abstract base class for phases
 """
 
 import logging
@@ -45,6 +44,32 @@ class PhaseResult:
         return PhaseResult(did_work=True, cost_usd=cost_usd)
 
 
+@dataclass
+class PhaseStatus:
+    """
+    Status of a phase for logging/monitoring.
+
+    Attributes:
+        phase_name: Name of the phase
+        status: One of 'pending', 'active', 'complete'
+        progress: Human-readable progress string (e.g., "3/10 files")
+        detail: Optional additional detail
+    """
+    phase_name: str
+    status: str  # 'pending', 'active', 'complete'
+    progress: str
+    detail: Optional[str] = None
+
+    def __str__(self) -> str:
+        if self.detail:
+            return f"{self.phase_name}: {self.status} ({self.progress}) - {self.detail}"
+        return f"{self.phase_name}: {self.status} ({self.progress})"
+
+    def short(self) -> str:
+        """Short format for inline logging."""
+        return f"{self.phase_name}={self.progress}"
+
+
 class Phase(ABC):
     """
     Base class for a processing phase.
@@ -53,6 +78,7 @@ class Phase(ABC):
     - should_run(): Decide if this phase should execute now
     - execute_once(): Process one unit of work (batch size determined internally)
     - is_complete(): Check if this phase is fully done
+    - get_status(): Return current progress/status for logging
 
     Resume semantics:
     - file_processing, seed_extraction, seed_scoring: Resume from where we left off
@@ -116,3 +142,26 @@ class Phase(ABC):
             True if no more work remains for this phase
         """
         pass
+
+    def get_status(self) -> PhaseStatus:
+        """
+        Get current status/progress of this phase.
+
+        Override in subclasses for meaningful progress reporting.
+        Default implementation uses should_run() and is_complete().
+
+        Returns:
+            PhaseStatus with progress information
+        """
+        if self.is_complete():
+            status = "complete"
+        elif self.should_run():
+            status = "active"
+        else:
+            status = "pending"
+
+        return PhaseStatus(
+            phase_name=self.name,
+            status=status,
+            progress="unknown"
+        )

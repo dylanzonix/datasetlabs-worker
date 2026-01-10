@@ -19,7 +19,7 @@ class DiversityAxis:
     values: List[str]  # e.g., ["horror", "romance", "comedy"]
 
 
-def compute_embeddings(texts: List[str], model: str = "text-embedding-3-large") -> List[np.ndarray]:
+def compute_embeddings(texts: List[str], model: str = "text-embedding-3-small") -> List[np.ndarray]:
     """Embed a list of texts. Returns list of numpy arrays."""
     if not texts:
         return []

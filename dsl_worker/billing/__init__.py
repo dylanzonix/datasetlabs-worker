@@ -1,5 +1,5 @@
 """
-Billing module for cost tracking and charging.
+Billing module for cost tracking, rate limiting, and resilient API calls.
 """
 
 from .pricing import (
@@ -18,16 +18,33 @@ from .cost_tracker import (
     CostEntry,
     ChargeRecord,
 )
+from .rate_limiter import (
+    RateLimiter,
+    SlidingWindowCounter,
+)
+from .resilient_client import (
+    ResilientClient,
+    RetryConfig,
+)
 
 __all__ = [
+    # Pricing
     "ModelPricing",
     "UsageCost",
     "PricingConfig",
     "get_pricing_config",
+    # Tracked client
     "TrackedOpenAIClient",
     "TrackedChatCompletion",
     "TrackedEmbeddingResponse",
+    # Cost tracking
     "CostTracker",
     "CostEntry",
     "ChargeRecord",
+    # Rate limiting
+    "RateLimiter",
+    "SlidingWindowCounter",
+    # Resilient client
+    "ResilientClient",
+    "RetryConfig",
 ]

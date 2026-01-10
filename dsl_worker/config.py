@@ -33,9 +33,12 @@ class WorkerSettings(BaseSettings):
     heartbeat_interval_seconds: int = 30
     checkpoint_interval_seconds: int = 60
 
+    # Generation settings
+    generation_parallel_samples: int = 30  # Number of samples to generate in parallel
+
     # Billing settings
-    billing_margin_multiplier: float = 2.0  # 2x = 100% margin (charge $2 for $1 cost)
-    billing_charge_threshold_cents: int = 1000  # $10 - charge when accumulated
+    billing_margin_multiplier: float = 4.0  # 2x = 100% margin (charge $2 for $1 cost)
+    billing_charge_threshold_cents: int = 100  # $1 - charge when accumulated
     billing_charge_interval_seconds: int = 60  # Charge at least every 60 seconds
 
 

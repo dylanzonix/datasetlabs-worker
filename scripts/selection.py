@@ -59,7 +59,7 @@ def compute_embeddings(texts: List[str]) -> List[np.ndarray]:
         return []
     
     response = client.embeddings.create(
-        model="text-embedding-3-large",
+        model="text-embedding-3-small",
         input=texts,
         encoding_format="float"
     )
