@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from sqlalchemy import func as sql_func
 
+from dsl_api.models import ProjectVersion
 from dsl_worker.phases.base import Phase, PhaseResult
 from dsl_worker.phases.seed_assignment import SeedAssignmentPhase, AssignedSeed
 from dsl_api.models.sample import Sample
@@ -447,6 +448,14 @@ class GenerationPhase(Phase):
                 tags=ctx.assigned_seed.diversity_assignments,
             )
             self.db.add(sample)
+
+            # Keep version.generated_count normalized
+            self.db.query(ProjectVersion).filter(
+                ProjectVersion.id == self.state.version_id
+            ).update(
+                {ProjectVersion.generated_count: ProjectVersion.generated_count + 1},
+                synchronize_session=False
+            )
 
             # Commit immediately - this makes the sample visible to users
             self.db.commit()

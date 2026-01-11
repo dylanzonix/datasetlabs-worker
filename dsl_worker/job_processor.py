@@ -424,15 +424,18 @@ class JobProcessor:
         db.commit()
 
     def _handle_pause_for_version(
-        self,
-        db: Session,
-        project: Project,
-        version: ProjectVersion,
-        cost_tracker: Optional[CostTracker],
-        message: str = "Worker paused"
+            self,
+            db: Session,
+            project: Project,
+            version: ProjectVersion,
+            cost_tracker: Optional[CostTracker],
+            message: str = "Worker paused"
     ) -> None:
         """Handle pause: update version status, charge remaining costs, emit event."""
         logger.info(f"Pausing version {version.id} of project {project.id}")
+
+        # Refresh to get accurate generated_count
+        db.refresh(version)
 
         # Charge any remaining costs
         if cost_tracker:
@@ -460,14 +463,17 @@ class JobProcessor:
         logger.info("✅ Paused successfully")
 
     def _handle_completion_for_version(
-        self,
-        db: Session,
-        project: Project,
-        version: ProjectVersion,
-        cost_tracker: CostTracker
+            self,
+            db: Session,
+            project: Project,
+            version: ProjectVersion,
+            cost_tracker: CostTracker
     ) -> None:
         """Handle successful completion for a version."""
         logger.info(f"Version {version.id} of project {project.id} completed")
+
+        # Refresh to get accurate generated_count
+        db.refresh(version)
 
         # Charge any remaining costs
         cost_tracker.charge_remaining()
@@ -500,12 +506,12 @@ class JobProcessor:
         )
 
     def _handle_force_stop_for_version(
-        self,
-        db: Session,
-        project: Project,
-        version: ProjectVersion,
-        cost_tracker: CostTracker,
-        reason: str
+            self,
+            db: Session,
+            project: Project,
+            version: ProjectVersion,
+            cost_tracker: CostTracker,
+            reason: str
     ) -> None:
         """
         Handle force-stop due to balance depletion or spend limit exceeded.
@@ -513,6 +519,9 @@ class JobProcessor:
         Uses 'failed' status with descriptive error message.
         """
         logger.warning(f"Force-stopping version {version.id}: {reason}")
+
+        # Refresh to get accurate generated_count
+        db.refresh(version)
 
         # Charge any remaining costs
         cost_tracker.charge_remaining()
