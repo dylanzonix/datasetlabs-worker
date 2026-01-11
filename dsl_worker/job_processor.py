@@ -87,11 +87,13 @@ class JobProcessor:
 
         If generation is running, immediately cancels all workers.
         """
-        logger.info("Stop requested")
+        # CHANGED: More descriptive logging at WARNING level
+        logger.warning("⚠️ Stop requested (likely SIGTERM/SIGINT from container orchestration)")
         self.should_stop = True
 
         # Immediately cancel generation if running
         if self._generation_phase:
+            logger.info("Cancelling generation phase workers...")
             self._generation_phase.request_stop()
 
     async def process_job(self, message_body: Dict[str, Any]) -> bool:

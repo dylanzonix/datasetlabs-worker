@@ -89,7 +89,10 @@ class WorkerService:
 
     def _handle_shutdown(self, signum, frame):
         """Handle graceful shutdown signals."""
-        logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+        # CHANGED: Use WARNING level and more descriptive message
+        import signal
+        signal_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT" if signum == signal.SIGINT else f"signal {signum}"
+        logger.warning(f"⚠️ SHUTDOWN SIGNAL RECEIVED: {signal_name} - initiating graceful shutdown...")
         self.running = False
 
         # Signal current job to stop
