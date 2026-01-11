@@ -424,12 +424,12 @@ class JobProcessor:
         db.commit()
 
     def _handle_pause_for_version(
-            self,
-            db: Session,
-            project: Project,
-            version: ProjectVersion,
-            cost_tracker: Optional[CostTracker],
-            message: str = "Worker paused"
+        self,
+        db: Session,
+        project: Project,
+        version: ProjectVersion,
+        cost_tracker: Optional[CostTracker],
+        message: str = "Worker paused"
     ) -> None:
         """Handle pause: update version status, charge remaining costs, emit event."""
         logger.info(f"Pausing version {version.id} of project {project.id}")
