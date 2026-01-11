@@ -45,13 +45,14 @@ class Worker:
 
         self.openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
 
-        self.blob_service_client = BlobServiceClient.from_connection_string(
-            settings.azure_storage_connection_string
+        self.blob_service_client = BlobServiceClient(
+            account_url=f"https://{settings.azure_storage_account_name}.blob.core.windows.net",
+            credential=settings.azure_storage_account_key,
         )
 
         # Job processor
         self.job_processor = JobProcessor(
-            session_factory=self.SessionLocal,
+            db_session_factory=self.SessionLocal,
             openai_client=self.openai_client,
             blob_service_client=self.blob_service_client,
         )
