@@ -463,11 +463,11 @@ class JobProcessor:
         logger.info("✅ Paused successfully")
 
     def _handle_completion_for_version(
-            self,
-            db: Session,
-            project: Project,
-            version: ProjectVersion,
-            cost_tracker: CostTracker
+        self,
+        db: Session,
+        project: Project,
+        version: ProjectVersion,
+        cost_tracker: CostTracker
     ) -> None:
         """Handle successful completion for a version."""
         logger.info(f"Version {version.id} of project {project.id} completed")
@@ -506,12 +506,12 @@ class JobProcessor:
         )
 
     def _handle_force_stop_for_version(
-            self,
-            db: Session,
-            project: Project,
-            version: ProjectVersion,
-            cost_tracker: CostTracker,
-            reason: str
+        self,
+        db: Session,
+        project: Project,
+        version: ProjectVersion,
+        cost_tracker: CostTracker,
+        reason: str
     ) -> None:
         """
         Handle force-stop due to balance depletion or spend limit exceeded.
