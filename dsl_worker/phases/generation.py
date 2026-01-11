@@ -36,6 +36,21 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+
+def sanitize_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Remove NULL bytes from row data before database insertion.
+
+    PostgreSQL JSONB cannot store \\u0000 (NULL bytes). LLMs occasionally
+    produce these in malformed output (especially in LaTeX/math content).
+    """
+    if row is None:
+        return row
+    json_str = json.dumps(row, ensure_ascii=False)
+    # Remove NULL bytes in both escaped and raw forms
+    clean_str = json_str.replace('\\u0000', '').replace('\x00', '')
+    return json.loads(clean_str)
+
 # Timeout for a single sample generation
 GENERATION_TIMEOUT = 300.0
 
@@ -469,63 +484,79 @@ class GenerationPhase(Phase):
         The commit happens immediately so users see the sample right away.
 
         FIX #4: Now also checks actual DB count to prevent overshoot on resume.
+        FIX #5: Sanitizes row data and handles DB errors with proper rollback.
         """
+        # Sanitize BEFORE acquiring lock (don't hold lock during string processing)
+        sample_data = sanitize_row(sample_data)
+        tags = sanitize_row(ctx.assigned_seed.diversity_assignments)
+
         async with self._db_lock:
-            # Lock the version row to serialize inserts across processes
-            self.db.query(ProjectVersion).filter(
-                ProjectVersion.id == self.state.version_id
-            ).with_for_update().first()
+            try:
+                # Lock the version row to serialize inserts across processes
+                self.db.query(ProjectVersion).filter(
+                    ProjectVersion.id == self.state.version_id
+                ).with_for_update().first()
 
-            # FIX #4: Check actual DB count BEFORE inserting (prevents overshoot)
-            current_count = (
-                self.db.query(sql_func.count(Sample.id))
-                .filter(Sample.version_id == self.state.version_id)
-                .scalar() or 0
-            )
-
-            # If we've already hit target, discard this sample
-            if current_count >= self.state.num_samples:
-                logger.info(
-                    f"[{self.name}] Target already reached in DB "
-                    f"({current_count}/{self.state.num_samples}), discarding sample {ctx.sample_index + 1}"
-                )
-                self._target_reached = True
-                return
-
-            # Get next sequence number for this version
-            max_seq = (
-                    self.db.query(sql_func.max(Sample.seq))
+                # FIX #4: Check actual DB count BEFORE inserting (prevents overshoot)
+                current_count = (
+                    self.db.query(sql_func.count(Sample.id))
                     .filter(Sample.version_id == self.state.version_id)
                     .scalar() or 0
-            )
+                )
 
-            sample = Sample(
-                id=uuid.uuid4(),
-                project_id=self.state.project_id,
-                version_id=self.state.version_id,
-                seq=max_seq + 1,
-                row=sample_data,
-                tags=ctx.assigned_seed.diversity_assignments,
-            )
-            self.db.add(sample)
+                # If we've already hit target, discard this sample
+                if current_count >= self.state.num_samples:
+                    logger.info(
+                        f"[{self.name}] Target already reached in DB "
+                        f"({current_count}/{self.state.num_samples}), discarding sample {ctx.sample_index + 1}"
+                    )
+                    self._target_reached = True
+                    return
 
-            # Keep version.generated_count normalized
-            self.db.query(ProjectVersion).filter(
-                ProjectVersion.id == self.state.version_id
-            ).update(
-                {ProjectVersion.generated_count: ProjectVersion.generated_count + 1},
-                synchronize_session=False
-            )
+                # Get next sequence number for this version
+                max_seq = (
+                        self.db.query(sql_func.max(Sample.seq))
+                        .filter(Sample.version_id == self.state.version_id)
+                        .scalar() or 0
+                )
 
-            self.db.commit()
+                sample = Sample(
+                    id=uuid.uuid4(),
+                    project_id=self.state.project_id,
+                    version_id=self.state.version_id,
+                    seq=max_seq + 1,
+                    row=sample_data,
+                    tags=tags,
+                )
+                self.db.add(sample)
 
-            new_count = current_count + 1
-            logger.info(f"💾 Sample saved (seq={max_seq + 1}, total={new_count}/{self.state.num_samples})")
+                # Keep version.generated_count normalized
+                self.db.query(ProjectVersion).filter(
+                    ProjectVersion.id == self.state.version_id
+                ).update(
+                    {ProjectVersion.generated_count: ProjectVersion.generated_count + 1},
+                    synchronize_session=False
+                )
 
-            # FIX #4: Signal workers to stop if we've hit the target
-            if new_count >= self.state.num_samples:
-                logger.info(f"[{self.name}] 🎯 Target reached ({new_count}/{self.state.num_samples}), signaling stop")
-                self._target_reached = True
+                self.db.commit()
+
+                new_count = current_count + 1
+                logger.info(f"💾 Sample saved (seq={max_seq + 1}, total={new_count}/{self.state.num_samples})")
+
+                # FIX #4: Signal workers to stop if we've hit the target
+                if new_count >= self.state.num_samples:
+                    logger.info(f"[{self.name}] 🎯 Target reached ({new_count}/{self.state.num_samples}), signaling stop")
+                    self._target_reached = True
+
+            except Exception as e:
+                # FIX #5: ALWAYS rollback on error to recover the session
+                logger.error(f"[{self.name}] Database error saving sample {ctx.sample_index + 1}: {e}")
+                try:
+                    self.db.rollback()
+                except Exception as rollback_err:
+                    logger.error(f"[{self.name}] Rollback also failed: {rollback_err}")
+                # Re-raise so the worker counts this as a failure
+                raise
 
     def is_complete(self) -> bool:
         """Complete when we've generated the target number of samples."""
