@@ -35,9 +35,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # ------------------------------------------------------------------------------
-# Load deploy.config (optional)
+# Load deploy.config (optional) - check for --production early
 # ------------------------------------------------------------------------------
-if [[ -f deploy.config ]]; then
+# Peek ahead for --production flag to load correct config
+for arg in "$@"; do
+  if [[ "$arg" == "--production" ]]; then
+    PRODUCTION_MODE="1"
+    break
+  fi
+done
+
+if [[ "${PRODUCTION_MODE:-0}" == "1" ]] && [[ -f deploy.config.prod ]]; then
+  echo "Loading PRODUCTION configuration from deploy.config.prod..."
+  # shellcheck disable=SC1091
+  source deploy.config.prod
+elif [[ -f deploy.config ]]; then
   echo "Loading configuration from deploy.config..."
   # shellcheck disable=SC1091
   source deploy.config
@@ -77,6 +89,9 @@ SB_AUTH_RULE_NAME="${SB_AUTH_RULE_NAME:-RootManageSharedAccessKey}"
 # NEW: Noop mode flag
 NOOP_MODE="${NOOP_MODE:-0}"
 
+# Production mode flag
+PRODUCTION_MODE="${PRODUCTION_MODE:-0}"
+
 # ------------------------------------------------------------------------------
 # Parse CLI args (optional)
 # ------------------------------------------------------------------------------
@@ -96,6 +111,7 @@ while [[ $# -gt 0 ]]; do
     --no-auto-fetch-sb-conn) AUTO_FETCH_SB_CONN="0"; shift 1 ;;
     --sb-auth-rule) SB_AUTH_RULE_NAME="$2"; shift 2 ;;
     --noop) NOOP_MODE="1"; shift 1 ;;
+    --production) PRODUCTION_MODE="1"; shift 1 ;;
     --help)
       cat <<EOF
 Usage: $0 [options]
@@ -118,6 +134,7 @@ KEDA behavior:
 
 Development:
   --noop                     Deploy in noop mode (worker won't process messages)
+  --production               Use .env.prod instead of .env for production deployment
 
 Advanced:
   --arm-api-version VERSION  (default: $ARM_API_VERSION)
@@ -136,7 +153,14 @@ done
 need_cmd az
 need_cmd docker
 
-[[ -f .env ]] || die ".env not found in $SCRIPT_DIR"
+# Select environment file based on mode
+if [[ "$PRODUCTION_MODE" == "1" ]]; then
+  ENV_FILE=".env.prod"
+else
+  ENV_FILE=".env"
+fi
+
+[[ -f "$ENV_FILE" ]] || die "$ENV_FILE not found in $SCRIPT_DIR"
 
 az account show >/dev/null 2>&1 || die "Not logged into Azure. Run: az login"
 SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
@@ -149,11 +173,11 @@ if ! az containerapp -h >/dev/null 2>&1; then
 fi
 
 # ------------------------------------------------------------------------------
-# Read .env -> YAML env list AND load into environment for this shell
+# Read env file -> YAML env list AND load into environment for this shell
 # ------------------------------------------------------------------------------
 set -a
-# shellcheck disable=SC1091
-source .env
+# shellcheck disable=SC1090
+source "$ENV_FILE"
 set +a
 
 ENV_VARS_YAML=""
@@ -173,7 +197,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 
   ENV_VARS_YAML+=$'        - name: '"$key"$'\n'
   ENV_VARS_YAML+=$'          value: '"$(yaml_quote "$value")"$'\n'
-done < .env
+done < "$ENV_FILE"
 
 # NEW: Add WORKER_MODE env var if in noop mode
 if [[ "$NOOP_MODE" == "1" ]]; then
@@ -214,12 +238,18 @@ fi
 echo ""
 echo "======================================"
 echo "Worker Build & Deploy"
+if [[ "$PRODUCTION_MODE" == "1" ]]; then
+  echo "🚀 ENVIRONMENT: PRODUCTION"
+else
+  echo "🔧 ENVIRONMENT: DEVELOPMENT"
+fi
 if [[ "$NOOP_MODE" == "1" ]]; then
   echo "🔴 MODE: NOOP (worker will NOT process messages)"
 else
   echo "MODE: NORMAL (worker will process messages)"
 fi
 echo "======================================"
+echo "Env File:          $ENV_FILE"
 echo "Resource Group:    $RESOURCE_GROUP"
 echo "App Name:          $CONTAINER_APP_NAME"
 echo "Environment:       $ENVIRONMENT_NAME"
@@ -375,8 +405,11 @@ if [[ "$NOOP_MODE" == "1" ]]; then
   echo "✅ Worker deployed in NOOP mode!"
   echo "   Worker will NOT process messages from Service Bus"
   echo "   Local workers can now handle all messages for debugging"
+elif [[ "$PRODUCTION_MODE" == "1" ]]; then
+  echo "✅ Worker deployed to PRODUCTION!"
+  echo "   Using: $ENV_FILE"
 else
-  echo "✅ Worker deployed successfully!"
+  echo "✅ Worker deployed successfully (development)!"
 fi
 echo "======================================"
 echo ""

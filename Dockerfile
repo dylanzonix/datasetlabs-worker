@@ -10,14 +10,14 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install Python dependencies
-COPY dsl_worker/requirements.txt .
+COPY worker/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy entire API repo (for shared models)
-COPY api/ ./api/
+# Copy API's dsl_api module (for shared models/db)
+COPY api/dsl_api/ ./dsl_api/
 
 # Copy worker code
-COPY dsl_worker/ ./worker/
+COPY worker/dsl_worker/ ./dsl_worker/
 
 # Run the worker
-CMD ["python", "-m", "worker.main"]
+CMD ["python", "-m", "dsl_worker.main"]
