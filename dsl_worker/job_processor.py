@@ -434,6 +434,9 @@ class JobProcessor:
         """Handle pause: update version status, charge remaining costs, emit event."""
         logger.info(f"Pausing version {version.id} of project {project.id}")
 
+        # Refresh to get accurate generated_count
+        db.refresh(version)
+
         # Charge any remaining costs
         if cost_tracker:
             cost_tracker.charge_remaining()
@@ -468,6 +471,9 @@ class JobProcessor:
     ) -> None:
         """Handle successful completion for a version."""
         logger.info(f"Version {version.id} of project {project.id} completed")
+
+        # Refresh to get accurate generated_count
+        db.refresh(version)
 
         # Charge any remaining costs
         cost_tracker.charge_remaining()
@@ -513,6 +519,9 @@ class JobProcessor:
         Uses 'failed' status with descriptive error message.
         """
         logger.warning(f"Force-stopping version {version.id}: {reason}")
+
+        # Refresh to get accurate generated_count
+        db.refresh(version)
 
         # Charge any remaining costs
         cost_tracker.charge_remaining()
