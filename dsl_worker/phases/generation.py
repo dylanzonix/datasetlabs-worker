@@ -36,6 +36,21 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+
+def sanitize_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Remove NULL bytes from row data before database insertion.
+
+    PostgreSQL JSONB cannot store \\u0000 (NULL bytes). LLMs occasionally
+    produce these in malformed output (especially in LaTeX/math content).
+    """
+    if row is None:
+        return row
+    json_str = json.dumps(row, ensure_ascii=False)
+    # Remove NULL bytes in both escaped and raw forms
+    clean_str = json_str.replace('\\u0000', '').replace('\x00', '')
+    return json.loads(clean_str)
+
 # Timeout for a single sample generation
 GENERATION_TIMEOUT = 300.0
 
@@ -124,6 +139,9 @@ class GenerationPhase(Phase):
         self._worker_tasks: List[asyncio.Task] = []
         self._cancel_lock = asyncio.Lock()
 
+        # FIX #4: Flag to signal target reached (prevents overshoot)
+        self._target_reached = False
+
     # =========================================================================
     # Phase interface
     # =========================================================================
@@ -157,6 +175,7 @@ class GenerationPhase(Phase):
         self._fail_count = 0
         self._cancelled_count = 0
         self._stop_requested = False
+        self._target_reached = False  # FIX #4: Reset target reached flag
         self._stop_event.clear()
         self._worker_tasks = []
 
@@ -164,19 +183,29 @@ class GenerationPhase(Phase):
             f"[{self.name}] Starting {self.parallel_samples} workers for {remaining} remaining samples"
         )
 
+        # FIX #1: Track worker start time to diagnose startup delay
+        worker_start_time = time.time()
+
         # Track last pause check time
         last_pause_check = [time.time()]
 
         def should_stop() -> bool:
             """
             Check if we should stop (pause requested or external stop).
+            Now with comprehensive logging for debugging spurious stops.
             """
             # Fast path: already stopped
             if self._stop_requested:
                 return True
 
-            # Check external stop callback (no DB hit)
+            # FIX #4: Check if target was reached
+            if self._target_reached:
+                logger.debug(f"[{self.name}] should_stop: target_reached=True")
+                return True
+
+            # FIX #3: Check external stop callback with logging
             if self.stop_checker and self.stop_checker():
+                logger.warning(f"[{self.name}] ⚠️ External stop_checker returned True - triggering stop")
                 self._stop_requested = True
                 return True
 
@@ -187,7 +216,7 @@ class GenerationPhase(Phase):
                 self.state.refresh()
 
                 if self.state.paused:
-                    self._trigger_immediate_stop("Pause detected from database")
+                    _trigger_immediate_stop("Pause detected from database")
                     return True
 
             return False
@@ -241,14 +270,19 @@ class GenerationPhase(Phase):
                 if charged:
                     logger.info(f"[{self.name}] Charged {charged}¢ to balance")
 
-                    # After charging, check if we've exceeded limits
+                    # FIX #3: Add explicit logging for each stop condition check
                     if self.cost_tracker.would_exceed_spend_limit(0):
+                        logger.warning(f"[{self.name}] ⚠️ Spend limit would be exceeded")
                         _trigger_immediate_stop("Spend limit exceeded after charge")
                     elif not self.cost_tracker.has_sufficient_balance():
+                        logger.warning(f"[{self.name}] ⚠️ Insufficient balance")
                         _trigger_immediate_stop("Balance depleted after charge")
 
         async def worker(worker_id: int):
             """Worker: grab index -> generate -> save immediately -> repeat"""
+            # FIX #1: Track first iteration for startup delay diagnosis
+            first_iteration = True
+
             while True:
                 # Check for stop BEFORE grabbing new work
                 if should_stop():
@@ -256,12 +290,22 @@ class GenerationPhase(Phase):
 
                 # Atomically get next sample index
                 async with self._index_lock:
+                    # FIX #4: Check target_reached under lock
+                    if self._target_reached:
+                        logger.debug(f"[Worker {worker_id}] Exiting: target already reached")
+                        return
                     if self._next_sample_index >= target:
                         return
                     if self._stop_requested:  # Double-check under lock
                         return
                     sample_idx = self._next_sample_index
                     self._next_sample_index += 1
+
+                # FIX #1: Log when worker starts its first sample
+                if first_iteration:
+                    elapsed = time.time() - worker_start_time
+                    logger.debug(f"[Worker {worker_id}] First sample acquired after {elapsed:.2f}s")
+                    first_iteration = False
 
                 # Get seed
                 if not assigned_seeds:
@@ -430,35 +474,81 @@ class GenerationPhase(Phase):
 
         Uses a lock to ensure sequence numbers are allocated atomically.
         The commit happens immediately so users see the sample right away.
+
+        FIX #4: Now also checks actual DB count to prevent overshoot on resume.
+        FIX #5: Sanitizes row data and handles DB errors with proper rollback.
         """
+        # Sanitize BEFORE acquiring lock (don't hold lock during string processing)
+        sample_data = sanitize_row(sample_data)
+        tags = sanitize_row(ctx.assigned_seed.diversity_assignments)
+
         async with self._db_lock:
-            # Get next sequence number for this version
-            max_seq = (
-                    self.db.query(sql_func.max(Sample.seq))
+            try:
+                # Lock the version row to serialize inserts across processes
+                self.db.query(ProjectVersion).filter(
+                    ProjectVersion.id == self.state.version_id
+                ).with_for_update().first()
+
+                # FIX #4: Check actual DB count BEFORE inserting (prevents overshoot)
+                current_count = (
+                    self.db.query(sql_func.count(Sample.id))
                     .filter(Sample.version_id == self.state.version_id)
                     .scalar() or 0
-            )
+                )
 
-            sample = Sample(
-                id=uuid.uuid4(),
-                project_id=self.state.project_id,
-                version_id=self.state.version_id,
-                seq=max_seq + 1,
-                row=sample_data,
-                tags=ctx.assigned_seed.diversity_assignments,
-            )
-            self.db.add(sample)
+                # If we've already hit target, discard this sample
+                if current_count >= self.state.num_samples:
+                    logger.info(
+                        f"[{self.name}] Target already reached in DB "
+                        f"({current_count}/{self.state.num_samples}), discarding sample {ctx.sample_index + 1}"
+                    )
+                    self._target_reached = True
+                    return
 
-            # Keep version.generated_count normalized
-            self.db.query(ProjectVersion).filter(
-                ProjectVersion.id == self.state.version_id
-            ).update(
-                {ProjectVersion.generated_count: ProjectVersion.generated_count + 1},
-                synchronize_session=False
-            )
+                # Get next sequence number for this version
+                max_seq = (
+                        self.db.query(sql_func.max(Sample.seq))
+                        .filter(Sample.version_id == self.state.version_id)
+                        .scalar() or 0
+                )
 
-            # Commit immediately - this makes the sample visible to users
-            self.db.commit()
+                sample = Sample(
+                    id=uuid.uuid4(),
+                    project_id=self.state.project_id,
+                    version_id=self.state.version_id,
+                    seq=max_seq + 1,
+                    row=sample_data,
+                    tags=tags,
+                )
+                self.db.add(sample)
+
+                # Keep version.generated_count normalized
+                self.db.query(ProjectVersion).filter(
+                    ProjectVersion.id == self.state.version_id
+                ).update(
+                    {ProjectVersion.generated_count: ProjectVersion.generated_count + 1},
+                    synchronize_session=False
+                )
+
+                self.db.commit()
+
+                new_count = current_count + 1
+                logger.info(f"💾 Sample saved (seq={max_seq + 1}, total={new_count}/{self.state.num_samples})")
+
+                # FIX #4: Signal workers to stop if we've hit the target
+                if new_count >= self.state.num_samples:
+                    logger.info(f"[{self.name}] 🎯 Target reached ({new_count}/{self.state.num_samples}), signaling stop")
+                    self._target_reached = True
+
+            except Exception as e:
+                # FIX #5: ALWAYS rollback on error to recover the session
+                logger.error(f"[{self.name}] Database error saving sample {ctx.sample_index + 1}: {e}")
+                try:
+                    self.db.rollback()
+                except Exception as rollback_err:
+                    logger.error(f"[{self.name}] Rollback also failed: {rollback_err}")
+                # Re-raise so the worker counts this as a failure
+                raise
 
     def is_complete(self) -> bool:
         """Complete when we've generated the target number of samples."""
@@ -1043,10 +1133,37 @@ Generate a high-quality, accurate row now.
     # =========================================================================
 
     def _create_synthetic_seed(self, sample_idx: int) -> AssignedSeed:
-        """Create a synthetic seed when no seeds are available."""
+        """
+        Create a synthetic seed when no seeds are available.
+
+        FIX #2: Distributes samples across diversity axes based on sample index
+        to ensure even coverage of the diversity spec (round-robin distribution).
+        """
+        diversity_assignments = {}
+
+        # If there's a diversity spec, assign values based on sample index
+        if self.state.diversity_spec:
+            # Build axis info similar to assignment phase
+            axes = []
+            for axis in self.state.diversity_spec:
+                axis_name = axis.get("name")
+                values = [v.get("value") for v in axis.get("values", [])]
+                if axis_name and values:
+                    axes.append({"name": axis_name, "values": values})
+
+            # Round-robin distribution across all axis combinations
+            if axes:
+                divisor = 1
+                for axis in axes:
+                    num_values = len(axis["values"])
+                    if num_values > 0:
+                        value_idx = (sample_idx // divisor) % num_values
+                        diversity_assignments[axis["name"]] = axis["values"][value_idx]
+                        divisor *= num_values
+
         return AssignedSeed(
             seed_text=f"Sample #{sample_idx + 1}",
             seed_id=None,
-            diversity_assignments={},
+            diversity_assignments=diversity_assignments,
             score=1.0,
         )

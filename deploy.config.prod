@@ -1,0 +1,26 @@
+# deploy.config.prod - Production worker deployment configuration
+
+# Azure resources (production)
+RESOURCE_GROUP=datasetlabs-rg
+CONTAINER_APP_NAME=datasetlabs-worker-prod
+ENVIRONMENT_NAME=datasetlabs-env-prod
+REGISTRY_NAME=datasetlabsregistry
+IMAGE_NAME=worker
+IMAGE_TAG=prod-$(git rev-parse --short HEAD)-$(date +%H%M%S)
+
+# Container settings (production - more resources if needed)
+CPU=4.0
+MEMORY=8.0Gi
+
+# Scaling: Always keep 1 warm worker for low latency
+MIN_REPLICAS=1
+MAX_REPLICAS=10
+
+# KEDA Scaling (production - aggressive scaling for low latency)
+MESSAGE_COUNT=1
+POLLING_INTERVAL=10
+COOLDOWN=300
+
+# Service Bus (production namespace in westus2)
+SERVICE_BUS_NAMESPACE=datasetlabs-bus-prod
+QUEUE_NAME=jobs
