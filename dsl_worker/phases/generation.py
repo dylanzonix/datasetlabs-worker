@@ -272,18 +272,10 @@ class GenerationPhase(Phase):
 
                     # FIX #3: Add explicit logging for each stop condition check
                     if self.cost_tracker.would_exceed_spend_limit(0):
-                        logger.warning(
-                            f"[{self.name}] ⚠️ Spend limit would be exceeded - "
-                            f"limit={self.cost_tracker._spend_limit_cents}¢, "
-                            f"current={self.cost_tracker._cumulative_project_spend_cents}¢"
-                        )
+                        logger.warning(f"[{self.name}] ⚠️ Spend limit would be exceeded")
                         _trigger_immediate_stop("Spend limit exceeded after charge")
                     elif not self.cost_tracker.has_sufficient_balance():
-                        logger.warning(
-                            f"[{self.name}] ⚠️ Insufficient balance - "
-                            f"balance={self.cost_tracker._user_balance_cents}¢, "
-                            f"pending={self.cost_tracker._pending_cost_cents}¢"
-                        )
+                        logger.warning(f"[{self.name}] ⚠️ Insufficient balance")
                         _trigger_immediate_stop("Balance depleted after charge")
 
         async def worker(worker_id: int):
