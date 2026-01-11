@@ -16,6 +16,8 @@ VERSION SEMANTICS:
 
 import asyncio
 import logging
+import os
+import socket
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -42,6 +44,9 @@ from dsl_worker.phases.seed_assignment import SeedAssignmentPhase
 from dsl_worker.phases.generation import GenerationPhase
 
 logger = logging.getLogger(__name__)
+
+# Unique identifier for this worker instance (useful for debugging concurrent processing issues)
+WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
 
 
 class JobProcessor:
@@ -87,8 +92,10 @@ class JobProcessor:
 
         If generation is running, immediately cancels all workers.
         """
-        # CHANGED: More descriptive logging at WARNING level
-        logger.warning("⚠️ Stop requested (likely SIGTERM/SIGINT from container orchestration)")
+        logger.warning(
+            f"⚠️ Stop requested on worker {WORKER_ID} "
+            f"(likely SIGTERM/SIGINT from container orchestration)"
+        )
         self.should_stop = True
 
         # Immediately cancel generation if running
@@ -112,7 +119,10 @@ class JobProcessor:
         project_id = UUID(project_id_str)
         version_id = UUID(version_id_str)
 
-        logger.info(f"🚀 Starting orchestrator: project={project_id}, version={version_id}")
+        logger.info(
+            f"🚀 Starting orchestrator: project={project_id}, version={version_id}, "
+            f"worker={WORKER_ID}"
+        )
 
         db: Session = self.SessionLocal()
         try:
@@ -313,28 +323,22 @@ class JobProcessor:
                         continue
 
                 # Execute ONE unit from EACH active phase concurrently
-                # BUT: We need to handle the case where pause/stop happens during execution
                 tasks = [p.execute_once() for p in active]
 
                 try:
-                    # Use a shorter timeout and check for pause/stop more frequently
-                    # For generation, the phase itself handles pause internally
-                    results = await asyncio.wait_for(
-                        asyncio.gather(*tasks, return_exceptions=True),
-                        timeout=300.0
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning("Phase execution timeout (300s)")
-                    # On timeout, check if we should stop
-                    state.refresh()
-                    if self.should_stop or state.paused:
-                        logger.info("⏸️  Stop/pause detected after timeout")
-                        generation.request_stop()
-                        self._handle_pause_for_version(db, project, version, cost_tracker, "Stopped after timeout")
-                        return self.should_stop  # False for external stop, True for pause
-                    continue
+                    # No outer timeout - phases handle their own timeouts internally.
+                    # Generation phase has:
+                    #   - Per-sample timeout (GENERATION_TIMEOUT = 300s)
+                    #   - Pause/stop checking every 0.5s
+                    #   - Immediate worker cancellation on request_stop()
+                    #
+                    # The previous 300s timeout was causing problems by interrupting
+                    # healthy workers mid-generation when processing took longer than
+                    # 5 minutes (which is normal for large batches).
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+
                 except asyncio.CancelledError:
-                    # The task was cancelled (probably by pause/stop)
+                    # The task was cancelled (probably by pause/stop signal)
                     logger.info("Phase execution cancelled")
                     generation.request_stop()
                     state.refresh()
