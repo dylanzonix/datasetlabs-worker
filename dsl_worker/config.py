@@ -41,5 +41,9 @@ class WorkerSettings(BaseSettings):
     billing_charge_threshold_cents: int = 100  # $1 - charge when accumulated
     billing_charge_interval_seconds: int = 60  # Charge at least every 60 seconds
 
+    brave_api_key: str
+    research_model: str = "gpt-5.2"
+    summarize_model: str = "gpt-5-nano"
+
 
 settings = WorkerSettings()

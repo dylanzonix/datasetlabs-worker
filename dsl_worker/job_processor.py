@@ -1,17 +1,13 @@
 """
 Job processor for the DSL worker.
 
-Orchestrates phases and manages project lifecycle:
-- File processing → Seed extraction → Seed scoring → Seed assignment → Generation
-- Tracks costs and charges user balance incrementally
-- Force-stops projects when balance is depleted or spend limit exceeded
-- Handles PAUSE immediately - cancels in-flight generation workers
+NEW ARCHITECTURE (v2):
+- ResearchPhase: Intelligent seed collection (replaces extraction/scoring/assignment)
+- GenerationPhase: Row generation with coverage gap awareness
 
-VERSION SEMANTICS:
-- Each job is associated with a specific version_id
-- (project_id, version_id) is treated as a completely fresh project
-- All phases start from scratch for each new version
-- Seeds, samples, and events are all scoped to the version
+Research and generation run concurrently:
+- Research explores sources, extracts seeds
+- Generation consumes seeds as they become available
 """
 
 import asyncio
@@ -27,7 +23,6 @@ from openai import AsyncOpenAI
 from sqlalchemy.orm import Session
 from azure.storage.blob import BlobServiceClient
 
-from dsl_api.db import SessionLocal
 from dsl_api.models.project import Project
 from dsl_api.models.project_version import ProjectVersion
 from dsl_api.models.project_event import ProjectEvent
@@ -37,39 +32,29 @@ from dsl_worker.project_state import ProjectState
 from dsl_worker.billing import CostTracker, TrackedOpenAIClient
 
 from dsl_worker.phases.base import PhaseResult
-from dsl_worker.phases.file_processing import FileProcessingPhase
-from dsl_worker.phases.seed_extraction import SeedExtractionPhase
-from dsl_worker.phases.seed_scoring import SeedScoringPhase
-from dsl_worker.phases.seed_assignment import SeedAssignmentPhase
-from dsl_worker.phases.generation import GenerationPhase
+from dsl_worker.phases.research import ResearchPhase
+from dsl_worker.phases.generation_v2 import GenerationPhase
 
 logger = logging.getLogger(__name__)
 
-# Unique identifier for this worker instance (useful for debugging concurrent processing issues)
 WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
+
+# Minimum seeds before generation starts
+MIN_SEEDS_BEFORE_GENERATION = int(os.getenv("MIN_SEEDS_BEFORE_GENERATION", "5"))
+
+# Status log interval
+STATUS_LOG_INTERVAL = 30.0
 
 
 class JobProcessor:
     """
-    Main job processor.
-
-    Orchestrates all phases for a project VERSION:
-    1. File processing (chunking + embedding)
-    2. Seed extraction (from chunks)
-    3. Seed scoring (against diversity axes)
-    4. Seed assignment (to diversity slots)
-    5. Sample generation (agentic tool calling)
-
-    IMPORTANT: All work is scoped to the version_id.
-    A new version means starting completely fresh.
-
-    Tracks costs and charges user balance periodically.
-    Force-stops projects when balance is depleted or spend limit exceeded.
-
-    PAUSE HANDLING:
-    - Checks for pause every iteration of the main loop
-    - When pause is detected during generation, immediately cancels all workers
-    - Costs are charged before pausing
+    Job processor using research-based seed collection.
+    
+    Two phases run concurrently:
+    1. Research: Explores sources, extracts seeds intelligently
+    2. Generation: Pulls seeds, generates rows with coverage awareness
+    
+    Generation starts as soon as seeds are available (non-blocking).
     """
 
     def __init__(
@@ -83,32 +68,21 @@ class JobProcessor:
         self.blob_service_client = blob_service_client
         self.should_stop = False
 
-        # Reference to generation phase for immediate stop capability
+        # Phase references for stop capability
+        self._research_phase: Optional[ResearchPhase] = None
         self._generation_phase: Optional[GenerationPhase] = None
 
     def request_stop(self):
-        """
-        Request graceful stop (SIGTERM/SIGINT).
-
-        If generation is running, immediately cancels all workers.
-        """
-        logger.warning(
-            f"⚠️ Stop requested on worker {WORKER_ID} "
-            f"(likely SIGTERM/SIGINT from container orchestration)"
-        )
+        """Request graceful stop (SIGTERM/SIGINT)."""
+        logger.warning(f"⚠️ Stop requested on worker {WORKER_ID}")
         self.should_stop = True
 
-        # Immediately cancel generation if running
         if self._generation_phase:
-            logger.info("Cancelling generation phase workers...")
-            self._generation_phase.request_stop()
+            self._generation_phase._stop_requested = True
+        # Research phase checks should_stop via stop_checker
 
     async def process_job(self, message_body: Dict[str, Any]) -> bool:
-        """
-        Process a job using the phase orchestrator.
-
-        Returns True if job completed or paused successfully.
-        """
+        """Process a job using research + generation pipeline."""
         project_id_str = message_body.get("project_id")
         version_id_str = message_body.get("version_id")
 
@@ -120,12 +94,12 @@ class JobProcessor:
         version_id = UUID(version_id_str)
 
         logger.info(
-            f"🚀 Starting orchestrator: project={project_id}, version={version_id}, "
-            f"worker={WORKER_ID}"
+            f"🚀 Starting job: project={project_id}, version={version_id}, worker={WORKER_ID}"
         )
 
         db: Session = self.SessionLocal()
         try:
+            # Validate project and version
             project = db.query(Project).filter(Project.id == project_id).first()
             if not project:
                 logger.error(f"Project not found: {project_id}")
@@ -136,63 +110,32 @@ class JobProcessor:
                 logger.error(f"Version not found: {version_id}")
                 return False
 
-            # Check version_id matches current - if not, this is a stale message
+            # Check for stale message
             if project.current_version_id != version_id:
-                logger.warning(
-                    f"Stale message (version mismatch): "
-                    f"message version={version_id}, current version={project.current_version_id}"
-                )
-                # This is not an error - just an outdated message
+                logger.warning(f"Stale message: version mismatch")
                 return True
 
-            # Check version status - only process if it's in 'running' state
+            # Check version status
             if version.status not in ("running", "pause_requested"):
-                logger.warning(
-                    f"Version {version_id} is not in running state (status={version.status}), "
-                    f"ignoring message"
-                )
+                logger.warning(f"Version not in running state: {version.status}")
                 return True
 
-            # Update version to running if it was in pause_requested
             if version.status == "pause_requested":
-                # This shouldn't happen normally, but handle gracefully
-                logger.info("Version was in pause_requested, treating as pause")
                 self._handle_pause_for_version(db, project, version, None, "Pause requested before start")
                 return True
 
-            # Set started_at if not already set
+            # Set started_at
             if version.started_at is None:
                 version.started_at = datetime.now(timezone.utc)
                 db.commit()
 
-            # Check if another project is already running for this user
-            running_project = (
-                db.query(Project)
-                .filter(
-                    Project.user_id == project.user_id,
-                    Project.id != project_id,
-                )
-                .join(ProjectVersion, Project.current_version_id == ProjectVersion.id)
-                .filter(ProjectVersion.status == "running")
-                .first()
-            )
-            if running_project:
-                logger.warning(
-                    f"User {project.user_id} already has running project {running_project.id}, "
-                    f"cannot start {project_id}"
-                )
-                # Return False to keep message in queue for retry
-                return False
-
             logger.info(f"Project: {project.name}")
             logger.info(f"  Version: {version.version_number}")
-            logger.info(f"  Status: {version.status}")
             logger.info(f"  Target: {version.num_samples} samples")
 
-            # Create tracked OpenAI client
+            # Create tracked client and cost tracker
             tracked_client = TrackedOpenAIClient(self.raw_openai_client)
-
-            # Create cost tracker with spend limit
+            
             cost_tracker = CostTracker(
                 db=db,
                 user_id=project.user_id,
@@ -203,192 +146,48 @@ class JobProcessor:
                 spend_limit_cents=project.spend_limit_cents,
             )
 
-            # Check initial balance and spend limit
+            # Check initial balance
             can_continue, stop_reason = cost_tracker.check_balance_and_charge()
             if not can_continue:
-                logger.warning(f"Cannot start project: {stop_reason}")
+                logger.warning(f"Cannot start: {stop_reason}")
                 self._handle_force_stop_for_version(db, project, version, cost_tracker, stop_reason)
                 return False
 
-            # Initialize state with version_id
+            # Initialize state
             state = ProjectState(db, project_id, version_id)
 
-            # Create phases (all will work with the version-scoped state)
-            file_processing = FileProcessingPhase(
-                'file_processing', state, db,
-                tracked_client, self.blob_service_client
-            )
-            seed_extraction = SeedExtractionPhase(
-                'seed_extraction', state, db, tracked_client
-            )
-            seed_scoring = SeedScoringPhase(
-                'seed_scoring', state, db, tracked_client
-            )
-            seed_assignment = SeedAssignmentPhase(
-                'seed_assignment', state, db, tracked_client
-            )
-            generation = GenerationPhase(
-                'generation', state, db, tracked_client,
-                assignment_phase=seed_assignment,
-                parallel_samples=settings.generation_parallel_samples,
+            # Create phases
+            self._research_phase = ResearchPhase(
+                name="research",
+                state=state,
+                db=db,
+                openai_client=tracked_client,
+                blob_service_client=self.blob_service_client,
+                stop_checker=lambda: self.should_stop or state.paused,
                 cost_tracker=cost_tracker,
-                stop_checker=lambda: self.should_stop,
             )
 
-            # Store reference for immediate stop capability
-            self._generation_phase = generation
+            self._generation_phase = GenerationPhase(
+                name="generation",
+                state=state,
+                db=db,
+                openai_client=tracked_client,
+                research_phase=self._research_phase,
+                parallel_samples=settings.generation_parallel_samples,
+                stop_checker=lambda: self.should_stop or state.paused,
+                cost_tracker=cost_tracker,
+            )
 
-            phases = [
-                file_processing,
-                seed_extraction,
-                seed_scoring,
-                seed_assignment,
-                generation,
-            ]
-
-            # Emit RUNNING event
+            # Emit running event
             self._emit_event(db, project, version, "running", "Worker started")
 
-            # Main loop
-            iteration = 0
-            last_status_log = time.time()
-            STATUS_LOG_INTERVAL = 30.0  # Log status every 30 seconds
-
-            while True:
-                iteration += 1
-
-                # Refresh state from database
-                state.refresh()
-
-                # Check for pause FIRST - before any other processing
-                if state.paused:
-                    logger.info("⏸️  Pause detected")
-                    # Request immediate stop from generation phase
-                    generation.request_stop()
-                    self._log_status(phases, cost_tracker)
-                    self._handle_pause_for_version(db, project, version, cost_tracker)
-                    return True
-
-                # Check for external stop
-                if self.should_stop:
-                    logger.info("⏸️  Stop signal received")
-                    # Request immediate stop from generation phase
-                    generation.request_stop()
-                    self._log_status(phases, cost_tracker)
-                    self._handle_pause_for_version(db, project, version, cost_tracker, "Stopped by signal")
-                    return False
-
-                # Check balance and charge if needed
-                can_continue, stop_reason = cost_tracker.check_balance_and_charge()
-                if not can_continue:
-                    logger.warning(f"💸 Stopping: {stop_reason}")
-                    generation.request_stop()
-                    self._log_status(phases, cost_tracker)
-                    self._handle_force_stop_for_version(db, project, version, cost_tracker, stop_reason)
-                    return False
-
-                # Periodic status logging
-                now = time.time()
-                if now - last_status_log >= STATUS_LOG_INTERVAL:
-                    self._log_status(phases, cost_tracker)
-                    last_status_log = now
-
-                # Find active phases
-                active = [p for p in phases if p.should_run()]
-
-                if not active:
-                    # Check if all complete
-                    if all(p.is_complete() for p in phases):
-                        logger.info("✅ All phases complete")
-                        self._log_status(phases, cost_tracker)  # Final status
-                        self._handle_completion_for_version(db, project, version, cost_tracker)
-                        return True
-                    else:
-                        # No work but not complete - wait with stop check
-                        logger.debug(f"Iteration {iteration}: No active phases, waiting")
-                        for _ in range(10):  # 10 x 0.1s = 1s total
-                            if self.should_stop:
-                                logger.info("⏸️  Stop signal received during wait")
-                                generation.request_stop()
-                                self._handle_pause_for_version(db, project, version, cost_tracker, "Stopped by signal")
-                                return False
-                            # Also check for pause during wait
-                            state.refresh()
-                            if state.paused:
-                                logger.info("⏸️  Pause detected during wait")
-                                generation.request_stop()
-                                self._handle_pause_for_version(db, project, version, cost_tracker)
-                                return True
-                            await asyncio.sleep(0.1)
-                        continue
-
-                # Execute ONE unit from EACH active phase concurrently
-                tasks = [p.execute_once() for p in active]
-
-                try:
-                    # No outer timeout - phases handle their own timeouts internally.
-                    # Generation phase has:
-                    #   - Per-sample timeout (GENERATION_TIMEOUT = 300s)
-                    #   - Pause/stop checking every 0.5s
-                    #   - Immediate worker cancellation on request_stop()
-                    #
-                    # The previous 300s timeout was causing problems by interrupting
-                    # healthy workers mid-generation when processing took longer than
-                    # 5 minutes (which is normal for large batches).
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                except asyncio.CancelledError:
-                    # The task was cancelled (probably by pause/stop signal)
-                    logger.info("Phase execution cancelled")
-                    generation.request_stop()
-                    state.refresh()
-                    if state.paused:
-                        self._handle_pause_for_version(db, project, version, cost_tracker)
-                        return True
-                    self._handle_pause_for_version(db, project, version, cost_tracker, "Cancelled")
-                    return False
-
-                # Process results and track costs
-                for i, result in enumerate(results):
-                    if isinstance(result, Exception):
-                        logger.error(f"❌ Error in {active[i].name}: {result}")
-                        raise result
-
-                    if isinstance(result, PhaseResult) and result.cost_usd > 0:
-                        cost_tracker.add_cost(
-                            phase=active[i].name,
-                            cost_usd=result.cost_usd,
-                        )
-
-                # Commit after each iteration
-                db.commit()
-
-                # Check for pause/stop AFTER execution too
-                state.refresh()
-                if state.paused:
-                    logger.info("⏸️  Pause detected after phase execution")
-                    generation.request_stop()
-                    self._log_status(phases, cost_tracker)
-                    self._handle_pause_for_version(db, project, version, cost_tracker)
-                    return True
-
-                if self.should_stop:
-                    logger.info("⏸️  Stop signal received after phase execution")
-                    generation.request_stop()
-                    self._log_status(phases, cost_tracker)
-                    self._handle_pause_for_version(db, project, version, cost_tracker, "Stopped by signal")
-                    return False
-
-                # Brief sleep to avoid tight loop
-                await asyncio.sleep(0.01)
+            # Run pipeline
+            result = await self._run_pipeline(db, project, version, state, cost_tracker)
+            return result
 
         except Exception as e:
-            logger.exception(f"❌ Orchestrator error: {e}")
-
-            # Make sure generation is stopped
-            if self._generation_phase:
-                self._generation_phase.request_stop()
-
+            logger.exception(f"❌ Job error: {e}")
+            
             try:
                 version = db.query(ProjectVersion).filter(ProjectVersion.id == version_id).first()
                 project = db.query(Project).filter(Project.id == project_id).first()
@@ -405,9 +204,225 @@ class JobProcessor:
             return False
 
         finally:
-            # Clean up reference
+            # Cleanup browser pool
+            if self._research_phase:
+                try:
+                    await self._research_phase.cleanup()
+                except Exception as e:
+                    logger.warning(f"Research cleanup error: {e}")
+                    
+            self._research_phase = None
             self._generation_phase = None
             db.close()
+
+    async def _run_pipeline(
+        self,
+        db: Session,
+        project: Project,
+        version: ProjectVersion,
+        state: ProjectState,
+        cost_tracker: CostTracker,
+    ) -> bool:
+        """Run research and generation concurrently."""
+        
+        research_done = asyncio.Event()
+        stop_reason: Optional[str] = None
+        last_status_log = time.time()
+        
+        async def research_loop():
+            """Run research until complete or stopped."""
+            nonlocal stop_reason
+            
+            try:
+                while not self.should_stop:
+                    state.refresh()
+                    if state.paused:
+                        return "paused"
+                        
+                    if self._research_phase.is_complete():
+                        logger.info("✅ Research complete")
+                        return "complete"
+                        
+                    if not self._research_phase.should_run():
+                        await asyncio.sleep(1)
+                        continue
+                        
+                    try:
+                        result = await self._research_phase.execute_once()
+                        
+                        # Track cost
+                        if result.cost_usd > 0:
+                            cost_tracker.add_cost(phase="research", cost_usd=result.cost_usd)
+                        
+                        # Check balance
+                        can_continue, reason = cost_tracker.check_balance_and_charge()
+                        if not can_continue:
+                            stop_reason = reason
+                            return f"stopped:{reason}"
+                            
+                    except Exception as e:
+                        logger.error(f"Research error: {e}")
+                        await asyncio.sleep(2)
+                        
+                    if not result.did_work:
+                        await asyncio.sleep(1)
+                        
+                return "stopped"
+                
+            finally:
+                research_done.set()
+                
+        async def generation_loop():
+            """Run generation, waiting for seeds."""
+            nonlocal stop_reason
+            
+            while not self.should_stop:
+                state.refresh()
+                if state.paused:
+                    return "paused"
+                    
+                if self._generation_phase.is_complete():
+                    logger.info("✅ Generation complete")
+                    return "complete"
+                    
+                # Wait for minimum seeds
+                seed_count = self._research_phase.get_seed_count()
+                if seed_count < MIN_SEEDS_BEFORE_GENERATION:
+                    if research_done.is_set():
+                        if seed_count == 0:
+                            logger.warning("No seeds collected - cannot generate")
+                            return "no_seeds"
+                        # Proceed with what we have
+                        logger.info(f"Research done, proceeding with {seed_count} seeds")
+                    else:
+                        logger.debug(f"Waiting for seeds: {seed_count}/{MIN_SEEDS_BEFORE_GENERATION}")
+                        await asyncio.sleep(2)
+                        continue
+                        
+                if not self._generation_phase.should_run():
+                    if research_done.is_set():
+                        return "complete"
+                    await asyncio.sleep(1)
+                    continue
+                    
+                try:
+                    result = await self._generation_phase.execute_once()
+                    
+                    # Track cost
+                    if result.cost_usd > 0:
+                        cost_tracker.add_cost(phase="generation", cost_usd=result.cost_usd)
+                    
+                    # Check balance
+                    can_continue, reason = cost_tracker.check_balance_and_charge()
+                    if not can_continue:
+                        stop_reason = reason
+                        return f"stopped:{reason}"
+                        
+                except Exception as e:
+                    logger.error(f"Generation error: {e}")
+                    await asyncio.sleep(2)
+                    
+                if not result.did_work:
+                    if research_done.is_set():
+                        return "complete"
+                    await asyncio.sleep(2)
+                    
+            return "stopped"
+            
+        async def status_loop():
+            """Periodic status logging."""
+            nonlocal last_status_log
+            
+            while True:
+                state.refresh()
+                if state.paused:
+                    return
+                    
+                now = time.time()
+                if now - last_status_log >= STATUS_LOG_INTERVAL:
+                    self._log_status(cost_tracker)
+                    last_status_log = now
+                    
+                # Check if done
+                if self._generation_phase.is_complete():
+                    return
+                if research_done.is_set() and not self._generation_phase.should_run():
+                    return
+                    
+                await asyncio.sleep(5)
+
+        # Run all loops
+        try:
+            results = await asyncio.gather(
+                research_loop(),
+                generation_loop(),
+                status_loop(),
+                return_exceptions=True,
+            )
+        except asyncio.CancelledError:
+            logger.info("Pipeline cancelled")
+            state.refresh()
+            if state.paused:
+                self._handle_pause_for_version(db, project, version, cost_tracker)
+                return True
+            self._handle_pause_for_version(db, project, version, cost_tracker, "Cancelled")
+            return False
+
+        # Final status log
+        self._log_status(cost_tracker)
+        
+        # Parse results
+        research_result = results[0] if not isinstance(results[0], Exception) else f"error:{results[0]}"
+        generation_result = results[1] if not isinstance(results[1], Exception) else f"error:{results[1]}"
+        
+        logger.info(f"Pipeline results: research={research_result}, generation={generation_result}")
+        
+        # Handle outcomes
+        if "paused" in [research_result, generation_result]:
+            self._handle_pause_for_version(db, project, version, cost_tracker)
+            return True
+            
+        if generation_result == "no_seeds":
+            self._handle_force_stop_for_version(
+                db, project, version, cost_tracker, 
+                "No seeds could be collected for this dataset"
+            )
+            return False
+            
+        if str(research_result).startswith("stopped:") or str(generation_result).startswith("stopped:"):
+            reason = stop_reason or "unknown"
+            self._handle_force_stop_for_version(db, project, version, cost_tracker, reason)
+            return False
+            
+        if str(research_result).startswith("error:") or str(generation_result).startswith("error:"):
+            error = research_result if str(research_result).startswith("error:") else generation_result
+            raise Exception(str(error).split(":", 1)[-1])
+            
+        # Success
+        if generation_result == "complete":
+            self._handle_completion_for_version(db, project, version, cost_tracker)
+            return True
+            
+        # Fallback
+        logger.warning(f"Unexpected pipeline end state: research={research_result}, generation={generation_result}")
+        return True
+
+    def _log_status(self, cost_tracker: CostTracker):
+        """Log current status."""
+        research_seeds = self._research_phase.get_seed_count() if self._research_phase else 0
+        research_target = self._research_phase.target_seeds if self._research_phase else 0
+        gen_count = self._generation_phase.state.samples_generated if self._generation_phase else 0
+        gen_target = self._generation_phase.state.num_samples if self._generation_phase else 0
+        
+        summary = cost_tracker.get_summary()
+        spent = summary["cumulative_project_spend_cents"] / 100
+        total_tokens = summary.get("total_tokens", 0)
+        
+        logger.info(
+            f"📊 Status: seeds={research_seeds}/{research_target} | "
+            f"samples={gen_count}/{gen_target} | "
+            f"spent=${spent:.2f} | tokens={total_tokens:,}"
+        )
 
     def _emit_event(
         self,
@@ -418,7 +433,7 @@ class JobProcessor:
         message: str,
         details: dict = None
     ) -> None:
-        """Emit project event for a specific version."""
+        """Emit project event."""
         event = ProjectEvent(
             project_id=project.id,
             version_id=version.id,
@@ -437,13 +452,10 @@ class JobProcessor:
         cost_tracker: Optional[CostTracker],
         message: str = "Worker paused"
     ) -> None:
-        """Handle pause: update version status, charge remaining costs, emit event."""
-        logger.info(f"Pausing version {version.id} of project {project.id}")
-
-        # Refresh to get accurate generated_count
+        """Handle pause."""
+        logger.info(f"Pausing version {version.id}")
         db.refresh(version)
 
-        # Charge any remaining costs
         if cost_tracker:
             cost_tracker.charge_remaining()
 
@@ -457,9 +469,10 @@ class JobProcessor:
                 {
                     "paused_at": datetime.now(timezone.utc).isoformat(),
                     "generated_count": version.generated_count,
+                    "seeds_collected": self._research_phase.get_seed_count() if self._research_phase else 0,
                     "total_cost_cents": summary["total_costs_cents"],
-                    "preprocessing_cost_cents": summary["preprocessing_costs_cents"],
-                    "generation_cost_cents": summary["generation_costs_cents"],
+                    "preprocessing_cost_cents": summary.get("preprocessing_costs_cents", 0),
+                    "generation_cost_cents": summary.get("generation_costs_cents", 0),
                 }
             )
         else:
@@ -475,13 +488,10 @@ class JobProcessor:
         version: ProjectVersion,
         cost_tracker: CostTracker
     ) -> None:
-        """Handle successful completion for a version."""
-        logger.info(f"Version {version.id} of project {project.id} completed")
-
-        # Refresh to get accurate generated_count
+        """Handle successful completion."""
+        logger.info(f"Version {version.id} completed")
         db.refresh(version)
 
-        # Charge any remaining costs
         cost_tracker.charge_remaining()
 
         version.status = "succeeded"
@@ -494,21 +504,16 @@ class JobProcessor:
             {
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "generated_count": version.generated_count,
+                "seeds_collected": self._research_phase.get_seed_count() if self._research_phase else 0,
                 "total_cost_cents": summary["total_costs_cents"],
-                "preprocessing_cost_cents": summary["preprocessing_costs_cents"],
-                "generation_cost_cents": summary["generation_costs_cents"],
                 "cumulative_project_spend_cents": summary["cumulative_project_spend_cents"],
             }
         )
 
         db.commit()
         logger.info(
-            f"✅ Completed: {summary['total_costs_cents']}¢ total "
-            f"(preprocessing: {summary['preprocessing_costs_cents']}¢, "
-            f"generation: {summary['generation_costs_cents']}¢), "
-            f"tokens: {summary.get('total_tokens', 0):,} "
-            f"(in={summary.get('total_input_tokens', 0):,} out={summary.get('total_output_tokens', 0):,}), "
-            f"balance: {summary['user_balance_cents']}¢"
+            f"✅ Completed: {version.generated_count} samples, "
+            f"${summary['total_costs_cents']/100:.2f} total"
         )
 
     def _handle_force_stop_for_version(
@@ -519,80 +524,39 @@ class JobProcessor:
         cost_tracker: CostTracker,
         reason: str
     ) -> None:
-        """
-        Handle force-stop due to balance depletion or spend limit exceeded.
-
-        Uses 'failed' status with descriptive error message.
-        """
+        """Handle force-stop due to balance/limit/error."""
         logger.warning(f"Force-stopping version {version.id}: {reason}")
-
-        # Refresh to get accurate generated_count
         db.refresh(version)
 
-        # Charge any remaining costs
         cost_tracker.charge_remaining()
 
-        # Build error message
         if reason == "insufficient_balance":
-            error_msg = "Insufficient balance to continue generation"
+            error_msg = "Insufficient balance to continue"
         elif reason == "spend_limit_exceeded":
             limit = project.spend_limit_cents
-            error_msg = f"Project spend limit of ${limit / 100:.2f} exceeded" if limit else "Spend limit exceeded"
+            error_msg = f"Spend limit of ${limit/100:.2f} exceeded" if limit else "Spend limit exceeded"
+        elif "seeds" in reason.lower():
+            error_msg = "Could not collect seeds for this dataset"
         else:
-            error_msg = f"Force-stopped: {reason}"
+            error_msg = f"Stopped: {reason}"
 
-        # Update version
         version.status = "failed"
         version.error = error_msg
         version.finished_at = datetime.now(timezone.utc)
 
-        # Build event details
         summary = cost_tracker.get_summary()
-        details = {
-            "reason": reason,
-            "stopped_at": datetime.now(timezone.utc).isoformat(),
-            "generated_count": version.generated_count,
-            "total_cost_cents": summary["total_costs_cents"],
-            "preprocessing_cost_cents": summary["preprocessing_costs_cents"],
-            "generation_cost_cents": summary["generation_costs_cents"],
-            "cumulative_project_spend_cents": summary["cumulative_project_spend_cents"],
-            "final_balance_cents": summary["user_balance_cents"],
-        }
-
-        # Add spend limit info if relevant
-        if project.spend_limit_cents is not None:
-            details["spend_limit_cents"] = project.spend_limit_cents
-            details["remaining_budget_cents"] = summary.get("remaining_budget_cents", 0)
-
-        self._emit_event(db, project, version, "failed", error_msg, details)
+        self._emit_event(
+            db, project, version, "failed",
+            error_msg,
+            {
+                "reason": reason,
+                "stopped_at": datetime.now(timezone.utc).isoformat(),
+                "generated_count": version.generated_count,
+                "seeds_collected": self._research_phase.get_seed_count() if self._research_phase else 0,
+                "total_cost_cents": summary["total_costs_cents"],
+                "final_balance_cents": summary["user_balance_cents"],
+            }
+        )
 
         db.commit()
-        logger.info(
-            f"🛑 Force-stopped: {reason} "
-            f"(preprocessing: {summary['preprocessing_costs_cents']}¢, "
-            f"generation: {summary['generation_costs_cents']}¢, "
-            f"tokens: {summary.get('total_tokens', 0):,})"
-        )
-
-    def _log_status(self, phases, cost_tracker) -> None:
-        """Log current status of all phases."""
-        parts = []
-        for p in phases:
-            s = p.get_status()
-            if s.status == "complete":
-                parts.append(f"✓{s.phase_name}")
-            elif s.status == "active":
-                parts.append(f"▶{s.phase_name}({s.progress})")
-            else:
-                parts.append(f"○{s.phase_name}")
-
-        summary = cost_tracker.get_summary()
-        spent = summary["cumulative_project_spend_cents"] / 100
-        total_tokens = summary.get("total_tokens", 0)
-        input_tokens = summary.get("total_input_tokens", 0)
-        output_tokens = summary.get("total_output_tokens", 0)
-
-        logger.info(
-            f"📊 Status: {' | '.join(parts)} | "
-            f"spent=${spent:.2f} | tokens={total_tokens:,} (in={input_tokens:,} out={output_tokens:,})"
-        )
+        logger.info(f"🛑 Force-stopped: {reason}")

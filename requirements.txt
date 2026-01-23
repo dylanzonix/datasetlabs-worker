@@ -37,3 +37,14 @@ psycopg2-binary
 # Vector database support
 pgvector==0.3.6
 numpy==1.26.4
+
+browser-use 
+markdownify 
+httpx
+llm_sandbox
+
+pdfplumber
+python-docx
+python-pptx
+openpyxl
+llm-sandbox[docker]
