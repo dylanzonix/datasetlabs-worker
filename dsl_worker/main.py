@@ -22,7 +22,7 @@ from azure.storage.blob import BlobServiceClient
 from dsl_api.db import SessionLocal
 from dsl_api.models.project import Project
 from dsl_worker.config import settings
-from dsl_worker.job_processor import JobProcessor
+from dsl_worker.job_processor_v2 import JobProcessorV2
 from dsl_worker.logging_setup import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -51,7 +51,7 @@ class Worker:
         )
 
         # Job processor
-        self.job_processor = JobProcessor(
+        self.job_processor = JobProcessorV2(
             db_session_factory=self.SessionLocal,
             openai_client=self.openai_client,
             blob_service_client=self.blob_service_client,

@@ -3,17 +3,16 @@ Sandboxed code execution using llm-sandbox.
 
 Provides secure, isolated code execution with:
 - Docker container isolation
-- File mounting for uploaded/downloaded files
+- Full workspace mounting
 - Seed collection via stdout parsing
 """
 
 import json
 import logging
 import os
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -33,72 +32,85 @@ class SandboxResult:
     success: bool
     stdout: str
     stderr: str
-    seeds: List[Dict]  # Seeds extracted from execution
+    seeds: List[Dict]  # Seeds extracted from execution (for backwards compat)
     error: Optional[str] = None
 
 
-# Seed collection wrapper injected into scripts
-SEED_WRAPPER_PREFIX = '''
-import json as _json
-import sys as _sys
-
-# Seed collection
-_collected_seeds = []
-
-def add_seeds(seeds):
-    """Add seeds to collection. Each seed should be a dict with text, note, source_url."""
-    if isinstance(seeds, dict):
-        seeds = [seeds]
-    for s in seeds:
-        _collected_seeds.append({
-            "text": s.get("text"),
-            "note": s.get("note", ""),
-            "source_url": s.get("source_url"),
-        })
-    print(f"[add_seeds] Added {len(seeds)} seeds", file=_sys.stderr)
-
-# Helper to read uploaded files
-def read_file(filename):
-    """Read an uploaded file from /sandbox/uploads/"""
-    path = f"/sandbox/uploads/{filename}"
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"File not found: {filename}. Available: {os.listdir('/sandbox/uploads/')}")
-    with open(path, 'r') as f:
-        return f.read()
-
-def read_file_bytes(filename):
-    """Read an uploaded file as bytes."""
-    path = f"/sandbox/uploads/{filename}"
-    with open(path, 'rb') as f:
-        return f.read()
-
-def list_files():
-    """List available uploaded files."""
-    return os.listdir('/sandbox/uploads/')
-
-# Make page_markdown available if provided
-page_markdown = open('/sandbox/page_markdown.txt').read() if os.path.exists('/sandbox/page_markdown.txt') else None
-page_url = open('/sandbox/page_url.txt').read().strip() if os.path.exists('/sandbox/page_url.txt') else None
-
+# Wrapper prefix for code execution
+CODE_PREFIX = '''
 import os
-import pandas as pd
-from bs4 import BeautifulSoup
+import sys
+import json
 import re
+
+# Workspace is mounted at /workspace
+WORKSPACE = "/workspace"
+
+def list_files(subdir=""):
+    """List files in workspace subdirectory."""
+    path = os.path.join(WORKSPACE, subdir) if subdir else WORKSPACE
+    if os.path.exists(path):
+        return os.listdir(path)
+    return []
+
+def read_file(path):
+    """Read a file from workspace. Path can be relative or absolute."""
+    if not path.startswith("/"):
+        path = os.path.join(WORKSPACE, path)
+    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        return f.read()
+
+def write_file(path, content):
+    """Write a file to workspace."""
+    if not path.startswith("/"):
+        path = os.path.join(WORKSPACE, path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(content)
+
+def grep(pattern, path, ignore_case=True):
+    """Grep for pattern in file, returns matching lines."""
+    import re
+    flags = re.IGNORECASE if ignore_case else 0
+    content = read_file(path)
+    matches = []
+    for i, line in enumerate(content.split('\\n'), 1):
+        if re.search(pattern, line, flags):
+            matches.append(f"{i}: {line}")
+    return "\\n".join(matches)
+
+def head(path, n=50):
+    """Get first n lines of file."""
+    content = read_file(path)
+    lines = content.split('\\n')[:n]
+    return "\\n".join(lines)
+
+def tail(path, n=50):
+    """Get last n lines of file."""
+    content = read_file(path)
+    lines = content.split('\\n')[-n:]
+    return "\\n".join(lines)
+
+# Import common libraries
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
 
 ###################
 # USER SCRIPT START
 ###################
 '''
 
-SEED_WRAPPER_SUFFIX = '''
+CODE_SUFFIX = '''
 ###################
 # USER SCRIPT END
 ###################
-
-# Output collected seeds as JSON
-print("__SANDBOX_SEEDS_START__")
-print(_json.dumps(_collected_seeds))
-print("__SANDBOX_SEEDS_END__")
 '''
 
 
@@ -107,7 +119,7 @@ class SandboxExecutor:
     Execute code in an isolated sandbox.
     
     Uses llm-sandbox for Docker container isolation.
-    Falls back to unsafe exec() if sandbox not available (development only).
+    Falls back to unsafe exec() if sandbox not available.
     """
     
     def __init__(
@@ -124,30 +136,28 @@ class SandboxExecutor:
             self._init_pool(pool_size)
     
     def _init_pool(self, pool_size: int):
-        """Initialize container pool for better performance."""
+        """Initialize container pool."""
         try:
             self._pool = create_pool_manager(
                 backend=self.backend,
                 config=PoolConfig(
                     max_pool_size=pool_size,
                     min_pool_size=1,
-                    idle_timeout=300.0,  # 5 min
+                    idle_timeout=300.0,
                     enable_prewarming=True,
                 ),
                 lang="python",
                 libraries=["pandas", "beautifulsoup4", "openpyxl", "pdfplumber"],
             )
-            logger.info(f"Sandbox pool initialized with {pool_size} containers")
+            logger.info(f"Sandbox pool initialized: {pool_size} containers")
         except Exception as e:
-            logger.warning(f"Failed to initialize sandbox pool: {e}")
+            logger.warning(f"Failed to init sandbox pool: {e}")
             self._pool = None
     
     def execute(
         self,
         script: str,
-        page_markdown: Optional[str] = None,
-        page_url: Optional[str] = None,
-        uploaded_files: Optional[Dict[str, str]] = None,  # filename -> local_path
+        workspace_dir: Optional[str] = None,
         timeout: int = 120,
     ) -> SandboxResult:
         """
@@ -155,39 +165,29 @@ class SandboxExecutor:
         
         Args:
             script: Python code to execute
-            page_markdown: Content of last fetched page
-            page_url: URL of last fetched page
-            uploaded_files: Dict mapping filename to local file path
+            workspace_dir: Directory to mount as /workspace
             timeout: Execution timeout in seconds
             
         Returns:
-            SandboxResult with stdout, stderr, and extracted seeds
+            SandboxResult with stdout, stderr
         """
         if SANDBOX_AVAILABLE:
-            return self._execute_sandboxed(
-                script, page_markdown, page_url, uploaded_files, timeout
-            )
+            return self._execute_sandboxed(script, workspace_dir, timeout)
         else:
-            logger.warning("Running code UNSANDBOXED - this is unsafe!")
-            return self._execute_unsafe(
-                script, page_markdown, page_url, uploaded_files
-            )
+            logger.warning("Running code UNSANDBOXED - development only!")
+            return self._execute_unsafe(script, workspace_dir)
     
     def _execute_sandboxed(
         self,
         script: str,
-        page_markdown: Optional[str],
-        page_url: Optional[str],
-        uploaded_files: Optional[Dict[str, str]],
+        workspace_dir: Optional[str],
         timeout: int,
     ) -> SandboxResult:
         """Execute in llm-sandbox container."""
         
-        # Wrap script with seed collection
-        wrapped_script = SEED_WRAPPER_PREFIX + script + SEED_WRAPPER_SUFFIX
+        wrapped_script = CODE_PREFIX + script + CODE_SUFFIX
         
         try:
-            # Use pool if available, otherwise create session
             session_kwargs = {
                 "lang": "python",
                 "keep_template": True,
@@ -196,47 +196,40 @@ class SandboxExecutor:
                 session_kwargs["pool"] = self._pool
             
             with SandboxSession(**session_kwargs) as session:
-                # Create directories in sandbox
-                session.execute_command("mkdir -p /sandbox/uploads /sandbox/downloads")
+                # Mount workspace if provided
+                if workspace_dir and os.path.exists(workspace_dir):
+                    # Copy entire workspace to container
+                    session.execute_command("mkdir -p /workspace")
+                    
+                    # Copy each subdirectory
+                    for subdir in ["uploads", "web", "extracted"]:
+                        src_dir = os.path.join(workspace_dir, subdir)
+                        if os.path.exists(src_dir):
+                            session.execute_command(f"mkdir -p /workspace/{subdir}")
+                            for filename in os.listdir(src_dir):
+                                src_path = os.path.join(src_dir, filename)
+                                if os.path.isfile(src_path):
+                                    session.copy_to_runtime(
+                                        src_path,
+                                        f"/workspace/{subdir}/{filename}"
+                                    )
+                    
+                    logger.debug(f"Mounted workspace: {workspace_dir}")
                 
-                # Copy page content if provided
-                if page_markdown:
-                    self._write_temp_and_copy(
-                        session, page_markdown, "/sandbox/page_markdown.txt"
-                    )
-                if page_url:
-                    self._write_temp_and_copy(
-                        session, page_url, "/sandbox/page_url.txt"
-                    )
-                
-                # Copy uploaded files
-                if uploaded_files:
-                    for filename, local_path in uploaded_files.items():
-                        if os.path.exists(local_path):
-                            session.copy_to_runtime(
-                                local_path, f"/sandbox/uploads/{filename}"
-                            )
-                            logger.debug(f"Copied {filename} to sandbox")
-                
-                # Execute the wrapped script
+                # Execute
                 result = session.run(
                     wrapped_script,
                     libraries=["pandas", "beautifulsoup4", "openpyxl"],
                 )
                 
-                # Parse seeds from output
                 stdout = result.stdout or ""
                 stderr = result.stderr or ""
-                seeds = self._extract_seeds(stdout)
-                
-                # Remove seed markers from visible output
-                clean_stdout = self._clean_output(stdout)
                 
                 return SandboxResult(
                     success=result.exit_code == 0,
-                    stdout=clean_stdout,
+                    stdout=stdout,
                     stderr=stderr,
-                    seeds=seeds,
+                    seeds=[],  # Not used in new flow
                     error=stderr if result.exit_code != 0 else None,
                 )
                 
@@ -250,88 +243,74 @@ class SandboxExecutor:
                 error=str(e),
             )
     
-    def _write_temp_and_copy(self, session, content: str, dest_path: str):
-        """Write content to temp file and copy to sandbox."""
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as f:
-            f.write(content)
-            temp_path = f.name
-        try:
-            session.copy_to_runtime(temp_path, dest_path)
-        finally:
-            os.unlink(temp_path)
-    
-    def _extract_seeds(self, stdout: str) -> List[Dict]:
-        """Extract seeds from stdout."""
-        seeds = []
-        
-        start_marker = "__SANDBOX_SEEDS_START__"
-        end_marker = "__SANDBOX_SEEDS_END__"
-        
-        if start_marker in stdout and end_marker in stdout:
-            try:
-                start = stdout.index(start_marker) + len(start_marker)
-                end = stdout.index(end_marker)
-                seeds_json = stdout[start:end].strip()
-                seeds = json.loads(seeds_json)
-                logger.info(f"Extracted {len(seeds)} seeds from sandbox output")
-            except (ValueError, json.JSONDecodeError) as e:
-                logger.warning(f"Failed to parse seeds from output: {e}")
-        
-        return seeds
-    
-    def _clean_output(self, stdout: str) -> str:
-        """Remove seed markers from output."""
-        start_marker = "__SANDBOX_SEEDS_START__"
-        end_marker = "__SANDBOX_SEEDS_END__"
-        
-        if start_marker in stdout:
-            # Remove everything from start marker to end
-            idx = stdout.index(start_marker)
-            return stdout[:idx].strip()
-        
-        return stdout
-    
     def _execute_unsafe(
         self,
         script: str,
-        page_markdown: Optional[str],
-        page_url: Optional[str],
-        uploaded_files: Optional[Dict[str, str]],
+        workspace_dir: Optional[str],
     ) -> SandboxResult:
-        """
-        Fallback: Execute with exec() - UNSAFE, for development only.
-        """
+        """Fallback: Execute with exec() - UNSAFE."""
         import io
         import sys
         
-        collected_seeds = []
-        
-        def add_seeds(seeds):
-            if isinstance(seeds, dict):
-                seeds = [seeds]
-            for s in seeds:
-                collected_seeds.append({
-                    "text": s.get("text"),
-                    "note": s.get("note", ""),
-                    "source_url": s.get("source_url"),
-                })
-        
+        # Build namespace with helpers
         namespace = {
-            "page_markdown": page_markdown,
-            "page_url": page_url,
-            "uploaded_files": uploaded_files or {},
-            "add_seeds": add_seeds,
+            "WORKSPACE": workspace_dir or ".",
             "json": json,
             "re": __import__("re"),
             "os": os,
         }
         
-        # Try to import common libs
+        # Add helper functions
+        def list_files(subdir=""):
+            path = os.path.join(workspace_dir or ".", subdir) if subdir else (workspace_dir or ".")
+            if os.path.exists(path):
+                return os.listdir(path)
+            return []
+        
+        def read_file(path):
+            if not path.startswith("/"):
+                path = os.path.join(workspace_dir or ".", path)
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
+        
+        def write_file(path, content):
+            if not path.startswith("/"):
+                path = os.path.join(workspace_dir or ".", path)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(content)
+        
+        def grep(pattern, path, ignore_case=True):
+            import re as re_module
+            flags = re_module.IGNORECASE if ignore_case else 0
+            content = read_file(path)
+            matches = []
+            for i, line in enumerate(content.split('\n'), 1):
+                if re_module.search(pattern, line, flags):
+                    matches.append(f"{i}: {line}")
+            return "\n".join(matches)
+        
+        def head(path, n=50):
+            content = read_file(path)
+            lines = content.split('\n')[:n]
+            return "\n".join(lines)
+        
+        def tail(path, n=50):
+            content = read_file(path)
+            lines = content.split('\n')[-n:]
+            return "\n".join(lines)
+        
+        namespace["list_files"] = list_files
+        namespace["read_file"] = read_file
+        namespace["write_file"] = write_file
+        namespace["grep"] = grep
+        namespace["head"] = head
+        namespace["tail"] = tail
+        
+        # Try to import libs
         try:
             import pandas as pd
             namespace["pd"] = pd
-            namespace["pandas"] = pd
         except ImportError:
             pass
         
@@ -355,7 +334,7 @@ class SandboxExecutor:
                 success=True,
                 stdout=stdout,
                 stderr=stderr,
-                seeds=collected_seeds,
+                seeds=[],
             )
         except Exception as e:
             stdout = sys.stdout.getvalue()
@@ -365,7 +344,7 @@ class SandboxExecutor:
                 success=False,
                 stdout=stdout,
                 stderr=stderr,
-                seeds=collected_seeds,
+                seeds=[],
                 error=str(e),
             )
         finally:

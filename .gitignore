@@ -98,3 +98,5 @@ poetry.lock
 repo.ai.txt
 
 browser_profiles/
+
+workspace_*/

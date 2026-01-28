@@ -10,13 +10,9 @@ Provides:
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Any
 
 from sqlalchemy.orm import Session
-from azure.storage.blob import BlobServiceClient
-
-from dsl_worker.project_state import ProjectState
-from dsl_worker.billing import TrackedOpenAIClient
 
 logger = logging.getLogger(__name__)
 
@@ -51,12 +47,12 @@ class PhaseStatus:
 
     Attributes:
         phase_name: Name of the phase
-        status: One of 'pending', 'active', 'complete'
-        progress: Human-readable progress string (e.g., "3/10 files")
+        status: One of 'pending', 'active', 'complete', 'idle'
+        progress: Human-readable progress string
         detail: Optional additional detail
     """
     phase_name: str
-    status: str  # 'pending', 'active', 'complete'
+    status: str
     progress: str
     detail: Optional[str] = None
 
@@ -76,22 +72,18 @@ class Phase(ABC):
 
     Each phase implements:
     - should_run(): Decide if this phase should execute now
-    - execute_once(): Process one unit of work (batch size determined internally)
+    - execute_once(): Process one unit of work
     - is_complete(): Check if this phase is fully done
-    - get_status(): Return current progress/status for logging
-
-    Resume semantics:
-    - file_processing, seed_extraction, seed_scoring: Resume from where we left off
-    - seed_assignment, generation: Always start fresh (ephemeral state)
+    - get_status(): Return current progress/status
     """
 
     def __init__(
             self,
             name: str,
-            state: ProjectState,
+            state: Any,  # ProjectState
             db: Session,
-            openai_client: Optional[TrackedOpenAIClient] = None,
-            blob_service_client: Optional[BlobServiceClient] = None,
+            openai_client: Optional[Any] = None,
+            blob_service_client: Optional[Any] = None,
     ):
         self.name = name
         self.state = state
@@ -106,11 +98,6 @@ class Phase(ABC):
         """
         Decide if this phase should execute in the current iteration.
 
-        Consider:
-        - Is there work available for this phase?
-        - Are dependencies complete? (for sequential phases)
-        - Is preview mode active? (for eager phases)
-
         Returns:
             True if execute_once() should be called
         """
@@ -121,15 +108,8 @@ class Phase(ABC):
         """
         Execute one unit of work for this phase.
 
-        The phase determines internally how much work constitutes "one unit":
-        - For file processing: one file
-        - For seed extraction: one chunk (or a small batch)
-        - For seed scoring: a batch of seeds
-        - For assignment: all seeds at once (algorithm requirement)
-        - For generation: one sample
-
         Returns:
-            PhaseResult with did_work flag and cost_cents
+            PhaseResult with did_work flag and cost_usd
         """
         pass
 
@@ -148,10 +128,6 @@ class Phase(ABC):
         Get current status/progress of this phase.
 
         Override in subclasses for meaningful progress reporting.
-        Default implementation uses should_run() and is_complete().
-
-        Returns:
-            PhaseStatus with progress information
         """
         if self.is_complete():
             status = "complete"
