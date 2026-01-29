@@ -97,6 +97,8 @@ poetry.lock
 *.log
 repo.ai.txt
 
+dev/
+
 browser_profiles/
 
 workspace_*/
