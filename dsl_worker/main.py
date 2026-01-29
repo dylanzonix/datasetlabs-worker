@@ -22,7 +22,7 @@ from azure.storage.blob import BlobServiceClient
 from dsl_api.db import SessionLocal
 from dsl_api.models.project import Project
 from dsl_worker.config import settings
-from dsl_worker.job_processor_v2 import JobProcessorV2
+from dsl_worker.job_processor_v3 import JobProcessorV3
 from dsl_worker.logging_setup import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -50,8 +50,8 @@ class Worker:
             credential=settings.azure_storage_account_key,
         )
 
-        # Job processor
-        self.job_processor = JobProcessorV2(
+        # Job processor (v3 - new pipeline)
+        self.job_processor = JobProcessorV3(
             db_session_factory=self.SessionLocal,
             openai_client=self.openai_client,
             blob_service_client=self.blob_service_client,
@@ -64,7 +64,6 @@ class Worker:
 
     def _handle_shutdown(self, signum, frame):
         """Handle graceful shutdown signals."""
-        # Use WARNING level and more descriptive message
         signal_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT" if signum == signal.SIGINT else f"signal {signum}"
         logger.warning(f"⚠️ SHUTDOWN SIGNAL RECEIVED: {signal_name} - initiating graceful shutdown...")
         self.running = False
@@ -88,14 +87,9 @@ class Worker:
             project_id = UUID(project_id_str)
             logger.info(f"Processing project {project_id}")
 
-            # NOTE: We do NOT set status to "running" here anymore.
-            # The job_processor will set it after validating the message is not stale.
-            # This prevents stale messages from incorrectly flipping status to "running".
-
             # Process the job
             success = await self.job_processor.process_job(body)
 
-            # Log result (status is already set correctly by job_processor)
             if success:
                 logger.info(f"Completed processing project {project_id}")
             else:
@@ -103,7 +97,7 @@ class Worker:
 
         except Exception as e:
             logger.exception(f"Error processing message: {e}")
-            # Update project to failed using ORM
+            # Update project to failed
             if project_id:
                 db: Session = self.SessionLocal()
                 try:
@@ -123,7 +117,6 @@ class Worker:
 
         if self.noop_mode:
             logger.info("🔴 Running in NOOP mode - idling indefinitely")
-            # Just sleep forever, keeping the container alive but not processing
             try:
                 while self.running:
                     await asyncio.sleep(60)
@@ -139,51 +132,35 @@ class Worker:
                 max_wait_time=30,
             )
 
-            # FIX: Use AutoLockRenewer to keep message lock alive during long processing
-            # This prevents another worker from picking up the same message
-            renewer = AutoLockRenewer(max_lock_renewal_duration=3600)  # Renew for up to 1 hour
+            renewer = AutoLockRenewer(max_lock_renewal_duration=3600)
 
             async with receiver:
                 while self.running:
                     try:
-                        # Receive messages with timeout
                         messages = await receiver.receive_messages(max_message_count=1, max_wait_time=5)
 
                         if not messages:
-                            # No messages, check if we should keep running
                             if not self.running:
                                 break
                             continue
 
                         for message in messages:
                             if not self.running:
-                                # Don't start new work if shutting down
                                 break
 
                             try:
-                                # FIX: Register message with auto-renewer BEFORE processing
-                                # This will automatically renew the lock every ~35 seconds
                                 renewer.register(receiver, message, max_lock_renewal_duration=3600)
-                                logger.debug(f"Registered message for auto-lock renewal (up to 1 hour)")
+                                logger.debug(f"Registered message for auto-lock renewal")
 
                                 await self.process_message(message)
-
-                                # Complete the message (remove from queue)
                                 await receiver.complete_message(message)
 
                             except MessageLockLostError as e:
-                                # Lock was lost despite renewal - another worker may have taken over
-                                logger.error(
-                                    f"⚠️ Message lock lost! Another worker may have processed this message. "
-                                    f"Error: {e}"
-                                )
-                                # Don't dead-letter - the message may have been processed by another worker
-                                # Just log and continue
+                                logger.error(f"⚠️ Message lock lost! {e}")
 
                             except Exception as e:
                                 logger.exception(f"Failed to process message: {e}")
                                 try:
-                                    # Dead letter the message
                                     await receiver.dead_letter_message(
                                         message,
                                         reason="ProcessingError",
@@ -194,10 +171,8 @@ class Worker:
 
                     except Exception as e:
                         logger.exception(f"Error in worker loop: {e}")
-                        # Brief pause before retrying
                         await asyncio.sleep(5)
 
-            # Clean up the renewer
             await renewer.close()
 
         logger.info("Worker stopped")
