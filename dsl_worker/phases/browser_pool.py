@@ -50,7 +50,7 @@ class BrowserPool:
         self,
         size: int = 5,
         profiles_dir: str = "./browser_profiles",
-        headless: bool = True,
+        headless: bool = False,
     ):
         self.size = size
         self.profiles_dir = Path(profiles_dir)

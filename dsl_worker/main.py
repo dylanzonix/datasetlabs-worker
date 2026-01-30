@@ -10,7 +10,6 @@ import logging
 import os
 import signal
 from datetime import datetime, timezone
-from typing import Optional
 from uuid import UUID
 
 from azure.servicebus.aio import ServiceBusClient, AutoLockRenewer
@@ -35,10 +34,8 @@ class Worker:
         self.running = True
         self.noop_mode = os.getenv("NOOP_MODE", "").lower() in ("true", "1", "yes")
 
-        # Database session factory
         self.SessionLocal = SessionLocal
 
-        # Initialize clients
         self.service_bus_client = ServiceBusClient.from_connection_string(
             settings.azure_service_bus_connection_string
         )
@@ -50,7 +47,6 @@ class Worker:
             credential=settings.azure_storage_account_key,
         )
 
-        # Job processor (v3 - new pipeline)
         self.job_processor = JobProcessorV3(
             db_session_factory=self.SessionLocal,
             openai_client=self.openai_client,
@@ -58,17 +54,15 @@ class Worker:
         )
         self.current_processor = self.job_processor
 
-        # Setup signal handlers
         signal.signal(signal.SIGTERM, self._handle_shutdown)
         signal.signal(signal.SIGINT, self._handle_shutdown)
 
     def _handle_shutdown(self, signum, frame):
         """Handle graceful shutdown signals."""
         signal_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT" if signum == signal.SIGINT else f"signal {signum}"
-        logger.warning(f"⚠️ SHUTDOWN SIGNAL RECEIVED: {signal_name} - initiating graceful shutdown...")
+        logger.warning(f"⚠️ SHUTDOWN SIGNAL RECEIVED: {signal_name}")
         self.running = False
 
-        # Signal current job to stop
         if self.current_processor:
             self.current_processor.request_stop()
 
@@ -76,7 +70,6 @@ class Worker:
         """Process a single message from the queue."""
         project_id = None
         try:
-            # Parse message body
             body = json.loads(str(message))
             project_id_str = body.get("project_id")
 
@@ -87,7 +80,6 @@ class Worker:
             project_id = UUID(project_id_str)
             logger.info(f"Processing project {project_id}")
 
-            # Process the job
             success = await self.job_processor.process_job(body)
 
             if success:
@@ -97,7 +89,6 @@ class Worker:
 
         except Exception as e:
             logger.exception(f"Error processing message: {e}")
-            # Update project to failed
             if project_id:
                 db: Session = self.SessionLocal()
                 try:
@@ -150,7 +141,6 @@ class Worker:
 
                             try:
                                 renewer.register(receiver, message, max_lock_renewal_duration=3600)
-                                logger.debug(f"Registered message for auto-lock renewal")
 
                                 await self.process_message(message)
                                 await receiver.complete_message(message)

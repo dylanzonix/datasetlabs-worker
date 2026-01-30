@@ -4,7 +4,6 @@ Sandboxed code execution using llm-sandbox.
 Provides secure, isolated code execution with:
 - Docker container isolation
 - Full workspace mounting
-- Seed collection via stdout parsing
 """
 
 import json
@@ -12,11 +11,10 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Check if llm-sandbox is available
 try:
     from llm_sandbox import SandboxSession
     from llm_sandbox.pool import PoolConfig, create_pool_manager
@@ -32,36 +30,30 @@ class SandboxResult:
     success: bool
     stdout: str
     stderr: str
-    seeds: List[Dict]  # Seeds extracted from execution (for backwards compat)
     error: Optional[str] = None
 
 
-# Wrapper prefix for code execution
 CODE_PREFIX = '''
 import os
 import sys
 import json
 import re
 
-# Workspace is mounted at /workspace
 WORKSPACE = "/workspace"
 
 def list_files(subdir=""):
-    """List files in workspace subdirectory."""
     path = os.path.join(WORKSPACE, subdir) if subdir else WORKSPACE
     if os.path.exists(path):
         return os.listdir(path)
     return []
 
 def read_file(path):
-    """Read a file from workspace. Path can be relative or absolute."""
     if not path.startswith("/"):
         path = os.path.join(WORKSPACE, path)
     with open(path, 'r', encoding='utf-8', errors='ignore') as f:
         return f.read()
 
 def write_file(path, content):
-    """Write a file to workspace."""
     if not path.startswith("/"):
         path = os.path.join(WORKSPACE, path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -69,7 +61,6 @@ def write_file(path, content):
         f.write(content)
 
 def grep(pattern, path, ignore_case=True):
-    """Grep for pattern in file, returns matching lines."""
     import re
     flags = re.IGNORECASE if ignore_case else 0
     content = read_file(path)
@@ -80,18 +71,15 @@ def grep(pattern, path, ignore_case=True):
     return "\\n".join(matches)
 
 def head(path, n=50):
-    """Get first n lines of file."""
     content = read_file(path)
     lines = content.split('\\n')[:n]
     return "\\n".join(lines)
 
 def tail(path, n=50):
-    """Get last n lines of file."""
     content = read_file(path)
     lines = content.split('\\n')[-n:]
     return "\\n".join(lines)
 
-# Import common libraries
 try:
     import pandas as pd
 except ImportError:
@@ -115,12 +103,7 @@ CODE_SUFFIX = '''
 
 
 class SandboxExecutor:
-    """
-    Execute code in an isolated sandbox.
-    
-    Uses llm-sandbox for Docker container isolation.
-    Falls back to unsafe exec() if sandbox not available.
-    """
+    """Execute code in an isolated sandbox."""
     
     def __init__(
         self,
@@ -160,17 +143,7 @@ class SandboxExecutor:
         workspace_dir: Optional[str] = None,
         timeout: int = 120,
     ) -> SandboxResult:
-        """
-        Execute code in sandbox.
-        
-        Args:
-            script: Python code to execute
-            workspace_dir: Directory to mount as /workspace
-            timeout: Execution timeout in seconds
-            
-        Returns:
-            SandboxResult with stdout, stderr
-        """
+        """Execute code in sandbox."""
         if SANDBOX_AVAILABLE:
             return self._execute_sandboxed(script, workspace_dir, timeout)
         else:
@@ -196,12 +169,9 @@ class SandboxExecutor:
                 session_kwargs["pool"] = self._pool
             
             with SandboxSession(**session_kwargs) as session:
-                # Mount workspace if provided
                 if workspace_dir and os.path.exists(workspace_dir):
-                    # Copy entire workspace to container
                     session.execute_command("mkdir -p /workspace")
                     
-                    # Copy each subdirectory
                     for subdir in ["uploads", "web", "extracted"]:
                         src_dir = os.path.join(workspace_dir, subdir)
                         if os.path.exists(src_dir):
@@ -213,10 +183,7 @@ class SandboxExecutor:
                                         src_path,
                                         f"/workspace/{subdir}/{filename}"
                                     )
-                    
-                    logger.debug(f"Mounted workspace: {workspace_dir}")
                 
-                # Execute
                 result = session.run(
                     wrapped_script,
                     libraries=["pandas", "beautifulsoup4", "openpyxl"],
@@ -229,7 +196,6 @@ class SandboxExecutor:
                     success=result.exit_code == 0,
                     stdout=stdout,
                     stderr=stderr,
-                    seeds=[],  # Not used in new flow
                     error=stderr if result.exit_code != 0 else None,
                 )
                 
@@ -239,7 +205,6 @@ class SandboxExecutor:
                 success=False,
                 stdout="",
                 stderr=str(e),
-                seeds=[],
                 error=str(e),
             )
     
@@ -252,7 +217,6 @@ class SandboxExecutor:
         import io
         import sys
         
-        # Build namespace with helpers
         namespace = {
             "WORKSPACE": workspace_dir or ".",
             "json": json,
@@ -260,7 +224,6 @@ class SandboxExecutor:
             "os": os,
         }
         
-        # Add helper functions
         def list_files(subdir=""):
             path = os.path.join(workspace_dir or ".", subdir) if subdir else (workspace_dir or ".")
             if os.path.exists(path):
@@ -280,34 +243,10 @@ class SandboxExecutor:
             with open(path, 'w', encoding='utf-8') as f:
                 f.write(content)
         
-        def grep(pattern, path, ignore_case=True):
-            import re as re_module
-            flags = re_module.IGNORECASE if ignore_case else 0
-            content = read_file(path)
-            matches = []
-            for i, line in enumerate(content.split('\n'), 1):
-                if re_module.search(pattern, line, flags):
-                    matches.append(f"{i}: {line}")
-            return "\n".join(matches)
-        
-        def head(path, n=50):
-            content = read_file(path)
-            lines = content.split('\n')[:n]
-            return "\n".join(lines)
-        
-        def tail(path, n=50):
-            content = read_file(path)
-            lines = content.split('\n')[-n:]
-            return "\n".join(lines)
-        
         namespace["list_files"] = list_files
         namespace["read_file"] = read_file
         namespace["write_file"] = write_file
-        namespace["grep"] = grep
-        namespace["head"] = head
-        namespace["tail"] = tail
         
-        # Try to import libs
         try:
             import pandas as pd
             namespace["pd"] = pd
@@ -320,7 +259,6 @@ class SandboxExecutor:
         except ImportError:
             pass
         
-        # Capture stdout/stderr
         old_stdout, old_stderr = sys.stdout, sys.stderr
         sys.stdout = io.StringIO()
         sys.stderr = io.StringIO()
@@ -334,7 +272,6 @@ class SandboxExecutor:
                 success=True,
                 stdout=stdout,
                 stderr=stderr,
-                seeds=[],
             )
         except Exception as e:
             stdout = sys.stdout.getvalue()
@@ -344,7 +281,6 @@ class SandboxExecutor:
                 success=False,
                 stdout=stdout,
                 stderr=stderr,
-                seeds=[],
                 error=str(e),
             )
         finally:

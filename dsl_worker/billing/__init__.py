@@ -10,7 +10,6 @@ from .pricing import (
 )
 from .tracked_client import (
     TrackedOpenAIClient,
-    TrackedChatCompletion,
     TrackedEmbeddingResponse,
 )
 from .cost_tracker import (

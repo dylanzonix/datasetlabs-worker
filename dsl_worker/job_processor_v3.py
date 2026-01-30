@@ -28,10 +28,17 @@ from dsl_worker.config import settings
 from dsl_worker.project_state import ProjectState
 from dsl_worker.billing import CostTracker, TrackedOpenAIClient
 
-from dsl_worker.phases.scope_processor import ScopeProcessor, Scope, Source
+from dsl_worker.phases.scope_processor import ScopeProcessor, Scope
 from dsl_worker.phases.row_generator import GenerationWorkerPool
-from dsl_worker.phases.browser_pool import BrowserPool
 from dsl_worker.phases.sandbox import SandboxExecutor
+
+# Try to import browser-use
+try:
+    from browser_use import Browser
+    BROWSER_AVAILABLE = True
+except ImportError:
+    Browser = None
+    BROWSER_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +67,7 @@ class JobProcessorV3:
         self.should_stop = False
         
         # Resources
-        self._browser_pool: Optional[BrowserPool] = None
+        self._browser: Optional[Any] = None
         self._sandbox: Optional[SandboxExecutor] = None
     
     def request_stop(self):
@@ -177,7 +184,6 @@ class JobProcessorV3:
             return False
             
         finally:
-            # Cleanup
             await self._cleanup()
             db.close()
     
@@ -202,25 +208,32 @@ class JobProcessorV3:
         # Load uploaded files
         await self._load_uploaded_files(state, workspace_dir)
         
-        # Initialize resources
-        self._browser_pool = BrowserPool(
-            size=int(os.getenv("BROWSER_POOL_SIZE", "3")),
-            headless=os.getenv("BROWSER_HEADLESS", "false").lower() in ("true", "1"),
-        )
-        await self._browser_pool.start()
+        # Initialize browser
+        if BROWSER_AVAILABLE:
+            self._browser = Browser(
+                headless=os.getenv("BROWSER_HEADLESS", "true").lower() in ("true", "1"),
+            )
+            await self._browser.start()
+            logger.info("[Pipeline] Browser initialized")
+        else:
+            logger.warning("[Pipeline] browser-use not available")
+            self._browser = None
         
+        # Initialize sandbox
         self._sandbox = SandboxExecutor(use_pool=True, pool_size=2)
         
-        # Create root scope
+        # Create root scope with SHORT description (full instructions are in system prompt)
+        # Extract first line or use generic description
+        first_line = state.generation_prompt.strip().split('\n')[0][:100]
+        root_description = first_line if first_line else "Root scope"
+        
         root_scope = Scope(
-            description=state.generation_prompt,
+            description=root_description,
             quota=state.num_samples,
-            knowledge=[],
-            sources=self._get_uploaded_sources(state, workspace_dir),
+            notes=[],
         )
         
         logger.info(f"[Pipeline] Root scope: {state.num_samples} rows")
-        logger.info(f"[Pipeline] Uploaded sources: {len(root_scope.sources)}")
         
         # Run scope processor
         logger.info("[Pipeline] Starting scope processor...")
@@ -228,12 +241,11 @@ class JobProcessorV3:
         scope_processor = ScopeProcessor(
             workspace_dir=workspace_dir,
             schema=state.columns,
+            project_instructions=state.generation_prompt,
             openai_client=tracked_client,
             brave_api_key=settings.brave_api_key,
-            browser_pool=self._browser_pool,
-            sandbox=self._sandbox,
+            browser=self._browser,
             stop_checker=self._make_stop_checker(state),
-            cost_tracker=cost_tracker,
         )
         
         try:
@@ -249,7 +261,7 @@ class JobProcessorV3:
             cost_tracker.add_cost(
                 phase="scope_processor",
                 cost_usd=scope_processor.get_total_cost(),
-                model=os.getenv("RESEARCH_MODEL", "gpt-4o"),
+                model=settings.research_model,
             )
         
         # Check if we should continue
@@ -273,7 +285,7 @@ class JobProcessorV3:
             project_id=project.id,
             version_id=version.id,
             brave_api_key=settings.brave_api_key,
-            browser_pool=self._browser_pool,
+            browser=self._browser,
             sandbox=self._sandbox,
             num_workers=settings.generation_parallel_samples,
             stop_checker=self._make_stop_checker(state),
@@ -310,7 +322,7 @@ class JobProcessorV3:
             cost_tracker.add_cost(
                 phase="generation",
                 cost_usd=stats['total_cost'],
-                model=os.getenv("GENERATION_MODEL", "gpt-4o"),
+                model=settings.generation_model,
             )
         
         # Handle final state
@@ -324,7 +336,6 @@ class JobProcessorV3:
             return True
         
         if total_success > 0:
-            # Partial success
             logger.warning(f"[Pipeline] Partial completion: {total_success}/{state.num_samples}")
             self._handle_completion(db, project, version, cost_tracker)
             return True
@@ -354,7 +365,7 @@ class JobProcessorV3:
             
             try:
                 if self.blob_service_client:
-                    container = os.getenv("AZURE_STORAGE_CONTAINER", "uploads")
+                    container = settings.azure_storage_container_name
                     blob_client = self.blob_service_client.get_blob_client(
                         container=container,
                         blob=blob_path
@@ -367,31 +378,14 @@ class JobProcessorV3:
             except Exception as e:
                 logger.error(f"[Pipeline] Failed to download {filename}: {e}")
     
-    def _get_uploaded_sources(self, state: ProjectState, workspace_dir: Path) -> list:
-        """Get uploaded files as sources."""
-        sources = []
-        uploads_dir = workspace_dir / "uploads"
-        
-        if uploads_dir.exists():
-            for f in uploads_dir.iterdir():
-                if f.is_file():
-                    sources.append(Source(
-                        file_path=f"uploads/{f.name}",
-                        url=None,
-                        summary=f"Uploaded file: {f.name}",
-                        example_potential=None,  # Will be determined by research
-                    ))
-        
-        return sources
-    
     async def _cleanup(self):
         """Cleanup resources."""
-        if self._browser_pool:
+        if self._browser:
             try:
-                await self._browser_pool.stop()
+                await self._browser.stop()
             except Exception as e:
                 logger.warning(f"Browser cleanup error: {e}")
-            self._browser_pool = None
+            self._browser = None
         
         if self._sandbox:
             try:
