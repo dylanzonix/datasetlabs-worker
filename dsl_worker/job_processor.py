@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
 
 
-class JobProcessorV3:
+class JobProcessor:
     """
     Simplified job processor.
     
