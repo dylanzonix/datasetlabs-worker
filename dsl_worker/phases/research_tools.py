@@ -1,24 +1,31 @@
 """
 Research Tools - ChatGPT-style browsing for research agent.
 
+Each ResearchTools instance has its OWN browser (one per scope).
+Browser is lazy-initialized on first use, cleaned up when scope ends.
+
 Tools:
 - brave_search(query, response_length) → search results artifact
 - open(ref_id_or_url, start_line, response_length) → page viewport
 - find(ref_id, pattern, response_length) → matching lines  
 - click(ref_id, link_id, response_length) → new page viewport
 - note(content) → add to notes
+- list_files(directory) → show available files with metadata
+- code_exec(script) → execute Python with submit_seed()
 - conclude_research(summary) → transition to decision mode
 - breakdown(children) → split scope
-- extract_seeds(ref_id, line_ranges) → create assignments from source
-- write_seeds(seeds) → create synthetic assignments
+- submit_seed(ref_id, lines, content) → create seed from source
+- done(reason) → finish when seeds exhausted
 - interact(url_or_ref_id, task) → browser agent for complex interactions
 """
 
 import asyncio
+import csv
 import json
 import logging
 import random
 import string
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -44,7 +51,16 @@ from dsl_worker.phases.artifacts import (
 
 logger = logging.getLogger(__name__)
 
-PAGE_LOAD_WAIT = 2.0
+# Browser-use imports
+try:
+    from browser_use import BrowserSession, Agent
+    from browser_use.llm.openai.chat import ChatOpenAI
+    BROWSER_AVAILABLE = True
+except ImportError:
+    BrowserSession = None
+    Agent = None
+    ChatOpenAI = None
+    BROWSER_AVAILABLE = False
 
 
 def short_id(length: int = 6) -> str:
@@ -59,6 +75,18 @@ class ResearchState(Enum):
 
 
 @dataclass
+class Seed:
+    """A seed for row generation."""
+    content: str
+    scope_id: str
+    scope_description: str
+    notes: List[str]
+    research_summary: Optional[str] = None
+    source_ref: Optional[str] = None
+    source_url: Optional[str] = None
+
+
+@dataclass
 class ResearchScope:
     """Current research scope context."""
     id: str
@@ -69,9 +97,81 @@ class ResearchScope:
     parent_notes: List[str] = field(default_factory=list)
 
 
+# =============================================================================
+# dsl_tools library injected into sandbox
+# =============================================================================
+
+DSL_TOOLS_LIBRARY = '''
+"""
+DSL Tools - Available in code execution sandbox.
+
+Usage:
+    from dsl_tools import submit_seed, list_files, file_info
+"""
+
+import json
+import os
+from pathlib import Path
+
+_WORKSPACE = os.environ.get("DSL_WORKSPACE", "/workspace")
+_SEEDS_FILE = os.path.join(_WORKSPACE, ".dsl_seeds.jsonl")
+
+
+def submit_seed(content: str, source: str = None) -> None:
+    """
+    Submit a seed for row generation.
+    
+    Args:
+        content: The seed content - what this row should be about
+        source: Optional source reference (e.g., "data.pdf page 3")
+    
+    Example:
+        submit_seed("Tesla Model 3", source="ev_list.csv row 15")
+    """
+    seed = {"content": content, "source": source}
+    
+    with open(_SEEDS_FILE, "a") as f:
+        f.write(json.dumps(seed) + "\\n")
+    
+    print(f"[seed] {content[:60]}...")
+
+
+def list_files(directory: str = "all") -> list:
+    """List available files. Returns list of paths."""
+    files = []
+    
+    if directory in ("uploads", "all"):
+        uploads = Path(_WORKSPACE) / "uploads"
+        if uploads.exists():
+            files.extend([str(f) for f in uploads.iterdir() if f.is_file()])
+    
+    if directory in ("downloads", "all"):
+        downloads = Path(_WORKSPACE) / "downloads"
+        if downloads.exists():
+            files.extend([str(f) for f in downloads.iterdir() if f.is_file()])
+    
+    return files
+
+
+def file_info(path: str) -> dict:
+    """Get file info: name, size_bytes, extension."""
+    p = Path(path)
+    if not p.exists():
+        return {"exists": False}
+    return {
+        "exists": True,
+        "name": p.name,
+        "size_bytes": p.stat().st_size,
+        "extension": p.suffix.lower(),
+    }
+'''
+
+
 class ResearchTools:
     """
     Tools for research agent to explore and understand a domain.
+    
+    Each instance has its OWN browser (one per scope).
     
     State machine:
     - RESEARCHING: Can search, browse, take notes
@@ -85,18 +185,26 @@ class ResearchTools:
         workspace_dir: Path,
         schema: List[Dict],
         brave_api_key: Optional[str] = None,
-        browser: Optional[Any] = None,
         openai_client: Optional[Any] = None,
         model: str = "gpt-4o",
+        sandbox: Optional[Any] = None,
         stop_checker: Optional[Callable[[], bool]] = None,
     ):
         self.workspace_dir = Path(workspace_dir)
         self.schema = schema
         self.brave_api_key = brave_api_key
-        self.browser = browser
         self.openai_client = openai_client
         self.model = model
+        self.sandbox = sandbox
         self.stop_checker = stop_checker
+        
+        # Ensure directories exist
+        (self.workspace_dir / "uploads").mkdir(parents=True, exist_ok=True)
+        (self.workspace_dir / "downloads").mkdir(parents=True, exist_ok=True)
+        
+        # Browser - lazy initialized, owned by this instance
+        self._browser: Optional[Any] = None
+        self._open_pages: Dict[str, Any] = {}  # ref_id -> page
         
         # Artifact storage
         self.artifacts = ArtifactStore()
@@ -104,6 +212,7 @@ class ResearchTools:
         # State machine
         self.state = ResearchState.RESEARCHING
         self.research_summary: Optional[str] = None
+        self.research_actions: int = 0  # Track searches/opens/reads
         
         # Current scope
         self.scope: Optional[ResearchScope] = None
@@ -111,11 +220,10 @@ class ResearchTools:
         # Track breakdown
         self.breakdown_children: Optional[List[Dict]] = None
         
-        # Track created assignments
-        self.assignment_dirs: List[str] = []
-        
-        # Ensure workspace
-        (self.workspace_dir / "assignments").mkdir(parents=True, exist_ok=True)
+        # Track seeds (in-memory)
+        self.seeds: List[Seed] = []
+        self.seeds_submitted: int = 0
+        self.is_done: bool = False
     
     def set_scope(self, scope: ResearchScope):
         """Set current scope being researched."""
@@ -123,6 +231,10 @@ class ResearchTools:
         self.breakdown_children = None
         self.state = ResearchState.RESEARCHING
         self.research_summary = None
+        self.research_actions = 0
+        self.seeds = []
+        self.seeds_submitted = 0
+        self.is_done = False
     
     def _should_stop(self) -> bool:
         return self.stop_checker and self.stop_checker()
@@ -140,46 +252,115 @@ class ResearchTools:
         return None
     
     # =========================================================================
+    # Browser Management
+    # =========================================================================
+    
+    async def _get_browser(self) -> Any:
+        """Get or create BrowserSession for this scope."""
+        if not BROWSER_AVAILABLE:
+            raise RuntimeError("browser-use not installed")
+        
+        if self._browser is None:
+            self._browser = BrowserSession(
+                headless=False,
+                downloads_path=str(self.workspace_dir / "downloads"),
+                auto_download_pdfs=True,
+            )
+            await self._browser.start()
+            scope_id = self.scope.id if self.scope else "unknown"
+            logger.info(f"[ResearchTools] BrowserSession started for scope {scope_id}")
+        
+        return self._browser
+    
+    async def cleanup(self):
+        """Cleanup browser session and resources. Called when scope ends."""
+        # Close any open pages
+        for ref_id, page in list(self._open_pages.items()):
+            try:
+                if self._browser:
+                    await self._browser.close_page(page)
+            except Exception as e:
+                logger.warning(f"[ResearchTools] Error closing page {ref_id}: {e}")
+        self._open_pages.clear()
+        
+        # Stop browser session
+        if self._browser:
+            try:
+                await self._browser.stop()
+                scope_id = self.scope.id if self.scope else "unknown"
+                logger.info(f"[ResearchTools] BrowserSession closed for scope {scope_id}")
+            except Exception as e:
+                logger.warning(f"[ResearchTools] Error stopping BrowserSession: {e}")
+            self._browser = None
+    
+    # =========================================================================
     # brave_search
     # =========================================================================
     
     async def brave_search(self, query: str, response_length: str = "medium") -> Tuple[str, float]:
-        """Search the web using Brave Search API."""
+        """Search the web using Brave Search API with retry."""
         if not self.brave_api_key:
             return "Error: Brave API key not configured", 0.0
         
         config = self._get_config(response_length)
         count = config["results"]
         
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    "https://api.search.brave.com/res/v1/web/search",
-                    params={"q": query, "count": count},
-                    headers={"X-Subscription-Token": self.brave_api_key},
-                    timeout=30.0,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-            
-            results = []
-            for i, r in enumerate(data.get("web", {}).get("results", [])):
-                results.append(SearchResult(
-                    id=i,
-                    title=r.get("title", ""),
-                    url=r.get("url", ""),
-                    snippet=r.get("description", ""),
-                    date=r.get("age"),
-                ))
-            
-            artifact = SearchResults(query=query, results=results)
-            ref_id = self.artifacts.store_search(artifact)
-            
-            return format_search_results(artifact, ref_id, count), 0.0
-            
-        except Exception as e:
-            logger.error(f"[ResearchTools] brave_search failed: {e}")
-            return f"Search error: {e}", 0.0
+        max_retries = 3
+        base_delay = 1.0
+        
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(
+                        "https://api.search.brave.com/res/v1/web/search",
+                        params={"q": query, "count": count},
+                        headers={"X-Subscription-Token": self.brave_api_key},
+                        timeout=30.0,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                
+                results = []
+                for i, r in enumerate(data.get("web", {}).get("results", [])):
+                    results.append(SearchResult(
+                        id=i,
+                        title=r.get("title", ""),
+                        url=r.get("url", ""),
+                        snippet=r.get("description", ""),
+                        date=r.get("age"),
+                    ))
+                
+                artifact = SearchResults(query=query, results=results)
+                ref_id = self.artifacts.store_search(artifact)
+                
+                return format_search_results(artifact, ref_id, count), 0.0
+                
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429 or e.response.status_code >= 500:
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)
+                        logger.warning(
+                            f"[ResearchTools] Brave search failed ({e.response.status_code}), "
+                            f"retry {attempt + 1}/{max_retries} in {delay}s"
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                logger.error(f"[ResearchTools] Brave search HTTP error: {e}")
+                return f"Search error: {e}", 0.0
+                
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(
+                        f"[ResearchTools] Brave search failed ({e}), "
+                        f"retry {attempt + 1}/{max_retries} in {delay}s"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                logger.error(f"[ResearchTools] brave_search failed: {e}")
+                return f"Search error: {e}", 0.0
+        
+        return "Search failed after retries", 0.0
     
     # =========================================================================
     # open
@@ -217,7 +398,115 @@ class ResearchTools:
             url = "https://" + url
         
         try:
-            markdown = await self._fetch_page(url)
+            session = await self._get_browser()
+            
+            # Track downloads before navigation
+            downloads_before = set(session.downloaded_files) if session.downloaded_files else set()
+            
+            # Navigate - may timeout for PDFs/downloads, that's expected
+            try:
+                await session.navigate_to(url)
+            except Exception as nav_error:
+                # Timeout is expected for PDF downloads - continue and check for downloads
+                logger.debug(f"[ResearchTools] Navigation exception (may be expected): {nav_error}")
+            
+            # Wait a moment for download to complete if one started
+            await asyncio.sleep(2.0)
+            
+            # Check for new downloads
+            downloads_after = set(session.downloaded_files) if session.downloaded_files else set()
+            new_downloads = downloads_after - downloads_before
+            
+            if new_downloads:
+                # File was downloaded - extract content
+                downloaded_path = Path(list(new_downloads)[0])
+                logger.info(f"[ResearchTools] File downloaded: {downloaded_path.name}")
+                
+                # Wait a bit more for large files to finish writing
+                await asyncio.sleep(1.0)
+                
+                # Extract content
+                content, file_info = await self._extract_file_content(downloaded_path)
+                
+                if content:
+                    lines = content.split('\n')
+                    
+                    page_view = PageView(
+                        url=url,
+                        fetched_at=datetime.now(timezone.utc).isoformat(),
+                        lines=lines,
+                        total_lines=len(lines),
+                        links=[],  # Downloaded files don't have links
+                    )
+                    ref_id = self.artifacts.store_page(page_view)
+                    
+                    # Build response with file info
+                    header = f"📄 Downloaded: {downloaded_path.name} ({file_info})\n"
+                    header += f"Source: {url}\n"
+                    header += "=" * 50 + "\n"
+                    
+                    viewport = format_viewport(lines, start_line, num_lines, ref_id, url)
+                    
+                    return f"{header}{viewport}", 0.0
+                else:
+                    # Couldn't extract content - tell agent about the file
+                    size_kb = downloaded_path.stat().st_size / 1024
+                    return (
+                        f"📥 File downloaded: {downloaded_path.name} ({size_kb:.1f}KB)\n"
+                        f"Location: /workspace/downloads/{downloaded_path.name}\n"
+                        f"Source: {url}\n\n"
+                        f"Could not extract text. Use code_exec() with appropriate library to process."
+                    ), 0.0
+            
+            # No download - try to get HTML content from the page
+            page = await session.get_current_page()
+            if not page:
+                return f"Failed to get page for {url}", 0.0
+            
+            markdown = ""
+            max_attempts = 3
+            
+            for attempt in range(max_attempts):
+                try:
+                    html = await page.evaluate('() => document.body.innerHTML')
+                    if html and len(html.strip()) > 0:
+                        markdown = md(html, heading_style='ATX')
+                        break
+                except Exception as e:
+                    logger.debug(f"[ResearchTools] HTML extraction attempt {attempt + 1} failed: {e}")
+                    await asyncio.sleep(1.0)
+            
+            if not markdown:
+                # One more check for late downloads
+                await asyncio.sleep(2.0)
+                downloads_after = set(session.downloaded_files) if session.downloaded_files else set()
+                new_downloads = downloads_after - downloads_before
+                
+                if new_downloads:
+                    downloaded_path = Path(list(new_downloads)[0])
+                    logger.info(f"[ResearchTools] Late download detected: {downloaded_path.name}")
+                    
+                    content, file_info = await self._extract_file_content(downloaded_path)
+                    
+                    if content:
+                        lines = content.split('\n')
+                        page_view = PageView(
+                            url=url,
+                            fetched_at=datetime.now(timezone.utc).isoformat(),
+                            lines=lines,
+                            total_lines=len(lines),
+                            links=[],
+                        )
+                        ref_id = self.artifacts.store_page(page_view)
+                        
+                        header = f"📄 Downloaded: {downloaded_path.name} ({file_info})\n"
+                        header += f"Source: {url}\n"
+                        header += "=" * 50 + "\n"
+                        
+                        viewport = format_viewport(lines, start_line, num_lines, ref_id, url)
+                        return f"{header}{viewport}", 0.0
+                
+                markdown = "Page loaded but no content extracted"
             
             lines = markdown.split('\n')
             links = extract_links_from_markdown(markdown, url)
@@ -231,6 +520,9 @@ class ResearchTools:
             )
             ref_id = self.artifacts.store_page(page_view)
             
+            # Keep page reference for potential interact()
+            self._open_pages[ref_id] = page
+            
             viewport = format_viewport(lines, start_line, num_lines, ref_id, url)
             links_table = format_links_table(links)
             
@@ -240,20 +532,80 @@ class ResearchTools:
             logger.error(f"[ResearchTools] open failed for {url}: {e}")
             return f"Failed to open {url}: {e}", 0.0
     
-    async def _fetch_page(self, url: str) -> str:
-        """Fetch page content using Browser."""
-        if not self.browser:
-            raise RuntimeError("Browser not initialized")
+    async def _extract_file_content(self, file_path: Path) -> Tuple[str, str]:
+        """
+        Extract text content from a downloaded file.
         
-        page = await self.browser.new_page(url)
-        await asyncio.sleep(PAGE_LOAD_WAIT)
+        Returns (content, file_info) tuple.
+        content is the extracted text, or empty string if extraction failed.
+        file_info is a brief description like "PDF, 15 pages" or "245KB".
+        """
+        ext = file_path.suffix.lower()
+        size_kb = file_path.stat().st_size / 1024
         
         try:
-            html = await page.evaluate('() => document.body.innerHTML')
-            markdown = md(html, heading_style='ATX', strip=['script', 'style'])
-            return markdown
-        finally:
-            await self.browser.close_page(page)
+            if ext == '.pdf':
+                try:
+                    import pdfplumber
+                    text_lines = []
+                    page_count = 0
+                    
+                    with pdfplumber.open(file_path) as pdf:
+                        page_count = len(pdf.pages)
+                        for i, page in enumerate(pdf.pages):
+                            text = page.extract_text() or ""
+                            if text.strip():
+                                text_lines.append(f"--- Page {i + 1} ---")
+                                text_lines.extend(text.split('\n'))
+                    
+                    if text_lines:
+                        return '\n'.join(text_lines), f"PDF, {page_count} pages"
+                    else:
+                        return "", f"PDF, {page_count} pages (no extractable text)"
+                        
+                except ImportError:
+                    logger.warning("[ResearchTools] pdfplumber not installed")
+                    return "", f"PDF, {size_kb:.1f}KB (pdfplumber not installed)"
+            
+            elif ext in ('.txt', '.md', '.csv', '.json', '.xml', '.html', '.htm'):
+                content = file_path.read_text(errors='ignore')
+                line_count = len(content.split('\n'))
+                return content, f"{ext[1:].upper()}, {line_count} lines"
+            
+            elif ext in ('.xlsx', '.xls'):
+                try:
+                    import pandas as pd
+                    
+                    # Read all sheets
+                    xlsx = pd.ExcelFile(file_path)
+                    all_text = []
+                    
+                    for sheet_name in xlsx.sheet_names:
+                        df = pd.read_excel(xlsx, sheet_name=sheet_name)
+                        all_text.append(f"--- Sheet: {sheet_name} ---")
+                        all_text.append(df.to_string())
+                    
+                    return '\n'.join(all_text), f"Excel, {len(xlsx.sheet_names)} sheets"
+                    
+                except ImportError:
+                    return "", f"Excel, {size_kb:.1f}KB (pandas not installed)"
+            
+            elif ext == '.docx':
+                try:
+                    from docx import Document
+                    doc = Document(file_path)
+                    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+                    return '\n\n'.join(paragraphs), f"Word doc, {len(paragraphs)} paragraphs"
+                except ImportError:
+                    return "", f"Word doc, {size_kb:.1f}KB (python-docx not installed)"
+            
+            else:
+                # Unknown type - can't extract
+                return "", f"{size_kb:.1f}KB"
+                
+        except Exception as e:
+            logger.error(f"[ResearchTools] File extraction failed for {file_path}: {e}")
+            return "", f"{size_kb:.1f}KB (extraction error: {e})"
     
     # =========================================================================
     # find
@@ -312,6 +664,193 @@ class ResearchTools:
         return f"Noted ({len(self.scope.notes)} total)", 0.0
     
     # =========================================================================
+    # list_files
+    # =========================================================================
+    
+    async def list_files(self, directory: str = "all") -> Tuple[str, float]:
+        """List available files with metadata preview."""
+        output = []
+        
+        for subdir in ["uploads", "downloads"]:
+            if directory not in (subdir, "all"):
+                continue
+            
+            dir_path = self.workspace_dir / subdir
+            if not dir_path.exists():
+                continue
+            
+            files = sorted([f for f in dir_path.iterdir() if f.is_file()])
+            if not files:
+                continue
+            
+            icon = "📁" if subdir == "uploads" else "📥"
+            output.append(f"{icon} {subdir.title()}:")
+            
+            for f in files:
+                size_kb = f.stat().st_size / 1024
+                meta = self._get_file_metadata(f)
+                
+                output.append(f"  {f.name} ({size_kb:.1f}KB)")
+                if meta:
+                    output.append(f"    └─ {meta}")
+        
+        if not output:
+            return "No files found. Upload files or browse web to download.", 0.0
+        
+        output.append("\nUse code_exec() to parse files and submit_seed() for items.")
+        return '\n'.join(output), 0.0
+    
+    def _get_file_metadata(self, path: Path) -> str:
+        """Quick metadata preview for common file types."""
+        ext = path.suffix.lower()
+        
+        try:
+            if ext == '.csv':
+                with open(path, 'r', errors='ignore') as f:
+                    reader = csv.reader(f)
+                    header = next(reader, None)
+                    row_count = sum(1 for _ in f) + 1
+                if header:
+                    cols = header[:5]
+                    more = f" +{len(header)-5} more" if len(header) > 5 else ""
+                    return f"Columns: {cols}{more} | ~{row_count} rows"
+                return f"~{row_count} rows"
+            
+            elif ext == '.json':
+                text = path.read_text(errors='ignore')[:10000]
+                data = json.loads(text)
+                if isinstance(data, list):
+                    return f"Array with {len(data)} items"
+                elif isinstance(data, dict):
+                    keys = list(data.keys())[:5]
+                    more = f" +{len(data)-5}" if len(data) > 5 else ""
+                    return f"Object keys: {keys}{more}"
+            
+            elif ext in ('.xlsx', '.xls'):
+                return "Excel spreadsheet"
+            
+            elif ext == '.pdf':
+                return "PDF document"
+            
+            elif ext in ('.db', '.sqlite', '.sqlite3'):
+                return "SQLite database"
+            
+            elif ext in ('.txt', '.md'):
+                lines = len(path.read_text(errors='ignore').split('\n'))
+                return f"~{lines} lines"
+                
+        except Exception:
+            pass
+        
+        return ""
+    
+    # =========================================================================
+    # code_exec
+    # =========================================================================
+    
+    async def code_exec(self, script: str, description: str = "") -> Tuple[str, float]:
+        """
+        Execute Python code with access to files and submit_seed().
+        
+        Available in script:
+        - submit_seed(content, source=None) - Submit a seed for row generation
+        - list_files() - List available files
+        - file_info(path) - Get file metadata
+        
+        Files are at:
+        - /workspace/uploads/ - User uploaded files
+        - /workspace/downloads/ - Browser downloaded files
+        """
+        if not self.sandbox:
+            return "Code execution not available", 0.0
+        
+        # Clear previous seeds file
+        seeds_file = self.workspace_dir / ".dsl_seeds.jsonl"
+        if seeds_file.exists():
+            seeds_file.unlink()
+        
+        # Build code with dsl_tools injected
+        full_script = f"""
+import os
+os.environ["DSL_WORKSPACE"] = "{self.workspace_dir}"
+
+{DSL_TOOLS_LIBRARY}
+
+# Common libraries
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
+
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None
+
+try:
+    from openpyxl import load_workbook
+except ImportError:
+    load_workbook = None
+
+# User script
+{script}
+"""
+        
+        result = self.sandbox.execute(
+            script=full_script,
+            workspace_dir=str(self.workspace_dir),
+            timeout=120,
+        )
+        
+        # Read any seeds that were submitted
+        new_seeds = []
+        if seeds_file.exists():
+            for line in seeds_file.read_text().strip().split('\n'):
+                if line:
+                    try:
+                        seed_data = json.loads(line)
+                        new_seeds.append(seed_data)
+                    except json.JSONDecodeError:
+                        pass
+        
+        # Add seeds to our collection
+        for seed_data in new_seeds:
+            self._add_seed_from_code(seed_data)
+        
+        # Build response
+        output_parts = []
+        
+        if result.stdout:
+            output_parts.append(result.stdout)
+        
+        if not result.success and result.stderr:
+            output_parts.append(f"Error: {result.stderr}")
+        
+        if new_seeds:
+            output_parts.append(f"\n✓ {len(new_seeds)} seeds submitted")
+            remaining = self.scope.quota - self.seeds_submitted if self.scope else 0
+            output_parts.append(f"  Remaining quota: {remaining}")
+        
+        return '\n'.join(output_parts) if output_parts else "Code executed (no output)", 0.0
+    
+    def _add_seed_from_code(self, seed_data: Dict):
+        """Add a seed that was submitted via code execution."""
+        if not self.scope:
+            return
+        
+        seed = Seed(
+            content=seed_data.get("content", ""),
+            scope_id=self.scope.id,
+            scope_description=self.scope.description,
+            notes=self.scope.parent_notes + self.scope.notes,
+            research_summary=self.research_summary,
+            source_ref=seed_data.get("source"),
+            source_url=None,
+        )
+        self.seeds.append(seed)
+        self.seeds_submitted += 1
+    
+    # =========================================================================
     # conclude_research
     # =========================================================================
     
@@ -319,13 +858,22 @@ class ResearchTools:
         """
         Conclude research phase and transition to decision mode.
         
-        Must be called before breakdown() or write_seeds()/extract_seeds().
+        Must be called before breakdown() or submit_seed().
+        Requires actual research to have been performed.
         """
         if not self.scope:
             return "No active scope", 0.0
         
         if not summary or len(summary.strip()) < 10:
             return "Please provide a meaningful summary of your research findings.", 0.0
+        
+        if self.research_actions == 0:
+            return (
+                "Cannot conclude research without having done any. "
+                "You need to use your research tools (brave_search, open, etc.) "
+                "to build understanding before concluding. Start by searching broadly "
+                "to understand your scope's domain."
+            ), 0.0
         
         self.state = ResearchState.CONCLUDED
         self.research_summary = summary
@@ -334,8 +882,8 @@ class ResearchTools:
             f"Research concluded. Summary recorded.\n\n"
             f"You can now either:\n"
             f"- breakdown(children) to split into smaller scopes\n"
-            f"- extract_seeds(ref_id, line_ranges) to extract seeds from sources\n"
-            f"- write_seeds(seeds) to write synthetic seeds"
+            f"- submit_seed() to submit seeds for row generation\n"
+            f"- done(reason) if seeds are exhausted before quota"
         ), 0.0
     
     # =========================================================================
@@ -367,112 +915,107 @@ class ResearchTools:
         return '\n'.join(lines), 0.0
     
     # =========================================================================
-    # extract_seeds
+    # submit_seed
     # =========================================================================
     
-    async def extract_seeds(
+    def submit_seed(
         self,
-        ref_id: str,
-        line_ranges: List[List[int]],
+        ref_id: Optional[str] = None,
+        lines: Optional[List[int]] = None,
+        content: Optional[str] = None,
     ) -> Tuple[str, float]:
-        """Extract seeds from page content by line ranges."""
-        error = self._require_state(ResearchState.CONCLUDED, "extract seeds")
+        """Submit a single seed for row generation."""
+        error = self._require_state(ResearchState.CONCLUDED, "submit seed")
         if error:
             return error, 0.0
-        
-        page = self.artifacts.get_page(ref_id)
-        if not page:
-            return f"Page not found: {ref_id}", 0.0
         
         if not self.scope:
             return "No active scope", 0.0
         
-        if not line_ranges:
-            return "No line ranges provided", 0.0
+        # Build seed content
+        seed_content = ""
+        source_ref = None
+        source_url = None
         
-        extracted = []
-        for start, end in line_ranges:
+        # Extract from source if ref_id + lines provided
+        if ref_id and lines and len(lines) == 2:
+            page = self.artifacts.get_page(ref_id)
+            if not page:
+                return f"Page not found: {ref_id}", 0.0
+            
+            start, end = lines
             start = max(0, start)
             end = min(len(page.lines), end + 1)
-            content = '\n'.join(page.lines[start:end]).strip()
-            if content:
-                extracted.append(content)
+            extracted = '\n'.join(page.lines[start:end]).strip()
+            
+            if extracted:
+                seed_content = extracted
+                source_ref = ref_id
+                source_url = page.url
         
-        if not extracted:
-            return "No content extracted from ranges", 0.0
+        # Add written content
+        if content:
+            if seed_content:
+                seed_content = f"{seed_content}\n\n{content}"
+            else:
+                seed_content = content
         
-        return self._write_assignments(
-            seeds=extracted,
-            synthetic=False,
-            source_ref=ref_id,
-            source_url=page.url,
-        ), 0.0
+        if not seed_content.strip():
+            return "Empty seed - provide ref_id+lines and/or content", 0.0
+        
+        # Create seed
+        all_notes = self.scope.parent_notes + self.scope.notes
+        seed = Seed(
+            content=seed_content,
+            scope_id=self.scope.id,
+            scope_description=self.scope.description,
+            notes=all_notes,
+            research_summary=self.research_summary,
+            source_ref=source_ref,
+            source_url=source_url,
+        )
+        self.seeds.append(seed)
+        self.seeds_submitted += 1
+        
+        remaining = self.scope.quota - self.seeds_submitted
+        
+        if remaining > 0:
+            return f"Seed {self.seeds_submitted} submitted | Remaining quota: {remaining}", 0.0
+        else:
+            return f"Seed {self.seeds_submitted} submitted | Quota filled!", 0.0
     
     # =========================================================================
-    # write_seeds
+    # done
     # =========================================================================
     
-    def write_seeds(self, seeds: List[str]) -> Tuple[str, float]:
-        """Write synthetic seeds."""
-        error = self._require_state(ResearchState.CONCLUDED, "write seeds")
+    def done(self, reason: str) -> Tuple[str, float]:
+        """Finish when seeds are exhausted before reaching quota."""
+        error = self._require_state(ResearchState.CONCLUDED, "done")
         if error:
             return error, 0.0
         
         if not self.scope:
             return "No active scope", 0.0
         
-        if not seeds:
-            return "No seeds provided", 0.0
+        if not reason or len(reason.strip()) < 5:
+            return "Please provide a reason why seeds are exhausted", 0.0
         
-        return self._write_assignments(
-            seeds=seeds,
-            synthetic=True,
-            source_ref=None,
-            source_url=None,
-        ), 0.0
+        self.is_done = True
+        remaining = self.scope.quota - self.seeds_submitted
+        
+        return f"Done. Submitted {self.seeds_submitted} seeds. Remaining {remaining} could not be filled. Reason: {reason}", 0.0
     
-    def _write_assignments(
-        self,
-        seeds: List[str],
-        synthetic: bool,
-        source_ref: Optional[str],
-        source_url: Optional[str],
-    ) -> str:
-        """Write assignment files for seeds."""
-        dir_id = short_id()
-        assignment_dir = self.workspace_dir / "assignments" / dir_id
-        assignment_dir.mkdir(parents=True, exist_ok=True)
-        
-        all_notes = self.scope.parent_notes + self.scope.notes
-        
-        written = 0
-        for i, seed in enumerate(seeds):
-            if not seed.strip():
-                continue
-            
-            assignment = {
-                "scope_id": self.scope.id,
-                "scope_description": self.scope.description,
-                "seed": seed,
-                "notes": all_notes,
-                "research_summary": self.research_summary,
-                "schema": self.schema,
-                "synthetic": synthetic,
-                "source_ref": source_ref,
-                "source_url": source_url,
-            }
-            
-            filepath = assignment_dir / f"{i:04d}.json"
-            filepath.write_text(
-                json.dumps(assignment, indent=2, ensure_ascii=False),
-                encoding='utf-8'
-            )
-            written += 1
-        
-        self.assignment_dirs.append(str(assignment_dir))
-        
-        kind = "synthetic" if synthetic else "extracted"
-        return f"Created {written} {kind} assignments in {dir_id}/"
+    @property
+    def remaining_quota(self) -> int:
+        """Get remaining quota for this scope."""
+        if not self.scope:
+            return 0
+        return max(0, self.scope.quota - self.seeds_submitted)
+    
+    @property
+    def quota_filled(self) -> bool:
+        """Check if quota is filled."""
+        return self.remaining_quota == 0
     
     # =========================================================================
     # interact (Browser Agent)
@@ -482,191 +1025,70 @@ class ResearchTools:
         """
         Use Browser Agent for complex interactions on a page.
         
-        The browser agent performs actions (clicking, typing, navigating).
-        It calls checkpoint() to report status and get instructions from you.
-        You stay in control - the browser agent just executes actions.
-        
-        Args:
-            url_or_ref_id: URL to start at, or ref_id of existing page
-            task: Initial task description for the browser agent
+        Uses the SAME browser session as open() - no context switching.
         """
-        if not self.browser:
-            return "Browser not initialized", 0.0
+        if not BROWSER_AVAILABLE:
+            return "browser-use not installed", 0.0
         
         if not self.openai_client:
             return "OpenAI client not initialized for interact()", 0.0
         
+        # Get our browser session
+        session = await self._get_browser()
+        
         # Resolve URL
         url = url_or_ref_id
-        page = self.artifacts.get_page(url_or_ref_id)
-        if page:
-            url = page.url
+        page_artifact = self.artifacts.get_page(url_or_ref_id)
+        if page_artifact:
+            url = page_artifact.url
         elif not url.startswith(("http://", "https://")):
             url = "https://" + url
         
-        try:
-            from browser_use import Agent
-            from browser_use.llm.openai.chat import ChatOpenAI
-        except ImportError:
-            return "browser-use not installed", 0.0
-        
-        # Create browser-use LLM
-        browser_llm = ChatOpenAI(model=self.model)
-        
-        # Track total cost from browser agent
         total_cost = 0.0
         
-        # Checkpoint state
-        checkpoint_count = 0
-        should_stop_session = False
-        final_page_content = None
-        final_url = url
-        
-        # Custom checkpoint tool for browser agent
-        from browser_use import Tools
-        tools = Tools()
-        
-        @tools.action(description="""Report your status and get instructions from the research coordinator.
-Call this when you:
-- Complete an action (logged in, clicked something, loaded page)
-- Reach a decision point
-- Need guidance on what to do next
-- Encounter an obstacle
-
-Describe what you did and what you see now.""")
-        async def checkpoint(status: str, browser_session) -> str:
-            nonlocal checkpoint_count, should_stop_session, final_page_content, final_url, total_cost
-            
-            checkpoint_count += 1
-            
-            if self._should_stop():
-                should_stop_session = True
-                return "STOP - Session ending. Call done() now."
-            
-            try:
-                # Capture current page
-                current_url = await browser_session.page.evaluate('() => window.location.href')
-                html = await browser_session.page.evaluate('() => document.body.innerHTML')
-                markdown = md(html, heading_style='ATX', strip=['script', 'style'])
-                
-                final_url = current_url
-                final_page_content = markdown
-                
-                # Create page artifact for research agent to see
-                lines = markdown.split('\n')
-                links = extract_links_from_markdown(markdown, current_url)
-                
-                page_view = PageView(
-                    url=current_url,
-                    fetched_at=datetime.now(timezone.utc).isoformat(),
-                    lines=lines,
-                    total_lines=len(lines),
-                    links=links,
-                )
-                ref_id = self.artifacts.store_page(page_view)
-                
-                # Format page content for research agent
-                config = self._get_config("medium")
-                viewport = format_viewport(lines, 0, config["lines"], ref_id, current_url)
-                links_table = format_links_table(links)
-                
-                # Build prompt for research agent
-                checkpoint_prompt = f"""Browser agent checkpoint #{checkpoint_count}
-
-Status from browser agent: {status}
-
-Current page:
-{viewport}
-{links_table}
-
-What should the browser agent do next? 
-- Give a brief instruction for the next action
-- Or say "done" to end the browser session and continue with this page"""
-
-                # Call research agent LLM for instructions
-                messages = [
-                    {"role": "system", "content": "You are coordinating a browser agent. Give brief, clear instructions for the next action, or say 'done' to end the session."},
-                    {"role": "user", "content": checkpoint_prompt}
-                ]
-                
-                response, cost = await self.openai_client.responses_create(
-                    model=self.model,
-                    input=messages,
-                    max_output_tokens=500,
-                )
-                total_cost += cost.total_cost_usd
-                
-                # Extract response text
-                instructions = ""
-                for item in response.output:
-                    if item.type == "message":
-                        for content in item.content:
-                            if hasattr(content, 'text'):
-                                instructions += content.text
-                
-                instructions = instructions.strip()
-                
-                logger.info(f"[interact] Checkpoint {checkpoint_count}: {status[:50]}...")
-                logger.info(f"[interact] Instructions: {instructions[:100]}...")
-                
-                # Check if research agent wants to end
-                if any(phrase in instructions.lower() for phrase in ["done", "end session", "that's enough", "stop"]):
-                    should_stop_session = True
-                    return f"{instructions}\n\nCall done() to end the browser session."
-                
-                return instructions
-                
-            except Exception as e:
-                logger.error(f"[interact] Checkpoint failed: {e}")
-                return f"Checkpoint error: {e}. Continue with your best judgment or call done()."
-        
-        # Run browser agent
         try:
-            agent_task = f"""Navigate to {url} and: {task}
-
-IMPORTANT: Call checkpoint() frequently to report status and get instructions.
-- After completing any action
-- When you see new content
-- When you're unsure what to do
-
-The research coordinator will guide you through checkpoint responses."""
-
+            # Create browser-use LLM
+            browser_llm = ChatOpenAI(model=self.model)
+            
             agent = Agent(
-                task=agent_task,
-                browser=self.browser,
+                task=f"Navigate to {url} and: {task}",
+                browser_session=session,
                 llm=browser_llm,
-                tools=tools,
                 calculate_cost=True,
             )
             
             history = await agent.run(max_steps=30)
             
-            # Get browser agent cost
-            if history.usage:
-                total_cost += history.usage.total_cost
+            # Get cost
+            if hasattr(history, 'usage') and history.usage:
+                if hasattr(history.usage, 'total_cost'):
+                    total_cost += history.usage.total_cost
             
-            # Create final artifact if we have page content
-            final_ref_id = None
-            if final_page_content:
-                lines = final_page_content.split('\n')
-                links = extract_links_from_markdown(final_page_content, final_url)
-                
-                page_view = PageView(
-                    url=final_url,
-                    fetched_at=datetime.now(timezone.utc).isoformat(),
-                    lines=lines,
-                    total_lines=len(lines),
-                    links=links,
-                )
-                final_ref_id = self.artifacts.store_page(page_view)
+            # Capture final page state as artifact
+            try:
+                current_page = await session.get_current_page()
+                if current_page:
+                    current_url = await current_page.evaluate('() => window.location.href')
+                    html = await current_page.evaluate('() => document.body.innerHTML')
+                    markdown = md(html, heading_style='ATX')
+                    
+                    lines = markdown.split('\n')
+                    links = extract_links_from_markdown(markdown, current_url)
+                    
+                    page_view = PageView(
+                        url=current_url,
+                        fetched_at=datetime.now(timezone.utc).isoformat(),
+                        lines=lines,
+                        total_lines=len(lines),
+                        links=links,
+                    )
+                    final_ref_id = self.artifacts.store_page(page_view)
+                    
+                    return f"Browser session completed. Final page stored as {final_ref_id}", total_cost
+            except Exception as e:
+                logger.warning(f"[interact] Could not capture final state: {e}")
             
-            success = history.is_successful() if hasattr(history, 'is_successful') else True
-            
-            result = f"Browser session completed ({checkpoint_count} checkpoints)"
-            if final_ref_id:
-                result += f"\nFinal page stored as {final_ref_id} - use open({final_ref_id}) to explore"
-            
-            return result, total_cost
+            return "Browser session completed", total_cost
             
         except Exception as e:
             logger.error(f"[interact] Browser agent failed: {e}")
@@ -676,8 +1098,18 @@ The research coordinator will guide you through checkpoint responses."""
     # Tool Definitions for LLM
     # =========================================================================
     
-    def get_tool_definitions(self) -> List[Dict]:
-        """Get Responses API format tool definitions."""
+    def get_tool_definitions(self, phase: str = None) -> List[Dict]:
+        """Get tool definitions for current or specified phase."""
+        if phase is None:
+            phase = "research" if self.state == ResearchState.RESEARCHING else "decision"
+        
+        if phase == "research":
+            return self._research_tools()
+        else:
+            return self._decision_tools()
+    
+    def _research_tools(self) -> List[Dict]:
+        """Tools available during research phase."""
         return [
             {
                 "type": "function",
@@ -788,14 +1220,54 @@ The research coordinator will guide you through checkpoint responses."""
             },
             {
                 "type": "function",
+                "name": "list_files",
+                "description": "List available files (uploads and downloads) with metadata preview.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "directory": {
+                            "type": "string",
+                            "enum": ["uploads", "downloads", "all"],
+                            "description": "Which directory to list (default: all)"
+                        }
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "name": "code_exec",
+                "description": """Execute Python code with file access.
+
+Available:
+- list_files(), file_info(path) - File utilities
+- pandas, pdfplumber, openpyxl (if installed)
+
+Files at /workspace/uploads/ and /workspace/downloads/""",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "script": {
+                            "type": "string",
+                            "description": "Python code to execute"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "What this code does"
+                        }
+                    },
+                    "required": ["script"]
+                }
+            },
+            {
+                "type": "function",
                 "name": "conclude_research",
-                "description": "Conclude research and transition to decision mode. MUST be called before breakdown() or seeding. Briefly summarize what you learned.",
+                "description": "Conclude research phase and transition to decision phase. Summarize what you learned about the domain. After this, your tools will change to breakdown/seeding tools.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "summary": {
                             "type": "string",
-                            "description": "Brief summary of research findings and what you learned about the domain"
+                            "description": "Summary of research findings and domain understanding"
                         },
                     },
                     "required": ["summary"]
@@ -803,8 +1275,32 @@ The research coordinator will guide you through checkpoint responses."""
             },
             {
                 "type": "function",
+                "name": "interact",
+                "description": "Use Browser Agent for complex page interactions (login, forms, JS-heavy pages, pagination). Uses same browser as open().",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url_or_ref_id": {
+                            "type": "string",
+                            "description": "URL or ref_id to interact with"
+                        },
+                        "task": {
+                            "type": "string",
+                            "description": "What to accomplish (e.g., 'login', 'click Load More')"
+                        },
+                    },
+                    "required": ["url_or_ref_id", "task"]
+                }
+            },
+        ]
+    
+    def _decision_tools(self) -> List[Dict]:
+        """Tools available during decision/seeding phase."""
+        return [
+            {
+                "type": "function",
                 "name": "breakdown",
-                "description": "Break scope into sub-scopes. Use when domain is too broad. Requires conclude_research() first.",
+                "description": "Break scope into sub-scopes. Each child becomes its own research agent.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -826,68 +1322,111 @@ The research coordinator will guide you through checkpoint responses."""
             },
             {
                 "type": "function",
-                "name": "extract_seeds",
-                "description": "Extract seeds from page content by line ranges. Use when source has actual row items. Requires conclude_research() first.",
+                "name": "submit_seed",
+                "description": "Submit a seed for row generation. Provide source extraction (ref_id + lines), written content, or both.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "ref_id": {
                             "type": "string",
-                            "description": "Page ref_id containing items"
+                            "description": "Page ref_id to extract from (optional)"
                         },
-                        "line_ranges": {
+                        "lines": {
                             "type": "array",
-                            "items": {
-                                "type": "array",
-                                "items": {"type": "integer"},
-                                "minItems": 2,
-                                "maxItems": 2
-                            },
-                            "description": "[[start, end], ...] line ranges to extract"
+                            "items": {"type": "integer"},
+                            "minItems": 2,
+                            "maxItems": 2,
+                            "description": "[start, end] line range to extract (requires ref_id)"
                         },
-                    },
-                    "required": ["ref_id", "line_ranges"]
+                        "content": {
+                            "type": "string",
+                            "description": "Written seed content or additional context (optional)"
+                        },
+                    }
                 }
             },
             {
                 "type": "function",
-                "name": "write_seeds",
-                "description": "Write seeds. Use when you understand what rows should be. Requires conclude_research() first.",
+                "name": "done",
+                "description": "Finish when seeds are exhausted before reaching quota. Use when seeds are finite (real items that exist or don't) and you've found all that exist. Don't use to quit early.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "seeds": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Seed descriptions - each becomes one row assignment"
+                        "reason": {
+                            "type": "string",
+                            "description": "Why seeds are exhausted"
                         },
                     },
-                    "required": ["seeds"]
+                    "required": ["reason"]
                 }
             },
             {
                 "type": "function",
-                "name": "interact",
-                "description": "Use Browser Agent for complex page interactions (login, forms, JS-heavy pages, pagination). You stay in control via checkpoints.",
+                "name": "note",
+                "description": "Record a note. Use to track coverage while seeding.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "url_or_ref_id": {
+                        "content": {
                             "type": "string",
-                            "description": "URL or ref_id to interact with"
-                        },
-                        "task": {
-                            "type": "string",
-                            "description": "What to accomplish (e.g., 'login', 'click Load More')"
+                            "description": "What you observed or decided"
                         },
                     },
-                    "required": ["url_or_ref_id", "task"]
+                    "required": ["content"]
+                }
+            },
+            {
+                "type": "function",
+                "name": "brave_search",
+                "description": "Search the web. Still available if you need to check something while seeding.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query"
+                        },
+                        "response_length": {
+                            "type": "string",
+                            "enum": ["short", "medium", "long"],
+                            "description": "short=5, medium=10, long=20 results"
+                        },
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
+                "type": "function",
+                "name": "open",
+                "description": "Open a URL or view lines from existing page. Still available for reference.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "ref_id_or_url": {
+                            "type": "string",
+                            "description": "URL to fetch, or ref_id (p0, p1...) to view existing"
+                        },
+                        "start_line": {
+                            "type": "integer",
+                            "description": "Line to start from (default: 0)"
+                        },
+                        "response_length": {
+                            "type": "string",
+                            "enum": ["short", "medium", "long"],
+                            "description": "short=60, medium=150, long=300 lines"
+                        },
+                    },
+                    "required": ["ref_id_or_url"]
                 }
             },
         ]
     
     async def execute_tool(self, name: str, args: Dict) -> Tuple[str, float]:
         """Execute tool by name with args. Returns (result, cost)."""
+        # Track research activity
+        if name in ("brave_search", "open", "click", "find", "interact"):
+            self.research_actions += 1
+        
         try:
             if name == "brave_search":
                 return await self.brave_search(
@@ -919,20 +1458,30 @@ The research coordinator will guide you through checkpoint responses."""
             elif name == "note":
                 return self.note(content=args.get("content", ""))
             
+            elif name == "list_files":
+                return await self.list_files(directory=args.get("directory", "all"))
+            
+            elif name == "code_exec":
+                return await self.code_exec(
+                    script=args.get("script", ""),
+                    description=args.get("description", ""),
+                )
+            
             elif name == "conclude_research":
                 return self.conclude_research(summary=args.get("summary", ""))
             
             elif name == "breakdown":
                 return self.breakdown(children=args.get("children", []))
             
-            elif name == "extract_seeds":
-                return await self.extract_seeds(
-                    ref_id=args.get("ref_id", ""),
-                    line_ranges=args.get("line_ranges", []),
+            elif name == "submit_seed":
+                return self.submit_seed(
+                    ref_id=args.get("ref_id"),
+                    lines=args.get("lines"),
+                    content=args.get("content"),
                 )
             
-            elif name == "write_seeds":
-                return self.write_seeds(seeds=args.get("seeds", []))
+            elif name == "done":
+                return self.done(reason=args.get("reason", ""))
             
             elif name == "interact":
                 return await self.interact(

@@ -42,7 +42,10 @@ class WorkerSettings(BaseSettings):
     billing_charge_interval_seconds: int = 60  # Charge at least every 60 seconds
 
     brave_api_key: str
+    brave_search_rps: float = 0.5  # requests per second
+
     research_model: str = "gpt-5.2"
+    generation_model: str = "gpt-5.2"
     summarize_model: str = "gpt-5-nano"
 
 

@@ -167,7 +167,9 @@ def format_search_results(results: SearchResults, ref_id: str, limit: int) -> st
     
     output = [f"[{ref_id}] Search results for: {results.query}\n"]
     for r in results.results[:limit]:
-        output.append(f"[{r.id}] {r.title}")
+        # Include date if available
+        date_str = f" ({r.date})" if r.date else ""
+        output.append(f"[{r.id}] {r.title}{date_str}")
         output.append(f"    {r.snippet[:200]}")
         output.append(f"    URL: {r.url}")
         output.append("")

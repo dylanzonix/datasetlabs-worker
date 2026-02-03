@@ -25,9 +25,12 @@ logger = logging.getLogger(__name__)
 @dataclass
 class RetryConfig:
     """Configuration for additional retry behavior (after OpenAI's built-in retries fail)."""
+
     # Extra retries after OpenAI gives up (for persistent rate limits)
     extra_retries_on_rate_limit: int = 3
-    extra_retry_base_delay: float = 30.0  # Start with longer delay since OpenAI already tried short ones
+    extra_retry_base_delay: float = (
+        30.0  # Start with longer delay since OpenAI already tried short ones
+    )
     extra_retry_max_delay: float = 120.0
 
 
@@ -38,7 +41,7 @@ def calculate_backoff(
     jitter: float = 0.3,
 ) -> float:
     """Calculate backoff delay with exponential growth and jitter."""
-    delay = base_delay * (2 ** attempt)
+    delay = base_delay * (2**attempt)
     delay = min(delay, max_delay)
     delay += delay * jitter * random.random()
     return delay
@@ -98,7 +101,7 @@ class ResilientClient:
         OpenAI's client handles transient retries.
         We add proactive rate limiting and extra retries for persistent 429s.
         """
-        model = api_kwargs.get('model', 'unknown')
+        model = api_kwargs.get("model", "unknown")
         self._total_requests += 1
         config = self._retry_config
 
@@ -106,7 +109,9 @@ class ResilientClient:
             try:
                 # Proactive rate limiting - wait if we're near limits
                 if self._rate_limiter:
-                    wait_time = await self._rate_limiter.acquire(model, estimated_tokens)
+                    wait_time = await self._rate_limiter.acquire(
+                        model, estimated_tokens
+                    )
                     if wait_time > 0:
                         self._total_rate_limit_waits += 1
 
@@ -114,15 +119,14 @@ class ResilientClient:
                 result = await operation(**api_kwargs)
 
                 # Record successful request for rate tracking
-                if self._rate_limiter and hasattr(result, 'usage'):
+                if self._rate_limiter and hasattr(result, "usage"):
                     total_tokens = 0
-                    if hasattr(result.usage, 'total_tokens'):
+                    if hasattr(result.usage, "total_tokens"):
                         total_tokens = result.usage.total_tokens
-                    elif hasattr(result.usage, 'input_tokens'):
-                        total_tokens = (
-                            getattr(result.usage, 'input_tokens', 0) +
-                            getattr(result.usage, 'output_tokens', 0)
-                        )
+                    elif hasattr(result.usage, "input_tokens"):
+                        total_tokens = getattr(
+                            result.usage, "input_tokens", 0
+                        ) + getattr(result.usage, "output_tokens", 0)
                     await self._rate_limiter.record(model, total_tokens)
 
                 return result
@@ -150,9 +154,11 @@ class ResilientClient:
 
             except openai.APIStatusError as e:
                 # Check if it's a rate limit that wasn't caught as RateLimitError
-                if getattr(e, 'status_code', 0) == 429:
+                if getattr(e, "status_code", 0) == 429:
                     if extra_attempt >= config.extra_retries_on_rate_limit:
-                        logger.error(f"Rate limit (429) persists for {model}, giving up")
+                        logger.error(
+                            f"Rate limit (429) persists for {model}, giving up"
+                        )
                         raise
 
                     self._total_extra_retries += 1
@@ -161,7 +167,9 @@ class ResilientClient:
                         config.extra_retry_base_delay,
                         config.extra_retry_max_delay,
                     )
-                    logger.warning(f"Rate limit (429) for {model}, waiting {delay:.1f}s")
+                    logger.warning(
+                        f"Rate limit (429) for {model}, waiting {delay:.1f}s"
+                    )
                     await asyncio.sleep(delay)
                 else:
                     # Not a rate limit, don't retry
@@ -216,6 +224,7 @@ class ResilientClient:
             estimated_tokens=estimated_tokens,
             model=model,
             input=input,
+            reasoning={"summary": "auto"},
             **kwargs,
         )
 

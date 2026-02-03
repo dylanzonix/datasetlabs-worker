@@ -1,14 +1,14 @@
 """
 Row Generator
 
-Agent that generates a single row from an assignment.
+Agent that generates a single row from a seed.
 
 Has full tool access:
 - web_search
-- browse
+- browse  
 - code_exec
 
-Takes an assignment (scope, notes, seed, schema) and produces one row.
+Takes a seed (scope, notes, content, schema) and produces one row.
 """
 
 import asyncio
@@ -21,10 +21,19 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from dsl_worker.config import settings
+from dsl_worker.phases.research_tools import Seed
 
 logger = logging.getLogger(__name__)
 
 MAX_GENERATION_TURNS = 15
+
+# Browser-use imports
+try:
+    from browser_use import Browser
+    BROWSER_AVAILABLE = True
+except ImportError:
+    Browser = None
+    BROWSER_AVAILABLE = False
 
 
 @dataclass
@@ -38,14 +47,9 @@ class GeneratedRow:
 
 class RowGenerator:
     """
-    Generates a single row from an assignment.
+    Generates a single row from a seed.
     
-    Each assignment file contains:
-    - scope_description: what this row should be
-    - seed: concrete anchor for this row
-    - notes: facts/constraints from research
-    - research_summary: summary of research findings
-    - schema: column definitions
+    Each generator can create its own browser if needed for web tasks.
     """
     
     def __init__(
@@ -53,19 +57,45 @@ class RowGenerator:
         workspace_dir: Path,
         openai_client: Any,
         brave_api_key: Optional[str] = None,
-        browser: Optional[Any] = None,
         sandbox: Optional[Any] = None,
         stop_checker: Optional[Callable[[], bool]] = None,
     ):
         self.workspace_dir = Path(workspace_dir)
         self.openai_client = openai_client
         self.brave_api_key = brave_api_key
-        self.browser = browser
         self.sandbox = sandbox
         self.stop_checker = stop_checker
+        
+        # Browser - lazy initialized if needed
+        self._browser: Optional[Any] = None
     
     def _should_stop(self) -> bool:
         return self.stop_checker and self.stop_checker()
+    
+    async def _get_browser(self) -> Any:
+        """Get or create browser for this generator."""
+        if not BROWSER_AVAILABLE:
+            return None
+        
+        if self._browser is None:
+            self._browser = Browser(
+                headless=False,
+                downloads_path=str(self.workspace_dir / "downloads"),
+                auto_download_pdfs=True,
+            )
+            await self._browser.start()
+            logger.debug("[RowGenerator] Browser started")
+        
+        return self._browser
+    
+    async def cleanup(self):
+        """Cleanup browser."""
+        if self._browser:
+            try:
+                await self._browser.stop()
+            except Exception as e:
+                logger.warning(f"[RowGenerator] Browser cleanup error: {e}")
+            self._browser = None
     
     async def generate(self, assignment: Dict) -> GeneratedRow:
         """Generate a single row from an assignment."""
@@ -153,7 +183,10 @@ class RowGenerator:
                 
                 if not any(item.type == "function_call" for item in response.output):
                     messages.append({"role": "assistant", "content": response.output_text})
-                    messages.append({"role": "user", "content": "Continue. Use set_column() to fill columns and submit_row() when done."})
+                    messages.append({
+                        "role": "user",
+                        "content": "Continue. Use set_column() to fill columns and submit_row() when done."
+                    })
                 
             except Exception as e:
                 logger.error(f"[RowGenerator] Error: {e}")
@@ -330,46 +363,68 @@ Be accurate. Follow the notes/constraints.
         
         import httpx
         
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    "https://api.search.brave.com/res/v1/web/search",
-                    params={"q": query, "count": 5},
-                    headers={"X-Subscription-Token": self.brave_api_key},
-                    timeout=30.0,
-                )
-                response.raise_for_status()
-                data = response.json()
+        max_retries = 3
+        base_delay = 1.0
+        
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(
+                        "https://api.search.brave.com/res/v1/web/search",
+                        params={"q": query, "count": 5},
+                        headers={"X-Subscription-Token": self.brave_api_key},
+                        timeout=30.0,
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    results = []
+                    for r in data.get("web", {}).get("results", []):
+                        results.append(
+                            f"- {r.get('title', '')}: {r.get('description', '')}\n"
+                            f"  {r.get('url', '')}"
+                        )
+                    
+                    return "\n".join(results) if results else "No results"
+                    
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429 or e.response.status_code >= 500:
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)
+                        await asyncio.sleep(delay)
+                        continue
+                return f"Search error: {e}"
                 
-                results = []
-                for r in data.get("web", {}).get("results", []):
-                    results.append(f"- {r.get('title', '')}: {r.get('description', '')}\n  {r.get('url', '')}")
-                
-                return "\n".join(results) if results else "No results"
-                
-        except Exception as e:
-            return f"Search error: {e}"
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    await asyncio.sleep(delay)
+                    continue
+                return f"Search error: {e}"
+        
+        return "Search failed after retries"
     
     async def _do_browse(self, url: str) -> str:
         """Browse a URL."""
-        if not self.browser:
+        browser = await self._get_browser()
+        if not browser:
             return "Browser not available"
         
         from markdownify import markdownify as md
         
         try:
-            page = await self.browser.new_page(url)
+            page = await browser.new_page(url)
             await asyncio.sleep(2.0)
             
             try:
                 html = await page.evaluate('() => document.body.innerHTML')
-                markdown = md(html, heading_style='ATX', strip=['script', 'style'])
+                markdown = md(html, heading_style='ATX')
                 
                 if len(markdown) > 3000:
                     return markdown[:3000] + f"\n\n[...truncated, {len(markdown)} total chars]"
                 return markdown
             finally:
-                await self.browser.close_page(page)
+                await browser.close_page(page)
                 
         except Exception as e:
             return f"Browse error: {e}"
@@ -391,7 +446,7 @@ Be accurate. Follow the notes/constraints.
 
 
 class GenerationWorkerPool:
-    """Pool of workers that process assignment directories."""
+    """Pool of workers that process seeds."""
     
     def __init__(
         self,
@@ -401,11 +456,12 @@ class GenerationWorkerPool:
         project_id: Any,
         version_id: Any,
         brave_api_key: Optional[str] = None,
-        browser: Optional[Any] = None,
+        browser: Optional[Any] = None,  # Ignored - each generator creates own if needed
         sandbox: Optional[Any] = None,
         num_workers: int = 10,
         stop_checker: Optional[Callable[[], bool]] = None,
         cost_tracker: Optional[Any] = None,
+        checkpoint_callback: Optional[Callable[[int, bool, Optional[str]], Any]] = None,
     ):
         self.workspace_dir = Path(workspace_dir)
         self.openai_client = openai_client
@@ -413,11 +469,11 @@ class GenerationWorkerPool:
         self.project_id = project_id
         self.version_id = version_id
         self.brave_api_key = brave_api_key
-        self.browser = browser
         self.sandbox = sandbox
         self.num_workers = num_workers
         self.stop_checker = stop_checker
         self.cost_tracker = cost_tracker
+        self.checkpoint_callback = checkpoint_callback
         
         self._total_cost = 0.0
         self._rows_generated = 0
@@ -426,24 +482,33 @@ class GenerationWorkerPool:
     def _should_stop(self) -> bool:
         return self.stop_checker and self.stop_checker()
     
-    async def process_directory(self, assignment_dir: str) -> Tuple[int, int]:
-        """Process all assignments in a directory. Returns (success_count, error_count)."""
-        dir_path = Path(assignment_dir)
-        if not dir_path.exists():
-            logger.warning(f"[GenerationPool] Directory not found: {assignment_dir}")
+    async def process_seeds(self, seeds: List[Seed], schema: List[Dict]) -> Tuple[int, int]:
+        """Process seeds directly. Returns (success_count, error_count)."""
+        if not seeds:
+            logger.warning("[GenerationPool] No seeds to process")
             return 0, 0
         
-        assignment_files = sorted(dir_path.glob("*.json"))
+        logger.info(f"[GenerationPool] Processing {len(seeds)} seeds with {self.num_workers} workers")
         
-        if not assignment_files:
-            logger.warning(f"[GenerationPool] No assignments in: {assignment_dir}")
-            return 0, 0
+        # Convert seeds to assignment dicts
+        assignments = []
+        for seed in seeds:
+            assignment = {
+                "scope_id": seed.scope_id,
+                "scope_description": seed.scope_description,
+                "seed": seed.content,
+                "notes": seed.notes,
+                "research_summary": seed.research_summary,
+                "schema": schema,
+                "source_ref": seed.source_ref,
+                "source_url": seed.source_url,
+            }
+            assignments.append(assignment)
         
-        logger.info(f"[GenerationPool] Processing {len(assignment_files)} assignments from {dir_path.name}")
-        
+        # Create queue with (index, assignment) pairs
         queue = asyncio.Queue()
-        for f in assignment_files:
-            await queue.put(f)
+        for i, assignment in enumerate(assignments):
+            await queue.put((i, assignment))
         
         success_count = 0
         error_count = 0
@@ -452,60 +517,74 @@ class GenerationWorkerPool:
         async def worker():
             nonlocal success_count, error_count
             
+            # Each worker gets its own generator (with potential for own browser)
             generator = RowGenerator(
                 workspace_dir=self.workspace_dir,
                 openai_client=self.openai_client,
                 brave_api_key=self.brave_api_key,
-                browser=self.browser,
                 sandbox=self.sandbox,
                 stop_checker=self.stop_checker,
             )
             
-            while True:
-                if self._should_stop():
-                    break
-                
-                try:
-                    assignment_file = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                
-                try:
-                    assignment = json.loads(assignment_file.read_text())
-                    result = await generator.generate(assignment)
+            try:
+                while True:
+                    if self._should_stop():
+                        break
                     
-                    self._total_cost += result.cost_usd
+                    try:
+                        index, assignment = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
                     
-                    if result.success and result.row:
-                        await self._save_row(result.row, assignment)
+                    try:
+                        result = await generator.generate(assignment)
                         
-                        async with lock:
-                            success_count += 1
-                            self._rows_generated += 1
+                        self._total_cost += result.cost_usd
                         
-                        if success_count % 10 == 0:
-                            logger.info(f"[GenerationPool] Generated {success_count} rows...")
-                    else:
+                        row_id = None
+                        if result.success and result.row:
+                            row_id = await self._save_row(result.row, assignment)
+                            
+                            async with lock:
+                                success_count += 1
+                                self._rows_generated += 1
+                            
+                            if success_count % 10 == 0:
+                                logger.info(f"[GenerationPool] Generated {success_count} rows...")
+                            
+                            # Checkpoint callback
+                            if self.checkpoint_callback:
+                                await self.checkpoint_callback(index, True, row_id)
+                        else:
+                            async with lock:
+                                error_count += 1
+                                self._errors += 1
+                            logger.warning(f"[GenerationPool] Failed: {result.error}")
+                            
+                            # Checkpoint callback for failure
+                            if self.checkpoint_callback:
+                                await self.checkpoint_callback(index, False, None)
+                            
+                    except Exception as e:
+                        logger.error(f"[GenerationPool] Error processing seed: {e}")
                         async with lock:
                             error_count += 1
                             self._errors += 1
-                        logger.warning(f"[GenerationPool] Failed: {result.error}")
                         
-                except Exception as e:
-                    logger.error(f"[GenerationPool] Error processing {assignment_file}: {e}")
-                    async with lock:
-                        error_count += 1
-                        self._errors += 1
+                        if self.checkpoint_callback:
+                            await self.checkpoint_callback(index, False, None)
+            finally:
+                await generator.cleanup()
         
         workers = [asyncio.create_task(worker()) for _ in range(self.num_workers)]
         await asyncio.gather(*workers)
         
-        logger.info(f"[GenerationPool] Completed {dir_path.name}: {success_count} success, {error_count} errors")
+        logger.info(f"[GenerationPool] Completed: {success_count} success, {error_count} errors")
         
         return success_count, error_count
     
-    async def _save_row(self, row: Dict, assignment: Dict):
-        """Save generated row to database."""
+    async def _save_row(self, row: Dict, assignment: Dict) -> Optional[str]:
+        """Save generated row to database. Returns row ID."""
         from sqlalchemy import func as sql_func
         from dsl_api.models.project_version import ProjectVersion
         from dsl_api.models.sample import Sample
@@ -513,6 +592,8 @@ class GenerationWorkerPool:
         row_json = json.dumps(row, ensure_ascii=False)
         clean_json = row_json.replace('\\u0000', '').replace('\x00', '')
         clean_row = json.loads(clean_json)
+        
+        row_id = str(uuid.uuid4())
         
         try:
             self.db.query(ProjectVersion).filter(
@@ -526,7 +607,7 @@ class GenerationWorkerPool:
             )
             
             sample = Sample(
-                id=uuid.uuid4(),
+                id=uuid.UUID(row_id),
                 project_id=self.project_id,
                 version_id=self.version_id,
                 seq=max_seq + 1,
@@ -543,6 +624,8 @@ class GenerationWorkerPool:
             )
             
             self.db.commit()
+            
+            return row_id
             
         except Exception as e:
             logger.error(f"[GenerationPool] Save failed: {e}")

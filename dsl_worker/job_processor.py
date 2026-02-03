@@ -1,10 +1,10 @@
 """
-Job Processor v3 - Simplified pipeline
+Job Processor - Simplified pipeline
 
 Pipeline:
 1. Create root scope from user spec
-2. Run scope processor (recursive research/breakdown)
-3. Run generation workers on assignment directories
+2. Run scope processor (recursive research/breakdown) - each scope gets own browser
+3. Run generation workers on seeds
 """
 
 import asyncio
@@ -27,18 +27,11 @@ from dsl_api.models.project_event import ProjectEvent
 from dsl_worker.config import settings
 from dsl_worker.project_state import ProjectState
 from dsl_worker.billing import CostTracker, TrackedOpenAIClient
+from dsl_worker.checkpoint import CheckpointManager, checkpoints_to_seeds
 
 from dsl_worker.phases.scope_processor import ScopeProcessor, Scope
 from dsl_worker.phases.row_generator import GenerationWorkerPool
 from dsl_worker.phases.sandbox import SandboxExecutor
-
-# Try to import browser-use
-try:
-    from browser_use import Browser
-    BROWSER_AVAILABLE = True
-except ImportError:
-    Browser = None
-    BROWSER_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -47,12 +40,10 @@ WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
 
 class JobProcessor:
     """
-    Simplified job processor.
+    Job processor for the pipeline.
     
-    Flow:
-    1. Load user spec
-    2. Run scope processor (creates assignments)
-    3. Run generation workers (creates rows)
+    Each scope creates its own browser (no shared browser).
+    Checkpoints are saved to Azure Blob for pause/resume.
     """
     
     def __init__(
@@ -66,8 +57,7 @@ class JobProcessor:
         self.blob_service_client = blob_service_client
         self.should_stop = False
         
-        # Resources
-        self._browser: Optional[Any] = None
+        # Sandbox (shared - it's just a Docker pool)
         self._sandbox: Optional[SandboxExecutor] = None
     
     def request_stop(self):
@@ -202,82 +192,118 @@ class JobProcessor:
         workspace_dir = Path(f"./workspace_{project.id}_{version.id}")
         workspace_dir.mkdir(parents=True, exist_ok=True)
         (workspace_dir / "uploads").mkdir(exist_ok=True)
-        (workspace_dir / "web").mkdir(exist_ok=True)
-        (workspace_dir / "assignments").mkdir(exist_ok=True)
+        (workspace_dir / "downloads").mkdir(exist_ok=True)
         
-        # Load uploaded files
+        # Load uploaded files from blob
         await self._load_uploaded_files(state, workspace_dir)
         
-        # Initialize browser
-        if BROWSER_AVAILABLE:
-            self._browser = Browser(
-                headless=os.getenv("BROWSER_HEADLESS", "true").lower() in ("true", "1"),
-            )
-            await self._browser.start()
-            logger.info("[Pipeline] Browser initialized")
-        else:
-            logger.warning("[Pipeline] browser-use not available")
-            self._browser = None
+        # Build files metadata for research agent
+        files_metadata = []
+        for f in state.files_snapshot:
+            filename = f.get('filename', '')
+            size_bytes = f.get('size_bytes', 0)
+            if filename:
+                size_str = f"{size_bytes / 1024:.1f}KB" if size_bytes else ""
+                files_metadata.append(f"{filename} ({size_str})" if size_str else filename)
         
-        # Initialize sandbox
-        self._sandbox = SandboxExecutor(use_pool=True, pool_size=2)
+        # Initialize sandbox (shared across scopes)
+        self._sandbox = SandboxExecutor(use_pool=True, pool_size=3)
         
-        # Create root scope with SHORT description (full instructions are in system prompt)
-        # Extract first line or use generic description
-        first_line = state.generation_prompt.strip().split('\n')[0][:100]
-        root_description = first_line if first_line else "Root scope"
-        
-        root_scope = Scope(
-            description=root_description,
-            quota=state.num_samples,
-            notes=[],
+        # Initialize checkpoint manager
+        checkpoint_mgr = CheckpointManager(
+            blob_service_client=self.blob_service_client,
+            container_name=settings.azure_storage_container_name,
+            project_id=project.id,
+            version_id=version.id,
         )
+        checkpoint = await checkpoint_mgr.initialize()
         
-        logger.info(f"[Pipeline] Root scope: {state.num_samples} rows")
-        
-        # Run scope processor
-        logger.info("[Pipeline] Starting scope processor...")
-        
-        scope_processor = ScopeProcessor(
-            workspace_dir=workspace_dir,
-            schema=state.columns,
-            project_instructions=state.generation_prompt,
-            openai_client=tracked_client,
-            brave_api_key=settings.brave_api_key,
-            browser=self._browser,
-            stop_checker=self._make_stop_checker(state),
-        )
-        
-        try:
-            assignment_dirs = await scope_processor.process(root_scope)
-        except Exception as e:
-            logger.error(f"[Pipeline] Scope processor failed: {e}")
-            raise
-        
-        logger.info(f"[Pipeline] Created {len(assignment_dirs)} assignment directories")
-        
-        # Track scope processor cost
-        if cost_tracker and scope_processor.get_total_cost() > 0:
-            cost_tracker.add_cost(
-                phase="scope_processor",
-                cost_usd=scope_processor.get_total_cost(),
-                model=settings.research_model,
+        # Check if resuming
+        seeds = []
+        if checkpoint.current_phase == "generation" and checkpoint.seeds:
+            # Resume from generation phase
+            logger.info(
+                f"[Pipeline] Resuming generation: "
+                f"{len(checkpoint.processed_seed_indices)}/{len(checkpoint.seeds)} done"
             )
+            seeds = checkpoints_to_seeds(checkpoint.seeds)
+            
+        elif checkpoint.current_phase == "research":
+            # Run or resume research phase
+            logger.info("[Pipeline] Starting/resuming research phase...")
+            
+            # Create root scope
+            first_line = state.generation_prompt.strip().split('\n')[0][:100]
+            root_description = first_line if first_line else "Root scope"
+            
+            root_scope = Scope(
+                description=root_description,
+                quota=state.num_samples,
+                notes=[],
+            )
+            
+            # Run scope processor
+            # NOTE: No browser passed in - each scope creates its own
+            scope_processor = ScopeProcessor(
+                workspace_dir=workspace_dir,
+                schema=state.columns,
+                project_instructions=state.generation_prompt,
+                openai_client=tracked_client,
+                brave_api_key=settings.brave_api_key,
+                sandbox=self._sandbox,
+                files_metadata=files_metadata,
+                stop_checker=self._make_stop_checker(state),
+            )
+            
+            try:
+                seeds = await scope_processor.process(root_scope)
+            except Exception as e:
+                logger.error(f"[Pipeline] Scope processor failed: {e}")
+                raise
+            
+            logger.info(f"[Pipeline] Research complete: {len(seeds)} seeds")
+            
+            # Track scope processor cost
+            if scope_processor.get_total_cost() > 0:
+                cost_tracker.add_cost(
+                    phase="scope_processor",
+                    cost_usd=scope_processor.get_total_cost(),
+                    model=settings.research_model,
+                )
+                await checkpoint_mgr.add_cost(scope_processor.get_total_cost())
+            
+            # Save seeds to checkpoint
+            await checkpoint_mgr.add_seeds(seeds)
+            await checkpoint_mgr.set_phase("generation")
         
         # Check if we should continue
         state.refresh()
         if state.paused:
+            await checkpoint_mgr.force_save()
             self._handle_pause(db, project, version, cost_tracker)
             return True
         
         can_continue, stop_reason = cost_tracker.check_balance_and_charge()
         if not can_continue:
+            await checkpoint_mgr.force_save()
             self._handle_force_stop(db, project, version, cost_tracker, stop_reason)
             return False
         
-        # Run generation
-        logger.info("[Pipeline] Starting generation workers...")
+        if not seeds:
+            logger.warning("[Pipeline] No seeds to process")
+            self._handle_force_stop(db, project, version, cost_tracker, "No seeds generated")
+            return False
         
+        # Filter to pending seeds only
+        pending_indices = checkpoint.get_pending_seed_indices()
+        pending_seeds = [seeds[i] for i in pending_indices]
+        
+        logger.info(
+            f"[Pipeline] Starting generation: "
+            f"{len(pending_seeds)} pending of {len(seeds)} total"
+        )
+        
+        # Run generation
         generation_pool = GenerationWorkerPool(
             workspace_dir=workspace_dir,
             openai_client=tracked_client,
@@ -285,62 +311,67 @@ class JobProcessor:
             project_id=project.id,
             version_id=version.id,
             brave_api_key=settings.brave_api_key,
-            browser=self._browser,
+            browser=None,  # Each generator can create its own if needed
             sandbox=self._sandbox,
             num_workers=settings.generation_parallel_samples,
             stop_checker=self._make_stop_checker(state),
             cost_tracker=cost_tracker,
+            checkpoint_callback=lambda idx, success, row_id: asyncio.create_task(
+                checkpoint_mgr.mark_seed_processed(pending_indices[idx], success, row_id)
+            ),
         )
         
-        total_success = 0
-        total_errors = 0
+        total_success, total_errors = await generation_pool.process_seeds(
+            pending_seeds, state.columns
+        )
         
-        for assignment_dir in assignment_dirs:
-            if self.should_stop:
-                break
-            
-            state.refresh()
-            if state.paused:
-                break
-            
-            success, errors = await generation_pool.process_directory(assignment_dir)
-            total_success += success
-            total_errors += errors
-            
-            # Check balance periodically
-            can_continue, stop_reason = cost_tracker.check_balance_and_charge()
-            if not can_continue:
-                self._handle_force_stop(db, project, version, cost_tracker, stop_reason)
-                return False
+        # Check balance after generation
+        can_continue, stop_reason = cost_tracker.check_balance_and_charge()
+        if not can_continue:
+            await checkpoint_mgr.force_save()
+            self._handle_force_stop(db, project, version, cost_tracker, stop_reason)
+            return False
         
         # Log stats
         stats = generation_pool.get_stats()
-        logger.info(f"[Pipeline] Generation complete: {stats['rows_generated']} rows, {stats['errors']} errors")
+        logger.info(
+            f"[Pipeline] Generation complete: "
+            f"{stats['rows_generated']} rows, {stats['errors']} errors"
+        )
         
         # Track generation cost
-        if cost_tracker and stats['total_cost'] > 0:
+        if stats['total_cost'] > 0:
             cost_tracker.add_cost(
                 phase="generation",
                 cost_usd=stats['total_cost'],
                 model=settings.generation_model,
             )
+            await checkpoint_mgr.add_cost(stats['total_cost'])
         
         # Handle final state
         state.refresh()
         if state.paused:
+            await checkpoint_mgr.force_save()
             self._handle_pause(db, project, version, cost_tracker)
             return True
         
-        if total_success >= state.num_samples:
+        # Calculate total success (previous + this run)
+        total_processed = len(checkpoint.processed_seed_indices) + total_success
+        
+        if total_processed >= state.num_samples or total_processed >= len(seeds):
+            # Success - delete checkpoint
+            await checkpoint_mgr.delete()
             self._handle_completion(db, project, version, cost_tracker)
             return True
         
         if total_success > 0:
-            logger.warning(f"[Pipeline] Partial completion: {total_success}/{state.num_samples}")
+            logger.warning(f"[Pipeline] Partial completion: {total_processed}/{state.num_samples}")
+            await checkpoint_mgr.delete()
             self._handle_completion(db, project, version, cost_tracker)
             return True
         
         # No rows generated
+        await checkpoint_mgr.force_save()
         self._handle_force_stop(db, project, version, cost_tracker, "No rows generated")
         return False
     
@@ -380,12 +411,7 @@ class JobProcessor:
     
     async def _cleanup(self):
         """Cleanup resources."""
-        if self._browser:
-            try:
-                await self._browser.stop()
-            except Exception as e:
-                logger.warning(f"Browser cleanup error: {e}")
-            self._browser = None
+        # Note: No browser to cleanup - each scope cleans up its own
         
         if self._sandbox:
             try:
