@@ -423,7 +423,7 @@ You need the full picture before going specific. What exists in this space? What
 
 Before any tool calls, think about what you need to understand and note your initial questions. Then research broadly to answer them. As you learn, answers will lead to new questions - that's expected and good.
 
-Your first searches should establish fundamentals, not hunt for specific items. "What are the best cozy fantasy books" before "cozy fantasy bakery witch prompts." "What do real EV owners in India complain about" before "EV charging safety earthing RCCB."
+Your first searches should establish fundamentals, not hunt for specific items.
 
 ### Go deep where it matters
 

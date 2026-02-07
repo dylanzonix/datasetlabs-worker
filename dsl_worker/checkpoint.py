@@ -68,23 +68,27 @@ class PipelineCheckpoint:
     updated_at: str = ""
     
     # Phase tracking
-    current_phase: str = "research"  # 'research', 'generation', 'completed'
-    
-    # Scope tracking
-    # We don't store the full tree - just track what's done and what's pending
+    # 'orchestrator' | 'generation' | 'completed'
+    # Legacy: 'research' is treated as 'orchestrator' on load
+    current_phase: str = "orchestrator"
+
+    # Scope tracking (legacy, kept for backward compat)
     completed_scope_ids: List[str] = field(default_factory=list)
-    pending_scopes: List[Dict] = field(default_factory=list)  # ScopeCheckpoint as dict
-    
-    # Seeds (output of research, input to generation)
+    pending_scopes: List[Dict] = field(default_factory=list)
+
+    # Seeds (output of orchestrator/generators, input to generation)
     seeds: List[Dict] = field(default_factory=list)  # SeedCheckpoint as dict
-    
+
     # Generation progress
     # Just indices - actual rows are in DB
     processed_seed_indices: List[int] = field(default_factory=list)
-    
+
+    # Recipe written by orchestrator (stored for resume)
+    recipe: Optional[str] = None
+
     # Cost tracking
     total_cost_usd: float = 0.0
-    
+
     # Error tracking
     errors: List[Dict] = field(default_factory=list)
     
@@ -97,6 +101,12 @@ class PipelineCheckpoint:
     def from_json(cls, json_str: str) -> 'PipelineCheckpoint':
         """Deserialize from JSON string."""
         data = json.loads(json_str)
+        # Handle legacy "research" phase → "orchestrator"
+        if data.get("current_phase") == "research":
+            data["current_phase"] = "orchestrator"
+        # Handle missing recipe field from old checkpoints
+        if "recipe" not in data:
+            data["recipe"] = None
         return cls(**data)
     
     def add_completed_scope(self, scope_id: str):
@@ -133,6 +143,7 @@ class PipelineCheckpoint:
             "total_seeds": len(self.seeds),
             "processed_seeds": len(self.processed_seed_indices),
             "pending_seeds": len(self.seeds) - len(self.processed_seed_indices),
+            "has_recipe": self.recipe is not None,
             "total_cost_usd": self.total_cost_usd,
             "errors": len(self.errors),
         }
@@ -331,6 +342,29 @@ class CheckpointManager:
         
         await self.save(force=True)
     
+    async def set_recipe(self, recipe: str):
+        """Store the orchestrator's recipe for resume."""
+        async with self._lock:
+            self._checkpoint.recipe = recipe
+
+        await self.save(force=True)
+
+    async def add_seed_dict(self, seed: Dict):
+        """Add a single seed dict (from generator queue)."""
+        async with self._lock:
+            checkpoint_seed = {
+                "content": json.dumps(seed),
+                "scope_id": "generator",
+                "scope_description": "",
+                "notes": [],
+                "status": "pending",
+                "row_id": None,
+            }
+            self._checkpoint.seeds.append(checkpoint_seed)
+            self._pending_updates += 1
+
+        await self.save()
+
     async def add_cost(self, cost_usd: float):
         """Add to total cost."""
         async with self._lock:
