@@ -28,7 +28,8 @@ class SeedCheckpoint:
     research_summary: Optional[str] = None
     source_ref: Optional[str] = None
     source_url: Optional[str] = None
-    
+    bucket_id: Optional[str] = None
+
     # Generation status
     status: str = "pending"  # 'pending', 'completed', 'failed'
     row_id: Optional[str] = None
@@ -107,6 +108,10 @@ class PipelineCheckpoint:
         # Handle missing recipe field from old checkpoints
         if "recipe" not in data:
             data["recipe"] = None
+        # Ensure all seeds have bucket_id field (backward compat)
+        for seed in data.get("seeds", []):
+            if "bucket_id" not in seed:
+                seed["bucket_id"] = None
         return cls(**data)
     
     def add_completed_scope(self, scope_id: str):
@@ -349,14 +354,29 @@ class CheckpointManager:
 
         await self.save(force=True)
 
-    async def add_seed_dict(self, seed: Dict):
-        """Add a single seed dict (from generator queue)."""
+    async def add_seed_dict(self, seed_envelope: Dict):
+        """Add a single seed envelope (from generator queue).
+
+        Envelope format: {"data": ..., "bucket_id": ..., "generator_id": ...}
+        Also accepts raw seed dicts for backward compat.
+        """
         async with self._lock:
+            # Handle new envelope format vs legacy raw dict
+            if "data" in seed_envelope:
+                seed_data = seed_envelope["data"]
+                bucket_id = seed_envelope.get("bucket_id")
+                generator_id = seed_envelope.get("generator_id", "generator")
+            else:
+                seed_data = seed_envelope
+                bucket_id = None
+                generator_id = "generator"
+
             checkpoint_seed = {
-                "content": json.dumps(seed),
-                "scope_id": "generator",
+                "content": json.dumps(seed_data) if isinstance(seed_data, dict) else str(seed_data),
+                "scope_id": generator_id,
                 "scope_description": "",
                 "notes": [],
+                "bucket_id": bucket_id,
                 "status": "pending",
                 "row_id": None,
             }
@@ -406,6 +426,7 @@ def seeds_to_checkpoints(seeds: List['Seed']) -> List[SeedCheckpoint]:
             research_summary=s.research_summary,
             source_ref=s.source_ref,
             source_url=s.source_url,
+            bucket_id=getattr(s, "bucket_id", None),
         )
         for s in seeds
     ]
@@ -414,9 +435,10 @@ def seeds_to_checkpoints(seeds: List['Seed']) -> List[SeedCheckpoint]:
 def checkpoints_to_seeds(checkpoints: List[Dict]) -> List['Seed']:
     """Convert checkpoint dicts back to Seed objects."""
     from dsl_worker.phases.research_tools import Seed
-    
-    return [
-        Seed(
+
+    seeds = []
+    for c in checkpoints:
+        seed = Seed(
             content=c["content"],
             scope_id=c["scope_id"],
             scope_description=c["scope_description"],
@@ -424,6 +446,7 @@ def checkpoints_to_seeds(checkpoints: List[Dict]) -> List['Seed']:
             research_summary=c.get("research_summary"),
             source_ref=c.get("source_ref"),
             source_url=c.get("source_url"),
+            bucket_id=c.get("bucket_id"),
         )
-        for c in checkpoints
-    ]
+        seeds.append(seed)
+    return seeds

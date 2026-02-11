@@ -21,27 +21,58 @@ logger = logging.getLogger(__name__)
 
 
 GENERATOR_SYSTEM_PROMPT = """\
-You are a seed generator agent. Your job is to iterate through a specific scope
-and yield individual seeds (items) for dataset generation.
+You are a seed extraction agent. Your job is to iterate through a scope and yield
+raw seed items as fast as possible. You are a rough extractor — the downstream
+pipeline will clean up and enrich your output.
 
-Your scope: {scope}
+## Your assignment
 
-Desired seed shape: {seed_description}
+Scope: {scope}
 
-## What to do
+Seed shape: {seed_description}
 
-1. Research your scope using web search, browsing, and code execution
-2. As you discover individual items/entities/examples, yield them using yield_seed()
-3. Each seed should be a JSON object with the fields described in the seed shape
-4. Continue until you've exhausted your scope or been stopped
+Target: ~{target_count} seeds
 
-## Guidelines
+## Strategy: speed over depth
 
-- Be thorough — explore multiple sources, pages, and angles
-- Yield seeds as you find them, don't wait until the end
-- Each seed should be specific and concrete (a real entity, data point, or scenario)
-- Include source information when available
-- If a source has many items, use code_exec to extract them programmatically
+You are NOT a research agent. Do not write summaries, analyze findings, or deliberate.
+Your loop is: search → open source → extract items → yield seeds → next source.
+
+### Efficiency techniques
+
+- **Line references**: When you open a page and see a list/table, note the line numbers.
+  Use open() with start_line to jump directly to relevant sections instead of re-reading.
+- **Programmatic extraction**: When a source has >20 items in structured format (tables,
+  lists, CSV, JSON), use code_exec to extract them all at once and yield in bulk.
+- **Bulk yielding**: Call yield_seed() for each item as you find it. Don't batch or wait.
+- **Multiple sources**: If one source doesn't cover your scope, search for more. Cast a
+  wide net — directories, databases, lists, rankings, registries.
+
+### Seed quality
+
+Each seed should be a JSON object matching the seed shape. Include:
+- The core data fields requested
+- A source_url when available (where you found it)
+- Enough detail that the downstream pipeline can work with it without re-researching
+
+Seeds don't need to be perfect — rough and complete beats polished and sparse.
+
+## Tools
+
+- brave_search(query): Search the web
+- open(ref_id_or_url, start_line): View a page (use start_line to jump to known sections)
+- find(ref_id, pattern): Search within a loaded page
+- click(ref_id, link_id): Follow a link
+- list_files(directory): List workspace files
+- code_exec(script, description): Execute Python for bulk extraction
+- interact(url_or_ref_id, task): Browser agent for JS-heavy pages
+- yield_seed(seed): Yield one seed item — call this for every item you discover
+
+## When to stop
+
+- You've reached or exceeded your target count (~{target_count} seeds)
+- You've exhausted your scope (no more sources to extract from)
+- Prefer to over-produce slightly rather than under-produce
 """
 
 
@@ -80,6 +111,9 @@ class GeneratorAgent:
         seed_description: str,
         seed_queue: asyncio.Queue,
         workspace_dir: Path,
+        generator_id: str = "generator",
+        target_count: int = 100,
+        bucket_id: Optional[str] = None,
         brave_api_key: Optional[str] = None,
         sandbox: Optional[Any] = None,
         stop_checker: Optional[Callable[[], bool]] = None,
@@ -88,6 +122,9 @@ class GeneratorAgent:
         self.scope = scope
         self.seed_description = seed_description
         self.seed_queue = seed_queue
+        self.generator_id = generator_id
+        self.target_count = target_count
+        self.bucket_id = bucket_id
         self.seeds_yielded: int = 0
         self._stopped = False
 
@@ -98,6 +135,7 @@ class GeneratorAgent:
         prompt = GENERATOR_SYSTEM_PROMPT.format(
             scope=scope,
             seed_description=seed_description,
+            target_count=target_count,
         )
 
         self._conversation = AgentConversation(
@@ -107,6 +145,8 @@ class GeneratorAgent:
             tools=registry,
             stop_checker=stop_checker,
             max_turns=max_turns,
+            reasoning={"effort": "medium", "summary": "detailed"},
+            label=f"generator:{generator_id}",
         )
 
     def _register_tools(
@@ -181,15 +221,28 @@ class GeneratorAgent:
 
         # Add yield_seed tool
         async def yield_seed(args: Dict) -> tuple[str, float]:
-            seed = args.get("seed", args)
-            # If the agent passed seed as a nested object, use it directly
-            # Otherwise treat the entire args as the seed
+            seed_data = args.get("seed", args)
             if "seed" in args and isinstance(args["seed"], dict):
-                seed = args["seed"]
+                seed_data = args["seed"]
 
-            await self.seed_queue.put(seed)
+            # Wrap in envelope with bucket and generator metadata
+            envelope = {
+                "data": seed_data,
+                "bucket_id": self.bucket_id,
+                "generator_id": self.generator_id,
+            }
+
+            await self.seed_queue.put(envelope)
             self.seeds_yielded += 1
-            return f"Seed #{self.seeds_yielded} yielded.", 0.0
+
+            remaining = self.target_count - self.seeds_yielded
+            if remaining <= 0:
+                return (
+                    f"Seed #{self.seeds_yielded} yielded. "
+                    f"Target reached ({self.target_count}). You can stop now.",
+                    0.0,
+                )
+            return f"Seed #{self.seeds_yielded} yielded. {remaining} remaining to target.", 0.0
 
         registry.add(
             name="yield_seed",
@@ -214,8 +267,8 @@ class GeneratorAgent:
         """
         try:
             result = await self._conversation.send(
-                f"Begin iterating through your scope and yield seeds. "
-                f"Scope: {self.scope}"
+                f"Begin extracting seeds from your scope. "
+                f"Target: ~{self.target_count} seeds. Scope: {self.scope}"
             )
             return result
         finally:

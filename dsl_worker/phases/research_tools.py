@@ -84,6 +84,7 @@ class Seed:
     research_summary: Optional[str] = None
     source_ref: Optional[str] = None
     source_url: Optional[str] = None
+    bucket_id: Optional[str] = None
 
 
 @dataclass

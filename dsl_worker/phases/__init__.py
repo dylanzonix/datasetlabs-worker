@@ -20,8 +20,7 @@ from .scope_processor import (
     Scope,
 )
 from .row_generator import (
-    RowGenerator,
-    GeneratedRow,
+    BucketTracker,
     GenerationWorkerPool,
 )
 from .sandbox import (
@@ -45,8 +44,7 @@ __all__ = [
     "ScopeProcessor",
     "Scope",
     # Row generation
-    "RowGenerator",
-    "GeneratedRow",
+    "BucketTracker",
     "GenerationWorkerPool",
     # Sandbox
     "SandboxExecutor",

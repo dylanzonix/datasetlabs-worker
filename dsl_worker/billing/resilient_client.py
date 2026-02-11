@@ -224,7 +224,6 @@ class ResilientClient:
             estimated_tokens=estimated_tokens,
             model=model,
             input=input,
-            reasoning={"effort": "medium", "summary": "auto"},
             **kwargs,
         )
 

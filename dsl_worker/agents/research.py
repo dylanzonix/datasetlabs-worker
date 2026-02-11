@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
 from dsl_worker.agents.base import AgentConversation, AgentResult
 from dsl_worker.agents.tools import ToolRegistry
@@ -19,25 +19,44 @@ from dsl_worker.phases.research_tools import ResearchTools, ResearchScope
 logger = logging.getLogger(__name__)
 
 RESEARCH_SYSTEM_PROMPT = """\
-You are a research agent. Your job is to thoroughly research topics using your tools.
+You are a research agent in a multi-agent system. An orchestrator sends you
+specific questions; your job is to investigate and give a focused answer.
 
-Available tools:
-- brave_search: Search the web
-- open: Open a URL or view a page you've already loaded
-- find: Search within a loaded page
-- click: Follow a link from a loaded page
-- interact: Use browser agent for complex interactions (forms, JS-heavy pages)
-- list_files: List available files in the workspace
-- code_exec: Execute Python code (pandas, pdfplumber available)
-- note: Record observations and findings
+The orchestrator controls depth — it will send follow-up questions if it needs
+more detail on any aspect. Your job is to give a solid answer to the specific
+question asked, then call respond() with your findings.
 
-Guidelines:
-- Research thoroughly before drawing conclusions
-- Cross-reference multiple sources when possible
-- Use note() freely to record important facts
-- Open and read full pages when snippets aren't enough
-- Use code_exec to process data files (CSV, Excel, PDF extraction)
-- When done, provide a clear summary of your findings
+## Tools
+
+- brave_search(query, response_length): Search the web
+- open(ref_id_or_url, start_line, response_length): View a page or file
+- find(ref_id, pattern, response_length): Search within a loaded page
+- click(ref_id, link_id, response_length): Follow a link
+- list_files(directory): List uploaded/downloaded files in the workspace
+- code_exec(script, description): Execute Python (pandas, pdfplumber, json available)
+- interact(url_or_ref_id, task): Browser agent for complex interactions (forms, JS-heavy pages)
+- respond(content): Submit your final answer — you MUST call this when done
+
+## How to work
+
+1. Search for information relevant to the question
+2. Open promising results and cross-reference key claims across 2-3 sources
+3. When you have enough to give a useful answer, call respond() with structured findings
+
+Do not over-research. A focused answer from 2-4 good sources is better than an
+exhaustive survey. If something is unclear or you can't find reliable information,
+say so — the orchestrator can ask targeted follow-ups.
+
+When a page has structured data (tables, lists), prefer code_exec to extract it
+programmatically rather than reading it manually.
+
+## Response format
+
+Call respond() with well-structured content:
+- Use headers and bullet points for scannability
+- Cite source URLs for key claims
+- State confidence levels when evidence is mixed
+- Distinguish facts from inferences
 """
 
 
@@ -72,7 +91,10 @@ class ResearchAgent:
         system_prompt: Optional[str] = None,
     ) -> None:
         self.workspace_dir = Path(workspace_dir)
-        self.notes: List[str] = []
+
+        # respond() tool state — reset per ask_full() call
+        self._responded: bool = False
+        self._response_text: str = ""
 
         # Create ResearchTools for its tool implementations
         # We use a dummy scope since we don't need the state machine
@@ -85,7 +107,7 @@ class ResearchAgent:
             sandbox=sandbox,
             stop_checker=stop_checker,
         )
-        # Set a dummy scope so note() works
+        # Set a dummy scope for ResearchTools compatibility
         self._impl.set_scope(ResearchScope(
             id="research",
             description="",
@@ -96,7 +118,7 @@ class ResearchAgent:
         registry = ToolRegistry()
         self._register_research_tools(registry)
 
-        # Create the conversation
+        # Create the conversation with reasoning enabled
         self._conversation = AgentConversation(
             openai_client=openai_client,
             model=model,
@@ -104,6 +126,8 @@ class ResearchAgent:
             tools=registry,
             stop_checker=stop_checker,
             max_turns=max_turns,
+            reasoning={"effort": "medium", "summary": "detailed"},
+            label="research",
         )
 
     def _register_research_tools(self, registry: ToolRegistry) -> None:
@@ -137,12 +161,6 @@ class ResearchAgent:
                 response_length=args.get("response_length", "medium"),
             )
 
-        async def note(args: Dict) -> tuple[str, float]:
-            content = args.get("content", "")
-            self.notes.append(content)
-            # Also delegate to impl so scope.notes stays in sync
-            return impl.note(content=content)
-
         async def list_files(args: Dict) -> tuple[str, float]:
             return await impl.list_files(
                 directory=args.get("directory", "all"),
@@ -169,7 +187,6 @@ class ResearchAgent:
             "open": open_page,
             "find": find,
             "click": click,
-            "note": note,
             "list_files": list_files,
             "code_exec": code_exec,
             "interact": interact,
@@ -184,19 +201,60 @@ class ResearchAgent:
                     parameters=defn.get("parameters", {}),
                     handler=handlers[name],
                 )
-            # Skip conclude_research — not used in new model
+            # Skip conclude_research, note — not used in new model
+
+        # respond() — explicit completion mechanism
+        async def respond(args: Dict) -> tuple[str, float]:
+            content = args.get("content", "")
+            self._responded = True
+            self._response_text = content
+            logger.info(f"[{self._conversation.label}] respond() called ({len(content)} chars)")
+            return "Response recorded.", 0.0
+
+        registry.add(
+            name="respond",
+            description=(
+                "Submit your final response. Call this when you have enough "
+                "information to answer the question. The content parameter IS "
+                "your answer — make it structured and complete."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "Your research findings and answer",
+                    },
+                },
+                "required": ["content"],
+            },
+            handler=respond,
+        )
 
     async def ask(self, message: str) -> str:
         """
         Send a question to the research agent and get a response.
         The agent will use its tools to research before answering.
         """
-        result = await self._conversation.send(message)
+        result = await self.ask_full(message)
         return result.text
 
     async def ask_full(self, message: str) -> AgentResult:
         """Like ask(), but returns the full AgentResult with cost info."""
-        return await self._conversation.send(message)
+        # Reset respond state for this turn
+        self._responded = False
+        self._response_text = ""
+
+        result = await self._conversation.send(
+            message,
+            exit_condition=lambda: self._responded,
+        )
+
+        # If agent used respond(), use that as the result text
+        if self._response_text:
+            result.text = self._response_text
+
+        return result
 
     @property
     def cost_usd(self) -> float:

@@ -4,10 +4,15 @@ Base agent conversation class.
 Wraps the OpenAI Responses API with a tool-use loop, cost tracking,
 and stop checking. All agent types (research, generator, orchestrator)
 build on this.
+
+Manages context manually — all messages (including reasoning items) are
+stored in self.messages and replayed as input each turn. This gives full
+debuggability and control over the conversation state.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -36,12 +41,17 @@ class AgentConversation:
     """
     Manages a multi-turn conversation with an LLM agent that can use tools.
 
+    Manages context manually — all output items (reasoning, messages, tool calls)
+    are captured into self.messages and replayed as input each turn. This preserves
+    reasoning context across turns while keeping the full conversation inspectable.
+
     Core loop:
-    1. Send messages to OpenAI Responses API
-    2. Parse response for text and function calls
-    3. Execute function calls via ToolRegistry
-    4. Append results to message history
-    5. Repeat until no more tool calls (or exit condition met)
+    1. Build input from system prompt + self.messages
+    2. Send to OpenAI Responses API
+    3. Capture all output items (reasoning, text, tool calls) into self.messages
+    4. Execute function calls via ToolRegistry (parallel if multiple)
+    5. Append tool outputs to self.messages
+    6. Repeat until no more tool calls (or exit condition met)
 
     Usage:
         tools = ToolRegistry()
@@ -52,6 +62,7 @@ class AgentConversation:
             model="gpt-5.2",
             system_prompt="You are a research agent.",
             tools=tools,
+            reasoning={"effort": "medium", "summary": "auto"},
         )
 
         result = await agent.send("Research X topic")
@@ -68,6 +79,8 @@ class AgentConversation:
         stop_checker: Optional[Callable[[], bool]] = None,
         max_turns: int = 100,
         max_output_tokens: int = 16_000,
+        reasoning: Optional[Dict[str, Any]] = {"effort": "medium", "summary": "detailed"},
+        label: str = "agent",
     ) -> None:
         self.openai_client = openai_client
         self.model = model
@@ -76,7 +89,12 @@ class AgentConversation:
         self.stop_checker = stop_checker
         self.max_turns = max_turns
         self.max_output_tokens = max_output_tokens
+        self.reasoning = reasoning
+        self.label = label
 
+        # Conversation state — this IS the context sent to the API each turn.
+        # Contains user messages, reasoning items, assistant messages,
+        # function_call items, and function_call_output items.
         self.messages: List[Dict[str, Any]] = []
         self.total_cost: float = 0.0
         self.total_turns: int = 0
@@ -101,7 +119,8 @@ class AgentConversation:
         Returns:
             AgentResult with the agent's text response, cost, and turn count.
         """
-        self.messages.append({"role": "user", "content": message})
+        msg = {"role": "user", "content": message}
+        self.messages.append(msg)
         return await self._run_loop(exit_condition)
 
     async def step(
@@ -116,7 +135,8 @@ class AgentConversation:
 
     def inject_message(self, role: str, content: str) -> None:
         """Add a message to the history without triggering a loop."""
-        self.messages.append({"role": role, "content": content})
+        msg = {"role": role, "content": content}
+        self.messages.append(msg)
 
     async def _run_loop(
         self,
@@ -127,17 +147,25 @@ class AgentConversation:
 
         for turn in range(self.max_turns):
             if self._should_stop():
+                logger.info(f"[{self.label}] stopped by stop_checker at turn {turn}")
                 result.stopped = True
                 break
 
             if exit_condition and exit_condition():
+                logger.info(f"[{self.label}] exit_condition met at turn {turn}")
                 break
 
-            # Build input: system prompt + message history
+            # Always build full input — system prompt + all messages
             input_items = (
                 [{"role": "system", "content": self.system_prompt}]
                 + self.messages
             )
+            logger.info(f"[{self.label}] turn {turn} — {len(input_items)} input items, ${self.total_cost:.4f} spent")
+
+            # Build kwargs
+            create_kwargs: Dict[str, Any] = {}
+            if self.reasoning is not None:
+                create_kwargs["reasoning"] = self.reasoning
 
             try:
                 response, cost = await self.openai_client.responses_create(
@@ -145,10 +173,10 @@ class AgentConversation:
                     input=input_items,
                     tools=self.tools.get_definitions() or None,
                     max_output_tokens=self.max_output_tokens,
+                    **create_kwargs,
                 )
             except Exception as e:
                 logger.error(f"API call failed: {e}", exc_info=True)
-                # Append error so agent can try to recover next turn
                 self.messages.append({
                     "role": "user",
                     "content": f"API error occurred: {e}. Please continue.",
@@ -160,11 +188,40 @@ class AgentConversation:
             self.total_turns += 1
             result.turns_taken = self.total_turns
 
-            # Parse response
+            # Parse response — capture ALL output items into self.messages
+            # using model_dump() to preserve every field the API needs.
+            # Order is critical: reasoning MUST be followed by its associated
+            # message or function_call (linked by internal IDs).
             text_parts: list[str] = []
             tool_calls: list = []
 
             for item in response.output:
+                # Store the complete item for replay.
+                # Reasoning items need special handling: the SDK's
+                # construct() + field_get_default() can turn the required
+                # `summary` field into None when the API returns null,
+                # and model_dump(exclude_none=True) then strips it entirely.
+                if item.type == "reasoning":
+                    summary = []
+                    if item.summary:
+                        summary = [
+                            {"type": s.type, "text": s.text}
+                            for s in item.summary
+                        ]
+                    dumped: dict = {
+                        "type": "reasoning",
+                        "id": item.id,
+                        "summary": summary,
+                    }
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            f"Reasoning item: summary has {len(summary)} entries"
+                        )
+                else:
+                    dumped = item.model_dump(exclude_none=True)
+                self.messages.append(dumped)
+
+                # Also extract what we need locally
                 if item.type == "message":
                     for content_block in item.content:
                         if hasattr(content_block, "text"):
@@ -175,56 +232,96 @@ class AgentConversation:
             output_text = "".join(text_parts)
 
             if not tool_calls:
-                # No tools called — agent is done for this turn
-                if output_text:
-                    self.messages.append({"role": "assistant", "content": output_text})
+                preview = output_text[:120].replace("\n", " ")
+                logger.info(f"[{self.label}] turn {turn} — text response ({len(output_text)} chars): {preview}")
                 result.text = output_text
                 break
 
-            # Agent made tool calls — execute them and continue the loop
-            if output_text:
-                self.messages.append({"role": "assistant", "content": output_text})
+            # Execute tools and append function_call_output items
+            # (function_call items are already in self.messages from parsing above)
+            tool_names = [tc.name for tc in tool_calls]
+            logger.info(f"[{self.label}] turn {turn} — {len(tool_calls)} tool call(s): {', '.join(tool_names)}")
 
-            for tc in tool_calls:
-                # Record the function call in message history
-                self.messages.append({
-                    "type": "function_call",
-                    "call_id": tc.call_id,
-                    "name": tc.name,
-                    "arguments": tc.arguments,
-                })
-
-                # Parse args and execute
-                try:
-                    args = json.loads(tc.arguments)
-                except json.JSONDecodeError:
-                    logger.warning(f"Bad tool args for {tc.name}: {tc.arguments}")
-                    args = {}
-
-                tool_result, tool_cost = await self.tools.execute(tc.name, args)
+            if len(tool_calls) > 1:
+                await self._execute_tools_parallel(tool_calls, result)
+            else:
+                tc = tool_calls[0]
+                result_text, tool_cost = await self._execute_tool(tc)
                 self.total_cost += tool_cost
                 result.cost_usd = self.total_cost
 
-                # Record the tool output
                 self.messages.append({
                     "type": "function_call_output",
                     "call_id": tc.call_id,
-                    "output": tool_result[:TOOL_OUTPUT_LIMIT],
+                    "output": result_text[:TOOL_OUTPUT_LIMIT],
                 })
 
-                # Check exit/stop after each tool
-                if self._should_stop():
-                    result.stopped = True
-                    break
-                if exit_condition and exit_condition():
-                    break
+            # Check exit/stop after tool execution
+            if self._should_stop():
+                logger.info(f"[{self.label}] stopped by stop_checker after tools at turn {turn}")
+                result.stopped = True
+                break
+            if exit_condition and exit_condition():
+                logger.info(f"[{self.label}] exit_condition met after tools at turn {turn}")
+                break
 
             # Capture any text the agent produced alongside tool calls
             result.text = output_text
         else:
             # Loop exhausted max_turns
             logger.warning(
-                f"Agent loop hit max turns ({self.max_turns})"
+                f"[{self.label}] hit max turns ({self.max_turns})"
             )
 
+        logger.info(
+            f"[{self.label}] loop done — {self.total_turns} turns, "
+            f"${self.total_cost:.4f}, {len(self.messages)} messages"
+        )
+
         return result
+
+    async def _execute_tool(self, tc) -> Tuple[str, float]:
+        """Execute a single tool call. Returns (result_text, cost)."""
+        try:
+            args = json.loads(tc.arguments)
+        except json.JSONDecodeError:
+            logger.warning(f"Bad tool args for {tc.name}: {tc.arguments}")
+            args = {}
+
+        return await self.tools.execute(tc.name, args)
+
+    async def _execute_tools_parallel(
+        self, tool_calls: list, result: AgentResult,
+    ) -> None:
+        """Execute multiple tool calls concurrently.
+
+        Note: function_call items are already in self.messages from parsing.
+        This method only appends the function_call_output items.
+        """
+
+        async def run_one(tc):
+            result_text, tool_cost = await self._execute_tool(tc)
+            return tc, result_text, tool_cost
+
+        results = await asyncio.gather(
+            *[run_one(tc) for tc in tool_calls],
+            return_exceptions=True,
+        )
+
+        for i, r in enumerate(results):
+            tc = tool_calls[i]
+
+            if isinstance(r, Exception):
+                logger.error(f"Parallel tool error for {tc.name}: {r}")
+                output_text = f"Error executing tool: {r}"
+            else:
+                _, output_text, tool_cost = r
+                self.total_cost += tool_cost
+                result.cost_usd = self.total_cost
+                output_text = output_text[:TOOL_OUTPUT_LIMIT]
+
+            self.messages.append({
+                "type": "function_call_output",
+                "call_id": tc.call_id,
+                "output": output_text,
+            })
