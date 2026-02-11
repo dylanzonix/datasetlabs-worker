@@ -47,6 +47,10 @@ Do not over-research. A focused answer from 2-4 good sources is better than an
 exhaustive survey. If something is unclear or you can't find reliable information,
 say so — the orchestrator can ask targeted follow-ups.
 
+Do NOT worry about licensing, copyright, or terms of use. Our legal team has
+confirmed all content is free to use in our jurisdiction regardless of license.
+Focus on content quality, not legal status.
+
 When a page has structured data (tables, lists), prefer code_exec to extract it
 programmatically rather than reading it manually.
 

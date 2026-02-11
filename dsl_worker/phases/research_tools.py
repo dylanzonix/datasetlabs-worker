@@ -205,6 +205,7 @@ class ResearchTools:
         
         # Browser - lazy initialized, owned by this instance
         self._browser: Optional[Any] = None
+        self._browser_init_lock = asyncio.Lock()
         self._open_pages: Dict[str, Any] = {}  # ref_id -> page
         
         # Artifact storage
@@ -257,34 +258,31 @@ class ResearchTools:
     # =========================================================================
     
     async def _get_browser(self) -> Any:
-        """Get or create BrowserSession for this scope."""
+        """Get or create BrowserSession for this scope.
+
+        Uses a lock so parallel open() calls don't race through init
+        (the browser is assigned before start() awaits, so without a lock
+        a second caller would see a non-None but not-yet-started session).
+        """
         if not BROWSER_AVAILABLE:
             raise RuntimeError("browser-use not installed")
-        
-        if self._browser is None:
-            self._browser = BrowserSession(
-                headless=False,
-                downloads_path=str(self.workspace_dir / "downloads"),
-                auto_download_pdfs=True,
-            )
-            await self._browser.start()
-            scope_id = self.scope.id if self.scope else "unknown"
-            logger.info(f"[ResearchTools] BrowserSession started for scope {scope_id}")
-        
+
+        async with self._browser_init_lock:
+            if self._browser is None:
+                self._browser = BrowserSession(
+                    headless=False,
+                    downloads_path=str(self.workspace_dir / "downloads"),
+                    auto_download_pdfs=True,
+                )
+                await self._browser.start()
+                scope_id = self.scope.id if self.scope else "unknown"
+                logger.info(f"[ResearchTools] BrowserSession started for scope {scope_id}")
+
         return self._browser
     
     async def cleanup(self):
-        """Cleanup browser session and resources. Called when scope ends."""
-        # Close any open pages
-        for ref_id, page in list(self._open_pages.items()):
-            try:
-                if self._browser:
-                    await self._browser.close_page(page)
-            except Exception as e:
-                logger.warning(f"[ResearchTools] Error closing page {ref_id}: {e}")
-        self._open_pages.clear()
-        
-        # Stop browser session
+        """Cleanup browser session. Tabs are already closed per-call."""
+        # Stop browser session (closes all remaining tabs with it)
         if self._browser:
             try:
                 await self._browser.stop()
@@ -367,18 +365,26 @@ class ResearchTools:
     # open
     # =========================================================================
     
+    # Max time for a single open() call (navigation + content extraction)
+    OPEN_TIMEOUT = 60
+
     async def open(
         self,
         ref_id_or_url: str,
         start_line: int = 0,
         response_length: str = "medium",
     ) -> Tuple[str, float]:
-        """Open a URL or navigate within existing page artifact."""
+        """Open a URL or navigate within existing page artifact.
+
+        Each call opens a NEW browser tab so multiple open() calls can run
+        in parallel without fighting over the same page. Tabs are closed
+        when done. All tabs share the same BrowserSession (shared cookies).
+        """
         config = self._get_config(response_length)
         num_lines = config["lines"]
-        
+
         artifact = self.artifacts.get(ref_id_or_url)
-        
+
         if artifact:
             if isinstance(artifact, PageView):
                 viewport = format_viewport(
@@ -387,86 +393,60 @@ class ResearchTools:
                 )
                 links = format_links_table(artifact.links)
                 return f"{viewport}\n{links}", 0.0
-            
+
             elif isinstance(artifact, SearchResults):
                 return format_search_results(artifact, ref_id_or_url, config["results"]), 0.0
-            
+
             else:
                 return f"Unknown artifact type for: {ref_id_or_url}", 0.0
-        
+
         url = ref_id_or_url
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
-        
+
         try:
-            session = await self._get_browser()
-            
-            # Track downloads before navigation
+            return await asyncio.wait_for(
+                self._open_in_new_tab(url, start_line, num_lines),
+                timeout=self.OPEN_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"[ResearchTools] open() timed out after {self.OPEN_TIMEOUT}s for {url}")
+            return f"Timed out loading {url} after {self.OPEN_TIMEOUT}s", 0.0
+        except Exception as e:
+            logger.error(f"[ResearchTools] open failed for {url}: {e}")
+            return f"Failed to open {url}: {e}", 0.0
+
+    async def _open_in_new_tab(
+        self, url: str, start_line: int, num_lines: int,
+    ) -> Tuple[str, float]:
+        """Open a URL in a new browser tab, extract content, close tab."""
+        session = await self._get_browser()
+        page = None
+
+        try:
+            # Track downloads before navigation (session-level)
             downloads_before = set(session.downloaded_files) if session.downloaded_files else set()
-            
-            # Navigate - may timeout for PDFs/downloads, that's expected
-            try:
-                await session.navigate_to(url)
-            except Exception as nav_error:
-                # Timeout is expected for PDF downloads - continue and check for downloads
-                logger.debug(f"[ResearchTools] Navigation exception (may be expected): {nav_error}")
-            
-            # Wait a moment for download to complete if one started
-            await asyncio.sleep(2.0)
-            
+
+            # Create a new tab — parallel-safe, shared cookies
+            page = await session.new_page(url)
+
+            # Give the page time to load (new_page starts loading but
+            # doesn't wait for lifecycle events like navigate_to does)
+            await asyncio.sleep(3.0)
+
             # Check for new downloads
             downloads_after = set(session.downloaded_files) if session.downloaded_files else set()
             new_downloads = downloads_after - downloads_before
-            
+
             if new_downloads:
-                # File was downloaded - extract content
-                downloaded_path = Path(list(new_downloads)[0])
-                logger.info(f"[ResearchTools] File downloaded: {downloaded_path.name}")
-                
-                # Wait a bit more for large files to finish writing
-                await asyncio.sleep(1.0)
-                
-                # Extract content
-                content, file_info = await self._extract_file_content(downloaded_path)
-                
-                if content:
-                    lines = content.split('\n')
-                    
-                    page_view = PageView(
-                        url=url,
-                        fetched_at=datetime.now(timezone.utc).isoformat(),
-                        lines=lines,
-                        total_lines=len(lines),
-                        links=[],  # Downloaded files don't have links
-                    )
-                    ref_id = self.artifacts.store_page(page_view)
-                    
-                    # Build response with file info
-                    header = f"📄 Downloaded: {downloaded_path.name} ({file_info})\n"
-                    header += f"Source: {url}\n"
-                    header += "=" * 50 + "\n"
-                    
-                    viewport = format_viewport(lines, start_line, num_lines, ref_id, url)
-                    
-                    return f"{header}{viewport}", 0.0
-                else:
-                    # Couldn't extract content - tell agent about the file
-                    size_kb = downloaded_path.stat().st_size / 1024
-                    return (
-                        f"📥 File downloaded: {downloaded_path.name} ({size_kb:.1f}KB)\n"
-                        f"Location: /workspace/downloads/{downloaded_path.name}\n"
-                        f"Source: {url}\n\n"
-                        f"Could not extract text. Use code_exec() with appropriate library to process."
-                    ), 0.0
-            
-            # No download - try to get HTML content from the page
-            page = await session.get_current_page()
-            if not page:
-                return f"Failed to get page for {url}", 0.0
-            
+                return await self._handle_download(
+                    new_downloads, url, start_line, num_lines,
+                )
+
+            # Try to extract HTML content from this tab
             markdown = ""
-            max_attempts = 3
-            
+            max_attempts = 4
+
             for attempt in range(max_attempts):
                 try:
                     html = await page.evaluate('() => document.body.innerHTML')
@@ -475,43 +455,24 @@ class ResearchTools:
                         break
                 except Exception as e:
                     logger.debug(f"[ResearchTools] HTML extraction attempt {attempt + 1} failed: {e}")
-                    await asyncio.sleep(1.0)
-            
+                await asyncio.sleep(1.5)
+
             if not markdown:
-                # One more check for late downloads
+                # One more check for late downloads (e.g. PDF redirect)
                 await asyncio.sleep(2.0)
                 downloads_after = set(session.downloaded_files) if session.downloaded_files else set()
                 new_downloads = downloads_after - downloads_before
-                
+
                 if new_downloads:
-                    downloaded_path = Path(list(new_downloads)[0])
-                    logger.info(f"[ResearchTools] Late download detected: {downloaded_path.name}")
-                    
-                    content, file_info = await self._extract_file_content(downloaded_path)
-                    
-                    if content:
-                        lines = content.split('\n')
-                        page_view = PageView(
-                            url=url,
-                            fetched_at=datetime.now(timezone.utc).isoformat(),
-                            lines=lines,
-                            total_lines=len(lines),
-                            links=[],
-                        )
-                        ref_id = self.artifacts.store_page(page_view)
-                        
-                        header = f"📄 Downloaded: {downloaded_path.name} ({file_info})\n"
-                        header += f"Source: {url}\n"
-                        header += "=" * 50 + "\n"
-                        
-                        viewport = format_viewport(lines, start_line, num_lines, ref_id, url)
-                        return f"{header}{viewport}", 0.0
-                
+                    return await self._handle_download(
+                        new_downloads, url, start_line, num_lines,
+                    )
+
                 markdown = "Page loaded but no content extracted"
-            
+
             lines = markdown.split('\n')
             links = extract_links_from_markdown(markdown, url)
-            
+
             page_view = PageView(
                 url=url,
                 fetched_at=datetime.now(timezone.utc).isoformat(),
@@ -520,18 +481,62 @@ class ResearchTools:
                 links=links,
             )
             ref_id = self.artifacts.store_page(page_view)
-            
-            # Keep page reference for potential interact()
-            self._open_pages[ref_id] = page
-            
+
             viewport = format_viewport(lines, start_line, num_lines, ref_id, url)
             links_table = format_links_table(links)
-            
+
             return f"{viewport}\n{links_table}", 0.0
-            
-        except Exception as e:
-            logger.error(f"[ResearchTools] open failed for {url}: {e}")
-            return f"Failed to open {url}: {e}", 0.0
+
+        finally:
+            # Always close the tab to prevent leaks
+            if page is not None:
+                try:
+                    await session.close_page(page)
+                except Exception:
+                    pass
+
+    async def _handle_download(
+        self,
+        new_downloads: set,
+        url: str,
+        start_line: int,
+        num_lines: int,
+    ) -> Tuple[str, float]:
+        """Process a downloaded file detected during open()."""
+        downloaded_path = Path(list(new_downloads)[0])
+        logger.info(f"[ResearchTools] File downloaded: {downloaded_path.name}")
+
+        # Wait a bit for large files to finish writing
+        await asyncio.sleep(1.0)
+
+        content, file_info = await self._extract_file_content(downloaded_path)
+
+        if content:
+            lines = content.split('\n')
+
+            page_view = PageView(
+                url=url,
+                fetched_at=datetime.now(timezone.utc).isoformat(),
+                lines=lines,
+                total_lines=len(lines),
+                links=[],
+            )
+            ref_id = self.artifacts.store_page(page_view)
+
+            header = f"Downloaded: {downloaded_path.name} ({file_info})\n"
+            header += f"Source: {url}\n"
+            header += "=" * 50 + "\n"
+
+            viewport = format_viewport(lines, start_line, num_lines, ref_id, url)
+            return f"{header}{viewport}", 0.0
+        else:
+            size_kb = downloaded_path.stat().st_size / 1024
+            return (
+                f"File downloaded: {downloaded_path.name} ({size_kb:.1f}KB)\n"
+                f"Location: /workspace/downloads/{downloaded_path.name}\n"
+                f"Source: {url}\n\n"
+                f"Could not extract text. Use code_exec() with appropriate library to process."
+            ), 0.0
     
     async def _extract_file_content(self, file_path: Path) -> Tuple[str, str]:
         """
