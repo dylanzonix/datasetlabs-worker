@@ -427,12 +427,16 @@ class ResearchTools:
             # Track downloads before navigation (session-level)
             downloads_before = set(session.downloaded_files) if session.downloaded_files else set()
 
-            # Create a new tab — parallel-safe, shared cookies
-            page = await session.new_page(url)
-
-            # Give the page time to load (new_page starts loading but
-            # doesn't wait for lifecycle events like navigate_to does)
-            await asyncio.sleep(3.0)
+            # Create a blank tab, then navigate with proper load-waiting.
+            # new_page(url) fires-and-forgets; page.goto() waits for
+            # networkIdle/load lifecycle events so fast pages return fast
+            # and slow pages get the time they need.
+            page = await session.new_page()
+            try:
+                await page.goto(url)
+            except Exception as nav_error:
+                # Timeout is expected for PDF downloads — continue and check
+                logger.debug(f"[ResearchTools] Navigation exception (may be expected): {nav_error}")
 
             # Check for new downloads
             downloads_after = set(session.downloaded_files) if session.downloaded_files else set()
