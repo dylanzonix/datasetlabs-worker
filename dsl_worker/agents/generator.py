@@ -22,51 +22,57 @@ logger = logging.getLogger(__name__)
 
 GENERATOR_SYSTEM_PROMPT = """\
 You are a seed extraction agent. Your job is to iterate through a scope and yield
-raw seed items as fast as possible. You are a rough extractor — the downstream
-pipeline will clean up and enrich your output.
+raw text chunks as fast as possible. You are a rough extractor — the downstream
+pipeline will clean up and transform your output.
 
 ## Your assignment
 
 Scope: {scope}
 
-Seed shape: {seed_description}
+Seed description: {seed_description}
 
 Target: ~{target_count} seeds
+
+## What seeds look like
+
+Seeds are raw text — not structured JSON. Grab content directly from sources:
+- A paragraph or section describing an item
+- A table row or block of tabular data
+- A formatted text block (lists, specs, profiles, descriptions)
+- A line range from a page containing the relevant content
+
+Each seed should contain enough context that a downstream agent can work with it.
+Include source attribution when practical (URL, page title, section heading) as
+part of the text.
 
 ## Strategy: speed over depth
 
 You are NOT a research agent. Do not write summaries, analyze findings, or deliberate.
-Your loop is: search → open source → extract items → yield seeds → next source.
+Your loop is: search → open source → extract text → yield seeds → next source.
 
 ### Efficiency techniques
 
-- **Line references**: When you open a page and see a list/table, note the line numbers.
-  Use open() with start_line to jump directly to relevant sections instead of re-reading.
+- **Line references**: When you open a page and see relevant content, note the line
+  numbers. Use open() with start_line to jump directly to sections instead of re-reading.
 - **Programmatic extraction**: When a source has >20 items in structured format (tables,
-  lists, CSV, JSON), use code_exec to extract them all at once and yield in bulk.
+  lists, CSV, JSON), use code_exec to extract them all at once and yield each as a
+  text chunk.
 - **Bulk yielding**: Call yield_seed() for each item as you find it. Don't batch or wait.
 - **Multiple sources**: If one source doesn't cover your scope, search for more. Cast a
   wide net — directories, databases, lists, rankings, registries.
-
-### Seed quality
-
-Each seed should be a JSON object matching the seed shape. Include:
-- The core data fields requested
-- A source_url when available (where you found it)
-- Enough detail that the downstream pipeline can work with it without re-researching
 
 Seeds don't need to be perfect — rough and complete beats polished and sparse.
 
 ## Tools
 
 - brave_search(query): Search the web
-- open(ref_id_or_url, start_line): View a page (use start_line to jump to known sections)
+- open(ref_id_or_url, start_line): View a page (use start_line to jump to sections)
 - find(ref_id, pattern): Search within a loaded page
 - click(ref_id, link_id): Follow a link
 - list_files(directory): List workspace files
 - code_exec(script, description): Execute Python for bulk extraction
 - interact(url_or_ref_id, task): Browser agent for JS-heavy pages
-- yield_seed(seed): Yield one seed item — call this for every item you discover
+- yield_seed(text): Yield one text chunk — call this for every item you discover
 
 ## When to stop
 
@@ -221,13 +227,13 @@ class GeneratorAgent:
 
         # Add yield_seed tool
         async def yield_seed(args: Dict) -> tuple[str, float]:
-            seed_data = args.get("seed", args)
-            if "seed" in args and isinstance(args["seed"], dict):
-                seed_data = args["seed"]
+            text = args.get("text", "")
+            if not text:
+                return "Error: 'text' is required and cannot be empty.", 0.0
 
             # Wrap in envelope with bucket and generator metadata
             envelope = {
-                "data": seed_data,
+                "data": text,
                 "bucket_id": self.bucket_id,
                 "generator_id": self.generator_id,
             }
@@ -246,16 +252,16 @@ class GeneratorAgent:
 
         registry.add(
             name="yield_seed",
-            description="Yield a seed item for dataset generation. Call this for each item you discover.",
+            description="Yield a text chunk as a seed for dataset generation. Call this for each item you discover.",
             parameters={
                 "type": "object",
                 "properties": {
-                    "seed": {
-                        "type": "object",
-                        "description": "The seed data as a JSON object",
+                    "text": {
+                        "type": "string",
+                        "description": "The raw text content to yield as a seed",
                     },
                 },
-                "required": ["seed"],
+                "required": ["text"],
             },
             handler=yield_seed,
         )

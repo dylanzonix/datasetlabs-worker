@@ -372,7 +372,7 @@ class CheckpointManager:
                 generator_id = "generator"
 
             checkpoint_seed = {
-                "content": json.dumps(seed_data) if isinstance(seed_data, dict) else str(seed_data),
+                "content": json.dumps(seed_data) if isinstance(seed_data, dict) else seed_data,
                 "scope_id": generator_id,
                 "scope_description": "",
                 "notes": [],

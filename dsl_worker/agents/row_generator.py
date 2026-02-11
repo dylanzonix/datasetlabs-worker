@@ -61,7 +61,7 @@ You are generating a single dataset row from a seed.
 
 ## Process
 
-1. Read the seed data — this is your anchor for what this row is about
+1. Read the seed text — this is your source material for this row
 2. Follow the pipeline instructions to transform the seed into a row
 3. Use set_column() to fill each column in the schema
 4. Use brave_search/open/code_exec if you need to look up specific information

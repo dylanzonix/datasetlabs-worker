@@ -560,7 +560,7 @@ class JobProcessor:
             if isinstance(envelope, dict) and "data" in envelope:
                 seed_data = envelope["data"]
                 bucket_id = envelope.get("bucket_id")
-                content = json.dumps(seed_data) if isinstance(seed_data, dict) else str(seed_data)
+                content = json.dumps(seed_data) if isinstance(seed_data, dict) else seed_data
             else:
                 content = json.dumps(envelope) if isinstance(envelope, dict) else str(envelope)
                 bucket_id = None
