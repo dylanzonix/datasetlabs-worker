@@ -144,7 +144,7 @@ def format_viewport(lines: List[str], start: int, count: int, ref_id: str, url: 
     return '\n'.join(output_lines)
 
 
-def format_links_table(links: List[PageLink], limit: int = 20) -> str:
+def format_links_table(links: List[PageLink], limit: int = 50) -> str:
     """Format links as table for LLM."""
     if not links:
         return "No links found."

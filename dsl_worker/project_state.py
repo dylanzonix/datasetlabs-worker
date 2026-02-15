@@ -36,14 +36,10 @@ class ProjectState:
         # State flags
         self.paused = False
 
-        # Cost controls
-        self.spend_limit_cents: Optional[int] = None
-
         # Project/Version configuration
         self.num_samples = 0
         self.generation_prompt = ""
         self.columns = []
-        self.use_internet = False
 
         # Version snapshot data
         self.files_snapshot: List[dict] = []
@@ -67,14 +63,10 @@ class ProjectState:
         # Update pause state
         self.paused = self._check_pause_requested()
 
-        # Update cost controls
-        self.spend_limit_cents = project.spend_limit_cents
-
         # Update version configuration
         self.num_samples = version.num_samples
         self.generation_prompt = version.generation_prompt
         self.columns = version.columns or []
-        self.use_internet = version.use_internet
         self.files_snapshot = version.files_snapshot or []
         self.examples_snapshot = version.examples_snapshot or []
 

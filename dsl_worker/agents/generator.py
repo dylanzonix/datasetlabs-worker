@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Optional
 from dsl_worker.agents.base import AgentConversation, AgentResult
 from dsl_worker.agents.tools import ToolRegistry
 from dsl_worker.billing.tracked_client import TrackedOpenAIClient
+from dsl_worker.phases.research_tools import ResearchTools, ResearchScope
 
 logger = logging.getLogger(__name__)
 
@@ -48,16 +49,38 @@ part of the text.
 ## Strategy: speed over depth
 
 You are NOT a research agent. Do not write summaries, analyze findings, or deliberate.
-Your loop is: search → open source → extract text → yield seeds → next source.
+Your loop is: search → open source → identify line ranges → yield seeds → next source.
 
-### Efficiency techniques
+### How to yield seeds efficiently
 
-- **Line references**: When you open a page and see relevant content, note the line
-  numbers. Use open() with start_line to jump directly to sections instead of re-reading.
+**Always prefer line references over copying text.** When you open a page and see
+relevant content, yield it by ref_id + line range instead of copying the text:
+
+```
+yield_seed(ref_id="p0", lines=[45, 120])  // Good — zero output tokens for content
+yield_seed(text="<500 words copied>")      // Bad — expensive output tokens
+```
+
+The system resolves the text from the cached page automatically. This is ~10x cheaper.
+
+### Workflow
+
+1. **Open a source** — note the ref_id (e.g. "p0") and scan for relevant sections
+2. **Identify line ranges** — each relevant item/section is a seed
+3. **yield_seed(ref_id, lines)** for each item — one call per seed
+4. **Use open(ref_id, start_line)** to scroll through long pages
+5. **Move to next source** when current one is exhausted
+
+### When to use text instead of line references
+
+- Content from code_exec output (not in a page)
+- Content you need to combine from multiple places
+- Very short items where a line ref would be overhead
+
+### Other techniques
+
 - **Programmatic extraction**: When a source has >20 items in structured format (tables,
-  lists, CSV, JSON), use code_exec to extract them all at once and yield each as a
-  text chunk.
-- **Bulk yielding**: Call yield_seed() for each item as you find it. Don't batch or wait.
+  lists, CSV, JSON), use code_exec to extract them all at once and yield each via text.
 - **Multiple sources**: If one source doesn't cover your scope, search for more. Cast a
   wide net — directories, databases, lists, rankings, registries.
 
@@ -72,7 +95,8 @@ Seeds don't need to be perfect — rough and complete beats polished and sparse.
 - list_files(directory): List workspace files
 - code_exec(script, description): Execute Python for bulk extraction
 - interact(url_or_ref_id, task): Browser agent for JS-heavy pages
-- yield_seed(text): Yield one text chunk — call this for every item you discover
+- yield_seed(ref_id, lines): Yield lines from a loaded page (preferred — cheap)
+- yield_seed(text): Yield raw text (fallback — expensive, avoid when possible)
 
 ## When to stop
 
@@ -124,6 +148,9 @@ class GeneratorAgent:
         sandbox: Optional[Any] = None,
         stop_checker: Optional[Callable[[], bool]] = None,
         max_turns: int = 200,
+        blob_service_client: Optional[Any] = None,
+        project_id: Optional[Any] = None,
+        on_tool_call: Optional[Callable[[str, str], None]] = None,
     ) -> None:
         self.scope = scope
         self.seed_description = seed_description
@@ -133,10 +160,33 @@ class GeneratorAgent:
         self.bucket_id = bucket_id
         self.seeds_yielded: int = 0
         self._stopped = False
+        self.blob_service_client = blob_service_client
+        self.project_id = project_id
 
-        # Build tools — research tools + yield_seed
+        # Combine _stopped flag with external stop checker so gen.stop() works
+        def combined_stop_checker():
+            if self._stopped:
+                return True
+            return stop_checker() if stop_checker else False
+
+        # Create ResearchTools directly (no need for a full ResearchAgent)
+        self._impl = ResearchTools(
+            workspace_dir=workspace_dir,
+            schema=[],
+            brave_api_key=brave_api_key,
+            openai_client=openai_client,
+            model=model,
+            sandbox=sandbox,
+            stop_checker=stop_checker,
+            blob_service_client=blob_service_client,
+            project_id=project_id,
+        )
+        self._impl.set_scope(ResearchScope(id="generator", description="", quota=0))
+
+        # Build tools — browsing tools + yield_seed
         registry = ToolRegistry()
-        self._register_tools(registry, openai_client, workspace_dir, brave_api_key, sandbox, stop_checker)
+        self._impl.register_on(registry)
+        self._register_yield_seed(registry)
 
         prompt = GENERATOR_SYSTEM_PROMPT.format(
             scope=scope,
@@ -149,87 +199,38 @@ class GeneratorAgent:
             model=model,
             system_prompt=prompt,
             tools=registry,
-            stop_checker=stop_checker,
+            stop_checker=combined_stop_checker,
             max_turns=max_turns,
             reasoning={"effort": "medium", "summary": "detailed"},
             label=f"generator:{generator_id}",
+            on_tool_call=on_tool_call,
         )
 
-    def _register_tools(
-        self,
-        registry: ToolRegistry,
-        openai_client: TrackedOpenAIClient,
-        workspace_dir: Path,
-        brave_api_key: Optional[str],
-        sandbox: Optional[Any],
-        stop_checker: Optional[Callable[[], bool]],
-    ) -> None:
-        """Register generator tools: research tools + yield_seed."""
-        # Import here to avoid circular deps at module level
-        from dsl_worker.agents.research import ResearchAgent
+    def _register_yield_seed(self, registry: ToolRegistry) -> None:
+        """Register the yield_seed tool (generator-specific)."""
+        impl = self._impl
 
-        # Create a research agent internally for its tools
-        self._research = ResearchAgent(
-            openai_client=openai_client,
-            model="unused",  # We won't use its conversation, just its tools
-            workspace_dir=workspace_dir,
-            brave_api_key=brave_api_key,
-            sandbox=sandbox,
-            stop_checker=stop_checker,
-        )
-
-        # Re-register the research tools from the research agent's impl
-        impl = self._research._impl
-        defs = impl.get_tool_definitions(phase="research")
-
-        handlers = {
-            "brave_search": lambda args: impl.brave_search(
-                query=args.get("query", ""),
-                response_length=args.get("response_length", "medium"),
-            ),
-            "open": lambda args: impl.open(
-                ref_id_or_url=args.get("ref_id_or_url", ""),
-                start_line=args.get("start_line", 0),
-                response_length=args.get("response_length", "medium"),
-            ),
-            "find": lambda args: impl.find(
-                ref_id=args.get("ref_id", ""),
-                pattern=args.get("pattern", ""),
-                response_length=args.get("response_length", "medium"),
-            ),
-            "click": lambda args: impl.click(
-                ref_id=args.get("ref_id", ""),
-                link_id=args.get("link_id", 0),
-                response_length=args.get("response_length", "medium"),
-            ),
-            "list_files": lambda args: impl.list_files(
-                directory=args.get("directory", "all"),
-            ),
-            "code_exec": lambda args: impl.code_exec(
-                script=args.get("script", ""),
-                description=args.get("description", ""),
-            ),
-            "interact": lambda args: impl.interact(
-                url_or_ref_id=args.get("url_or_ref_id", ""),
-                task=args.get("task", ""),
-            ),
-        }
-
-        for defn in defs:
-            name = defn.get("name")
-            if name in handlers:
-                registry.add(
-                    name=name,
-                    description=defn.get("description", ""),
-                    parameters=defn.get("parameters", {}),
-                    handler=handlers[name],
-                )
-
-        # Add yield_seed tool
         async def yield_seed(args: Dict) -> tuple[str, float]:
+            ref_id = args.get("ref_id")
+            lines = args.get("lines")
             text = args.get("text", "")
+
+            # Resolve text from page cache if ref_id + lines provided
+            if ref_id and lines and len(lines) == 2:
+                page = impl.artifacts.get_page(ref_id)
+                if not page:
+                    return f"Error: page '{ref_id}' not found in cache.", 0.0
+                start, end = lines
+                start = max(0, start)
+                end = min(len(page.lines), end + 1)
+                if start >= end:
+                    return f"Error: invalid line range [{start}, {end}].", 0.0
+                text = "\n".join(page.lines[start:end]).strip()
+                if page.url:
+                    text = f"Source: {page.url} (lines {start}-{end-1})\n\n{text}"
+
             if not text:
-                return "Error: 'text' is required and cannot be empty.", 0.0
+                return "Error: provide either 'text' or 'ref_id' + 'lines'.", 0.0
 
             # Wrap in envelope with bucket and generator metadata
             envelope = {
@@ -252,16 +253,28 @@ class GeneratorAgent:
 
         registry.add(
             name="yield_seed",
-            description="Yield a text chunk as a seed for dataset generation. Call this for each item you discover.",
+            description=(
+                "Yield a seed. PREFERRED: use ref_id + lines to reference content "
+                "from a loaded page (avoids copying text). Fallback: use text for "
+                "content not from a page."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
+                    "ref_id": {
+                        "type": "string",
+                        "description": "Page ref_id (e.g. 'p0') — from open() or click()",
+                    },
+                    "lines": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "[start_line, end_line] — inclusive range from the page",
+                    },
                     "text": {
                         "type": "string",
-                        "description": "The raw text content to yield as a seed",
+                        "description": "Raw text content (only if not referencing a page)",
                     },
                 },
-                "required": ["text"],
             },
             handler=yield_seed,
         )
@@ -292,6 +305,6 @@ class GeneratorAgent:
     async def cleanup(self) -> None:
         """Clean up resources."""
         try:
-            await self._research.cleanup()
+            await self._impl.cleanup()
         except Exception as e:
             logger.warning(f"Generator cleanup error: {e}")

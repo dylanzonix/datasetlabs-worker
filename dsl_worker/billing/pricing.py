@@ -20,6 +20,7 @@ class ModelPricing:
     """Pricing for a single model (USD per token)."""
     input_per_token: float
     output_per_token: float
+    cached_input_per_token: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -30,10 +31,12 @@ class UsageCost:
     output_tokens: int
     input_cost_usd: float
     output_cost_usd: float
+    cached_input_tokens: int = 0
+    cached_input_cost_usd: float = 0.0
 
     @property
     def total_cost_usd(self) -> float:
-        return self.input_cost_usd + self.output_cost_usd
+        return self.input_cost_usd + self.output_cost_usd + self.cached_input_cost_usd
 
 
 class PricingConfig:
@@ -54,6 +57,7 @@ class PricingConfig:
                 self._models[model_name] = ModelPricing(
                     input_per_token=prices.get("input", 0.0),
                     output_per_token=prices.get("output", 0.0),
+                    cached_input_per_token=prices.get("cached_input", 0.0),
                 )
 
             logger.info(f"Loaded pricing for {len(self._models)} models")
@@ -71,14 +75,16 @@ class PricingConfig:
         model: str,
         input_tokens: int,
         output_tokens: int = 0,
+        cached_input_tokens: int = 0,
     ) -> UsageCost:
         """
         Calculate cost for an API call.
 
         Args:
             model: Model name (e.g., "gpt-4o")
-            input_tokens: Number of input tokens
+            input_tokens: Number of input tokens (non-cached portion)
             output_tokens: Number of output tokens
+            cached_input_tokens: Number of cached input tokens
 
         Returns:
             UsageCost with breakdown
@@ -92,6 +98,7 @@ class PricingConfig:
 
         input_cost = input_tokens * pricing.input_per_token
         output_cost = output_tokens * pricing.output_per_token
+        cached_input_cost = cached_input_tokens * pricing.cached_input_per_token
 
         return UsageCost(
             model=model,
@@ -99,6 +106,8 @@ class PricingConfig:
             output_tokens=output_tokens,
             input_cost_usd=input_cost,
             output_cost_usd=output_cost,
+            cached_input_tokens=cached_input_tokens,
+            cached_input_cost_usd=cached_input_cost,
         )
 
 

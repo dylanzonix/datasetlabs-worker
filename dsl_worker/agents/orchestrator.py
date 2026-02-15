@@ -2,7 +2,7 @@
 Orchestrator agent — the brain that coordinates dataset generation.
 
 Reads the conversation history, does research, creates a plan (pipelines +
-buckets + generators), and runs generation via the blocking generate() tool.
+buckets + generators), and runs generation via set_plan().
 """
 
 from __future__ import annotations
@@ -17,9 +17,7 @@ from dsl_worker.agents.base import AgentConversation, AgentResult
 from dsl_worker.agents.tools import ToolRegistry
 from dsl_worker.agents.research import ResearchAgent
 from dsl_worker.agents.generator import GeneratorAgent
-from dsl_worker.agents.row_generator import RowGeneratorAgent
 from dsl_worker.billing.tracked_client import TrackedOpenAIClient
-from dsl_worker.utils import count_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -31,40 +29,65 @@ You are the orchestrator for a dataset generation system.
 
 A user has described a dataset they want through a consultation chat (below).
 Your job is to figure out the **optimal strategy** for building it — what
-sources to extract from, how to transform that raw material into high-quality
-rows, and at what distribution — then execute that strategy.
+sources to use, how to transform raw material into high-quality rows, and at
+what distribution — then execute that strategy.
 
-The best strategy depends on what exists out there and what combination of
-seeds + pipeline will produce the highest quality rows. Strategy is about both:
+Strategy is about:
 
-- **Seeds** — what raw material to extract and from where. Sometimes there are
-  sources very close to the desired rows needing minimal transformation.
-  Sometimes seeds are just anchors (names, topics, references) and the heavy
-  lifting happens in the pipeline.
+- **Seeds** — anchors for diversity and coverage. Each seed gives a row a
+  unique starting point, preventing mode collapse. What carries the diversity
+  for this dataset? The right seed form depends on where the diversity lives —
+  sometimes it's extracted content because the source material IS the value,
+  sometimes it's a reference or pointer because the row generator can look up
+  what it needs per-row. The orchestrator should be specific about what seeds
+  are and where they come from, always grounded in real sources.
 - **Pipeline** — how to transform each seed into a final row. The row generator
-  is also an agent with full research, browsing, and code execution tools. The
-  pipeline instructions can delegate significant work — looking up additional
-  info, applying domain-specific methodology, synthesizing content around a seed.
-
-The optimal approach is the combination that produces the best output. Often you
-won't know what that is until you research or test. Your core responsibility is
-to discover and validate the best seed + pipeline combination before committing
-to full-scale generation.
+  is a full agent with browsing, search, code execution, and randomization
+  tools. Pipeline instructions can delegate significant work — looking up
+  details within a seed's scope, exploring sources, applying methodology,
+  synthesizing content. Don't pre-resolve work at the seed level that the row
+  generator could handle per-row.
 
 The golden case is finding source material that is **higher quality than what
-you could generate yourself**. You're a capable LLM, but experts, professionals,
-and curated real-world content often surpass what you'd produce — authoritative
-references, domain experts, proven creative work, vetted datasets. When such
-sources exist, use them. When they don't, lean on synthesis but be deliberate
-about injecting quality through strong pipeline instructions and research-backed
-domain knowledge. Not all real data is good — seek the best, not just the real.
+you could generate yourself**. Experts, professionals, and curated real-world
+content often surpass what you'd produce — authoritative references, domain
+experts, proven creative work, vetted datasets. When such sources exist, use
+them. When they don't, lean on synthesis but be deliberate about injecting
+quality through strong pipeline instructions and research-backed domain
+knowledge. Not all real data is good — seek the best, not just the real.
+
+## Synthetic diversity risk
+
+Not all datasets face the same risk from synthetic generation. Use this
+reference when reasoning about your strategy — it tells you where to invest
+in diversity engineering vs. where correctness constraints naturally suffice.
+
+| Output type | Diversity risk | Why |
+|---|---|---|
+| Code, math, formal reasoning | LOW | Verifiable via execution/checks |
+| Structured outputs (JSON, SQL, tool calls) | VERY LOW | Schema validation dominates |
+| Information extraction & normalization | LOW | Deterministic validation possible |
+| Instruction following / assistant behavior | MEDIUM | Style homogenization risk |
+| Technical explanations / tutoring | MEDIUM | Tone collapses easily |
+| Customer support / sales simulations | MEDIUM-HIGH | Intent accuracy easy; realism harder |
+| Long-form reports & summaries | HIGH | Structure holds; discourse diversity collapses |
+| Game dialogue / character writing | HIGH | Needs persona anchoring |
+| Creative fiction / storytelling | VERY HIGH | Trope attractors + narrator voice collapse |
+| Natural multi-turn conversation | VERY HIGH | Social nuance hard to synthesize |
+| Humor / poetry / cultural voice | EXTREME | Highest human-signal dependency |
+
+For high-risk areas, diversity must be deliberately engineered — primarily
+through seed variety from real sources carrying genuine differences, and
+secondarily through controlled randomization (the rng tool) for dimensions
+where seed-level variety isn't sufficient or the model can genuinely go
+either way.
 
 ## Resources
 
 {resources_section}
 - Web search and browsing via research agents
 - Code execution (Python) via research agents
-- Generator agents for extracting raw text seeds from web sources
+- Generator agents for extracting seeds from sources
 
 ## Column schema
 {columns_description}
@@ -72,22 +95,48 @@ domain knowledge. Not all real data is good — seek the best, not just the real
 ## Conversation history
 {conversation_summary}
 
+## How to work
+
+1. **Strategize first.** Call strategy() with your strategic analysis before
+   any other tool:
+   - What does quality look like for this dataset — per-row and overall?
+   - Where does the diversity live? What should seeds carry?
+   - What are the possible approaches? If there are meaningfully different
+     strategies (different seed designs, source mixes, pipeline splits),
+     reason about the tradeoffs. If the approach is obvious, explain why.
+   - What could go wrong? What are the risks with your chosen approach?
+   - What do you need to confirm about sources before committing?
+
+2. **Research to confirm.** Use research() to ground your strategy in specifics.
+   Even with strong intuitions, confirm them — what specific sources exist,
+   what does their content look like, are they rich enough for your target
+   count? Use ask_research() to drill deeper where source structure matters
+   for extraction. Resolve any uncertainty here, not through trial-and-error.
+
+3. **Set the plan and go.** Once your strategy is confirmed, call set_plan()
+   to start generation immediately:
+   - Pipeline instructions telling the row generator exactly how to transform
+     seeds into rows — leverage the row generator's full capabilities (browsing,
+     search, code execution, rng) in these instructions
+   - Generators with specific scopes for seed extraction
+   - Buckets for distribution (if needed)
+   The system generates sample rows first and pauses for user review.
+
 ## Tools
 
-**research(task)** — Spawn a research agent to investigate a question. Use for
-understanding the domain, finding where quality content lives, and mapping the
-landscape. Use ask_research(agent_id, question) for follow-ups.
+**strategy(analysis)** — Record your strategic analysis. Call this first, before
+researching or planning. Must include: quality definition, diversity analysis,
+approach reasoning (consider alternatives if non-obvious), and risk assessment.
 
-**set_plan(plan)** — Commit a generation plan. The system will automatically
-sample each generator and run seeds through the pipeline, showing you actual
-results. If the samples look wrong, call set_plan() again with adjustments.
-Iterate until the approach works.
+**research(task)** — Spawn a research agent to investigate a specific question.
+Give it a precise, answerable task — not a broad survey. Use ask_research(
+agent_id, question) for follow-ups to dig deeper into specifics.
 
-**add_generator(generator)** — Add a generator to the current plan (also
-auto-samples). Use for shortage recovery or expanding coverage.
+**set_plan(plan)** — Set and start the generation plan. Begins generation
+immediately. The system generates sample rows and pauses for user review.
 
-**generate()** — Run the full pipeline. Blocks until complete, shortage, or
-paused for user review.
+**add_generator(generator)** — Add a generator to the current plan. Use for
+shortage recovery — add targeted generators for buckets that are short.
 
 **done(reason)** — Signal orchestration is complete.
 
@@ -95,18 +144,20 @@ paused for user review.
 
 A plan has three parts:
 
-**Pipelines** — Instructions for turning raw text seeds into rows. Tell the
-row generator exactly how to interpret the seed and what to produce for each
-column. Usually one pipeline unless categories need genuinely different processing.
+**Pipelines** — Instructions for turning seeds into rows. Tell the row
+generator exactly how to interpret the seed and what to produce. The row
+generator is a full agent with browsing, search, code execution, and rng
+tools — pipeline instructions can leverage all of these. Use one pipeline
+unless categories need fundamentally different processing; a single pipeline
+can include conditional logic for moderate variation.
 
 **Buckets** (optional) — Distribution controls. Each bucket has a weight and
 maps to a pipeline. Skip entirely for uniform datasets.
 
-**Generators** — Extraction agents that find sources and yield raw text seeds.
-Each has a scope (what to look for), seed_description (what kind of text),
-target_count, and optional bucket_id. Seeds are raw text — paragraphs, table
-sections, content blocks. Generators are rough extractors; the pipeline handles
-transformation.
+**Generators** — Extraction agents that find sources and yield seeds. Each has
+a scope (what to extract and from where), seed_description (what each seed
+should look like), target_count, and optional bucket_id. Generators are rough
+extractors; the pipeline handles transformation and enrichment.
 
 ```json
 {{
@@ -120,9 +171,8 @@ transformation.
   ],
   "generators": [
     {{
-      "id": "gen_1",
-      "scope": "What to extract and from where",
-      "seed_description": "What kind of text to grab",
+      "scope": "What to extract and from where — be specific",
+      "seed_description": "What each seed should look like",
       "target_count": 200,
       "bucket_id": "primary"
     }}
@@ -134,17 +184,25 @@ transformation.
 
 - **Quality first.** Seek source material that exceeds what you'd synthesize.
   Not all real data is good — aim for the highest quality sources available.
+- **Seeds are for diversity and coverage.** What carries the diversity for this
+  dataset? Design seeds around that. Real sources over synthetic.
+- **The row generator is capable.** It has full browsing, search, code execution,
+  and randomization tools. If per-seed exploration or lookup is needed, the
+  pipeline can handle it — don't pre-resolve work at the seed level that
+  belongs in the pipeline.
+- **Think, confirm, execute.** Reason about the best strategy, use research to
+  confirm specifics, then commit. Don't over-research what you're confident
+  about.
 - **No licensing concerns.** Our legal team has confirmed all content is free
   to use in our jurisdiction regardless of license or copyright. Do not waste
   time researching licenses or avoiding copyrighted material — focus on quality.
 - **Coverage and diversity matter.** A good strategy produces varied, well-
-  distributed rows, not just individually good ones.
-- Research the domain before planning. Understand what exists and what quality
-  looks like in this space.
+  distributed rows, not just individually good ones. Consult the synthetic
+  diversity risk table to calibrate how much diversity engineering is needed.
 - The simplest strategy that produces quality results wins.
 - Generators yield raw text. The pipeline handles transformation and filtering.
-- When generate() returns "shortage", add more generators and run again.
-- When generate() returns "sampling_paused", call done("sampling_paused").
+- When set_plan() returns "shortage", add more generators and run again.
+- When set_plan() returns "sampling_paused", call done("sampling_paused").
 - Target: {num_samples} rows.
 """
 
@@ -152,7 +210,7 @@ transformation.
 class OrchestratorAgent:
     """
     Main orchestrator. Reads conversation, researches, creates plan,
-    and runs generation via the blocking generate() tool.
+    and runs generation via set_plan().
 
     Usage:
         orchestrator = OrchestratorAgent(
@@ -180,8 +238,13 @@ class OrchestratorAgent:
         stop_checker: Optional[Callable[[], bool]] = None,
         cost_checker: Optional[Callable[[], tuple[bool, Optional[str]]]] = None,
         on_generate: Optional[Callable[[Dict, asyncio.Queue, asyncio.Future], Awaitable]] = None,
+        previous_recipe: Optional[str] = None,
+        blob_service_client: Optional[Any] = None,
+        project_id: Optional[Any] = None,
+        on_tool_call: Optional[Callable[[str, str], None]] = None,
     ) -> None:
         self.chat_history = chat_history
+        self.previous_recipe = previous_recipe
         self.columns = columns
         self.num_samples = num_samples
         self.workspace_dir = Path(workspace_dir)
@@ -192,6 +255,9 @@ class OrchestratorAgent:
         self.stop_checker = stop_checker
         self.cost_checker = cost_checker
         self.on_generate = on_generate
+        self.blob_service_client = blob_service_client
+        self.project_id = project_id
+        self.on_tool_call = on_tool_call
 
         # State
         self.plan: Optional[Dict] = None
@@ -212,6 +278,15 @@ class OrchestratorAgent:
         convo_summary = self._format_conversation()
         resources_section = self._format_resources(uploaded_files)
 
+        if self.previous_recipe:
+            convo_summary += (
+                f"\n\n## Previous plan (user requested changes)\n"
+                f"```json\n{self.previous_recipe}\n```\n"
+                f"The user has provided feedback on the sample rows. Review the "
+                f"conversation history for their feedback, then adjust the pipeline "
+                f"instructions accordingly and call set_plan()."
+            )
+
         system_prompt = ORCHESTRATOR_SYSTEM_PROMPT.format(
             num_samples=num_samples,
             columns_description=columns_desc,
@@ -226,8 +301,10 @@ class OrchestratorAgent:
             tools=registry,
             stop_checker=stop_checker,
             max_turns=300,
-            reasoning={"effort": "medium", "summary": "detailed"},
+            reasoning={"effort": "high", "summary": "detailed"},
             label="orchestrator",
+            continue_on_text=True,
+            on_tool_call=on_tool_call,
         )
 
     def _new_id(self) -> str:
@@ -238,12 +315,16 @@ class OrchestratorAgent:
         if not self.columns:
             return "(no columns defined)"
 
-        lines = ["| Name | Type | Description |", "|------|------|-------------|"]
+        lines = ["| Name | Type | Details |", "|------|------|---------|"]
         for col in self.columns:
             name = col.get("name", "?")
             ctype = col.get("type", "?")
-            desc = col.get("description", "")
-            lines.append(f"| {name} | {ctype} | {desc} |")
+            details = ""
+            if ctype == "enum" and col.get("enum_values"):
+                details = f"values: {col['enum_values']}"
+            elif ctype == "json" and col.get("json_schema"):
+                details = f"json_schema defined"
+            lines.append(f"| {name} | {ctype} | {details} |")
         return "\n".join(lines)
 
     def _format_conversation(self) -> str:
@@ -279,6 +360,37 @@ class OrchestratorAgent:
     def _register_tools(self, registry: ToolRegistry) -> None:
         """Register orchestrator tools."""
 
+        # --- strategy (think tool) ---
+        async def strategy(args: Dict) -> tuple[str, float]:
+            analysis = args.get("analysis", "")
+            logger.info(f"[Orchestrator] strategy() called ({len(analysis)} chars)")
+            return "Strategy recorded. Proceed with research or set_plan().", 0.0
+
+        registry.add(
+            name="strategy",
+            description=(
+                "Record your strategic analysis before researching or planning. "
+                "Must include: quality definition, diversity analysis, approach "
+                "reasoning (consider alternatives when non-obvious), and risk "
+                "assessment. Call this BEFORE research() or set_plan()."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "analysis": {
+                        "type": "string",
+                        "description": (
+                            "Your strategic reasoning. Cover: quality definition, "
+                            "diversity analysis, approach reasoning (with alternatives "
+                            "if non-obvious), and what could go wrong."
+                        ),
+                    },
+                },
+                "required": ["analysis"],
+            },
+            handler=strategy,
+        )
+
         # --- research ---
         async def research(args: Dict) -> tuple[str, float]:
             task = args.get("task", "")
@@ -291,6 +403,9 @@ class OrchestratorAgent:
                 brave_api_key=self.brave_api_key,
                 sandbox=self.sandbox,
                 stop_checker=self.stop_checker,
+                blob_service_client=self.blob_service_client,
+                project_id=self.project_id,
+                on_tool_call=self.on_tool_call,
             )
             agent._conversation.label = f"research:{agent_id}"
             self._research_agents[agent_id] = agent
@@ -357,10 +472,17 @@ class OrchestratorAgent:
             if "plan" in args and isinstance(args["plan"], dict):
                 plan = args["plan"]
 
+            # Extract new_version flag (top-level arg, not part of plan data)
+            new_version = args.get("new_version", False)
+
             # Validate plan structure
             errors = self._validate_plan(plan)
             if errors:
                 return f"Plan validation failed:\n" + "\n".join(f"- {e}" for e in errors), 0.0
+
+            # Store new_version flag in plan metadata for job_processor
+            if new_version:
+                plan["_new_version"] = True
 
             self.plan = plan
             self.plan_version += 1
@@ -388,27 +510,80 @@ class OrchestratorAgent:
             generators = plan.get("generators", [])
             summary_parts.append(f"Generators ({len(generators)}):")
             for g in generators:
+                gen_id = g.get("id", "gen")
                 summary_parts.append(
-                    f"  - {g.get('id')}: scope=\"{g.get('scope', '')[:60]}\" "
+                    f"  - {gen_id}: scope=\"{g.get('scope', '')[:60]}\" "
                     f"target={g.get('target_count', 100)} bucket={g.get('bucket_id', 'none')}"
                 )
 
-            # Auto-sample: run each generator for a few seeds and process through pipeline
-            sample_text, sample_cost = await self._sample_generators(
-                generators, plan.get("pipelines", {}), buckets,
-            )
-            if sample_text:
-                summary_parts.append("")
-                summary_parts.append(sample_text)
+            # === Start generation ===
+            if not self.on_generate:
+                summary_parts.append("\nWarning: no on_generate callback — generation skipped.")
+                return "\n".join(summary_parts), 0.0
 
-            return "\n".join(summary_parts), sample_cost
+            # Create a fresh queue for this generation run
+            self.seed_queue = asyncio.Queue()
+
+            # Create future for the result
+            result_future: asyncio.Future = asyncio.get_event_loop().create_future()
+
+            # Signal job_processor to start the generation consumer
+            await self.on_generate(self.plan, self.seed_queue, result_future)
+
+            # Start all generator agents — they feed the seed queue
+            for gen_config in generators:
+                gen_id = gen_config.get("id", self._new_id())
+
+                # Skip generators that are already running
+                if gen_id in self._generators:
+                    continue
+
+                gen = GeneratorAgent(
+                    openai_client=self.openai_client,
+                    model=self.model,
+                    scope=gen_config.get("scope", ""),
+                    seed_description=gen_config.get("seed_description", ""),
+                    seed_queue=self.seed_queue,
+                    workspace_dir=self.workspace_dir,
+                    generator_id=gen_id,
+                    target_count=gen_config.get("target_count", 100),
+                    bucket_id=gen_config.get("bucket_id"),
+                    brave_api_key=self.brave_api_key,
+                    sandbox=self.sandbox,
+                    stop_checker=self.stop_checker,
+                    blob_service_client=self.blob_service_client,
+                    project_id=self.project_id,
+                    on_tool_call=self.on_tool_call,
+                )
+                self._generators[gen_id] = gen
+
+                task = asyncio.create_task(gen.run())
+                self._generator_tasks[gen_id] = task
+
+            logger.info(
+                f"[Orchestrator] set_plan: "
+                f"{len(generators)} generators started, awaiting result..."
+            )
+
+            # Block until the consumer resolves the future
+            try:
+                result = await result_future
+            except Exception as e:
+                return f"Generation error: {e}", 0.0
+
+            summary_parts.append(f"\n## Generation result\n{json.dumps(result, indent=2)}")
+
+            # Auto-exit on sampling_paused
+            if result.get("status") == "sampling_paused":
+                self._is_done = True
+
+            return "\n".join(summary_parts), 0.0
 
         registry.add(
             name="set_plan",
             description=(
-                "Set the generation plan. Includes pipelines (processing instructions), "
-                "buckets (optional distribution controls), and generators (seed extraction agents). "
-                "Each call creates a new plan version."
+                "Set and start the generation plan. Begins generation immediately. "
+                "The system generates sample rows and pauses for user review."
             ),
             parameters={
                 "type": "object",
@@ -446,8 +621,12 @@ class OrchestratorAgent:
                                         "target_count": {"type": "integer"},
                                         "bucket_id": {"type": "string"},
                                     },
-                                    "required": ["id", "scope", "seed_description"],
+                                    "required": ["scope", "seed_description"],
                                 },
+                            },
+                            "new_version": {
+                                "type": "boolean",
+                                "description": "If true, creates a new dataset version instead of appending to the current one. Use when user feedback requires fundamentally different data (e.g. different schema, different approach). Default false.",
                             },
                         },
                         "required": ["pipelines", "generators"],
@@ -467,42 +646,31 @@ class OrchestratorAgent:
             if "generator" in args and isinstance(args["generator"], dict):
                 generator = args["generator"]
 
-            # Validate generator
-            if not generator.get("id") or not generator.get("scope"):
-                return "Error: generator needs at least 'id' and 'scope'.", 0.0
+            if not generator.get("scope"):
+                return "Error: generator needs 'scope'.", 0.0
 
             # Append to current plan (no version bump)
             self.plan["generators"].append(generator)
 
-            parts = [
-                f"Generator '{generator.get('id')}' added to plan. "
-                f"Now {len(self.plan['generators'])} generators total."
-            ]
-
-            # Auto-sample the new generator
-            sample_text, sample_cost = await self._sample_generators(
-                [generator],
-                self.plan.get("pipelines", {}),
-                self.plan.get("buckets", []),
-            )
-            if sample_text:
-                parts.append("")
-                parts.append(sample_text)
-
-            return "\n".join(parts), sample_cost
+            gen_id = generator.get("id", "new_gen")
+            return (
+                f"Generator '{gen_id}' added to plan. "
+                f"Now {len(self.plan['generators'])} generators total. "
+                f"Call set_plan() again to restart generation with the updated plan."
+            ), 0.0
 
         registry.add(
             name="add_generator",
             description=(
                 "Add a generator to the current plan. Use for shortage recovery — "
-                "add targeted generators for buckets that are short, then generate() again."
+                "add targeted generators for buckets that are short, then call set_plan() again."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "generator": {
                         "type": "object",
-                        "description": "Generator definition (same shape as in set_plan)",
+                        "description": "Generator definition with scope and seed_description",
                         "properties": {
                             "id": {"type": "string"},
                             "scope": {"type": "string"},
@@ -510,82 +678,12 @@ class OrchestratorAgent:
                             "target_count": {"type": "integer"},
                             "bucket_id": {"type": "string"},
                         },
-                        "required": ["id", "scope", "seed_description"],
+                        "required": ["scope", "seed_description"],
                     },
                 },
                 "required": ["generator"],
             },
             handler=add_generator,
-        )
-
-        # --- generate ---
-        async def generate(args: Dict) -> tuple[str, float]:
-            if not self.plan:
-                return "Error: call set_plan() first.", 0.0
-
-            if not self.on_generate:
-                return "Error: generation callback not configured.", 0.0
-
-            # Create a fresh queue for this generation run
-            self.seed_queue = asyncio.Queue()
-
-            # Create future for the result
-            result_future: asyncio.Future = asyncio.get_event_loop().create_future()
-
-            # Signal job_processor to start the generation consumer
-            await self.on_generate(self.plan, self.seed_queue, result_future)
-
-            # Start all generator agents — they feed the seed queue
-            generators_config = self.plan.get("generators", [])
-            for gen_config in generators_config:
-                gen_id = gen_config.get("id", self._new_id())
-
-                # Skip generators that are already running from a previous generate() call
-                if gen_id in self._generators:
-                    continue
-
-                gen = GeneratorAgent(
-                    openai_client=self.openai_client,
-                    model=self.model,
-                    scope=gen_config.get("scope", ""),
-                    seed_description=gen_config.get("seed_description", ""),
-                    seed_queue=self.seed_queue,
-                    workspace_dir=self.workspace_dir,
-                    generator_id=gen_id,
-                    target_count=gen_config.get("target_count", 100),
-                    bucket_id=gen_config.get("bucket_id"),
-                    brave_api_key=self.brave_api_key,
-                    sandbox=self.sandbox,
-                    stop_checker=self.stop_checker,
-                )
-                self._generators[gen_id] = gen
-
-                task = asyncio.create_task(gen.run())
-                self._generator_tasks[gen_id] = task
-
-            logger.info(
-                f"[Orchestrator] generate() started: "
-                f"{len(generators_config)} generators, awaiting result..."
-            )
-
-            # Block until the consumer resolves the future
-            try:
-                result = await result_future
-            except Exception as e:
-                return f"Generation error: {e}", 0.0
-
-            # Return result to LLM as JSON
-            return json.dumps(result, indent=2), 0.0
-
-        registry.add(
-            name="generate",
-            description=(
-                "Run the generation pipeline. This blocks until generation completes, "
-                "runs into a shortage, or pauses for user review. Returns a result "
-                "object with status and details."
-            ),
-            parameters={"type": "object", "properties": {}},
-            handler=generate,
         )
 
         # --- done ---
@@ -657,166 +755,6 @@ class OrchestratorAgent:
 
         return errors
 
-    def _get_pipeline_instructions(
-        self, gen_config: Dict, pipelines: Dict, buckets: List[Dict],
-    ) -> str:
-        """Resolve pipeline instructions for a generator via its bucket."""
-        bucket_id = gen_config.get("bucket_id")
-        if bucket_id and buckets:
-            for b in buckets:
-                if b.get("id") == bucket_id:
-                    pid = b.get("pipeline_id", "main")
-                    pipeline = pipelines.get(pid, {})
-                    return pipeline.get("instructions", "")
-        # Fallback: use first pipeline
-        for pipeline in pipelines.values():
-            return pipeline.get("instructions", "")
-        return ""
-
-    async def _sample_generators(
-        self,
-        generators: List[Dict],
-        pipelines: Dict,
-        buckets: List[Dict],
-        seeds_per_generator: int = 2,
-    ) -> tuple[str, float]:
-        """Run each generator for a few seeds and process through pipeline.
-
-        Returns (formatted_results, total_cost). Called automatically by
-        set_plan() and add_generator() so the orchestrator sees real output.
-        """
-        if not generators or not pipelines:
-            return "", 0.0
-
-        total_cost = 0.0
-        all_results: list[dict] = []
-        PER_ITEM_TOKEN_CAP = 500
-
-        for gen_config in generators[:3]:  # Cap at 3 generators
-            gen_id = gen_config.get("id", "sample_gen")
-            scope = gen_config.get("scope", "")
-            seed_desc = gen_config.get("seed_description", "text chunk")
-            pipeline_instructions = self._get_pipeline_instructions(
-                gen_config, pipelines, buckets,
-            )
-
-            if not scope:
-                continue
-
-            # Run a small generator
-            sample_queue: asyncio.Queue = asyncio.Queue()
-            sample_gen = GeneratorAgent(
-                openai_client=self.openai_client,
-                model=self.model,
-                scope=scope,
-                seed_description=seed_desc,
-                seed_queue=sample_queue,
-                workspace_dir=self.workspace_dir,
-                generator_id=f"sample_{gen_id}",
-                target_count=seeds_per_generator,
-                bucket_id=None,
-                brave_api_key=self.brave_api_key,
-                sandbox=self.sandbox,
-                stop_checker=self.stop_checker,
-                max_turns=50,
-            )
-
-            try:
-                await sample_gen.run()
-                total_cost += sample_gen.cost_usd
-            except Exception as e:
-                all_results.append({
-                    "generator_id": gen_id,
-                    "error": f"Generator failed: {e}",
-                })
-                continue
-            finally:
-                await sample_gen.cleanup()
-
-            # Collect seeds
-            seeds: list[str] = []
-            while not sample_queue.empty():
-                item = sample_queue.get_nowait()
-                if item is not None:
-                    text = item.get("data", "") if isinstance(item, dict) else str(item)
-                    if isinstance(text, dict):
-                        text = json.dumps(text)
-                    seeds.append(text)
-
-            if not seeds:
-                all_results.append({
-                    "generator_id": gen_id,
-                    "error": "Generator produced 0 seeds.",
-                })
-                continue
-
-            # Run each seed through the pipeline
-            row_agent = RowGeneratorAgent(
-                openai_client=self.openai_client,
-                model=self.model,
-                workspace_dir=self.workspace_dir,
-                brave_api_key=self.brave_api_key,
-                sandbox=self.sandbox,
-                stop_checker=self.stop_checker,
-            )
-            try:
-                for seed_text in seeds:
-                    row_result = await row_agent.generate(
-                        seed=seed_text,
-                        pipeline_instructions=pipeline_instructions,
-                        schema=self.columns,
-                    )
-                    total_cost += row_result.cost_usd
-                    all_results.append({
-                        "generator_id": gen_id,
-                        "seed": seed_text,
-                        "row": row_result.row if row_result.success else None,
-                        "skipped": row_result.skipped,
-                        "skip_reason": row_result.skip_reason,
-                        "error": row_result.error,
-                    })
-            finally:
-                await row_agent.cleanup()
-
-        if not all_results:
-            return "", total_cost
-
-        # Format results with token-based truncation
-        parts = [f"## Sample results ({sum(1 for r in all_results if r.get('row'))} rows from {len(generators)} generators)\n"]
-        full_parts = list(parts)
-
-        for r in all_results:
-            gen_label = r.get("generator_id", "?")
-
-            if r.get("error") and "seed" not in r:
-                full_item = f"[{gen_label}] {r['error']}\n"
-            else:
-                full_item = f"[{gen_label}] Seed:\n{r.get('seed', '(empty)')}\n"
-                if r.get("skipped"):
-                    full_item += f"-> SKIPPED: {r['skip_reason']}\n"
-                elif r.get("error"):
-                    full_item += f"-> ERROR: {r['error']}\n"
-                elif r.get("row"):
-                    full_item += f"-> Row: {json.dumps(r['row'], indent=2)}\n"
-
-            full_parts.append(full_item)
-
-            item_tokens = count_tokens(full_item)
-            if item_tokens > PER_ITEM_TOKEN_CAP:
-                char_limit = PER_ITEM_TOKEN_CAP * 4
-                parts.append(full_item[:char_limit] + "\n[truncated, full in sample_results.txt]")
-            else:
-                parts.append(full_item)
-
-        parts.append(f"Sample cost: ${total_cost:.4f}")
-
-        # Write full results to workspace file
-        full_output = "\n".join(full_parts) + f"\n\nSample cost: ${total_cost:.4f}"
-        sample_file = self.workspace_dir / "sample_results.txt"
-        sample_file.write_text(full_output, encoding="utf-8")
-
-        return "\n".join(parts), total_cost
-
     async def run(self) -> AgentResult:
         """
         Run the orchestrator. This is the main entry point.
@@ -829,8 +767,8 @@ class OrchestratorAgent:
         5. Handle results and complete
         """
         result = await self._conversation.send(
-            "Begin. Read the conversation history and figure out the best "
-            "strategy for building this dataset.",
+            "Begin. Read the conversation history, then call strategy() with "
+            "your strategic analysis.",
             exit_condition=lambda: self._is_done,
         )
         return result

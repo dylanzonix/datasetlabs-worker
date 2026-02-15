@@ -77,6 +77,8 @@ class ScopeProcessor:
         sandbox: Optional[Any] = None,
         files_metadata: Optional[List[str]] = None,
         stop_checker: Optional[Callable[[], bool]] = None,
+        blob_service_client: Optional[Any] = None,
+        project_id: Optional[Any] = None,
     ):
         self.workspace_dir = Path(workspace_dir)
         self.schema = schema
@@ -86,6 +88,8 @@ class ScopeProcessor:
         self.sandbox = sandbox
         self.files_metadata = files_metadata or []
         self.stop_checker = stop_checker
+        self.blob_service_client = blob_service_client
+        self.project_id = project_id
         
         self._total_cost = 0.0
         self._all_seeds: List[Seed] = []
@@ -117,6 +121,8 @@ class ScopeProcessor:
             model=settings.research_model,
             sandbox=self.sandbox,
             stop_checker=self.stop_checker,
+            blob_service_client=self.blob_service_client,
+            project_id=self.project_id,
         )
         
         # Set scope with inherited notes

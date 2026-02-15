@@ -5,7 +5,6 @@ Handles:
 - Accumulating costs from API calls
 - Charging to user balance at intervals
 - Checking if user has sufficient balance
-- Enforcing project spend limits
 - THREAD-SAFE for concurrent workers
 """
 
@@ -58,7 +57,6 @@ class CostTracker:
         margin_multiplier: Multiply raw costs by this (e.g., 2.0 for 100% margin)
         charge_threshold_cents: Charge when accumulated costs reach this
         charge_interval_seconds: Charge at least this often
-        spend_limit_cents: Initial spend limit (refreshed from DB)
     """
 
     def __init__(
@@ -69,7 +67,6 @@ class CostTracker:
         margin_multiplier: float = 2.0,
         charge_threshold_cents: int = 100,
         charge_interval_seconds: int = 60,
-        spend_limit_cents: Optional[int] = None,
     ):
         self.db = db
         self.user_id = user_id
@@ -77,11 +74,6 @@ class CostTracker:
         self.margin_multiplier = margin_multiplier
         self.charge_threshold_cents = charge_threshold_cents
         self.charge_interval_seconds = charge_interval_seconds
-
-        # Spend limit cache
-        self._spend_limit_cache: Optional[int] = spend_limit_cents
-        self._spend_limit_cache_time: datetime = datetime.now(timezone.utc)
-        self._spend_limit_cache_ttl_seconds: float = 5.0
 
         # Append-only lists
         self._costs: List[CostEntry] = []
@@ -109,32 +101,6 @@ class CostTracker:
         )
         return abs(result) if result else 0
 
-    def _get_current_spend_limit(self) -> Optional[int]:
-        """Fetch current spend limit from database with caching."""
-        now = datetime.now(timezone.utc)
-        age = (now - self._spend_limit_cache_time).total_seconds()
-
-        if age < self._spend_limit_cache_ttl_seconds:
-            return self._spend_limit_cache
-
-        from dsl_api.models.project import Project
-
-        project = self.db.query(Project).filter(Project.id == self.project_id).first()
-        if project:
-            old_limit = self._spend_limit_cache
-            self._spend_limit_cache = project.spend_limit_cents
-
-            if old_limit != self._spend_limit_cache:
-                logger.info(f"Spend limit updated: {old_limit}¢ -> {self._spend_limit_cache}¢")
-
-        self._spend_limit_cache_time = now
-        return self._spend_limit_cache
-
-    @property
-    def spend_limit_cents(self) -> Optional[int]:
-        """Current spend limit."""
-        return self._get_current_spend_limit()
-
     @property
     def cumulative_spend_cents(self) -> int:
         """Total spend on this project including current run."""
@@ -144,14 +110,6 @@ class CostTracker:
     def _total_charged_cents_unlocked(self) -> int:
         """Get total charged cents (must hold lock)."""
         return sum(c.amount_cents for c in self._charges)
-
-    @property
-    def remaining_budget_cents(self) -> Optional[int]:
-        """Remaining budget for this project."""
-        limit = self.spend_limit_cents
-        if limit is None:
-            return None
-        return max(0, limit - self.cumulative_spend_cents)
 
     def add_cost(
         self,
@@ -299,25 +257,9 @@ class CostTracker:
         """Check if user has enough balance to continue."""
         return self.get_user_balance_cents() > 0
 
-    def is_within_spend_limit(self) -> bool:
-        """Check if we're still within the project spend limit."""
-        limit = self.spend_limit_cents
-        if limit is None:
-            return True
-        with self._lock:
-            projected_spend = (
-                self._cumulative_spend_at_start +
-                self._total_charged_cents_unlocked() +
-                self._uncharged_cents_unlocked()
-            )
-        return projected_spend <= limit
-
     def check_balance_and_charge(self) -> tuple[bool, Optional[str]]:
-        """Combined check: charge if needed, then verify balance and spend limit."""
+        """Combined check: charge if needed, then verify balance."""
         self.charge_if_needed()
-
-        if not self.is_within_spend_limit():
-            return False, "spend_limit_exceeded"
 
         if not self.has_sufficient_balance():
             return False, "insufficient_balance"
@@ -326,8 +268,6 @@ class CostTracker:
 
     def get_summary(self) -> dict:
         """Get a summary of costs and charges."""
-        limit = self.spend_limit_cents
-
         with self._lock:
             total_costs_cents = self._total_costs_cents_unlocked()
             total_charged_cents = self._total_charged_cents_unlocked()
@@ -350,9 +290,5 @@ class CostTracker:
             "total_output_tokens": total_output_tokens,
             "total_tokens": total_input_tokens + total_output_tokens,
         }
-
-        if limit is not None:
-            summary["spend_limit_cents"] = limit
-            summary["remaining_budget_cents"] = max(0, limit - cumulative)
 
         return summary

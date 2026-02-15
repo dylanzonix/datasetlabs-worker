@@ -20,8 +20,22 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from dsl_worker.agents.tools import ToolRegistry
 from dsl_worker.billing.tracked_client import TrackedOpenAIClient
+from dsl_worker.utils import count_tokens
 
 logger = logging.getLogger(__name__)
+
+# Langfuse is optional — tracing is a no-op if not configured
+try:
+    from langfuse import get_client as _get_langfuse_client
+
+    def _get_langfuse():
+        try:
+            return _get_langfuse_client()
+        except Exception:
+            return None
+except ImportError:
+    def _get_langfuse():
+        return None
 
 # Max characters to include from a tool result
 TOOL_OUTPUT_LIMIT = 15_000
@@ -79,8 +93,11 @@ class AgentConversation:
         stop_checker: Optional[Callable[[], bool]] = None,
         max_turns: int = 100,
         max_output_tokens: int = 16_000,
-        reasoning: Optional[Dict[str, Any]] = {"effort": "medium", "summary": "detailed"},
+        reasoning: Optional[Dict[str, Any]] = None,
         label: str = "agent",
+        continue_on_text: bool = False,
+        context_window: int = 400_000,
+        on_tool_call: Optional[Callable[[str, str], None]] = None,
     ) -> None:
         self.openai_client = openai_client
         self.model = model
@@ -89,8 +106,11 @@ class AgentConversation:
         self.stop_checker = stop_checker
         self.max_turns = max_turns
         self.max_output_tokens = max_output_tokens
-        self.reasoning = reasoning
+        self.reasoning = reasoning if reasoning is not None else {"effort": "medium", "summary": "detailed"}
         self.label = label
+        self.continue_on_text = continue_on_text
+        self.context_window = context_window
+        self.on_tool_call = on_tool_call
 
         # Conversation state — this IS the context sent to the API each turn.
         # Contains user messages, reasoning items, assistant messages,
@@ -101,6 +121,40 @@ class AgentConversation:
 
     def _should_stop(self) -> bool:
         return self.stop_checker is not None and self.stop_checker()
+
+    def _trim_context(self) -> None:
+        """Drop oldest messages if total context would exceed the window limit."""
+        # Reserve space for system prompt + output
+        system_tokens = count_tokens(self.system_prompt)
+        budget = self.context_window - system_tokens - self.max_output_tokens
+
+        if budget <= 0 or not self.messages:
+            return
+
+        # Count tokens per message (json serialization as proxy)
+        msg_tokens = []
+        total = 0
+        for msg in self.messages:
+            t = count_tokens(json.dumps(msg, ensure_ascii=False))
+            msg_tokens.append(t)
+            total += t
+
+        if total <= budget:
+            return
+
+        # Drop from the front until we fit
+        dropped = 0
+        while total > budget and dropped < len(self.messages):
+            total -= msg_tokens[dropped]
+            dropped += 1
+
+        if dropped > 0:
+            self.messages = self.messages[dropped:]
+            logger.warning(
+                f"[{self.label}] trimmed {dropped} oldest messages "
+                f"to fit context window ({total} tokens remaining, "
+                f"budget {budget})"
+            )
 
     async def send(
         self,
@@ -143,6 +197,30 @@ class AgentConversation:
         exit_condition: Optional[Callable[[], bool]] = None,
     ) -> AgentResult:
         """Core agent loop. Calls API, handles tools, repeats."""
+        langfuse = _get_langfuse()
+        if langfuse:
+            return await self._run_loop_traced(langfuse, exit_condition)
+        return await self._run_loop_inner(exit_condition)
+
+    async def _run_loop_traced(
+        self,
+        langfuse,
+        exit_condition: Optional[Callable[[], bool]] = None,
+    ) -> AgentResult:
+        """Wrapper that creates a Langfuse span around the agent loop."""
+        with langfuse.start_as_current_observation(
+            as_type="span",
+            name=self.label,
+            metadata={"model": self.model, "max_turns": self.max_turns},
+        ):
+            result = await self._run_loop_inner(exit_condition)
+            return result
+
+    async def _run_loop_inner(
+        self,
+        exit_condition: Optional[Callable[[], bool]] = None,
+    ) -> AgentResult:
+        """Core agent loop. Calls API, handles tools, repeats."""
         result = AgentResult()
 
         for turn in range(self.max_turns):
@@ -154,6 +232,9 @@ class AgentConversation:
             if exit_condition and exit_condition():
                 logger.info(f"[{self.label}] exit_condition met at turn {turn}")
                 break
+
+            # Trim oldest messages if approaching context window limit
+            self._trim_context()
 
             # Always build full input — system prompt + all messages
             input_items = (
@@ -235,6 +316,16 @@ class AgentConversation:
                 preview = output_text[:120].replace("\n", " ")
                 logger.info(f"[{self.label}] turn {turn} — text response ({len(output_text)} chars): {preview}")
                 result.text = output_text
+
+                if self.continue_on_text:
+                    # Don't break — inject a continuation prompt so the agent
+                    # keeps working (e.g. orchestrator thinking before acting).
+                    self.messages.append({
+                        "role": "user",
+                        "content": "Continue.",
+                    })
+                    continue
+
                 break
 
             # Execute tools and append function_call_output items
@@ -282,6 +373,9 @@ class AgentConversation:
 
     async def _execute_tool(self, tc) -> Tuple[str, float]:
         """Execute a single tool call. Returns (result_text, cost)."""
+        if self.on_tool_call:
+            self.on_tool_call(self.label, tc.name)
+
         try:
             args = json.loads(tc.arguments)
         except json.JSONDecodeError:

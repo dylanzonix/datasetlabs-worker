@@ -18,6 +18,7 @@ typing-inspection==0.4.2
 typing_extensions==4.15.0
 scipy
 pyyaml
+jsonschema
 
 # Azure dependencies
 azure-storage-blob==12.19.0
@@ -42,6 +43,8 @@ browser-use
 markdownify 
 httpx
 llm_sandbox
+
+langfuse
 
 pdfplumber
 python-docx

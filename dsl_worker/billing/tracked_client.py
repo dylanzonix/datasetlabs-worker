@@ -89,20 +89,29 @@ class TrackedOpenAIClient:
 
         input_tokens = 0
         output_tokens = 0
+        cached_input_tokens = 0
 
         if hasattr(response, 'usage') and response.usage:
             input_tokens = getattr(response.usage, 'input_tokens', 0)
             output_tokens = getattr(response.usage, 'output_tokens', 0)
 
+            details = getattr(response.usage, 'input_tokens_details', None)
+            if details:
+                cached_input_tokens = getattr(details, 'cached_tokens', 0) or 0
+
+        # input_tokens from the API includes cached tokens, so subtract them
+        non_cached_input_tokens = input_tokens - cached_input_tokens
+
         cost = self._pricing.calculate_cost(
             model=model,
-            input_tokens=input_tokens,
+            input_tokens=non_cached_input_tokens,
             output_tokens=output_tokens,
+            cached_input_tokens=cached_input_tokens,
         )
 
         logger.debug(
             f"Responses API: model={model}, "
-            f"input={input_tokens}, output={output_tokens}, "
+            f"input={non_cached_input_tokens}, cached={cached_input_tokens}, output={output_tokens}, "
             f"cost=${cost.total_cost_usd:.6f}"
         )
 

@@ -133,6 +133,7 @@ class GenerationWorkerPool:
         checkpoint_callback: Optional[Callable[[int, bool, Optional[str]], Any]] = None,
         plan: Optional[Dict] = None,
         bucket_tracker: Optional[BucketTracker] = None,
+        blob_service_client: Optional[Any] = None,
     ):
         self.workspace_dir = Path(workspace_dir)
         self.openai_client = openai_client
@@ -148,6 +149,7 @@ class GenerationWorkerPool:
         self.checkpoint_callback = checkpoint_callback
         self.plan = plan
         self.bucket_tracker = bucket_tracker
+        self.blob_service_client = blob_service_client
 
         self._total_cost = 0.0
         self._rows_generated = 0
@@ -210,6 +212,8 @@ class GenerationWorkerPool:
                 brave_api_key=self.brave_api_key,
                 sandbox=self.sandbox,
                 stop_checker=self.stop_checker,
+                blob_service_client=self.blob_service_client,
+                project_id=self.project_id,
             )
 
             try:

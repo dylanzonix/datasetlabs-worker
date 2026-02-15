@@ -48,5 +48,18 @@ class WorkerSettings(BaseSettings):
     generation_model: str = "gpt-5.2"
     summarize_model: str = "gpt-5-nano"
 
+    # Browser proxy (Bright Data residential, optional — leave blank to disable)
+    browser_proxy_server: str = ""       # e.g. "http://brd.superproxy.io:22225"
+    browser_proxy_username: str = ""     # includes geo-pin: brd-customer-XXX-zone-residential-country-us-state-newyork
+    browser_proxy_password: str = ""
+
+    # Cookie persistence blob path (global pre-auth cookies shared across all projects)
+    browser_global_cookies_blob_path: str = "browser/global_cookies.json"
+
+    # Langfuse observability (optional — leave blank to disable)
+    langfuse_secret_key: str = ""
+    langfuse_public_key: str = ""
+    langfuse_base_url: str = "https://cloud.langfuse.com"
+
 
 settings = WorkerSettings()

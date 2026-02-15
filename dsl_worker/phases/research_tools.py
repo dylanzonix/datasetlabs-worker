@@ -190,6 +190,8 @@ class ResearchTools:
         model: str = "gpt-4o",
         sandbox: Optional[Any] = None,
         stop_checker: Optional[Callable[[], bool]] = None,
+        blob_service_client: Optional[Any] = None,
+        project_id: Optional[str] = None,
     ):
         self.workspace_dir = Path(workspace_dir)
         self.schema = schema
@@ -198,6 +200,8 @@ class ResearchTools:
         self.model = model
         self.sandbox = sandbox
         self.stop_checker = stop_checker
+        self.blob_service_client = blob_service_client
+        self.project_id = str(project_id) if project_id else None
         
         # Ensure directories exist
         (self.workspace_dir / "uploads").mkdir(parents=True, exist_ok=True)
@@ -269,10 +273,36 @@ class ResearchTools:
 
         async with self._browser_init_lock:
             if self._browser is None:
+                from dsl_worker.config import settings
+
+                # Build proxy settings if configured (Bright Data residential)
+                proxy = None
+                if settings.browser_proxy_server:
+                    from browser_use.browser import ProxySettings
+                    proxy = ProxySettings(
+                        server=settings.browser_proxy_server,
+                        username=settings.browser_proxy_username or None,
+                        password=settings.browser_proxy_password or None,
+                    )
+
+                # Load cookies from Azure Blob (global + per-project)
+                storage_state = None
+                if self.blob_service_client and self.project_id:
+                    from dsl_worker.phases.cookie_manager import load_cookies
+                    storage_state = load_cookies(
+                        self.blob_service_client,
+                        settings.azure_storage_container_name,
+                        self.project_id,
+                        settings.browser_global_cookies_blob_path,
+                    )
+
                 self._browser = BrowserSession(
                     headless=False,
                     downloads_path=str(self.workspace_dir / "downloads"),
                     auto_download_pdfs=True,
+                    keep_alive=True,
+                    proxy=proxy,
+                    storage_state=storage_state,
                 )
                 await self._browser.start()
                 scope_id = self.scope.id if self.scope else "unknown"
@@ -281,10 +311,23 @@ class ResearchTools:
         return self._browser
     
     async def cleanup(self):
-        """Cleanup browser session. Tabs are already closed per-call."""
-        # Stop browser session (closes all remaining tabs with it)
+        """Cleanup browser session. Saves cookies, then stops browser."""
         if self._browser:
             try:
+                # Save project cookies to Azure Blob before stopping
+                if self.blob_service_client and self.project_id:
+                    from dsl_worker.config import settings
+                    from dsl_worker.phases.cookie_manager import save_project_cookies
+                    try:
+                        save_project_cookies(
+                            self._browser,
+                            self.blob_service_client,
+                            settings.azure_storage_container_name,
+                            self.project_id,
+                        )
+                    except Exception as e:
+                        logger.warning(f"[ResearchTools] Failed to save cookies: {e}")
+
                 await self._browser.stop()
                 scope_id = self.scope.id if self.scope else "unknown"
                 logger.info(f"[ResearchTools] BrowserSession closed for scope {scope_id}")
@@ -499,6 +542,27 @@ class ResearchTools:
                 except Exception:
                     pass
 
+    def _upload_download_to_blob(self, local_path: Path) -> Optional[str]:
+        """Upload a downloaded file to Azure Blob for persistence. Returns blob path or None."""
+        if not self.blob_service_client or not self.project_id:
+            return None
+
+        from dsl_worker.config import settings
+
+        blob_path = f"projects/{self.project_id}/downloads/{local_path.name}"
+        try:
+            blob_client = self.blob_service_client.get_blob_client(
+                container=settings.azure_storage_container_name,
+                blob=blob_path,
+            )
+            with open(local_path, "rb") as f:
+                blob_client.upload_blob(f, overwrite=True)
+            logger.info(f"[ResearchTools] Uploaded download to blob: {blob_path}")
+            return blob_path
+        except Exception as e:
+            logger.warning(f"[ResearchTools] Failed to upload download to blob: {e}")
+            return None
+
     async def _handle_download(
         self,
         new_downloads: set,
@@ -512,6 +576,9 @@ class ResearchTools:
 
         # Wait a bit for large files to finish writing
         await asyncio.sleep(1.0)
+
+        # Upload to Azure Blob for durability (file also stays local for immediate use)
+        self._upload_download_to_blob(downloaded_path)
 
         content, file_info = await self._extract_file_content(downloaded_path)
 
@@ -1034,18 +1101,20 @@ except ImportError:
     async def interact(self, url_or_ref_id: str, task: str) -> Tuple[str, float]:
         """
         Use Browser Agent for complex interactions on a page.
-        
-        Uses the SAME browser session as open() - no context switching.
+
+        Uses the SAME browser session as open() — session persists after
+        completion (keep_alive=True), so cookies, auth state, and page
+        context are preserved for subsequent open()/click() calls.
         """
         if not BROWSER_AVAILABLE:
             return "browser-use not installed", 0.0
-        
+
         if not self.openai_client:
             return "OpenAI client not initialized for interact()", 0.0
-        
+
         # Get our browser session
         session = await self._get_browser()
-        
+
         # Resolve URL
         url = url_or_ref_id
         page_artifact = self.artifacts.get_page(url_or_ref_id)
@@ -1053,27 +1122,39 @@ except ImportError:
             url = page_artifact.url
         elif not url.startswith(("http://", "https://")):
             url = "https://" + url
-        
+
         total_cost = 0.0
-        
+
         try:
             # Create browser-use LLM
             browser_llm = ChatOpenAI(model=self.model)
-            
+
             agent = Agent(
                 task=f"Navigate to {url} and: {task}",
                 browser_session=session,
                 llm=browser_llm,
                 calculate_cost=True,
             )
-            
+
             history = await agent.run(max_steps=30)
-            
+
             # Get cost
             if hasattr(history, 'usage') and history.usage:
                 if hasattr(history.usage, 'total_cost'):
                     total_cost += history.usage.total_cost
-            
+
+            # Clean up extra tabs the agent may have opened (prevent leaks)
+            try:
+                pages = await session.get_pages()
+                if len(pages) > 1:
+                    for extra_page in pages[1:]:
+                        try:
+                            await session.close_page(extra_page)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
             # Capture final page state as artifact
             try:
                 current_page = await session.get_current_page()
@@ -1081,10 +1162,10 @@ except ImportError:
                     current_url = await current_page.evaluate('() => window.location.href')
                     html = await current_page.evaluate('() => document.body.innerHTML')
                     markdown = md(html, heading_style='ATX')
-                    
+
                     lines = markdown.split('\n')
                     links = extract_links_from_markdown(markdown, current_url)
-                    
+
                     page_view = PageView(
                         url=current_url,
                         fetched_at=datetime.now(timezone.utc).isoformat(),
@@ -1093,21 +1174,80 @@ except ImportError:
                         links=links,
                     )
                     final_ref_id = self.artifacts.store_page(page_view)
-                    
+
                     return f"Browser session completed. Final page stored as {final_ref_id}", total_cost
             except Exception as e:
                 logger.warning(f"[interact] Could not capture final state: {e}")
-            
+
             return "Browser session completed", total_cost
-            
+
         except Exception as e:
             logger.error(f"[interact] Browser agent failed: {e}")
             return f"Browser agent error: {e}", total_cost
     
     # =========================================================================
+    # Tool Registration for Agent Framework
+    # =========================================================================
+
+    def register_on(self, registry: 'ToolRegistry') -> None:
+        """
+        Register browsing/research tools onto an agent ToolRegistry.
+
+        Registers: brave_search, open, find, click, list_files, code_exec,
+        interact. Skips scope-dependent tools (note, conclude_research,
+        submit_seed, breakdown, done).
+
+        This is the single place adapter functions live — agents call this
+        instead of duplicating the boilerplate.
+        """
+        # Adapter closures that translate args dict -> method calls
+        handlers = {
+            "brave_search": lambda args: self.brave_search(
+                query=args.get("query", ""),
+                response_length=args.get("response_length", "medium"),
+            ),
+            "open": lambda args: self.open(
+                ref_id_or_url=args.get("ref_id_or_url", ""),
+                start_line=args.get("start_line", 0),
+                response_length=args.get("response_length", "medium"),
+            ),
+            "find": lambda args: self.find(
+                ref_id=args.get("ref_id", ""),
+                pattern=args.get("pattern", ""),
+                response_length=args.get("response_length", "medium"),
+            ),
+            "click": lambda args: self.click(
+                ref_id=args.get("ref_id", ""),
+                link_id=args.get("link_id", 0),
+                response_length=args.get("response_length", "medium"),
+            ),
+            "list_files": lambda args: self.list_files(
+                directory=args.get("directory", "all"),
+            ),
+            "code_exec": lambda args: self.code_exec(
+                script=args.get("script", ""),
+                description=args.get("description", ""),
+            ),
+            "interact": lambda args: self.interact(
+                url_or_ref_id=args.get("url_or_ref_id", ""),
+                task=args.get("task", ""),
+            ),
+        }
+
+        for defn in self._research_tools():
+            name = defn.get("name")
+            if name in handlers:
+                registry.add(
+                    name=name,
+                    description=defn.get("description", ""),
+                    parameters=defn.get("parameters", {}),
+                    handler=handlers[name],
+                )
+
+    # =========================================================================
     # Tool Definitions for LLM
     # =========================================================================
-    
+
     def get_tool_definitions(self, phase: str = None) -> List[Dict]:
         """Get tool definitions for current or specified phase."""
         if phase is None:
@@ -1286,7 +1426,7 @@ Files at /workspace/uploads/ and /workspace/downloads/""",
             {
                 "type": "function",
                 "name": "interact",
-                "description": "Use Browser Agent for complex page interactions (login, forms, JS-heavy pages, pagination). Uses same browser as open().",
+                "description": "Use Browser Agent for complex page interactions (login, forms, captchas, JS-heavy pages, pagination). Browser session persists — cookies and state are preserved for subsequent open()/click() calls.",
                 "parameters": {
                     "type": "object",
                     "properties": {

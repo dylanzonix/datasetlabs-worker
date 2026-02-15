@@ -14,7 +14,6 @@ from uuid import UUID
 
 from azure.servicebus.aio import ServiceBusClient, AutoLockRenewer
 from azure.servicebus.exceptions import MessageLockLostError
-from openai import AsyncOpenAI
 from sqlalchemy.orm import Session
 from azure.storage.blob import BlobServiceClient
 
@@ -23,6 +22,13 @@ from dsl_api.models.project import Project
 from dsl_worker.config import settings
 from dsl_worker.job_processor import JobProcessor
 from dsl_worker.logging_setup import setup_logging
+
+# Use Langfuse-wrapped AsyncOpenAI if configured, otherwise plain OpenAI.
+# The wrapper auto-traces every responses.create() call with zero code changes.
+if settings.langfuse_secret_key:
+    from langfuse.openai import AsyncOpenAI
+else:
+    from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +177,14 @@ class Worker:
 async def main():
     """Main entry point."""
     setup_logging()
+
+    # Configure Langfuse env vars (the SDK reads these automatically)
+    if settings.langfuse_secret_key:
+        os.environ.setdefault("LANGFUSE_SECRET_KEY", settings.langfuse_secret_key)
+        os.environ.setdefault("LANGFUSE_PUBLIC_KEY", settings.langfuse_public_key)
+        os.environ.setdefault("LANGFUSE_BASE_URL", settings.langfuse_base_url)
+        logger.info("Langfuse tracing enabled")
+
     worker = Worker()
     await worker.run()
 

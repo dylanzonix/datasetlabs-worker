@@ -40,12 +40,13 @@ question asked, then call respond() with your findings.
 ## How to work
 
 1. Search for information relevant to the question
-2. Open promising results and cross-reference key claims across 2-3 sources
-3. When you have enough to give a useful answer, call respond() with structured findings
+2. Open 1-2 promising results to get what you need
+3. Call respond() as soon as you can answer the question
 
-Do not over-research. A focused answer from 2-4 good sources is better than an
-exhaustive survey. If something is unclear or you can't find reliable information,
-say so — the orchestrator can ask targeted follow-ups.
+Be efficient. The orchestrator asked a specific question — answer it and move on.
+A focused answer from 1-2 good sources beats an exhaustive survey. If you find
+yourself opening more than 3-4 pages, you're over-researching. The orchestrator
+will ask targeted follow-ups if it needs more depth.
 
 Do NOT worry about licensing, copyright, or terms of use. Our legal team has
 confirmed all content is free to use in our jurisdiction regardless of license.
@@ -91,8 +92,11 @@ class ResearchAgent:
         brave_api_key: Optional[str] = None,
         sandbox: Optional[Any] = None,
         stop_checker: Optional[Callable[[], bool]] = None,
-        max_turns: int = 50,
+        max_turns: int = 20,
         system_prompt: Optional[str] = None,
+        blob_service_client: Optional[Any] = None,
+        project_id: Optional[Any] = None,
+        on_tool_call: Optional[Callable[[str, str], None]] = None,
     ) -> None:
         self.workspace_dir = Path(workspace_dir)
 
@@ -110,6 +114,8 @@ class ResearchAgent:
             model=model,
             sandbox=sandbox,
             stop_checker=stop_checker,
+            blob_service_client=blob_service_client,
+            project_id=project_id,
         )
         # Set a dummy scope for ResearchTools compatibility
         self._impl.set_scope(ResearchScope(
@@ -132,80 +138,13 @@ class ResearchAgent:
             max_turns=max_turns,
             reasoning={"effort": "medium", "summary": "detailed"},
             label="research",
+            on_tool_call=on_tool_call,
         )
 
     def _register_research_tools(self, registry: ToolRegistry) -> None:
         """Register research tools, delegating to ResearchTools methods."""
-        impl = self._impl
-
-        async def brave_search(args: Dict) -> tuple[str, float]:
-            return await impl.brave_search(
-                query=args.get("query", ""),
-                response_length=args.get("response_length", "medium"),
-            )
-
-        async def open_page(args: Dict) -> tuple[str, float]:
-            return await impl.open(
-                ref_id_or_url=args.get("ref_id_or_url", ""),
-                start_line=args.get("start_line", 0),
-                response_length=args.get("response_length", "medium"),
-            )
-
-        async def find(args: Dict) -> tuple[str, float]:
-            return await impl.find(
-                ref_id=args.get("ref_id", ""),
-                pattern=args.get("pattern", ""),
-                response_length=args.get("response_length", "medium"),
-            )
-
-        async def click(args: Dict) -> tuple[str, float]:
-            return await impl.click(
-                ref_id=args.get("ref_id", ""),
-                link_id=args.get("link_id", 0),
-                response_length=args.get("response_length", "medium"),
-            )
-
-        async def list_files(args: Dict) -> tuple[str, float]:
-            return await impl.list_files(
-                directory=args.get("directory", "all"),
-            )
-
-        async def code_exec(args: Dict) -> tuple[str, float]:
-            return await impl.code_exec(
-                script=args.get("script", ""),
-                description=args.get("description", ""),
-            )
-
-        async def interact(args: Dict) -> tuple[str, float]:
-            return await impl.interact(
-                url_or_ref_id=args.get("url_or_ref_id", ""),
-                task=args.get("task", ""),
-            )
-
-        # Get tool definitions from ResearchTools (research phase only)
-        defs = impl.get_tool_definitions(phase="research")
-
-        # Map tool name -> (handler, definition)
-        handlers = {
-            "brave_search": brave_search,
-            "open": open_page,
-            "find": find,
-            "click": click,
-            "list_files": list_files,
-            "code_exec": code_exec,
-            "interact": interact,
-        }
-
-        for defn in defs:
-            name = defn.get("name")
-            if name in handlers:
-                registry.add(
-                    name=name,
-                    description=defn.get("description", ""),
-                    parameters=defn.get("parameters", {}),
-                    handler=handlers[name],
-                )
-            # Skip conclude_research, note — not used in new model
+        # Register browsing tools via shared helper (brave_search, open, etc.)
+        self._impl.register_on(registry)
 
         # respond() — explicit completion mechanism
         async def respond(args: Dict) -> tuple[str, float]:
