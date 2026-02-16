@@ -97,6 +97,7 @@ class ResearchAgent:
         blob_service_client: Optional[Any] = None,
         project_id: Optional[Any] = None,
         on_tool_call: Optional[Callable[[str, str], None]] = None,
+        mcp_tools: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         self.workspace_dir = Path(workspace_dir)
 
@@ -139,6 +140,7 @@ class ResearchAgent:
             reasoning={"effort": "medium", "summary": "detailed"},
             label="research",
             on_tool_call=on_tool_call,
+            extra_tools=mcp_tools or [],
         )
 
     def _register_research_tools(self, registry: ToolRegistry) -> None:

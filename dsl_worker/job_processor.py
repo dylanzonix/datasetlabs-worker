@@ -26,6 +26,8 @@ from dsl_api.models.project import Project
 from dsl_api.models.project_version import ProjectVersion
 from dsl_api.models.project_event import ProjectEvent
 from dsl_api.models.chat_message import ChatMessage
+from dsl_api.models.project_file import ProjectFile
+from dsl_api.models.project_connector import ProjectConnector
 
 from dsl_worker.config import settings
 
@@ -87,6 +89,8 @@ class JobProcessor:
 
         # Sandbox (shared - it's just a Docker pool)
         self._sandbox: Optional[SandboxExecutor] = None
+        # MCP tools for current job (set during _run_pipeline)
+        self._mcp_tools: list = []
 
     def request_stop(self):
         """Request graceful stop."""
@@ -249,7 +253,7 @@ class JobProcessor:
         (workspace_dir / "downloads").mkdir(exist_ok=True)
 
         # Load uploaded files from blob
-        await self._load_uploaded_files(state, workspace_dir)
+        await self._load_uploaded_files(db, project.id, workspace_dir)
 
         # Initialize sandbox
         self._sandbox = SandboxExecutor(use_pool=True, pool_size=3)
@@ -284,14 +288,35 @@ class JobProcessor:
         chat_history = self._load_chat_history(db, project.id)
 
         # Build uploaded files metadata for orchestrator context
-        uploaded_files = []
-        if state.files_snapshot:
-            for f in state.files_snapshot:
-                uploaded_files.append({
-                    "filename": f.get("filename", "unknown"),
-                    "content_type": f.get("content_type", ""),
-                    "size_bytes": f.get("size_bytes", 0),
-                })
+        project_files = (
+            db.query(ProjectFile)
+            .filter(
+                ProjectFile.project_id == project.id,
+                ProjectFile.deleted_at.is_(None),
+                ProjectFile.status == "uploaded",
+            )
+            .all()
+        )
+        uploaded_files = [
+            {
+                "filename": f.filename,
+                "content_type": f.content_type,
+                "size_bytes": f.size_bytes,
+            }
+            for f in project_files
+        ]
+
+        # Load connectors for MCP tool injection
+        connectors = (
+            db.query(ProjectConnector)
+            .filter(
+                ProjectConnector.project_id == project.id,
+                ProjectConnector.deleted_at.is_(None),
+            )
+            .all()
+        )
+        mcp_tools = self._build_mcp_tools(connectors)
+        self._mcp_tools = mcp_tools
 
         logger.info(f"[Pipeline] Starting orchestrator with {len(chat_history)} chat messages")
 
@@ -320,8 +345,8 @@ class JobProcessor:
                     generation_prompt=state.generation_prompt,
                     columns=state.columns,
                     diversity_spec=None,
-                    files_snapshot=state.files_snapshot,
-                    examples_snapshot=state.examples_snapshot,
+                    files_snapshot=[],
+                    examples_snapshot=[],
                     status="running",
                 )
                 db.add(new_version)
@@ -433,6 +458,7 @@ class JobProcessor:
             blob_service_client=self.blob_service_client,
             project_id=project.id,
             on_tool_call=on_tool_call,
+            mcp_tools=mcp_tools,
         )
 
         try:
@@ -743,6 +769,7 @@ class JobProcessor:
             plan=plan,
             bucket_tracker=bucket_tracker,
             blob_service_client=self.blob_service_client,
+            mcp_tools=self._mcp_tools,
         )
 
         success, errors = await pool.process_seeds(seeds, schema)
@@ -837,6 +864,7 @@ class JobProcessor:
             plan=plan,
             bucket_tracker=bucket_tracker,
             blob_service_client=self.blob_service_client,
+            mcp_tools=self._mcp_tools,
         )
 
         total_success, total_errors = await pool.process_seeds(
@@ -878,39 +906,71 @@ class JobProcessor:
         self._handle_force_stop(db, project, version, cost_tracker, "No rows generated")
         return False
 
-    async def _load_uploaded_files(self, state: ProjectState, workspace_dir: Path):
+    async def _load_uploaded_files(self, db: Session, project_id, workspace_dir: Path):
         """Download uploaded files from Azure to workspace."""
-        if not state.files_snapshot:
+        files = (
+            db.query(ProjectFile)
+            .filter(
+                ProjectFile.project_id == project_id,
+                ProjectFile.deleted_at.is_(None),
+                ProjectFile.status == "uploaded",
+            )
+            .all()
+        )
+
+        if not files:
             logger.info("[Pipeline] No uploaded files")
             return
 
-        logger.info(f"[Pipeline] Loading {len(state.files_snapshot)} uploaded files...")
+        logger.info(f"[Pipeline] Loading {len(files)} uploaded files...")
 
         uploads_dir = workspace_dir / "uploads"
 
-        for f in state.files_snapshot:
-            filename = f.get('filename')
-            blob_path = f.get('blob_path')
-
-            if not filename or not blob_path:
-                continue
-
-            local_path = uploads_dir / filename
-
+        for f in files:
+            local_path = uploads_dir / f.filename
             try:
                 if self.blob_service_client:
                     container = settings.azure_storage_container_name
                     blob_client = self.blob_service_client.get_blob_client(
                         container=container,
-                        blob=blob_path
+                        blob=f.blob_path,
                     )
                     with open(local_path, "wb") as file:
                         file.write(blob_client.download_blob().readall())
-                    logger.info(f"[Pipeline] Downloaded: {filename}")
+                    logger.info(f"[Pipeline] Downloaded: {f.filename}")
                 else:
-                    logger.warning(f"[Pipeline] No blob client, can't download {filename}")
+                    logger.warning(f"[Pipeline] No blob client, can't download {f.filename}")
             except Exception as e:
-                logger.error(f"[Pipeline] Failed to download {filename}: {e}")
+                logger.error(f"[Pipeline] Failed to download {f.filename}: {e}")
+
+    def _build_mcp_tools(self, connectors) -> list:
+        """Build MCP tool definitions from project connectors."""
+        from dsl_api.crypto import decrypt_secret
+
+        mcp_tools = []
+        for conn in connectors:
+            tool_def = {"type": "mcp", "server_label": conn.server_label}
+
+            if conn.server_url:
+                tool_def["server_url"] = conn.server_url
+            if conn.connector_id:
+                tool_def["connector_id"] = conn.connector_id
+            if conn.server_description:
+                tool_def["server_description"] = conn.server_description
+            if conn.allowed_tools is not None:
+                tool_def["allowed_tools"] = conn.allowed_tools
+
+            # Decrypt auth
+            if conn.authorization_encrypted:
+                tool_def["authorization"] = decrypt_secret(conn.authorization_encrypted)
+            if conn.headers_encrypted:
+                import json as _json
+                tool_def["headers"] = _json.loads(decrypt_secret(conn.headers_encrypted))
+
+            tool_def["require_approval"] = "never"
+            mcp_tools.append(tool_def)
+
+        return mcp_tools
 
     async def _cleanup(self):
         """Cleanup resources."""

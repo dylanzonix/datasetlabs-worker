@@ -242,6 +242,7 @@ class OrchestratorAgent:
         blob_service_client: Optional[Any] = None,
         project_id: Optional[Any] = None,
         on_tool_call: Optional[Callable[[str, str], None]] = None,
+        mcp_tools: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         self.chat_history = chat_history
         self.previous_recipe = previous_recipe
@@ -258,6 +259,7 @@ class OrchestratorAgent:
         self.blob_service_client = blob_service_client
         self.project_id = project_id
         self.on_tool_call = on_tool_call
+        self.mcp_tools = mcp_tools or []
 
         # State
         self.plan: Optional[Dict] = None
@@ -305,6 +307,7 @@ class OrchestratorAgent:
             label="orchestrator",
             continue_on_text=True,
             on_tool_call=on_tool_call,
+            extra_tools=self.mcp_tools,
         )
 
     def _new_id(self) -> str:
@@ -406,6 +409,7 @@ class OrchestratorAgent:
                 blob_service_client=self.blob_service_client,
                 project_id=self.project_id,
                 on_tool_call=self.on_tool_call,
+                mcp_tools=self.mcp_tools,
             )
             agent._conversation.label = f"research:{agent_id}"
             self._research_agents[agent_id] = agent
@@ -554,6 +558,7 @@ class OrchestratorAgent:
                     blob_service_client=self.blob_service_client,
                     project_id=self.project_id,
                     on_tool_call=self.on_tool_call,
+                    mcp_tools=self.mcp_tools,
                 )
                 self._generators[gen_id] = gen
 

@@ -121,11 +121,13 @@ class RowGeneratorAgent:
         stop_checker: Optional[Callable[[], bool]] = None,
         blob_service_client: Optional[Any] = None,
         project_id: Optional[Any] = None,
+        mcp_tools: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         self.openai_client = openai_client
         self.model = model
         self.workspace_dir = Path(workspace_dir)
         self.stop_checker = stop_checker
+        self.mcp_tools = mcp_tools or []
 
         # Tool state — reset per generate() call
         self._current_row: Dict[str, Any] = {}
@@ -433,6 +435,7 @@ class RowGeneratorAgent:
             max_turns=MAX_GENERATION_TURNS,
             reasoning={"effort": "low", "summary": "auto"},
             label="row_generator",
+            extra_tools=self.mcp_tools,
         )
 
         result = await conversation.send(

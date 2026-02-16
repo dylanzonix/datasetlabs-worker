@@ -151,6 +151,7 @@ class GeneratorAgent:
         blob_service_client: Optional[Any] = None,
         project_id: Optional[Any] = None,
         on_tool_call: Optional[Callable[[str, str], None]] = None,
+        mcp_tools: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         self.scope = scope
         self.seed_description = seed_description
@@ -204,6 +205,7 @@ class GeneratorAgent:
             reasoning={"effort": "medium", "summary": "detailed"},
             label=f"generator:{generator_id}",
             on_tool_call=on_tool_call,
+            extra_tools=mcp_tools or [],
         )
 
     def _register_yield_seed(self, registry: ToolRegistry) -> None:
