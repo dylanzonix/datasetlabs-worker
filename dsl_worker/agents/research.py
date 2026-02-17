@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, List
 
 from dsl_worker.agents.base import AgentConversation, AgentResult
 from dsl_worker.agents.tools import ToolRegistry
