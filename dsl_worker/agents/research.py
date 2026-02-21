@@ -3,18 +3,24 @@ Research agent — conversational agent with web browsing and code execution too
 
 The orchestrator talks to this agent to research a topic. It has no concept
 of scopes, seeds, or hierarchy — it's just research tools + conversation.
+
+V3: When given a SourceManager, the agent can also save research material
+as persistent sources for later use by row generators.
 """
 
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, List
+from typing import Any, Callable, Dict, Optional, List, TYPE_CHECKING
 
 from dsl_worker.agents.base import AgentConversation, AgentResult
 from dsl_worker.agents.tools import ToolRegistry
 from dsl_worker.billing.tracked_client import TrackedOpenAIClient
 from dsl_worker.phases.research_tools import ResearchTools, ResearchScope
+
+if TYPE_CHECKING:
+    from dsl_worker.phases.source_manager import SourceManager
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +70,19 @@ Call respond() with well-structured content:
 - Distinguish facts from inferences
 """
 
+SAVE_SOURCE_PROMPT_ADDITION = """
+
+## Saving Sources
+
+Use save_source() to persist any valuable research material you find. This saves
+the content as a file that row generators can later read when producing dataset rows.
+Save broadly — it's better to have extra sources than to miss useful material.
+
+Choose appropriate tags and authority scores:
+- Authority: wiki/docs=0.9, expert blog=0.7, forum/community=0.5, random=0.3
+- Tags: use short, descriptive labels relevant to the dataset topic
+"""
+
 
 class ResearchAgent:
     """
@@ -98,8 +117,10 @@ class ResearchAgent:
         project_id: Optional[Any] = None,
         on_tool_call: Optional[Callable[[str, str], None]] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
+        source_manager: Optional["SourceManager"] = None,
     ) -> None:
         self.workspace_dir = Path(workspace_dir)
+        self._source_manager = source_manager
 
         # respond() tool state — reset per ask_full() call
         self._responded: bool = False
@@ -129,11 +150,16 @@ class ResearchAgent:
         registry = ToolRegistry()
         self._register_research_tools(registry)
 
+        # Build system prompt — add save_source instructions if source_manager provided
+        effective_prompt = system_prompt or RESEARCH_SYSTEM_PROMPT
+        if source_manager and not system_prompt:
+            effective_prompt = RESEARCH_SYSTEM_PROMPT + SAVE_SOURCE_PROMPT_ADDITION
+
         # Create the conversation with reasoning enabled
         self._conversation = AgentConversation(
             openai_client=openai_client,
             model=model,
-            system_prompt=system_prompt or RESEARCH_SYSTEM_PROMPT,
+            system_prompt=effective_prompt,
             tools=registry,
             stop_checker=stop_checker,
             max_turns=max_turns,
@@ -147,6 +173,70 @@ class ResearchAgent:
         """Register research tools, delegating to ResearchTools methods."""
         # Register browsing tools via shared helper (brave_search, open, etc.)
         self._impl.register_on(registry)
+
+        # save_source — only if source_manager is provided
+        if self._source_manager:
+            source_mgr = self._source_manager
+
+            async def save_source(args: Dict) -> tuple[str, float]:
+                try:
+                    result = await source_mgr.save_source(
+                        content=args.get("content", ""),
+                        path=args.get("path", ""),
+                        description=args.get("description", ""),
+                        tags=args.get("tags", []),
+                        authority=args.get("authority", 0.5),
+                        source_type=args.get("source_type", "article"),
+                        url=args.get("url"),
+                    )
+                    return f"Source saved: {result}", 0.0
+                except Exception as e:
+                    return f"Error saving source: {e}", 0.0
+
+            registry.add(
+                name="save_source",
+                description=(
+                    "Save research material as a persistent source file. "
+                    "Row generators will later read these sources when producing rows. "
+                    "Save any valuable content you find during research."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "The content to save (text, markdown, data, etc.)",
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Relative path within sources/ (e.g., 'combat/wiki_peek.md')",
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Brief description of what this source contains",
+                        },
+                        "tags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Tags for filtering (e.g., ['combat', 'mechanics'])",
+                        },
+                        "authority": {
+                            "type": "number",
+                            "description": "Authority score 0-1 (wiki=0.9, expert=0.7, forum=0.5, random=0.3)",
+                        },
+                        "source_type": {
+                            "type": "string",
+                            "description": "Source category: wiki, forum, article, code, data, upload, etc.",
+                        },
+                        "url": {
+                            "type": "string",
+                            "description": "Original URL if this is web content (optional)",
+                        },
+                    },
+                    "required": ["content", "path", "description", "tags", "authority", "source_type"],
+                },
+                handler=save_source,
+            )
 
         # respond() — explicit completion mechanism
         async def respond(args: Dict) -> tuple[str, float]:

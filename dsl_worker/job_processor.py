@@ -1,10 +1,12 @@
 """
-Job Processor - Orchestrator-driven pipeline
+Job Processor — V3 orchestrator-driven pipeline
 
-Pipeline:
-1. Load conversation history
-2. Run orchestrator (research, generators, recipe)
-3. Run generation workers on seeds from queue
+Flow:
+1. Load conversation history and uploaded files
+2. Initialize SourceManager for research accumulation
+3. Run orchestrator (loop: research → create work items → generate → monitor)
+4. Generation runs in background, consuming work items from queue
+5. Orchestrator talks to user via ask_user() during generation
 """
 
 import asyncio
@@ -51,29 +53,27 @@ except ImportError:
         yield
 from dsl_worker.project_state import ProjectState
 from dsl_worker.billing import CostTracker, TrackedOpenAIClient
-from dsl_worker.checkpoint import CheckpointManager, checkpoints_to_seeds
+from dsl_worker.checkpoint import CheckpointManager, checkpoints_to_work_items
 
 from dsl_worker.agents import OrchestratorAgent
-from dsl_worker.phases.research_tools import Seed
-from dsl_worker.phases.row_generator import GenerationWorkerPool, BucketTracker
+from dsl_worker.phases.source_manager import SourceManager
+from dsl_worker.phases.row_generator import GenerationWorkerPool
 from dsl_worker.phases.sandbox import SandboxExecutor
 
 logger = logging.getLogger(__name__)
 
 WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
 
-# Batch size for queue → generation pool.
-# Seeds trickle in slowly from generators, so a small batch ensures rows
-# start processing almost immediately (5s timeout flush handles partials).
+# Batch size for work item queue → generation pool.
 GENERATION_BATCH_SIZE = 5
 
 
 class JobProcessor:
     """
-    Job processor for the orchestrator-driven pipeline.
+    Job processor for the V3 orchestrator-driven pipeline.
 
-    Flow: conversation → orchestrator → seeds → generation
-    Checkpoints are saved to Azure Blob for pause/resume.
+    Flow: conversation → orchestrator (research + work items) → generation
+    Checkpoints saved to Azure Blob for pause/resume.
     """
 
     def __init__(
@@ -181,9 +181,6 @@ class JobProcessor:
             self._emit_event(db, project, version, "running", "Worker started")
 
             # Run pipeline (wrapped in Langfuse trace if available)
-            # propagate_attributes tags every Langfuse observation created
-            # inside this block with session/user/metadata — so all API calls
-            # from all agents are grouped under one session in the Langfuse UI.
             with propagate_attributes(
                 session_id=str(project_id),
                 user_id=str(project.user_id),
@@ -244,7 +241,7 @@ class JobProcessor:
         tracked_client: TrackedOpenAIClient,
         cost_tracker: CostTracker,
     ) -> bool:
-        """Run the orchestrator-driven pipeline."""
+        """Run the V3 orchestrator-driven pipeline."""
 
         # Create workspace
         workspace_dir = Path(f"./workspace_{project.id}_{version.id}")
@@ -258,6 +255,10 @@ class JobProcessor:
         # Initialize sandbox
         self._sandbox = SandboxExecutor(use_pool=True, pool_size=3)
 
+        # Initialize source manager
+        source_manager = SourceManager(workspace_dir)
+        await source_manager.initialize()
+
         # Initialize checkpoint manager
         checkpoint_mgr = CheckpointManager(
             blob_service_client=self.blob_service_client,
@@ -270,16 +271,17 @@ class JobProcessor:
         stop_checker = self._make_stop_checker(state)
 
         # Check if resuming from generation phase
-        if checkpoint.current_phase == "generation" and checkpoint.seeds:
+        if checkpoint.current_phase == "generation" and checkpoint.work_items:
             logger.info(
                 f"[Pipeline] Resuming generation: "
-                f"{len(checkpoint.processed_seed_indices)}/{len(checkpoint.seeds)} done"
+                f"{len(checkpoint.processed_indices)}/{len(checkpoint.work_items)} done"
             )
             version.progress_detail = {"phase": "generating"}
             db.commit()
             return await self._run_generation_from_checkpoint(
                 db, project, version, state, tracked_client, cost_tracker,
                 checkpoint_mgr, checkpoint, workspace_dir, stop_checker,
+                source_manager,
             )
 
         # --- Fresh run: orchestrator-driven flow ---
@@ -320,89 +322,103 @@ class JobProcessor:
 
         logger.info(f"[Pipeline] Starting orchestrator with {len(chat_history)} chat messages")
 
-        # on_generate callback — called when orchestrator's set_plan() fires
-        async def on_generate(
-            plan: Dict,
-            seed_queue: asyncio.Queue,
-            result_future: asyncio.Future,
-        ):
-            nonlocal version, checkpoint_mgr
+        # === Generation state (shared between orchestrator callbacks and consumer) ===
+        work_item_queue: asyncio.Queue = asyncio.Queue()
+        generation_stats = {
+            "rows_generated": 0,
+            "errors": 0,
+            "skipped": 0,
+            "in_progress": 0,
+            "total_cost": 0.0,
+        }
+        generation_task: Optional[asyncio.Task] = None
+        generation_lock = asyncio.Lock()
 
-            # Handle new_version flag — orchestrator decided to create a fresh dataset
-            if plan.pop("_new_version", False):
-                logger.info("[Pipeline] Orchestrator requested new version")
-                from sqlalchemy import func as sql_func
-                max_num = (
-                    db.query(sql_func.max(ProjectVersion.version_number))
-                    .filter(ProjectVersion.project_id == project.id)
-                    .scalar()
-                    or 0
-                )
-                new_version = ProjectVersion(
-                    project_id=project.id,
-                    version_number=max_num + 1,
-                    num_samples=state.num_samples,
-                    generation_prompt=state.generation_prompt,
-                    columns=state.columns,
-                    diversity_spec=None,
-                    files_snapshot=[],
-                    examples_snapshot=[],
-                    status="running",
-                )
-                db.add(new_version)
-                project.current_version_id = new_version.id
-                db.commit()
-                db.refresh(new_version)
+        # === Callbacks for orchestrator ===
 
-                # Switch to the new version
-                version = new_version
-                checkpoint_mgr = CheckpointManager(
-                    blob_service_client=self.blob_service_client,
-                    container_name=settings.azure_storage_container_name,
-                    project_id=project.id,
-                    version_id=version.id,
-                )
-                await checkpoint_mgr.initialize()
-                self._emit_event(db, project, version, "run_started", "New version created by orchestrator")
-                logger.info(f"[Pipeline] Created version v{new_version.version_number} (id={new_version.id})")
+        async def on_create_work_items(items: List[Dict]) -> int:
+            nonlocal generation_task
 
-            # Save plan as JSON to version.recipe and checkpoint
-            plan_json = json.dumps(plan, indent=2)
-            await checkpoint_mgr.set_recipe(plan_json)
-            await checkpoint_mgr.set_phase("generation")
-            version.recipe = plan_json
+            # Checkpoint each work item
+            for item in items:
+                await checkpoint_mgr.add_work_item(item)
+
+            # Queue items for generation
+            for item in items:
+                await work_item_queue.put(item)
+
+            # Start/continue the generation consumer if not running
+            async with generation_lock:
+                if generation_task is None or generation_task.done():
+                    await checkpoint_mgr.set_phase("generation")
+                    generation_task = asyncio.create_task(
+                        self._run_generation_consumer(
+                            db=db,
+                            project=project,
+                            version=version,
+                            tracked_client=tracked_client,
+                            cost_tracker=cost_tracker,
+                            checkpoint_mgr=checkpoint_mgr,
+                            work_item_queue=work_item_queue,
+                            workspace_dir=workspace_dir,
+                            stop_checker=stop_checker,
+                            schema=state.columns,
+                            source_manager=source_manager,
+                            generation_stats=generation_stats,
+                        )
+                    )
+
+            return len(items)
+
+        async def on_ask_user(message: str) -> str:
+            # Post assistant message to chat
+            chat_msg = ChatMessage(
+                project_id=project.id,
+                role="assistant",
+                content=message,
+            )
+            db.add(chat_msg)
             db.commit()
 
-            # Start generation consumer as a background task
-            # The consumer will resolve result_future when done
-            asyncio.create_task(
-                self._run_generation_from_queue_v2(
-                    db=db,
-                    project=project,
-                    version=version,
-                    state=state,
-                    tracked_client=tracked_client,
-                    cost_tracker=cost_tracker,
-                    checkpoint_mgr=checkpoint_mgr,
-                    plan=plan,
-                    seed_queue=seed_queue,
-                    workspace_dir=workspace_dir,
-                    stop_checker=stop_checker,
-                    schema=state.columns,
-                    result_future=result_future,
-                    num_generators=len(plan.get("generators", [])),
-                )
-            )
+            # Update progress
+            version.progress_detail = {"phase": "waiting_for_user"}
+            db.commit()
 
-        # Detect feedback re-run: recipe exists from previous run but we're
-        # not resuming from a generation checkpoint (checkpoint was deleted).
-        previous_recipe = None
-        if version.recipe and checkpoint.current_phase != "generation":
-            previous_recipe = version.recipe
-            logger.info("[Pipeline] Feedback re-run detected — passing previous recipe to orchestrator")
+            logger.info(f"[Pipeline] ask_user: waiting for user response...")
+
+            # Poll for user response (10 minute timeout)
+            for _ in range(600):
+                await asyncio.sleep(1)
+                if stop_checker():
+                    version.progress_detail = {"phase": "generating"}
+                    db.commit()
+                    return "[User did not respond — generation was paused]"
+
+                new_msg = (
+                    db.query(ChatMessage)
+                    .filter(
+                        ChatMessage.project_id == project.id,
+                        ChatMessage.role == "user",
+                        ChatMessage.created_at > chat_msg.created_at,
+                    )
+                    .order_by(ChatMessage.created_at.asc())
+                    .first()
+                )
+                if new_msg:
+                    version.progress_detail = {"phase": "generating"}
+                    db.commit()
+                    logger.info(f"[Pipeline] ask_user: got user response ({len(new_msg.content)} chars)")
+                    return new_msg.content
+
+            version.progress_detail = {"phase": "generating"}
+            db.commit()
+            return "[User did not respond within 10 minutes — continuing]"
+
+        def on_check_progress() -> Dict:
+            return dict(generation_stats)
 
         # Progress tracking via tool call observation
-        progress_counters: Dict[str, Any] = {"phase": "strategizing"}
+        progress_counters: Dict[str, Any] = {"phase": "researching"}
         last_progress_flush = time.time()
 
         def on_tool_call(agent_label: str, tool_name: str):
@@ -410,22 +426,24 @@ class JobProcessor:
 
             # Phase transitions (orchestrator tools)
             phase_map = {
-                "strategy": "strategizing",
-                "research": "researching",
-                "ask_research": "researching",
-                "set_plan": "generating",
-                "add_generator": "generating",
+                "run_subagent": "researching",
+                "save_source": "researching",
+                "create_work_items": "generating",
+                "check_progress": "generating",
+                "ask_user": "waiting_for_user",
+                "done": "completing",
             }
             if tool_name in phase_map:
                 progress_counters["phase"] = phase_map[tool_name]
 
-            # Counter increments (sub-agent tools)
+            # Counter increments
             counter_map = {
                 "brave_search": "searches",
                 "open": "sources",
                 "click": "sources",
                 "code_exec": "analyses",
-                "yield_seed": "seeds",
+                "save_source": "saved_sources",
+                "create_work_items": "work_items_created",
             }
             if tool_name in counter_map:
                 key = counter_map[tool_name]
@@ -438,7 +456,7 @@ class JobProcessor:
                 db.commit()
                 last_progress_flush = now
 
-        version.progress_detail = {"phase": "strategizing"}
+        version.progress_detail = {"phase": "researching"}
         db.commit()
 
         # Create and run orchestrator
@@ -449,12 +467,14 @@ class JobProcessor:
             openai_client=tracked_client,
             model=settings.research_model,
             workspace_dir=workspace_dir,
+            source_manager=source_manager,
+            on_create_work_items=on_create_work_items,
+            on_ask_user=on_ask_user,
+            on_check_progress=on_check_progress,
             uploaded_files=uploaded_files if uploaded_files else None,
             brave_api_key=settings.brave_api_key,
             sandbox=self._sandbox,
             stop_checker=stop_checker,
-            on_generate=on_generate,
-            previous_recipe=previous_recipe,
             blob_service_client=self.blob_service_client,
             project_id=project.id,
             on_tool_call=on_tool_call,
@@ -482,8 +502,16 @@ class JobProcessor:
         finally:
             await orchestrator.cleanup()
 
-        # Check final state — the orchestrator calls done() which ends its loop.
-        # Generation has already completed by then (set_plan(start=true) blocks).
+        # Wait for generation consumer to finish processing remaining items
+        if generation_task and not generation_task.done():
+            # Send poison pill to signal no more items coming
+            await work_item_queue.put(None)
+            try:
+                await generation_task
+            except Exception as e:
+                logger.error(f"[Pipeline] Generation consumer error: {e}")
+
+        # Check final state
         state.refresh()
         if state.paused:
             await checkpoint_mgr.force_save()
@@ -496,12 +524,7 @@ class JobProcessor:
             self._handle_force_stop(db, project, version, cost_tracker, stop_reason)
             return False
 
-        # Check if version was auto-paused by the consumer (sample_ready)
         db.refresh(version)
-        if version.status == "paused":
-            await checkpoint_mgr.force_save()
-            return True
-
         if version.generated_count and version.generated_count > 0:
             await checkpoint_mgr.set_phase("completed")
             await checkpoint_mgr.force_save()
@@ -513,66 +536,30 @@ class JobProcessor:
         self._handle_force_stop(db, project, version, cost_tracker, "No rows generated")
         return False
 
-    def _load_chat_history(self, db: Session, project_id: UUID) -> List[Dict[str, str]]:
-        """Load chat messages and format for the orchestrator."""
-        messages = (
-            db.query(ChatMessage)
-            .filter(ChatMessage.project_id == project_id)
-            .order_by(ChatMessage.created_at.asc())
-            .all()
-        )
-
-        history = []
-        for msg in messages:
-            history.append({
-                "role": msg.role,
-                "content": msg.content,
-            })
-
-        return history
-
-    async def _run_generation_from_queue_v2(
+    async def _run_generation_consumer(
         self,
         db: Session,
         project: Project,
         version: ProjectVersion,
-        state: ProjectState,
         tracked_client: TrackedOpenAIClient,
         cost_tracker: CostTracker,
         checkpoint_mgr: CheckpointManager,
-        plan: Dict,
-        seed_queue: asyncio.Queue,
+        work_item_queue: asyncio.Queue,
         workspace_dir: Path,
         stop_checker,
         schema: List[Dict],
-        result_future: asyncio.Future,
-        num_generators: int = 1,
+        source_manager: SourceManager,
+        generation_stats: Dict,
     ) -> None:
-        """Consume seeds from the queue and run generation. Resolves result_future when done."""
-
-        SAMPLE_SIZE = 5
-        MAX_DEFERRED = 20
-        bucket_tracker = BucketTracker(plan, state.num_samples)
-
+        """
+        Background consumer: dequeue work items, batch them, and run
+        through GenerationWorkerPool. Updates generation_stats in place.
+        """
         batch: List[Dict] = []
-        seed_index = len(checkpoint_mgr.checkpoint.seeds)
-        generators_done = 0
-        total_success = 0
-        total_errors = 0
-        is_initial_run = True  # First set_plan(start=true) triggers sampling pause
-
-        # Round-robin bucket diversity for initial sample
-        sampled_buckets: set = set()
-        deferred_seeds: List[Dict] = []
-        all_bucket_ids = {
-            b.get("id", f"bucket_{i}")
-            for i, b in enumerate(plan.get("buckets", []))
-        } or {"_default"}
-        buckets_to_sample = min(len(all_bucket_ids), SAMPLE_SIZE)
+        batch_start_index = len(checkpoint_mgr.checkpoint.work_items)
 
         try:
             while True:
-                # Check stop conditions
                 if stop_checker():
                     break
 
@@ -580,179 +567,61 @@ class JobProcessor:
                 if not can_continue:
                     break
 
-                # Auto-pause after sample rows on initial run
-                if is_initial_run and total_success >= SAMPLE_SIZE:
-                    logger.info(
-                        f"[Generation] Auto-pausing after {SAMPLE_SIZE} sample rows "
-                        f"for user review (buckets sampled: {sampled_buckets})"
-                    )
-                    # Drain deferred seeds into checkpoint
-                    for ds in deferred_seeds:
-                        await checkpoint_mgr.add_seed_dict(ds)
-                        seed_index += 1
-                    deferred_seeds = []
-
-                    # Drain remaining seeds into checkpoint
-                    while not seed_queue.empty():
-                        remaining = seed_queue.get_nowait()
-                        if remaining is not None:
-                            await checkpoint_mgr.add_seed_dict(remaining)
-                            seed_index += 1
-
-                    self._handle_sample_pause(db, project, version, cost_tracker, total_success)
-
-                    if not result_future.done():
-                        result_future.set_result({
-                            "status": "sampling_paused",
-                            "rows_generated": total_success,
-                            "errors": total_errors,
-                        })
-                    return
-
-                # Re-queue deferred seeds once all buckets sampled or enough samples
-                if deferred_seeds and (
-                    len(sampled_buckets) >= buckets_to_sample
-                    or total_success >= SAMPLE_SIZE
-                    or not is_initial_run
-                ):
-                    for ds in deferred_seeds:
-                        await checkpoint_mgr.add_seed_dict(ds)
-                        batch.append(ds)
-                        seed_index += 1
-                    deferred_seeds = []
-
                 try:
-                    seed = await asyncio.wait_for(seed_queue.get(), timeout=5.0)
+                    item = await asyncio.wait_for(work_item_queue.get(), timeout=5.0)
                 except asyncio.TimeoutError:
                     # Flush batch on timeout
                     if batch:
-                        s, e = await self._process_seed_batch_v2(
-                            batch, schema, plan, bucket_tracker, db, project, version,
+                        await self._process_work_item_batch(
+                            batch, schema, source_manager, db, project, version,
                             tracked_client, cost_tracker, checkpoint_mgr,
-                            workspace_dir, stop_checker, seed_index - len(batch),
+                            workspace_dir, stop_checker, batch_start_index,
+                            generation_stats,
                         )
-                        total_success += s
-                        total_errors += e
+                        batch_start_index += len(batch)
                         batch = []
                     continue
 
-                if seed is None:
-                    # Poison pill from a generator
-                    generators_done += 1
-                    logger.info(
-                        f"[Generation] Generator finished "
-                        f"({generators_done}/{num_generators})"
-                    )
-
-                    # Flush current batch
+                if item is None:
+                    # Poison pill — no more items coming
                     if batch:
-                        s, e = await self._process_seed_batch_v2(
-                            batch, schema, plan, bucket_tracker, db, project, version,
+                        await self._process_work_item_batch(
+                            batch, schema, source_manager, db, project, version,
                             tracked_client, cost_tracker, checkpoint_mgr,
-                            workspace_dir, stop_checker, seed_index - len(batch),
+                            workspace_dir, stop_checker, batch_start_index,
+                            generation_stats,
                         )
-                        total_success += s
-                        total_errors += e
+                        batch_start_index += len(batch)
                         batch = []
-
-                    # Drain any remaining seeds before checking if all generators done
-                    while not seed_queue.empty():
-                        remaining = seed_queue.get_nowait()
-                        if remaining is None:
-                            generators_done += 1
-                            continue
-                        await checkpoint_mgr.add_seed_dict(remaining)
-                        batch.append(remaining)
-                        seed_index += 1
-
-                    if batch:
-                        s, e = await self._process_seed_batch_v2(
-                            batch, schema, plan, bucket_tracker, db, project, version,
-                            tracked_client, cost_tracker, checkpoint_mgr,
-                            workspace_dir, stop_checker, seed_index - len(batch),
-                        )
-                        total_success += s
-                        total_errors += e
-                        batch = []
-
-                    if generators_done >= num_generators:
-                        break
-                    continue
-
-                # During initial sampling, defer seeds from already-sampled buckets
-                # to ensure round-robin bucket coverage in the sample
-                seed_bucket = seed.get("bucket_id", "_default") if isinstance(seed, dict) else "_default"
-                if (
-                    is_initial_run
-                    and total_success < SAMPLE_SIZE
-                    and seed_bucket in sampled_buckets
-                    and len(sampled_buckets) < buckets_to_sample
-                    and len(deferred_seeds) < MAX_DEFERRED
-                ):
-                    deferred_seeds.append(seed)
-                    continue
-
-                # Track which buckets have been sampled
-                if is_initial_run:
-                    sampled_buckets.add(seed_bucket)
-
-                # Checkpoint the seed
-                await checkpoint_mgr.add_seed_dict(seed)
-                batch.append(seed)
-                seed_index += 1
-
-                # Process batch when full
-                if len(batch) >= GENERATION_BATCH_SIZE:
-                    s, e = await self._process_seed_batch_v2(
-                        batch, schema, plan, bucket_tracker, db, project, version,
-                        tracked_client, cost_tracker, checkpoint_mgr,
-                        workspace_dir, stop_checker, seed_index - len(batch),
-                    )
-                    total_success += s
-                    total_errors += e
-                    batch = []
-
-                # Check if all bucket quotas are met
-                if await bucket_tracker.is_complete():
-                    logger.info("[Generation] All bucket quotas met")
                     break
 
-            # Determine final status
-            bucket_status = await bucket_tracker.get_status()
+                batch.append(item)
 
-            if await bucket_tracker.is_complete():
-                status = "complete"
-            elif generators_done >= num_generators:
-                status = "shortage"
-            else:
-                status = "complete"  # Stopped for other reason
-
-            result = {
-                "status": status,
-                "rows_generated": total_success,
-                "errors": total_errors,
-                "bucket_status": bucket_status,
-            }
-
-            logger.info(
-                f"[Generation] Queue consumer done: status={status}, "
-                f"{total_success} success, {total_errors} errors"
-            )
-
-            if not result_future.done():
-                result_future.set_result(result)
+                if len(batch) >= GENERATION_BATCH_SIZE:
+                    await self._process_work_item_batch(
+                        batch, schema, source_manager, db, project, version,
+                        tracked_client, cost_tracker, checkpoint_mgr,
+                        workspace_dir, stop_checker, batch_start_index,
+                        generation_stats,
+                    )
+                    batch_start_index += len(batch)
+                    batch = []
 
         except Exception as e:
             logger.error(f"[Generation] Consumer error: {e}")
-            if not result_future.done():
-                result_future.set_exception(e)
 
-    async def _process_seed_batch_v2(
+        logger.info(
+            f"[Generation] Consumer done: "
+            f"{generation_stats['rows_generated']} success, "
+            f"{generation_stats['errors']} errors, "
+            f"{generation_stats['skipped']} skipped"
+        )
+
+    async def _process_work_item_batch(
         self,
         batch: List[Dict],
         schema: List[Dict],
-        plan: Dict,
-        bucket_tracker: BucketTracker,
+        source_manager: SourceManager,
         db: Session,
         project: Project,
         version: ProjectVersion,
@@ -762,38 +631,16 @@ class JobProcessor:
         workspace_dir: Path,
         stop_checker,
         start_index: int,
-    ) -> tuple[int, int]:
-        """Process a batch of seed envelopes through the generation pool. Returns (success, errors)."""
+        generation_stats: Dict,
+    ) -> None:
+        """Process a batch of work items through the generation pool."""
 
-        # Convert seed envelopes to Seed objects
-        seeds = []
-        for envelope in batch:
-            # Handle envelope format: {"data": ..., "bucket_id": ..., "generator_id": ...}
-            if isinstance(envelope, dict) and "data" in envelope:
-                seed_data = envelope["data"]
-                bucket_id = envelope.get("bucket_id")
-                content = json.dumps(seed_data) if isinstance(seed_data, dict) else seed_data
-            else:
-                content = json.dumps(envelope) if isinstance(envelope, dict) else str(envelope)
-                bucket_id = None
+        if not batch:
+            return
 
-            seed = Seed(
-                content=content,
-                scope_id=envelope.get("generator_id", "generator") if isinstance(envelope, dict) else "generator",
-                scope_description="",
-                notes=[],
-                research_summary=None,
-                source_ref=None,
-                source_url=None,
-                bucket_id=bucket_id,
-            )
-            seeds.append(seed)
+        logger.info(f"[Generation] Processing batch of {len(batch)} work items")
 
-        if not seeds:
-            return 0, 0
-
-        logger.info(f"[Generation] Processing batch of {len(seeds)} seeds")
-
+        manifest_summary = source_manager.get_manifest_summary()
         concurrency = settings.generation_parallel_samples
 
         pool = GenerationWorkerPool(
@@ -809,18 +656,24 @@ class JobProcessor:
             stop_checker=stop_checker,
             cost_tracker=cost_tracker,
             checkpoint_callback=lambda idx, success, row_id: asyncio.create_task(
-                checkpoint_mgr.mark_seed_processed(start_index + idx, success, row_id)
+                checkpoint_mgr.mark_processed(start_index + idx, success, row_id)
             ),
-            plan=plan,
-            bucket_tracker=bucket_tracker,
             blob_service_client=self.blob_service_client,
             mcp_tools=self._mcp_tools,
         )
 
-        success, errors = await pool.process_seeds(seeds, schema)
+        success, errors = await pool.process_work_items(
+            batch, schema, manifest_summary
+        )
+
+        # Update shared stats
+        stats = pool.get_stats()
+        generation_stats["rows_generated"] += success
+        generation_stats["errors"] += errors
+        generation_stats["skipped"] += stats["skipped"]
+        generation_stats["total_cost"] += stats["total_cost"]
 
         # Track generation cost
-        stats = pool.get_stats()
         if stats["total_cost"] > 0:
             cost_tracker.add_cost(
                 phase="generation",
@@ -828,8 +681,6 @@ class JobProcessor:
                 model=settings.generation_model,
             )
             await checkpoint_mgr.add_cost(stats["total_cost"])
-
-        return success, errors
 
     async def _run_generation_from_checkpoint(
         self,
@@ -843,52 +694,28 @@ class JobProcessor:
         checkpoint,
         workspace_dir: Path,
         stop_checker,
+        source_manager: SourceManager,
     ) -> bool:
         """Resume generation from a saved checkpoint."""
 
-        seeds = checkpoints_to_seeds(checkpoint.seeds)
+        work_items = checkpoints_to_work_items(checkpoint.work_items)
 
-        # Filter to pending seeds only
-        pending_indices = checkpoint.get_pending_seed_indices()
-        pending_seeds = [seeds[i] for i in pending_indices]
+        # Filter to pending items only
+        pending_indices = checkpoint.get_pending_indices()
+        pending_items = [work_items[i] for i in pending_indices]
 
-        if not pending_seeds:
-            logger.info("[Pipeline] All seeds already processed")
+        if not pending_items:
+            logger.info("[Pipeline] All work items already processed")
             await checkpoint_mgr.delete()
             self._handle_completion(db, project, version, cost_tracker)
             return True
 
         logger.info(
             f"[Pipeline] Resuming generation: "
-            f"{len(pending_seeds)} pending of {len(seeds)} total"
+            f"{len(pending_items)} pending of {len(work_items)} total"
         )
 
-        # Try to parse plan from checkpoint recipe (JSON).
-        # Fall back to legacy string recipe (no plan, no bucket tracking).
-        plan = None
-        bucket_tracker = None
-        if checkpoint.recipe:
-            try:
-                plan = json.loads(checkpoint.recipe)
-                bucket_tracker = BucketTracker(plan, state.num_samples)
-
-                # Pre-populate bucket tracker with already-processed seed counts
-                processed_indices = set(checkpoint.processed_seed_indices)
-                for idx in processed_indices:
-                    if idx < len(seeds):
-                        seed = seeds[idx]
-                        # Only count successful rows (check checkpoint status)
-                        seed_ckpt = checkpoint.seeds[idx]
-                        if seed_ckpt.get("status") == "completed":
-                            await bucket_tracker.record_success(seed.bucket_id)
-
-                logger.info("[Pipeline] Resumed with plan and bucket tracking")
-            except (json.JSONDecodeError, TypeError):
-                # Legacy string recipe — no plan structure
-                logger.info("[Pipeline] Legacy recipe format, no bucket tracking")
-                plan = None
-                bucket_tracker = None
-
+        manifest_summary = source_manager.get_manifest_summary()
         concurrency = settings.generation_parallel_samples
 
         pool = GenerationWorkerPool(
@@ -904,16 +731,14 @@ class JobProcessor:
             stop_checker=stop_checker,
             cost_tracker=cost_tracker,
             checkpoint_callback=lambda idx, success, row_id: asyncio.create_task(
-                checkpoint_mgr.mark_seed_processed(pending_indices[idx], success, row_id)
+                checkpoint_mgr.mark_processed(pending_indices[idx], success, row_id)
             ),
-            plan=plan,
-            bucket_tracker=bucket_tracker,
             blob_service_client=self.blob_service_client,
             mcp_tools=self._mcp_tools,
         )
 
-        total_success, total_errors = await pool.process_seeds(
-            pending_seeds, state.columns
+        total_success, total_errors = await pool.process_work_items(
+            pending_items, state.columns, manifest_summary
         )
 
         # Track cost
@@ -940,7 +765,7 @@ class JobProcessor:
             self._handle_pause(db, project, version, cost_tracker)
             return True
 
-        total_processed = len(checkpoint.processed_seed_indices) + total_success
+        total_processed = len(checkpoint.processed_indices) + total_success
 
         if total_processed > 0:
             await checkpoint_mgr.delete()
@@ -950,6 +775,24 @@ class JobProcessor:
         await checkpoint_mgr.force_save()
         self._handle_force_stop(db, project, version, cost_tracker, "No rows generated")
         return False
+
+    def _load_chat_history(self, db: Session, project_id: UUID) -> List[Dict[str, str]]:
+        """Load chat messages and format for the orchestrator."""
+        messages = (
+            db.query(ChatMessage)
+            .filter(ChatMessage.project_id == project_id)
+            .order_by(ChatMessage.created_at.asc())
+            .all()
+        )
+
+        history = []
+        for msg in messages:
+            history.append({
+                "role": msg.role,
+                "content": msg.content,
+            })
+
+        return history
 
     async def _load_uploaded_files(self, db: Session, project_id, workspace_dir: Path):
         """Download uploaded files from Azure to workspace."""
@@ -1046,40 +889,6 @@ class JobProcessor:
         db.add(event)
         db.commit()
 
-    def _handle_sample_pause(
-        self,
-        db: Session,
-        project: Project,
-        version: ProjectVersion,
-        cost_tracker: Optional[CostTracker],
-        sample_count: int = 5,
-    ) -> None:
-        """Handle auto-pause after sample rows are generated."""
-        logger.info(f"Version {version.id} paused for sample review ({sample_count} samples)")
-        db.refresh(version)
-
-        if cost_tracker:
-            cost_tracker.charge_remaining()
-
-        version.status = "paused"
-        version.progress_detail = {"phase": "sample_review"}
-
-        details = {
-            "sample_count": sample_count,
-            "sample_ready": True,
-            "paused_at": datetime.now(timezone.utc).isoformat(),
-        }
-        if cost_tracker:
-            summary = cost_tracker.get_summary()
-            details["total_cost_cents"] = summary["total_costs_cents"]
-
-        self._emit_event(
-            db, project, version, "sample_ready",
-            f"Sample rows ready for review ({sample_count} rows)",
-            details,
-        )
-        db.commit()
-
     def _handle_pause(
         self,
         db: Session,
@@ -1096,7 +905,6 @@ class JobProcessor:
             cost_tracker.charge_remaining()
 
         version.status = "paused"
-        # Keep progress_detail so frontend can show timeline in paused state
 
         details = {"paused_at": datetime.now(timezone.utc).isoformat()}
         if cost_tracker:

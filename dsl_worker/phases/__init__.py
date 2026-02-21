@@ -20,8 +20,11 @@ from .scope_processor import (
     Scope,
 )
 from .row_generator import (
-    BucketTracker,
     GenerationWorkerPool,
+)
+from .source_manager import (
+    SourceManager,
+    SourceEntry,
 )
 from .sandbox import (
     SandboxExecutor,
@@ -44,8 +47,10 @@ __all__ = [
     "ScopeProcessor",
     "Scope",
     # Row generation
-    "BucketTracker",
     "GenerationWorkerPool",
+    # Source management
+    "SourceManager",
+    "SourceEntry",
     # Sandbox
     "SandboxExecutor",
     "SandboxResult",

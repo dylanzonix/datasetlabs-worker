@@ -1,8 +1,16 @@
 """
 Orchestrator agent — the brain that coordinates dataset generation.
 
-Reads the conversation history, does research, creates a plan (pipelines +
-buckets + generators), and runs generation via set_plan().
+V3: Loop-based orchestrator with direct research tools, source management,
+work item creation, and human-in-the-loop via ask_user().
+
+No more seeds, generators, or forced pipeline phases. The orchestrator:
+1. Researches the domain (directly or via subagents)
+2. Accumulates sources via save_source
+3. Creates work items (instruction + schema per row)
+4. Monitors generation progress
+5. Talks to the user mid-generation via ask_user
+6. Loops until target reached, then done()
 """
 
 from __future__ import annotations
@@ -16,10 +24,14 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 from dsl_worker.agents.base import AgentConversation, AgentResult
 from dsl_worker.agents.tools import ToolRegistry
 from dsl_worker.agents.research import ResearchAgent
-from dsl_worker.agents.generator import GeneratorAgent
 from dsl_worker.billing.tracked_client import TrackedOpenAIClient
+from dsl_worker.phases.source_manager import SourceManager
 
 logger = logging.getLogger(__name__)
+
+
+# Max chars for read_file results
+READ_FILE_LIMIT = 30_000
 
 
 ORCHESTRATOR_SYSTEM_PROMPT = """\
@@ -27,67 +39,78 @@ You are the orchestrator for a dataset generation system.
 
 ## Your mission
 
-A user has described a dataset they want through a consultation chat (below).
-Your job is to figure out the **optimal strategy** for building it — what
-sources to use, how to transform raw material into high-quality rows, and at
-what distribution — then execute that strategy.
+A user described a dataset through a consultation chat (below). Your job is to
+build it by: researching the domain, accumulating sources, creating work items
+(one per row), and monitoring generation quality.
 
-Strategy is about:
+## Source system
 
-- **Seeds** — anchors for diversity and coverage. Each seed gives a row a
-  unique starting point, preventing mode collapse. What carries the diversity
-  for this dataset? The right seed form depends on where the diversity lives —
-  sometimes it's extracted content because the source material IS the value,
-  sometimes it's a reference or pointer because the row generator can look up
-  what it needs per-row. The orchestrator should be specific about what seeds
-  are and where they come from, always grounded in real sources.
-- **Pipeline** — how to transform each seed into a final row. The row generator
-  is a full agent with browsing, search, code execution, and randomization
-  tools. Pipeline instructions can delegate significant work — looking up
-  details within a seed's scope, exploring sources, applying methodology,
-  synthesizing content. Don't pre-resolve work at the seed level that the row
-  generator could handle per-row.
+Sources are files saved to /workspace/sources/ with metadata in a manifest.
+Use save_source() to accumulate research material. Subagents (via run_subagent)
+can also save sources. Row generators read the manifest to find relevant sources.
 
-The golden case is finding source material that is **higher quality than what
-you could generate yourself**. Experts, professionals, and curated real-world
-content often surpass what you'd produce — authoritative references, domain
-experts, proven creative work, vetted datasets. When such sources exist, use
-them. When they don't, lean on synthesis but be deliberate about injecting
-quality through strong pipeline instructions and research-backed domain
-knowledge. Not all real data is good — seek the best, not just the real.
+Save broadly — it's better to have extra sources than to miss useful material.
+Good sources include: wiki pages, expert articles, reference data, code samples,
+curated lists, structured datasets. Authority scores: wiki/docs=0.9, expert=0.7,
+forum/community=0.5, random=0.3.
+
+## How to work (loop, not pipeline)
+
+1. **Understand the task.** Read the conversation history and any uploaded files.
+2. **Research.** Use your direct tools (brave_search, open) for domain understanding.
+   Delegate to subagents (run_subagent) for breadth — e.g. "research X and save
+   relevant sources." Subagents can save_source too.
+3. **Create work items.** Call create_work_items() with instructions for the row
+   generator. Each work item produces one row. The instruction tells the row
+   generator exactly what to do — reference source files by path/tag, specify
+   research tasks, define the transformation.
+4. **Monitor.** Call check_progress() to see how generation is going. If error
+   rates are high, adjust instructions. If more rows are needed, create more
+   work items.
+5. **Sample and consult.** After ~20 rows are generated, use ask_user() to show
+   sample rows and get feedback. Adjust instructions or sources based on feedback.
+6. **Repeat.** Steps 2-5 can overlap. Start generating while still researching
+   other areas. Create more work items as you discover new sources.
+7. **Complete.** Call done() when the target is reached.
+
+## Work items
+
+Each work item = {{instruction, schema (optional)}}
+
+The instruction tells the row generator exactly what to do. Reference source
+files and tags in the instruction. The row generator has tools: read_file,
+brave_search, open, code_exec, set_column, submit_row, skip, rng.
+
+Examples of good instructions:
+- "Read sources/combat/wiki_lean_peek.md. Write a gameplay tip about the lean/
+  peek mechanic. Use a casual, experienced tone."
+- "Search for a recent news article about {{topic}}. Summarize the key points
+  as a structured entry with title, summary, and key_facts."
+- "Read the manifest for sources tagged 'recipes'. Pick one recipe source,
+  extract the ingredients and steps, and format as a structured row."
+
+One work item → one agent → one row. The instruction determines how much
+effort the row generator puts in (2 turns for simple extraction, 15 for
+synthesis with research).
 
 ## Synthetic diversity risk
 
-Not all datasets face the same risk from synthetic generation. Use this
-reference when reasoning about your strategy — it tells you where to invest
-in diversity engineering vs. where correctness constraints naturally suffice.
-
-| Output type | Diversity risk | Why |
+| Output type | Risk | Strategy |
 |---|---|---|
-| Code, math, formal reasoning | LOW | Verifiable via execution/checks |
-| Structured outputs (JSON, SQL, tool calls) | VERY LOW | Schema validation dominates |
-| Information extraction & normalization | LOW | Deterministic validation possible |
-| Instruction following / assistant behavior | MEDIUM | Style homogenization risk |
-| Technical explanations / tutoring | MEDIUM | Tone collapses easily |
-| Customer support / sales simulations | MEDIUM-HIGH | Intent accuracy easy; realism harder |
-| Long-form reports & summaries | HIGH | Structure holds; discourse diversity collapses |
-| Game dialogue / character writing | HIGH | Needs persona anchoring |
-| Creative fiction / storytelling | VERY HIGH | Trope attractors + narrator voice collapse |
-| Natural multi-turn conversation | VERY HIGH | Social nuance hard to synthesize |
-| Humor / poetry / cultural voice | EXTREME | Highest human-signal dependency |
+| Code, math, formal reasoning | LOW | Correctness constraints suffice |
+| Structured outputs (JSON, SQL) | VERY LOW | Schema validation dominates |
+| Information extraction | LOW | Deterministic validation possible |
+| Instruction following | MEDIUM | Vary instruction styles |
+| Technical explanations | MEDIUM | Vary tone/audience in instructions |
+| Creative / dialogue / humor | HIGH-EXTREME | Source variety essential |
 
-For high-risk areas, diversity must be deliberately engineered — primarily
-through seed variety from real sources carrying genuine differences, and
-secondarily through controlled randomization (the rng tool) for dimensions
-where seed-level variety isn't sufficient or the model can genuinely go
-either way.
+For high-risk areas, diversity comes from varied sources and varied instructions.
 
 ## Resources
 
 {resources_section}
-- Web search and browsing via research agents
-- Code execution (Python) via research agents
-- Generator agents for extracting seeds from sources
+- Web search and browsing (direct tools + subagents)
+- Code execution (Python)
 
 ## Column schema
 {columns_description}
@@ -95,131 +118,74 @@ either way.
 ## Conversation history
 {conversation_summary}
 
-## How to work
-
-1. **Strategize first.** Call strategy() with your strategic analysis before
-   any other tool:
-   - What does quality look like for this dataset — per-row and overall?
-   - Where does the diversity live? What should seeds carry?
-   - What are the possible approaches? If there are meaningfully different
-     strategies (different seed designs, source mixes, pipeline splits),
-     reason about the tradeoffs. If the approach is obvious, explain why.
-   - What could go wrong? What are the risks with your chosen approach?
-   - What do you need to confirm about sources before committing?
-
-2. **Research to confirm.** Use research() to ground your strategy in specifics.
-   Even with strong intuitions, confirm them — what specific sources exist,
-   what does their content look like, are they rich enough for your target
-   count? Use ask_research() to drill deeper where source structure matters
-   for extraction. Resolve any uncertainty here, not through trial-and-error.
-
-3. **Set the plan and go.** Once your strategy is confirmed, call set_plan()
-   to start generation immediately:
-   - Pipeline instructions telling the row generator exactly how to transform
-     seeds into rows — leverage the row generator's full capabilities (browsing,
-     search, code execution, rng) in these instructions
-   - Generators with specific scopes for seed extraction
-   - Buckets for distribution (if needed)
-   The system generates sample rows first and pauses for user review.
+## Current source manifest
+{manifest_summary}
 
 ## Tools
 
-**strategy(analysis)** — Record your strategic analysis. Call this first, before
-researching or planning. Must include: quality definition, diversity analysis,
-approach reasoning (consider alternatives if non-obvious), and risk assessment.
+**Direct research tools:**
+- brave_search(query): Search the web
+- open(ref_id_or_url, start_line): View a page or file
+- find(ref_id, pattern): Search within a loaded page
+- click(ref_id, link_id): Follow a link
+- code_exec(script, description): Execute Python
+- interact(url_or_ref_id, task): Browser agent for complex interactions
 
-**research(task)** — Spawn a research agent to investigate a specific question.
-Give it a precise, answerable task — not a broad survey. Use ask_research(
-agent_id, question) for follow-ups to dig deeper into specifics.
+**Source management:**
+- save_source(content, path, description, tags, authority, source_type):
+  Save research material as a persistent source file
+- read_file(path): Read any file in the workspace (sources, uploads, etc.)
+- list_files(directory): List files in a directory
 
-**set_plan(plan)** — Set and start the generation plan. Begins generation
-immediately. The system generates sample rows and pauses for user review.
+**Delegation:**
+- run_subagent(task): Spawn a research subagent. It can search, browse,
+  and save_source. Returns its text response.
 
-**add_generator(generator)** — Add a generator to the current plan. Use for
-shortage recovery — add targeted generators for buckets that are short.
+**Generation:**
+- create_work_items(items): Create work items for row generation. Each item
+  has an instruction string and optional schema override. Does NOT block —
+  generation runs in background while you continue working.
+- check_progress(): Check generation stats (rows generated, errors, skipped)
 
-**done(reason)** — Signal orchestration is complete.
+**Human-in-the-loop:**
+- ask_user(message): Send a message to the user and wait for their response.
+  Use to show samples, ask for feedback, clarify requirements.
 
-## Plan structure
-
-A plan has three parts:
-
-**Pipelines** — Instructions for turning seeds into rows. Tell the row
-generator exactly how to interpret the seed and what to produce. The row
-generator is a full agent with browsing, search, code execution, and rng
-tools — pipeline instructions can leverage all of these. Use one pipeline
-unless categories need fundamentally different processing; a single pipeline
-can include conditional logic for moderate variation.
-
-**Buckets** (optional) — Distribution controls. Each bucket has a weight and
-maps to a pipeline. Skip entirely for uniform datasets.
-
-**Generators** — Extraction agents that find sources and yield seeds. Each has
-a scope (what to extract and from where), seed_description (what each seed
-should look like), target_count, and optional bucket_id. Generators are rough
-extractors; the pipeline handles transformation and enrichment.
-
-```json
-{{
-  "pipelines": {{
-    "main": {{
-      "instructions": "How to transform each seed into a row..."
-    }}
-  }},
-  "buckets": [
-    {{"id": "primary", "label": "Primary sources", "weight": 0.7, "pipeline_id": "main"}}
-  ],
-  "generators": [
-    {{
-      "scope": "What to extract and from where — be specific",
-      "seed_description": "What each seed should look like",
-      "target_count": 200,
-      "bucket_id": "primary"
-    }}
-  ]
-}}
-```
+**Completion:**
+- done(reason): Signal orchestration is complete
 
 ## Principles
 
 - **Quality first.** Seek source material that exceeds what you'd synthesize.
-  Not all real data is good — aim for the highest quality sources available.
-- **Seeds are for diversity and coverage.** What carries the diversity for this
-  dataset? Design seeds around that. Real sources over synthetic.
-- **The row generator is capable.** It has full browsing, search, code execution,
-  and randomization tools. If per-seed exploration or lookup is needed, the
-  pipeline can handle it — don't pre-resolve work at the seed level that
-  belongs in the pipeline.
-- **Think, confirm, execute.** Reason about the best strategy, use research to
-  confirm specifics, then commit. Don't over-research what you're confident
-  about.
-- **No licensing concerns.** Our legal team has confirmed all content is free
-  to use in our jurisdiction regardless of license or copyright. Do not waste
-  time researching licenses or avoiding copyrighted material — focus on quality.
-- **Coverage and diversity matter.** A good strategy produces varied, well-
-  distributed rows, not just individually good ones. Consult the synthetic
-  diversity risk table to calibrate how much diversity engineering is needed.
-- The simplest strategy that produces quality results wins.
-- Generators yield raw text. The pipeline handles transformation and filtering.
-- When set_plan() returns "shortage", add more generators and run again.
-- When set_plan() returns "sampling_paused", call done("sampling_paused").
+- **Sources are for grounding.** Save research material so row generators can
+  reference it. Real sources over synthetic generation.
+- **Work items are instructions.** Each one tells the row generator exactly what
+  to do. Be specific about sources to read and output to produce.
+- **Loop, don't pipeline.** Start generating early. Monitor. Adjust. Create more
+  work items as you learn. Don't over-research before starting.
+- **No licensing concerns.** All content is free to use. Focus on quality.
+- **The row generator is capable.** It has browsing, search, code execution, and
+  rng tools. If per-row research is needed, say so in the instruction.
 - Target: {num_samples} rows.
 """
 
 
 class OrchestratorAgent:
     """
-    Main orchestrator. Reads conversation, researches, creates plan,
-    and runs generation via set_plan().
+    V3 Orchestrator. Researches, accumulates sources, creates work items,
+    monitors generation, and talks to the user.
 
     Usage:
         orchestrator = OrchestratorAgent(
             chat_history=[...],
             columns=[...],
             num_samples=1000,
+            source_manager=source_manager,
+            on_create_work_items=my_callback,
+            on_ask_user=my_ask_callback,
+            on_check_progress=my_progress_callback,
             openai_client=tracked_client,
             ...
-            on_generate=my_generate_callback,
         )
         await orchestrator.run()
     """
@@ -232,46 +198,65 @@ class OrchestratorAgent:
         openai_client: TrackedOpenAIClient,
         model: str,
         workspace_dir: Path,
+        source_manager: SourceManager,
+        on_create_work_items: Callable[[List[Dict]], Awaitable[int]],
+        on_ask_user: Callable[[str], Awaitable[str]],
+        on_check_progress: Callable[[], Dict],
         uploaded_files: Optional[List[Dict[str, Any]]] = None,
         brave_api_key: Optional[str] = None,
         sandbox: Optional[Any] = None,
         stop_checker: Optional[Callable[[], bool]] = None,
         cost_checker: Optional[Callable[[], tuple[bool, Optional[str]]]] = None,
-        on_generate: Optional[Callable[[Dict, asyncio.Queue, asyncio.Future], Awaitable]] = None,
-        previous_recipe: Optional[str] = None,
         blob_service_client: Optional[Any] = None,
         project_id: Optional[Any] = None,
         on_tool_call: Optional[Callable[[str, str], None]] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         self.chat_history = chat_history
-        self.previous_recipe = previous_recipe
         self.columns = columns
         self.num_samples = num_samples
         self.workspace_dir = Path(workspace_dir)
         self.openai_client = openai_client
         self.model = model
+        self.source_manager = source_manager
+        self.on_create_work_items = on_create_work_items
+        self.on_ask_user = on_ask_user
+        self.on_check_progress = on_check_progress
         self.brave_api_key = brave_api_key
         self.sandbox = sandbox
         self.stop_checker = stop_checker
         self.cost_checker = cost_checker
-        self.on_generate = on_generate
         self.blob_service_client = blob_service_client
         self.project_id = project_id
         self.on_tool_call = on_tool_call
         self.mcp_tools = mcp_tools or []
 
         # State
-        self.plan: Optional[Dict] = None
-        self.plan_version: int = 0
-        self.seed_queue: asyncio.Queue = asyncio.Queue()
-        self._research_agents: Dict[str, ResearchAgent] = {}
-        self._generators: Dict[str, GeneratorAgent] = {}
-        self._generator_tasks: Dict[str, asyncio.Task] = {}
+        self._subagents: Dict[str, ResearchAgent] = {}
         self._is_done = False
         self._next_id = 0
+        self._total_work_items_created = 0
 
-        # Build tools
+        # Build tools — direct research tools + orchestrator-specific tools
+        from dsl_worker.phases.research_tools import ResearchTools, ResearchScope
+
+        self._impl = ResearchTools(
+            workspace_dir=workspace_dir,
+            schema=[],
+            brave_api_key=brave_api_key,
+            openai_client=openai_client,
+            model=model,
+            sandbox=sandbox,
+            stop_checker=stop_checker,
+            blob_service_client=blob_service_client,
+            project_id=project_id,
+        )
+        self._impl.set_scope(ResearchScope(
+            id="orchestrator",
+            description="",
+            quota=0,
+        ))
+
         registry = ToolRegistry()
         self._register_tools(registry)
 
@@ -279,21 +264,14 @@ class OrchestratorAgent:
         columns_desc = self._format_columns()
         convo_summary = self._format_conversation()
         resources_section = self._format_resources(uploaded_files)
-
-        if self.previous_recipe:
-            convo_summary += (
-                f"\n\n## Previous plan (user requested changes)\n"
-                f"```json\n{self.previous_recipe}\n```\n"
-                f"The user has provided feedback on the sample rows. Review the "
-                f"conversation history for their feedback, then adjust the pipeline "
-                f"instructions accordingly and call set_plan()."
-            )
+        manifest_summary = source_manager.get_manifest_summary()
 
         system_prompt = ORCHESTRATOR_SYSTEM_PROMPT.format(
             num_samples=num_samples,
             columns_description=columns_desc,
             conversation_summary=convo_summary,
             resources_section=resources_section,
+            manifest_summary=manifest_summary,
         )
 
         self._conversation = AgentConversation(
@@ -326,7 +304,7 @@ class OrchestratorAgent:
             if ctype == "enum" and col.get("enum_values"):
                 details = f"values: {col['enum_values']}"
             elif ctype == "json" and col.get("json_schema"):
-                details = f"json_schema defined"
+                details = "json_schema defined"
             lines.append(f"| {name} | {ctype} | {details} |")
         return "\n".join(lines)
 
@@ -361,41 +339,113 @@ class OrchestratorAgent:
         return "\n".join(lines)
 
     def _register_tools(self, registry: ToolRegistry) -> None:
-        """Register orchestrator tools."""
+        """Register all orchestrator tools."""
 
-        # --- strategy (think tool) ---
-        async def strategy(args: Dict) -> tuple[str, float]:
-            analysis = args.get("analysis", "")
-            logger.info(f"[Orchestrator] strategy() called ({len(analysis)} chars)")
-            return "Strategy recorded. Proceed with research or set_plan().", 0.0
+        # --- Direct research tools (brave_search, open, find, click, etc.) ---
+        self._impl.register_on(registry)
+
+        # --- save_source ---
+        source_mgr = self.source_manager
+
+        async def save_source(args: Dict) -> tuple[str, float]:
+            try:
+                result = await source_mgr.save_source(
+                    content=args.get("content", ""),
+                    path=args.get("path", ""),
+                    description=args.get("description", ""),
+                    tags=args.get("tags", []),
+                    authority=args.get("authority", 0.5),
+                    source_type=args.get("source_type", "article"),
+                    url=args.get("url"),
+                )
+                count = source_mgr.source_count
+                return f"Source saved: {result} (manifest now has {count} sources)", 0.0
+            except Exception as e:
+                return f"Error saving source: {e}", 0.0
 
         registry.add(
-            name="strategy",
+            name="save_source",
             description=(
-                "Record your strategic analysis before researching or planning. "
-                "Must include: quality definition, diversity analysis, approach "
-                "reasoning (consider alternatives when non-obvious), and risk "
-                "assessment. Call this BEFORE research() or set_plan()."
+                "Save research material as a persistent source file. "
+                "Row generators will read these sources when producing rows."
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "analysis": {
+                    "content": {
                         "type": "string",
-                        "description": (
-                            "Your strategic reasoning. Cover: quality definition, "
-                            "diversity analysis, approach reasoning (with alternatives "
-                            "if non-obvious), and what could go wrong."
-                        ),
+                        "description": "The content to save",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path within sources/ (e.g., 'combat/wiki_peek.md')",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Brief description of what this source contains",
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Tags for filtering",
+                    },
+                    "authority": {
+                        "type": "number",
+                        "description": "Authority score 0-1",
+                    },
+                    "source_type": {
+                        "type": "string",
+                        "description": "Source category: wiki, forum, article, code, data, upload",
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "Original URL if web content (optional)",
                     },
                 },
-                "required": ["analysis"],
+                "required": ["content", "path", "description", "tags", "authority", "source_type"],
             },
-            handler=strategy,
+            handler=save_source,
         )
 
-        # --- research ---
-        async def research(args: Dict) -> tuple[str, float]:
+        # --- read_file ---
+        async def read_file(args: Dict) -> tuple[str, float]:
+            path_str = args.get("path", "")
+            try:
+                path = Path(path_str)
+                if not path.is_absolute():
+                    candidate = self.workspace_dir / path
+                    if not candidate.exists():
+                        candidate = self.workspace_dir / "sources" / path
+                    path = candidate
+
+                if not path.exists():
+                    return f"File not found: {path_str}", 0.0
+
+                content = path.read_text(encoding="utf-8")
+                if len(content) > READ_FILE_LIMIT:
+                    content = content[:READ_FILE_LIMIT] + f"\n\n[Truncated at {READ_FILE_LIMIT} chars]"
+                return content, 0.0
+            except Exception as e:
+                return f"Error reading file: {e}", 0.0
+
+        registry.add(
+            name="read_file",
+            description="Read a file from the workspace (sources, uploads, etc.).",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path (relative to workspace or sources directory)",
+                    },
+                },
+                "required": ["path"],
+            },
+            handler=read_file,
+        )
+
+        # --- run_subagent ---
+        async def run_subagent(args: Dict) -> tuple[str, float]:
             task = args.get("task", "")
             agent_id = self._new_id()
 
@@ -410,299 +460,169 @@ class OrchestratorAgent:
                 project_id=self.project_id,
                 on_tool_call=self.on_tool_call,
                 mcp_tools=self.mcp_tools,
+                source_manager=self.source_manager,
             )
-            agent._conversation.label = f"research:{agent_id}"
-            self._research_agents[agent_id] = agent
+            agent._conversation.label = f"subagent:{agent_id}"
+            self._subagents[agent_id] = agent
 
             result = await agent.ask_full(task)
             return (
-                f"[Research agent {agent_id}]\n{result.text}\n\n"
+                f"[Subagent {agent_id}]\n{result.text}\n\n"
                 f"(cost: ${result.cost_usd:.4f}, {result.turns_taken} turns)"
             ), result.cost_usd
 
         registry.add(
-            name="research",
+            name="run_subagent",
             description=(
-                "Spawn a research agent to investigate a specific question. "
-                "The agent will research and return a focused answer. "
-                "Use ask_research() for follow-up questions to dig deeper."
+                "Spawn a research subagent. It can search, browse, save sources, "
+                "and return a text response. Use for delegating research tasks."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "task": {
                         "type": "string",
-                        "description": "What to research (be specific)",
+                        "description": "What the subagent should research",
                     },
                 },
                 "required": ["task"],
             },
-            handler=research,
+            handler=run_subagent,
         )
 
-        # --- ask_research ---
-        async def ask_research(args: Dict) -> tuple[str, float]:
-            agent_id = args.get("agent_id", "")
-            question = args.get("question", "")
+        # --- create_work_items ---
+        async def create_work_items(args: Dict) -> tuple[str, float]:
+            items = args.get("items", [])
+            if not items:
+                return "Error: no items provided", 0.0
 
-            agent = self._research_agents.get(agent_id)
-            if not agent:
-                return f"Research agent '{agent_id}' not found.", 0.0
-
-            result = await agent.ask_full(question)
-            return result.text, result.cost_usd
-
-        registry.add(
-            name="ask_research",
-            description=(
-                "Send a follow-up question to an existing research agent. "
-                "Use this to drill deeper into specific aspects of their findings. "
-                "The agent retains full context from previous questions."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "agent_id": {"type": "string", "description": "Research agent ID"},
-                    "question": {"type": "string", "description": "Follow-up question"},
-                },
-                "required": ["agent_id", "question"],
-            },
-            handler=ask_research,
-        )
-
-        # --- set_plan ---
-        async def set_plan(args: Dict) -> tuple[str, float]:
-            plan = args.get("plan", args)
-            if "plan" in args and isinstance(args["plan"], dict):
-                plan = args["plan"]
-
-            # Extract new_version flag (top-level arg, not part of plan data)
-            new_version = args.get("new_version", False)
-
-            # Validate plan structure
-            errors = self._validate_plan(plan)
+            # Validate items
+            errors = []
+            for i, item in enumerate(items):
+                if not isinstance(item, dict):
+                    errors.append(f"Item {i}: must be an object")
+                elif not item.get("instruction"):
+                    errors.append(f"Item {i}: 'instruction' is required")
             if errors:
-                return f"Plan validation failed:\n" + "\n".join(f"- {e}" for e in errors), 0.0
+                return "Validation errors:\n" + "\n".join(f"- {e}" for e in errors), 0.0
 
-            # Store new_version flag in plan metadata for job_processor
-            if new_version:
-                plan["_new_version"] = True
+            count = await self.on_create_work_items(items)
+            self._total_work_items_created += count
 
-            self.plan = plan
-            self.plan_version += 1
-
-            # Build confirmation with computed quotas
-            summary_parts = [f"Plan v{self.plan_version} saved."]
-
-            pipelines = plan.get("pipelines", {})
-            summary_parts.append(f"Pipelines: {len(pipelines)} ({', '.join(pipelines.keys())})")
-
-            buckets = plan.get("buckets", [])
-            if buckets:
-                total_weight = sum(b.get("weight", 1.0) for b in buckets)
-                summary_parts.append(f"Buckets ({len(buckets)}):")
-                for b in buckets:
-                    weight = b.get("weight", 1.0)
-                    quota = round(self.num_samples * weight / total_weight)
-                    summary_parts.append(
-                        f"  - {b.get('id')}: {b.get('label', '')} "
-                        f"(weight={weight}, quota={quota} rows)"
-                    )
-            else:
-                summary_parts.append(f"No buckets (uniform sampling, target={self.num_samples} rows)")
-
-            generators = plan.get("generators", [])
-            summary_parts.append(f"Generators ({len(generators)}):")
-            for g in generators:
-                gen_id = g.get("id", "gen")
-                summary_parts.append(
-                    f"  - {gen_id}: scope=\"{g.get('scope', '')[:60]}\" "
-                    f"target={g.get('target_count', 100)} bucket={g.get('bucket_id', 'none')}"
-                )
-
-            # === Start generation ===
-            if not self.on_generate:
-                summary_parts.append("\nWarning: no on_generate callback — generation skipped.")
-                return "\n".join(summary_parts), 0.0
-
-            # Create a fresh queue for this generation run
-            self.seed_queue = asyncio.Queue()
-
-            # Create future for the result
-            result_future: asyncio.Future = asyncio.get_event_loop().create_future()
-
-            # Signal job_processor to start the generation consumer
-            await self.on_generate(self.plan, self.seed_queue, result_future)
-
-            # Start all generator agents — they feed the seed queue
-            for gen_config in generators:
-                gen_id = gen_config.get("id", self._new_id())
-
-                # Skip generators that are already running
-                if gen_id in self._generators:
-                    continue
-
-                gen = GeneratorAgent(
-                    openai_client=self.openai_client,
-                    model=self.model,
-                    scope=gen_config.get("scope", ""),
-                    seed_description=gen_config.get("seed_description", ""),
-                    seed_queue=self.seed_queue,
-                    workspace_dir=self.workspace_dir,
-                    generator_id=gen_id,
-                    target_count=gen_config.get("target_count", 100),
-                    bucket_id=gen_config.get("bucket_id"),
-                    brave_api_key=self.brave_api_key,
-                    sandbox=self.sandbox,
-                    stop_checker=self.stop_checker,
-                    blob_service_client=self.blob_service_client,
-                    project_id=self.project_id,
-                    on_tool_call=self.on_tool_call,
-                    mcp_tools=self.mcp_tools,
-                )
-                self._generators[gen_id] = gen
-
-                task = asyncio.create_task(gen.run())
-                self._generator_tasks[gen_id] = task
-
-            logger.info(
-                f"[Orchestrator] set_plan: "
-                f"{len(generators)} generators started, awaiting result..."
-            )
-
-            # Block until the consumer resolves the future
-            try:
-                result = await result_future
-            except Exception as e:
-                return f"Generation error: {e}", 0.0
-
-            summary_parts.append(f"\n## Generation result\n{json.dumps(result, indent=2)}")
-
-            # Auto-exit on sampling_paused
-            if result.get("status") == "sampling_paused":
-                self._is_done = True
-
-            return "\n".join(summary_parts), 0.0
-
-        registry.add(
-            name="set_plan",
-            description=(
-                "Set and start the generation plan. Begins generation immediately. "
-                "The system generates sample rows and pauses for user review."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "plan": {
-                        "type": "object",
-                        "description": "The plan object with pipelines, buckets (optional), and generators",
-                        "properties": {
-                            "pipelines": {
-                                "type": "object",
-                                "description": "Map of pipeline_id -> {instructions: string}",
-                            },
-                            "buckets": {
-                                "type": "array",
-                                "description": "Optional distribution controls",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "id": {"type": "string"},
-                                        "label": {"type": "string"},
-                                        "weight": {"type": "number"},
-                                        "pipeline_id": {"type": "string"},
-                                    },
-                                    "required": ["id", "weight", "pipeline_id"],
-                                },
-                            },
-                            "generators": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "id": {"type": "string"},
-                                        "scope": {"type": "string"},
-                                        "seed_description": {"type": "string"},
-                                        "target_count": {"type": "integer"},
-                                        "bucket_id": {"type": "string"},
-                                    },
-                                    "required": ["scope", "seed_description"],
-                                },
-                            },
-                            "new_version": {
-                                "type": "boolean",
-                                "description": "If true, creates a new dataset version instead of appending to the current one. Use when user feedback requires fundamentally different data (e.g. different schema, different approach). Default false.",
-                            },
-                        },
-                        "required": ["pipelines", "generators"],
-                    },
-                },
-                "required": ["plan"],
-            },
-            handler=set_plan,
-        )
-
-        # --- add_generator ---
-        async def add_generator(args: Dict) -> tuple[str, float]:
-            if not self.plan:
-                return "Error: call set_plan() first.", 0.0
-
-            generator = args.get("generator", args)
-            if "generator" in args and isinstance(args["generator"], dict):
-                generator = args["generator"]
-
-            if not generator.get("scope"):
-                return "Error: generator needs 'scope'.", 0.0
-
-            # Append to current plan (no version bump)
-            self.plan["generators"].append(generator)
-
-            gen_id = generator.get("id", "new_gen")
+            # Refresh manifest summary in case subagents added sources
+            manifest_summary = self.source_manager.get_manifest_summary()
             return (
-                f"Generator '{gen_id}' added to plan. "
-                f"Now {len(self.plan['generators'])} generators total. "
-                f"Call set_plan() again to restart generation with the updated plan."
+                f"Created {count} work items. "
+                f"Total work items created: {self._total_work_items_created}. "
+                f"Target: {self.num_samples} rows.\n"
+                f"Generation is running in the background. Use check_progress() to monitor.\n"
+                f"\nCurrent manifest:\n{manifest_summary}"
             ), 0.0
 
         registry.add(
-            name="add_generator",
+            name="create_work_items",
             description=(
-                "Add a generator to the current plan. Use for shortage recovery — "
-                "add targeted generators for buckets that are short, then call set_plan() again."
+                "Create work items for row generation. Each item has an instruction "
+                "that tells the row generator what to do. Generation runs in the "
+                "background — you can continue researching and creating more items."
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "generator": {
-                        "type": "object",
-                        "description": "Generator definition with scope and seed_description",
-                        "properties": {
-                            "id": {"type": "string"},
-                            "scope": {"type": "string"},
-                            "seed_description": {"type": "string"},
-                            "target_count": {"type": "integer"},
-                            "bucket_id": {"type": "string"},
+                    "items": {
+                        "type": "array",
+                        "description": "Work items to create",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "instruction": {
+                                    "type": "string",
+                                    "description": (
+                                        "What the row generator should do. Reference source "
+                                        "files, specify research tasks, define the transformation."
+                                    ),
+                                },
+                                "schema": {
+                                    "type": "array",
+                                    "description": "Optional schema override for this item",
+                                    "items": {"type": "object"},
+                                },
+                                "tags": {
+                                    "type": "object",
+                                    "description": "Optional metadata tags for the generated row",
+                                },
+                            },
+                            "required": ["instruction"],
                         },
-                        "required": ["scope", "seed_description"],
                     },
                 },
-                "required": ["generator"],
+                "required": ["items"],
             },
-            handler=add_generator,
+            handler=create_work_items,
+        )
+
+        # --- check_progress ---
+        async def check_progress(args: Dict) -> tuple[str, float]:
+            stats = self.on_check_progress()
+            rows = stats.get("rows_generated", 0)
+            errors = stats.get("errors", 0)
+            skipped = stats.get("skipped", 0)
+            in_progress = stats.get("in_progress", 0)
+            total_cost = stats.get("total_cost", 0)
+
+            target = self.num_samples
+            remaining = max(0, target - rows)
+
+            lines = [
+                f"## Generation Progress",
+                f"- Rows generated: {rows} / {target} ({rows/target*100:.0f}%)" if target else f"- Rows generated: {rows}",
+                f"- Errors: {errors}",
+                f"- Skipped: {skipped}",
+                f"- In progress: {in_progress}",
+                f"- Work items created: {self._total_work_items_created}",
+                f"- Generation cost: ${total_cost:.4f}",
+                f"- Remaining to target: {remaining}",
+            ]
+            return "\n".join(lines), 0.0
+
+        registry.add(
+            name="check_progress",
+            description="Check generation progress: rows generated, errors, skipped, etc.",
+            parameters={"type": "object", "properties": {}},
+            handler=check_progress,
+        )
+
+        # --- ask_user ---
+        async def ask_user(args: Dict) -> tuple[str, float]:
+            message = args.get("message", "")
+            logger.info(f"[Orchestrator] ask_user() called ({len(message)} chars)")
+            response = await self.on_ask_user(message)
+            return f"User response: {response}", 0.0
+
+        registry.add(
+            name="ask_user",
+            description=(
+                "Send a message to the user and wait for their response. "
+                "Use to show sample rows, ask for feedback, or clarify requirements. "
+                "The message is posted as a chat message — the user sees it in the UI."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "Message to send to the user",
+                    },
+                },
+                "required": ["message"],
+            },
+            handler=ask_user,
         )
 
         # --- done ---
         async def done(args: Dict) -> tuple[str, float]:
             reason = args.get("reason", "complete")
             self._is_done = True
-
-            # Stop all generators
-            for gen_id, gen in self._generators.items():
-                gen.stop()
-                task = self._generator_tasks.get(gen_id)
-                if task and not task.done():
-                    task.cancel()
-
             return f"Orchestrator done: {reason}", 0.0
 
         registry.add(
@@ -713,67 +633,23 @@ class OrchestratorAgent:
                 "properties": {
                     "reason": {
                         "type": "string",
-                        "description": "Why orchestration is done (complete, sampling_paused, error)",
+                        "description": "Why orchestration is done",
                     },
                 },
             },
             handler=done,
         )
 
-    def _validate_plan(self, plan: Dict) -> List[str]:
-        """Validate plan structure. Returns list of error messages (empty = valid)."""
-        errors = []
-
-        if not isinstance(plan.get("pipelines"), dict):
-            errors.append("'pipelines' must be an object")
-        elif not plan["pipelines"]:
-            errors.append("At least one pipeline is required")
-
-        generators = plan.get("generators")
-        if not isinstance(generators, list):
-            errors.append("'generators' must be an array")
-        elif not generators:
-            errors.append("At least one generator is required")
-        else:
-            pipeline_ids = set(plan.get("pipelines", {}).keys())
-            bucket_ids = {b.get("id") for b in plan.get("buckets", [])}
-
-            for i, g in enumerate(generators):
-                if not g.get("scope"):
-                    errors.append(f"Generator {i}: 'scope' is required")
-
-                # If buckets exist, validate bucket_id references
-                if bucket_ids and g.get("bucket_id"):
-                    if g["bucket_id"] not in bucket_ids:
-                        errors.append(
-                            f"Generator {i}: bucket_id '{g['bucket_id']}' "
-                            f"not found in buckets"
-                        )
-
-            # Validate bucket pipeline_id references
-            for b in plan.get("buckets", []):
-                if b.get("pipeline_id") and b["pipeline_id"] not in pipeline_ids:
-                    errors.append(
-                        f"Bucket '{b.get('id')}': pipeline_id '{b['pipeline_id']}' "
-                        f"not found in pipelines"
-                    )
-
-        return errors
-
     async def run(self) -> AgentResult:
         """
         Run the orchestrator. This is the main entry point.
 
-        The orchestrator will:
-        1. Read conversation context (already in system prompt)
-        2. Research the domain
-        3. Create a plan (set_plan)
-        4. Run generation (generate — blocks until complete/shortage/paused)
-        5. Handle results and complete
+        The orchestrator will loop: research → create work items → monitor →
+        adjust → done. It continues until it calls done() or hits max_turns.
         """
         result = await self._conversation.send(
-            "Begin. Read the conversation history, then call strategy() with "
-            "your strategic analysis.",
+            "Begin. Read the conversation history and uploaded files, then start "
+            "researching and building the dataset.",
             exit_condition=lambda: self._is_done,
         )
         return result
@@ -782,27 +658,19 @@ class OrchestratorAgent:
     def cost_usd(self) -> float:
         """Total cost across orchestrator + all sub-agents."""
         total = self._conversation.total_cost
-        for agent in self._research_agents.values():
+        for agent in self._subagents.values():
             total += agent.cost_usd
-        for gen in self._generators.values():
-            total += gen.cost_usd
         return total
 
     async def cleanup(self) -> None:
-        """Clean up all sub-agents."""
-        for agent in self._research_agents.values():
+        """Clean up all sub-agents and resources."""
+        for agent in self._subagents.values():
             try:
                 await agent.cleanup()
             except Exception as e:
-                logger.warning(f"Research agent cleanup error: {e}")
+                logger.warning(f"Subagent cleanup error: {e}")
 
-        for gen in self._generators.values():
-            try:
-                await gen.cleanup()
-            except Exception as e:
-                logger.warning(f"Generator cleanup error: {e}")
-
-        # Cancel any running generator tasks
-        for task in self._generator_tasks.values():
-            if not task.done():
-                task.cancel()
+        try:
+            await self._impl.cleanup()
+        except Exception as e:
+            logger.warning(f"Orchestrator research tools cleanup error: {e}")
