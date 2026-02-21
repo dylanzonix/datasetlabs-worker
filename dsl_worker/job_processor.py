@@ -551,6 +551,7 @@ class JobProcessor:
         """Consume seeds from the queue and run generation. Resolves result_future when done."""
 
         SAMPLE_SIZE = 5
+        MAX_DEFERRED = 20
         bucket_tracker = BucketTracker(plan, state.num_samples)
 
         batch: List[Dict] = []
@@ -559,6 +560,15 @@ class JobProcessor:
         total_success = 0
         total_errors = 0
         is_initial_run = True  # First set_plan(start=true) triggers sampling pause
+
+        # Round-robin bucket diversity for initial sample
+        sampled_buckets: set = set()
+        deferred_seeds: List[Dict] = []
+        all_bucket_ids = {
+            b.get("id", f"bucket_{i}")
+            for i, b in enumerate(plan.get("buckets", []))
+        } or {"_default"}
+        buckets_to_sample = min(len(all_bucket_ids), SAMPLE_SIZE)
 
         try:
             while True:
@@ -574,8 +584,14 @@ class JobProcessor:
                 if is_initial_run and total_success >= SAMPLE_SIZE:
                     logger.info(
                         f"[Generation] Auto-pausing after {SAMPLE_SIZE} sample rows "
-                        f"for user review"
+                        f"for user review (buckets sampled: {sampled_buckets})"
                     )
+                    # Drain deferred seeds into checkpoint
+                    for ds in deferred_seeds:
+                        await checkpoint_mgr.add_seed_dict(ds)
+                        seed_index += 1
+                    deferred_seeds = []
+
                     # Drain remaining seeds into checkpoint
                     while not seed_queue.empty():
                         remaining = seed_queue.get_nowait()
@@ -592,6 +608,18 @@ class JobProcessor:
                             "errors": total_errors,
                         })
                     return
+
+                # Re-queue deferred seeds once all buckets sampled or enough samples
+                if deferred_seeds and (
+                    len(sampled_buckets) >= buckets_to_sample
+                    or total_success >= SAMPLE_SIZE
+                    or not is_initial_run
+                ):
+                    for ds in deferred_seeds:
+                        await checkpoint_mgr.add_seed_dict(ds)
+                        batch.append(ds)
+                        seed_index += 1
+                    deferred_seeds = []
 
                 try:
                     seed = await asyncio.wait_for(seed_queue.get(), timeout=5.0)
@@ -650,6 +678,23 @@ class JobProcessor:
                     if generators_done >= num_generators:
                         break
                     continue
+
+                # During initial sampling, defer seeds from already-sampled buckets
+                # to ensure round-robin bucket coverage in the sample
+                seed_bucket = seed.get("bucket_id", "_default") if isinstance(seed, dict) else "_default"
+                if (
+                    is_initial_run
+                    and total_success < SAMPLE_SIZE
+                    and seed_bucket in sampled_buckets
+                    and len(sampled_buckets) < buckets_to_sample
+                    and len(deferred_seeds) < MAX_DEFERRED
+                ):
+                    deferred_seeds.append(seed)
+                    continue
+
+                # Track which buckets have been sampled
+                if is_initial_run:
+                    sampled_buckets.add(seed_bucket)
 
                 # Checkpoint the seed
                 await checkpoint_mgr.add_seed_dict(seed)

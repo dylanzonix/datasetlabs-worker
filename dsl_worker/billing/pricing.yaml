@@ -40,7 +40,7 @@ models:
   # GPT 5
   gpt-5.2:
     input: 0.00000175    # $1.75 / 1M tokens
-    cached_input: 0.000000175  # $0.175 / 1M tokens
+    cached_input: 0.00000018  # $0.18 / 1M tokens (Azure pricing)
     output: 0.000014     # $14.00 / 1M tokens
 
   gpt-5-nano:

@@ -25,8 +25,10 @@ class WorkerSettings(BaseSettings):
     azure_storage_account_key: str
     azure_storage_container_name: str = "datasetlabs"
 
-    # OpenAI
-    openai_api_key: str
+    # Azure OpenAI
+    azure_openai_api_key: str
+    azure_openai_endpoint: str  # e.g. "https://found-mlr2zdw9-eastus2.cognitiveservices.azure.com"
+    azure_openai_api_version: str = "2025-04-01-preview"
 
     # Worker settings
     max_concurrent_jobs: int = 1

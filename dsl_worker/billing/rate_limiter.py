@@ -110,15 +110,17 @@ class RateLimiter:
     Manages separate sliding windows per model.
     """
 
+    # Azure OpenAI deployment limits
     DEFAULT_LIMITS = {
-        "gpt-4o": RateLimitConfig("gpt-4o", rpm_limit=500, tpm_limit=30_000),
-        "gpt-4o-mini": RateLimitConfig("gpt-4o-mini", rpm_limit=500, tpm_limit=200_000),
-        "gpt-5.2": RateLimitConfig("gpt-5.2", rpm_limit=500, tpm_limit=30_000),
-        "gpt-5-mini": RateLimitConfig("gpt-5-mini", rpm_limit=500, tpm_limit=200_000),
-        "o1": RateLimitConfig("o1", rpm_limit=500, tpm_limit=30_000),
-        "o1-mini": RateLimitConfig("o1-mini", rpm_limit=500, tpm_limit=150_000),
-        "text-embedding-3-large": RateLimitConfig("text-embedding-3-large", rpm_limit=500, tpm_limit=1_000_000),
-        "text-embedding-3-small": RateLimitConfig("text-embedding-3-small", rpm_limit=500, tpm_limit=1_000_000),
+        "gpt-4o": RateLimitConfig("gpt-4o", rpm_limit=1_500, tpm_limit=150_000),
+        "gpt-4o-mini": RateLimitConfig("gpt-4o-mini", rpm_limit=1_500, tpm_limit=200_000),
+        "gpt-5.2": RateLimitConfig("gpt-5.2", rpm_limit=1_500, tpm_limit=150_000),
+        "gpt-5-mini": RateLimitConfig("gpt-5-mini", rpm_limit=1_500, tpm_limit=200_000),
+        "gpt-5-nano": RateLimitConfig("gpt-5-nano", rpm_limit=1_500, tpm_limit=1_000_000),
+        "o1": RateLimitConfig("o1", rpm_limit=1_500, tpm_limit=150_000),
+        "o1-mini": RateLimitConfig("o1-mini", rpm_limit=1_500, tpm_limit=150_000),
+        "text-embedding-3-large": RateLimitConfig("text-embedding-3-large", rpm_limit=1_500, tpm_limit=1_000_000),
+        "text-embedding-3-small": RateLimitConfig("text-embedding-3-small", rpm_limit=1_500, tpm_limit=1_000_000),
     }
 
     def __init__(
