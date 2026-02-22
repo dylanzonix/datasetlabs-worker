@@ -35,6 +35,19 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import httpx
 from markdownify import markdownify as md
 
+# Langfuse is optional — tracing is a no-op if not configured
+try:
+    from langfuse import get_client as _get_langfuse_client
+
+    def _get_langfuse():
+        try:
+            return _get_langfuse_client()
+        except Exception:
+            return None
+except ImportError:
+    def _get_langfuse():
+        return None
+
 from dsl_worker.phases.artifacts import (
     ArtifactStore,
     SearchResults,
@@ -114,7 +127,7 @@ import json
 import os
 from pathlib import Path
 
-_WORKSPACE = os.environ.get("DSL_WORKSPACE", "/workspace")
+_WORKSPACE = "/workspace"
 _SEEDS_FILE = os.path.join(_WORKSPACE, ".dsl_seeds.jsonl")
 
 
@@ -192,6 +205,7 @@ class ResearchTools:
         stop_checker: Optional[Callable[[], bool]] = None,
         blob_service_client: Optional[Any] = None,
         project_id: Optional[str] = None,
+        uploaded_file_urls: Optional[Dict[str, str]] = None,
     ):
         self.workspace_dir = Path(workspace_dir)
         self.schema = schema
@@ -202,15 +216,19 @@ class ResearchTools:
         self.stop_checker = stop_checker
         self.blob_service_client = blob_service_client
         self.project_id = str(project_id) if project_id else None
-        
-        # Ensure directories exist
-        (self.workspace_dir / "uploads").mkdir(parents=True, exist_ok=True)
+        self.uploaded_file_urls = uploaded_file_urls
+
+        # Ensure downloads dir exists (uploads go direct to sandbox via SAS URLs)
         (self.workspace_dir / "downloads").mkdir(parents=True, exist_ok=True)
         
         # Browser - lazy initialized, owned by this instance
         self._browser: Optional[Any] = None
         self._browser_init_lock = asyncio.Lock()
         self._open_pages: Dict[str, Any] = {}  # ref_id -> page
+
+        # Sandbox session - lazy initialized, owned by this instance
+        self._sandbox_session: Optional[Any] = None
+        self._sandbox_session_lock = asyncio.Lock()
         
         # Artifact storage
         self.artifacts = ArtifactStore()
@@ -310,8 +328,60 @@ class ResearchTools:
 
         return self._browser
     
+    # =========================================================================
+    # Sandbox Session Management
+    # =========================================================================
+
+    async def _get_sandbox_session(self):
+        """Get or create a persistent sandbox session for this instance.
+
+        Lazy-creates a SandboxSession on first call, uploads workspace files
+        once, and returns the same session for subsequent calls.
+        """
+        from dsl_worker.phases.sandbox import SandboxSession
+        from sandbox_service.models import SessionConfig
+
+        async with self._sandbox_session_lock:
+            if self._sandbox_session is None:
+                langfuse = _get_langfuse()
+                if langfuse:
+                    ctx = langfuse.start_as_current_observation(
+                        as_type="span",
+                        name="sandbox:create_session",
+                    )
+                    ctx.__enter__()
+                else:
+                    ctx = None
+
+                try:
+                    config = SessionConfig(network_enabled=True, memory_limit="4g")
+                    session_client = await self.sandbox.create_session(config)
+                    self._sandbox_session = SandboxSession(session_client, self.sandbox)
+                    await self._sandbox_session.upload_workspace(
+                        self.workspace_dir,
+                        file_urls=self.uploaded_file_urls,
+                    )
+                    scope_id = self.scope.id if self.scope else "unknown"
+                    logger.info(f"[ResearchTools] Sandbox session created for scope {scope_id}")
+                finally:
+                    if ctx is not None:
+                        ctx.__exit__(None, None, None)
+
+        return self._sandbox_session
+
     async def cleanup(self):
-        """Cleanup browser session. Saves cookies, then stops browser."""
+        """Cleanup browser and sandbox sessions."""
+        # Cleanup sandbox session
+        if self._sandbox_session:
+            try:
+                await self._sandbox_session.close()
+                scope_id = self.scope.id if self.scope else "unknown"
+                logger.info(f"[ResearchTools] Sandbox session closed for scope {scope_id}")
+            except Exception as e:
+                logger.warning(f"[ResearchTools] Error closing sandbox session: {e}")
+            self._sandbox_session = None
+
+        # Cleanup browser session
         if self._browser:
             try:
                 # Save project cookies to Azure Blob before stopping
@@ -747,33 +817,30 @@ class ResearchTools:
     async def list_files(self, directory: str = "all") -> Tuple[str, float]:
         """List available files with metadata preview."""
         output = []
-        
-        for subdir in ["uploads", "downloads"]:
-            if directory not in (subdir, "all"):
-                continue
-            
-            dir_path = self.workspace_dir / subdir
-            if not dir_path.exists():
-                continue
-            
-            files = sorted([f for f in dir_path.iterdir() if f.is_file()])
-            if not files:
-                continue
-            
-            icon = "📁" if subdir == "uploads" else "📥"
-            output.append(f"{icon} {subdir.title()}:")
-            
-            for f in files:
-                size_kb = f.stat().st_size / 1024
-                meta = self._get_file_metadata(f)
-                
-                output.append(f"  {f.name} ({size_kb:.1f}KB)")
-                if meta:
-                    output.append(f"    └─ {meta}")
-        
+
+        # Uploads: show from uploaded_file_urls keys (files are in sandbox, not on disk)
+        if directory in ("uploads", "all") and self.uploaded_file_urls:
+            output.append("📁 Uploads:")
+            for filename in sorted(self.uploaded_file_urls.keys()):
+                output.append(f"  {filename}")
+
+        # Downloads: show from local disk (browser downloads)
+        if directory in ("downloads", "all"):
+            dir_path = self.workspace_dir / "downloads"
+            if dir_path.exists():
+                files = sorted([f for f in dir_path.iterdir() if f.is_file()])
+                if files:
+                    output.append("📥 Downloads:")
+                    for f in files:
+                        size_kb = f.stat().st_size / 1024
+                        meta = self._get_file_metadata(f)
+                        output.append(f"  {f.name} ({size_kb:.1f}KB)")
+                        if meta:
+                            output.append(f"    └─ {meta}")
+
         if not output:
             return "No files found. Upload files or browse web to download.", 0.0
-        
+
         output.append("\nUse code_exec() to parse files and submit_seed() for items.")
         return '\n'.join(output), 0.0
     
@@ -828,29 +895,41 @@ class ResearchTools:
     async def code_exec(self, script: str, description: str = "") -> Tuple[str, float]:
         """
         Execute Python code with access to files and submit_seed().
-        
+
         Available in script:
         - submit_seed(content, source=None) - Submit a seed for row generation
         - list_files() - List available files
         - file_info(path) - Get file metadata
-        
+
         Files are at:
         - /workspace/uploads/ - User uploaded files
         - /workspace/downloads/ - Browser downloaded files
         """
         if not self.sandbox:
             return "Code execution not available", 0.0
-        
-        # Clear previous seeds file
-        seeds_file = self.workspace_dir / ".dsl_seeds.jsonl"
-        if seeds_file.exists():
-            seeds_file.unlink()
-        
+
+        langfuse = _get_langfuse()
+        if langfuse:
+            with langfuse.start_as_current_observation(
+                as_type="span",
+                name="tool:code_exec",
+                input={
+                    "script": script[:500],
+                    "description": description,
+                },
+            ) as span:
+                result_text, cost = await self._do_code_exec(script)
+                span.update(output={
+                    "result_preview": result_text[:300],
+                    "seeds_extracted": self.seeds_submitted,
+                })
+                return result_text, cost
+        return await self._do_code_exec(script)
+
+    async def _do_code_exec(self, script: str) -> Tuple[str, float]:
+        """Execute Python code (implementation)."""
         # Build code with dsl_tools injected
         full_script = f"""
-import os
-os.environ["DSL_WORKSPACE"] = "{self.workspace_dir}"
-
 {DSL_TOOLS_LIBRARY}
 
 # Common libraries
@@ -869,47 +948,93 @@ try:
 except ImportError:
     load_workbook = None
 
+# Clear previous seeds file
+import os
+_seeds_path = os.path.join("/workspace", ".dsl_seeds.jsonl")
+if os.path.exists(_seeds_path):
+    os.remove(_seeds_path)
+
 # User script
 {script}
 """
-        
-        result = self.sandbox.execute(
+
+        session = await self._get_sandbox_session()
+        result = await session.execute(
             script=full_script,
-            workspace_dir=str(self.workspace_dir),
             timeout=120,
         )
-        
-        # Read any seeds that were submitted
+
+        # Read any seeds that were submitted (from sandbox filesystem)
         new_seeds = []
-        if seeds_file.exists():
-            for line in seeds_file.read_text().strip().split('\n'):
+        try:
+            seeds_content = await session.read_file(".dsl_seeds.jsonl")
+            for line in seeds_content.strip().split('\n'):
                 if line:
                     try:
                         seed_data = json.loads(line)
                         new_seeds.append(seed_data)
                     except json.JSONDecodeError:
                         pass
-        
+        except Exception:
+            pass  # No seeds file = no seeds submitted
+
         # Add seeds to our collection
         for seed_data in new_seeds:
             self._add_seed_from_code(seed_data)
-        
+
         # Build response
         output_parts = []
-        
+
         if result.stdout:
             output_parts.append(result.stdout)
-        
+
         if not result.success and result.stderr:
             output_parts.append(f"Error: {result.stderr}")
-        
+
         if new_seeds:
             output_parts.append(f"\n✓ {len(new_seeds)} seeds submitted")
             remaining = self.scope.quota - self.seeds_submitted if self.scope else 0
             output_parts.append(f"  Remaining quota: {remaining}")
-        
+
         return '\n'.join(output_parts) if output_parts else "Code executed (no output)", 0.0
     
+    # =========================================================================
+    # shell_exec
+    # =========================================================================
+
+    async def shell_exec(self, command: str, description: str = "") -> Tuple[str, float]:
+        """Execute a shell command in the sandbox."""
+        if not self.sandbox:
+            return "Shell execution not available", 0.0
+
+        langfuse = _get_langfuse()
+        if langfuse:
+            with langfuse.start_as_current_observation(
+                as_type="span",
+                name="tool:shell_exec",
+                input={
+                    "command": command[:500],
+                    "description": description,
+                },
+            ) as span:
+                result_text, cost = await self._do_shell_exec(command)
+                span.update(output={"result_preview": result_text[:300]})
+                return result_text, cost
+        return await self._do_shell_exec(command)
+
+    async def _do_shell_exec(self, command: str) -> Tuple[str, float]:
+        """Execute a shell command (implementation)."""
+        session = await self._get_sandbox_session()
+        result = await session.exec_shell(command=command, timeout=60)
+
+        output_parts = []
+        if result.stdout:
+            output_parts.append(result.stdout)
+        if not result.success and result.stderr:
+            output_parts.append(f"Error: {result.stderr}")
+
+        return '\n'.join(output_parts) if output_parts else "Command executed (no output)", 0.0
+
     def _add_seed_from_code(self, seed_data: Dict):
         """Add a seed that was submitted via code execution."""
         if not self.scope:
@@ -1228,6 +1353,10 @@ except ImportError:
                 script=args.get("script", ""),
                 description=args.get("description", ""),
             ),
+            "shell_exec": lambda args: self.shell_exec(
+                command=args.get("command", ""),
+                description=args.get("description", ""),
+            ),
             "interact": lambda args: self.interact(
                 url_or_ref_id=args.get("url_or_ref_id", ""),
                 task=args.get("task", ""),
@@ -1406,6 +1535,30 @@ Files at /workspace/uploads/ and /workspace/downloads/""",
                         }
                     },
                     "required": ["script"]
+                }
+            },
+            {
+                "type": "function",
+                "name": "shell_exec",
+                "description": """Execute a shell command in the sandbox.
+
+Use for system-level operations: installing packages, running CLI tools,
+file manipulation, piping commands, etc.
+
+Working directory is /workspace. Files at /workspace/uploads/ and /workspace/downloads/""",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Shell command to execute"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "What this command does"
+                        }
+                    },
+                    "required": ["command"]
                 }
             },
             {
@@ -1616,7 +1769,13 @@ Files at /workspace/uploads/ and /workspace/downloads/""",
                     script=args.get("script", ""),
                     description=args.get("description", ""),
                 )
-            
+
+            elif name == "shell_exec":
+                return await self.shell_exec(
+                    command=args.get("command", ""),
+                    description=args.get("description", ""),
+                )
+
             elif name == "conclude_research":
                 return self.conclude_research(summary=args.get("summary", ""))
             

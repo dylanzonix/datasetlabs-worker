@@ -25,7 +25,7 @@ from dsl_worker.phases.research_tools import ResearchTools, ResearchScope
 
 logger = logging.getLogger(__name__)
 
-MAX_GENERATION_TURNS = 15
+MAX_GENERATION_TURNS = 30
 
 # Max chars for read_file results
 READ_FILE_LIMIT = 30_000
@@ -63,6 +63,8 @@ You MUST deliver your output via tool calls. Text responses are discarded by the
 
 For each column in the schema, call set_column(name, value). Then call submit_row().
 If the assignment is unusable, call skip(reason).
+
+IMPORTANT: Call set_column for ALL columns in a SINGLE response. Do not call set_column one at a time across multiple turns — batch all set_column calls together, then call submit_row in the same response or the next one.
 
 DO NOT write JSON, code blocks, or row content as text. Only tool calls are captured.
 
@@ -129,6 +131,7 @@ class RowGeneratorAgent:
         stop_checker: Optional[Callable[[], bool]] = None,
         blob_service_client: Optional[Any] = None,
         project_id: Optional[Any] = None,
+        uploaded_file_urls: Optional[Dict[str, str]] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         self.openai_client = openai_client
@@ -155,6 +158,7 @@ class RowGeneratorAgent:
             stop_checker=stop_checker,
             blob_service_client=blob_service_client,
             project_id=project_id,
+            uploaded_file_urls=uploaded_file_urls,
         )
         # Set a dummy scope for ResearchTools compatibility
         self._impl.set_scope(ResearchScope(

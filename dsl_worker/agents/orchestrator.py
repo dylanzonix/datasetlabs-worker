@@ -172,6 +172,7 @@ class OrchestratorAgent:
         blob_service_client: Optional[Any] = None,
         project_id: Optional[Any] = None,
         on_tool_call: Optional[Callable[[str, str], None]] = None,
+        uploaded_file_urls: Optional[Dict[str, str]] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         self.chat_history = chat_history
@@ -188,6 +189,7 @@ class OrchestratorAgent:
         self.blob_service_client = blob_service_client
         self.project_id = project_id
         self.on_tool_call = on_tool_call
+        self.uploaded_file_urls = uploaded_file_urls
         self.mcp_tools = mcp_tools or []
 
         # State
@@ -293,6 +295,7 @@ class OrchestratorAgent:
                 blob_service_client=self.blob_service_client,
                 project_id=self.project_id,
                 on_tool_call=self.on_tool_call,
+                uploaded_file_urls=self.uploaded_file_urls,
                 mcp_tools=self.mcp_tools,
             )
             agent._conversation.label = f"subagent:{agent_id}"
@@ -337,6 +340,7 @@ class OrchestratorAgent:
             stop_checker=self.stop_checker,
             blob_service_client=self.blob_service_client,
             project_id=self.project_id,
+            uploaded_file_urls=self.uploaded_file_urls,
         )
         self._impl.set_scope(ResearchScope(
             id="orchestrator",

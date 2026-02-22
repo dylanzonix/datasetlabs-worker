@@ -15,16 +15,17 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import socket
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 from openai import AsyncOpenAI
 from sqlalchemy.orm import Session
-from azure.storage.blob import BlobServiceClient
+from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
 
 from dsl_api.models.project import Project
 from dsl_api.models.project_version import ProjectVersion
@@ -60,7 +61,7 @@ from dsl_worker.checkpoint import CheckpointManager, checkpoints_to_work_items
 from dsl_worker.agents import OrchestratorAgent
 from dsl_worker.agents.topic_agent import TopicAgent
 from dsl_worker.phases.row_generator import GenerationWorkerPool
-from dsl_worker.phases.sandbox import SandboxExecutor
+from sandbox_service import SandboxClient
 
 logger = logging.getLogger(__name__)
 
@@ -90,8 +91,9 @@ class JobProcessor:
         self.blob_service_client = blob_service_client
         self.should_stop = False
 
-        # Sandbox (shared - it's just a Docker pool)
-        self._sandbox: Optional[SandboxExecutor] = None
+        # Sandbox client (shared HTTP connection — each agent creates its own session)
+        self._sandbox: Optional[SandboxClient] = None
+        self._workspace_dir: Optional[Path] = None
         # MCP tools for current job (set during _run_pipeline)
         self._mcp_tools: list = []
 
@@ -246,17 +248,18 @@ class JobProcessor:
     ) -> bool:
         """Run the V4 three-tier pipeline."""
 
-        # Create workspace
+        # Create workspace (only downloads/ needed locally — uploads go direct to sandbox)
         workspace_dir = Path(f"./workspace_{project.id}_{version.id}")
         workspace_dir.mkdir(parents=True, exist_ok=True)
-        (workspace_dir / "uploads").mkdir(exist_ok=True)
         (workspace_dir / "downloads").mkdir(exist_ok=True)
+        self._workspace_dir = workspace_dir
 
-        # Load uploaded files from blob
-        await self._load_uploaded_files(db, project.id, workspace_dir)
+        # Generate SAS URLs for uploaded files (sandbox service fetches them directly)
+        uploaded_file_urls = self._generate_file_urls(db, project.id)
 
-        # Initialize sandbox
-        self._sandbox = SandboxExecutor(use_pool=True, pool_size=3)
+        # Initialize sandbox client
+        self._sandbox = SandboxClient(settings.sandbox_service_url, timeout=150.0)
+        await self._sandbox.__aenter__()
 
         # Initialize checkpoint manager
         checkpoint_mgr = CheckpointManager(
@@ -367,6 +370,7 @@ class JobProcessor:
                             stop_checker=stop_checker,
                             schema=state.columns,
                             generation_stats=generation_stats,
+                            uploaded_file_urls=uploaded_file_urls,
                         )
                     )
 
@@ -474,6 +478,7 @@ class JobProcessor:
             blob_service_client=self.blob_service_client,
             project_id=project.id,
             on_tool_call=on_tool_call,
+            uploaded_file_urls=uploaded_file_urls if uploaded_file_urls else None,
             mcp_tools=mcp_tools,
         )
 
@@ -754,6 +759,7 @@ class JobProcessor:
         stop_checker,
         schema: List[Dict],
         generation_stats: Dict,
+            uploaded_file_urls: Optional[Dict[str, str]] = None,
     ) -> None:
         """
         Background consumer: dequeue work items, batch them, and run
@@ -780,7 +786,7 @@ class JobProcessor:
                             batch, schema, db, project, version,
                             tracked_client, cost_tracker, checkpoint_mgr,
                             workspace_dir, stop_checker, batch_start_index,
-                            generation_stats,
+                            generation_stats, uploaded_file_urls=uploaded_file_urls,
                         )
                         batch_start_index += len(batch)
                         batch = []
@@ -793,7 +799,7 @@ class JobProcessor:
                             batch, schema, db, project, version,
                             tracked_client, cost_tracker, checkpoint_mgr,
                             workspace_dir, stop_checker, batch_start_index,
-                            generation_stats,
+                            generation_stats, uploaded_file_urls=uploaded_file_urls,
                         )
                         batch_start_index += len(batch)
                         batch = []
@@ -806,7 +812,7 @@ class JobProcessor:
                         batch, schema, db, project, version,
                         tracked_client, cost_tracker, checkpoint_mgr,
                         workspace_dir, stop_checker, batch_start_index,
-                        generation_stats,
+                        generation_stats, uploaded_file_urls=uploaded_file_urls,
                     )
                     batch_start_index += len(batch)
                     batch = []
@@ -835,6 +841,7 @@ class JobProcessor:
         stop_checker,
         start_index: int,
         generation_stats: Dict,
+            uploaded_file_urls: Optional[Dict[str, str]] = None,
     ) -> None:
         """Process a batch of work items through the generation pool."""
 
@@ -861,6 +868,7 @@ class JobProcessor:
                 checkpoint_mgr.mark_processed(start_index + idx, success, row_id)
             ),
             blob_service_client=self.blob_service_client,
+            uploaded_file_urls=uploaded_file_urls,
             mcp_tools=self._mcp_tools,
         )
 
@@ -916,6 +924,9 @@ class JobProcessor:
 
         concurrency = settings.generation_parallel_samples
 
+        # Generate SAS URLs for uploaded files (needed by row generators)
+        uploaded_file_urls = self._generate_file_urls(db, project.id)
+
         pool = GenerationWorkerPool(
             workspace_dir=workspace_dir,
             openai_client=tracked_client,
@@ -932,6 +943,7 @@ class JobProcessor:
                 checkpoint_mgr.mark_processed(pending_indices[idx], success, row_id)
             ),
             blob_service_client=self.blob_service_client,
+            uploaded_file_urls=uploaded_file_urls if uploaded_file_urls else None,
             mcp_tools=self._mcp_tools,
         )
 
@@ -992,9 +1004,13 @@ class JobProcessor:
 
         return history
 
-    async def _load_uploaded_files(self, db: Session, project_id, workspace_dir: Path):
-        """Download uploaded files from Azure to workspace."""
-        files = (
+    def _generate_file_urls(self, db: Session, project_id) -> Dict[str, str]:
+        """Generate short-lived SAS URLs for uploaded files (no local download needed).
+
+        Returns dict of filename -> SAS URL. The sandbox service will fetch
+        these URLs directly into the session workspace.
+        """
+        project_files = (
             db.query(ProjectFile)
             .filter(
                 ProjectFile.project_id == project_id,
@@ -1003,31 +1019,38 @@ class JobProcessor:
             )
             .all()
         )
-
-        if not files:
+        if not project_files:
             logger.info("[Pipeline] No uploaded files")
-            return
+            return {}
 
-        logger.info(f"[Pipeline] Loading {len(files)} uploaded files...")
+        urls: Dict[str, str] = {}
+        container = settings.azure_storage_container_name
 
-        uploads_dir = workspace_dir / "uploads"
+        for f in project_files:
+            filename = f.filename
+            blob_path = f.blob_path
+            if not filename or not blob_path:
+                continue
 
-        for f in files:
-            local_path = uploads_dir / f.filename
             try:
-                if self.blob_service_client:
-                    container = settings.azure_storage_container_name
-                    blob_client = self.blob_service_client.get_blob_client(
-                        container=container,
-                        blob=f.blob_path,
-                    )
-                    with open(local_path, "wb") as file:
-                        file.write(blob_client.download_blob().readall())
-                    logger.info(f"[Pipeline] Downloaded: {f.filename}")
-                else:
-                    logger.warning(f"[Pipeline] No blob client, can't download {f.filename}")
+                sas_token = generate_blob_sas(
+                    account_name=settings.azure_storage_account_name,
+                    account_key=settings.azure_storage_account_key,
+                    container_name=container,
+                    blob_name=blob_path,
+                    permission=BlobSasPermissions(read=True),
+                    expiry=datetime.now(timezone.utc) + timedelta(hours=1),
+                )
+                blob_url = (
+                    f"https://{settings.azure_storage_account_name}.blob.core.windows.net"
+                    f"/{container}/{blob_path}?{sas_token}"
+                )
+                urls[filename] = blob_url
+                logger.info(f"[Pipeline] Generated SAS URL for: {filename}")
             except Exception as e:
-                logger.error(f"[Pipeline] Failed to download {f.filename}: {e}")
+                logger.error(f"[Pipeline] Failed to generate SAS URL for {filename}: {e}")
+
+        return urls
 
     def _build_mcp_tools(self, connectors) -> list:
         """Build MCP tool definitions from project connectors."""
@@ -1062,10 +1085,20 @@ class JobProcessor:
         """Cleanup resources."""
         if self._sandbox:
             try:
-                self._sandbox.close()
+                await self._sandbox.__aexit__(None, None, None)
             except Exception as e:
                 logger.warning(f"Sandbox cleanup error: {e}")
             self._sandbox = None
+
+        # Clean up workspace directory
+        workspace_dir = getattr(self, "_workspace_dir", None)
+        if workspace_dir and workspace_dir.exists():
+            try:
+                shutil.rmtree(workspace_dir)
+                logger.info(f"Cleaned up workspace: {workspace_dir}")
+            except Exception as e:
+                logger.warning(f"Workspace cleanup error: {e}")
+            self._workspace_dir = None
 
     def _emit_event(
         self,

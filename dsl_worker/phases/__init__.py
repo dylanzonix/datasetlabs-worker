@@ -17,7 +17,7 @@ from .row_generator import (
     GenerationWorkerPool,
 )
 from .sandbox import (
-    SandboxExecutor,
+    SandboxSession,
     SandboxResult,
 )
 
@@ -34,6 +34,6 @@ __all__ = [
     # Row generation
     "GenerationWorkerPool",
     # Sandbox
-    "SandboxExecutor",
+    "SandboxSession",
     "SandboxResult",
 ]

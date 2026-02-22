@@ -1,27 +1,34 @@
 """
-Sandboxed code execution using llm-sandbox.
+Sandboxed code execution using sandbox_service.
 
 Provides secure, isolated code execution with:
-- Docker container isolation
-- Full workspace mounting
+- Persistent sessions per agent (lazy-created on first use)
+- Async HTTP-based execution via sandbox_service
+- OOM detection, timeouts, memory limits
+- Langfuse tracing for sandbox operations
 """
 
-import json
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, Optional
+
+from sandbox_service import SandboxClient, SandboxSessionClient
 
 logger = logging.getLogger(__name__)
 
+# Langfuse is optional — tracing is a no-op if not configured
 try:
-    from llm_sandbox import SandboxSession
-    from llm_sandbox.pool import PoolConfig, create_pool_manager
-    SANDBOX_AVAILABLE = True
+    from langfuse import get_client as _get_langfuse_client
+
+    def _get_langfuse():
+        try:
+            return _get_langfuse_client()
+        except Exception:
+            return None
 except ImportError:
-    SANDBOX_AVAILABLE = False
-    logger.warning("llm-sandbox not installed - code execution will be unsafe")
+    def _get_langfuse():
+        return None
 
 
 @dataclass
@@ -30,6 +37,9 @@ class SandboxResult:
     success: bool
     stdout: str
     stderr: str
+    exit_code: int = 0
+    oom_killed: bool = False
+    timed_out: bool = False
     error: Optional[str] = None
 
 
@@ -102,195 +112,173 @@ CODE_SUFFIX = '''
 '''
 
 
-class SandboxExecutor:
-    """Execute code in an isolated sandbox."""
-    
-    def __init__(
-        self,
-        use_pool: bool = True,
-        pool_size: int = 3,
-        backend: str = "docker",
-    ):
-        self.use_pool = use_pool and SANDBOX_AVAILABLE
-        self.backend = backend
-        self._pool = None
-        
-        if self.use_pool:
-            self._init_pool(pool_size)
-    
-    def _init_pool(self, pool_size: int):
-        """Initialize container pool."""
+class SandboxSession:
+    """Wraps a sandbox_service session for code execution."""
+
+    def __init__(self, session_client: SandboxSessionClient, sandbox_client: SandboxClient):
+        self._session = session_client
+        self._client = sandbox_client
+
+    @property
+    def session_id(self) -> str:
+        return self._session.session_id
+
+    async def execute(self, script: str, timeout: int = 120) -> SandboxResult:
+        """Execute Python code, return result (with Langfuse span)."""
+        langfuse = _get_langfuse()
+        if langfuse:
+            with langfuse.start_as_current_observation(
+                as_type="span",
+                name="sandbox:execute",
+                input={"script_length": len(script), "timeout": timeout},
+            ) as span:
+                result = await self._do_execute(script, timeout)
+                span.update(
+                    output={
+                        "success": result.success,
+                        "exit_code": result.exit_code,
+                        "oom_killed": result.oom_killed,
+                        "timed_out": result.timed_out,
+                    },
+                    level="ERROR" if not result.success else "DEFAULT",
+                )
+                return result
+        return await self._do_execute(script, timeout)
+
+    async def _do_execute(self, script: str, timeout: int) -> SandboxResult:
+        """Execute Python code, return result."""
+        wrapped = CODE_PREFIX + script + CODE_SUFFIX
+
         try:
-            self._pool = create_pool_manager(
-                backend=self.backend,
-                config=PoolConfig(
-                    max_pool_size=pool_size,
-                    min_pool_size=1,
-                    idle_timeout=300.0,
-                    enable_prewarming=True,
-                ),
-                lang="python",
-                libraries=["pandas", "beautifulsoup4", "openpyxl", "pdfplumber"],
+            result = await self._session.exec_python(wrapped, timeout=timeout)
+            return SandboxResult(
+                success=result.success and result.exit_code == 0,
+                stdout=result.stdout or "",
+                stderr=result.stderr or "",
+                exit_code=result.exit_code,
+                oom_killed=result.oom_killed,
+                timed_out=result.timed_out,
+                error=(result.stderr or None) if result.exit_code != 0 else None,
             )
-            logger.info(f"Sandbox pool initialized: {pool_size} containers")
-        except Exception as e:
-            logger.warning(f"Failed to init sandbox pool: {e}")
-            self._pool = None
-    
-    def execute(
-        self,
-        script: str,
-        workspace_dir: Optional[str] = None,
-        timeout: int = 120,
-    ) -> SandboxResult:
-        """Execute code in sandbox."""
-        if SANDBOX_AVAILABLE:
-            return self._execute_sandboxed(script, workspace_dir, timeout)
-        else:
-            logger.warning("Running code UNSANDBOXED - development only!")
-            return self._execute_unsafe(script, workspace_dir)
-    
-    def _execute_sandboxed(
-        self,
-        script: str,
-        workspace_dir: Optional[str],
-        timeout: int,
-    ) -> SandboxResult:
-        """Execute in llm-sandbox container."""
-        
-        wrapped_script = CODE_PREFIX + script + CODE_SUFFIX
-        
-        try:
-            session_kwargs = {
-                "lang": "python",
-                "keep_template": True,
-            }
-            if self._pool:
-                session_kwargs["pool"] = self._pool
-            
-            with SandboxSession(**session_kwargs) as session:
-                if workspace_dir and os.path.exists(workspace_dir):
-                    session.execute_command("mkdir -p /workspace")
-                    
-                    for subdir in ["uploads", "web", "extracted"]:
-                        src_dir = os.path.join(workspace_dir, subdir)
-                        if os.path.exists(src_dir):
-                            session.execute_command(f"mkdir -p /workspace/{subdir}")
-                            for filename in os.listdir(src_dir):
-                                src_path = os.path.join(src_dir, filename)
-                                if os.path.isfile(src_path):
-                                    session.copy_to_runtime(
-                                        src_path,
-                                        f"/workspace/{subdir}/{filename}"
-                                    )
-                
-                result = session.run(
-                    wrapped_script,
-                    libraries=["pandas", "beautifulsoup4", "openpyxl"],
-                )
-                
-                stdout = result.stdout or ""
-                stderr = result.stderr or ""
-                
-                return SandboxResult(
-                    success=result.exit_code == 0,
-                    stdout=stdout,
-                    stderr=stderr,
-                    error=stderr if result.exit_code != 0 else None,
-                )
-                
         except Exception as e:
             logger.error(f"Sandbox execution failed: {e}")
             return SandboxResult(
                 success=False,
                 stdout="",
                 stderr=str(e),
+                exit_code=-1,
                 error=str(e),
             )
-    
-    def _execute_unsafe(
-        self,
-        script: str,
-        workspace_dir: Optional[str],
-    ) -> SandboxResult:
-        """Fallback: Execute with exec() - UNSAFE."""
-        import io
-        import sys
-        
-        namespace = {
-            "WORKSPACE": workspace_dir or ".",
-            "json": json,
-            "re": __import__("re"),
-            "os": os,
-        }
-        
-        def list_files(subdir=""):
-            path = os.path.join(workspace_dir or ".", subdir) if subdir else (workspace_dir or ".")
-            if os.path.exists(path):
-                return os.listdir(path)
-            return []
-        
-        def read_file(path):
-            if not path.startswith("/"):
-                path = os.path.join(workspace_dir or ".", path)
-            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                return f.read()
-        
-        def write_file(path, content):
-            if not path.startswith("/"):
-                path = os.path.join(workspace_dir or ".", path)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, 'w', encoding='utf-8') as f:
-                f.write(content)
-        
-        namespace["list_files"] = list_files
-        namespace["read_file"] = read_file
-        namespace["write_file"] = write_file
-        
+
+    async def exec_shell(self, command: str, timeout: int = 60) -> SandboxResult:
+        """Execute a shell command, return result (with Langfuse span)."""
+        langfuse = _get_langfuse()
+        if langfuse:
+            with langfuse.start_as_current_observation(
+                as_type="span",
+                name="sandbox:exec_shell",
+                input={"command_length": len(command), "timeout": timeout},
+            ) as span:
+                result = await self._do_exec_shell(command, timeout)
+                span.update(
+                    output={
+                        "success": result.success,
+                        "exit_code": result.exit_code,
+                        "oom_killed": result.oom_killed,
+                        "timed_out": result.timed_out,
+                    },
+                    level="ERROR" if not result.success else "DEFAULT",
+                )
+                return result
+        return await self._do_exec_shell(command, timeout)
+
+    async def _do_exec_shell(self, command: str, timeout: int) -> SandboxResult:
+        """Execute a shell command, return result."""
         try:
-            import pandas as pd
-            namespace["pd"] = pd
-        except ImportError:
-            pass
-        
-        try:
-            from bs4 import BeautifulSoup
-            namespace["BeautifulSoup"] = BeautifulSoup
-        except ImportError:
-            pass
-        
-        old_stdout, old_stderr = sys.stdout, sys.stderr
-        sys.stdout = io.StringIO()
-        sys.stderr = io.StringIO()
-        
-        try:
-            exec(script, namespace)
-            stdout = sys.stdout.getvalue()
-            stderr = sys.stderr.getvalue()
-            
+            result = await self._session.exec_shell(command, timeout=timeout)
             return SandboxResult(
-                success=True,
-                stdout=stdout,
-                stderr=stderr,
+                success=result.success and result.exit_code == 0,
+                stdout=result.stdout or "",
+                stderr=result.stderr or "",
+                exit_code=result.exit_code,
+                oom_killed=result.oom_killed,
+                timed_out=result.timed_out,
+                error=(result.stderr or None) if result.exit_code != 0 else None,
             )
         except Exception as e:
-            stdout = sys.stdout.getvalue()
-            stderr = sys.stderr.getvalue() + f"\n{e}"
-            
+            logger.error(f"Sandbox shell execution failed: {e}")
             return SandboxResult(
                 success=False,
-                stdout=stdout,
-                stderr=stderr,
+                stdout="",
+                stderr=str(e),
+                exit_code=-1,
                 error=str(e),
             )
-        finally:
-            sys.stdout, sys.stderr = old_stdout, old_stderr
-    
-    def close(self):
-        """Cleanup resources."""
-        if self._pool:
-            try:
-                self._pool.close()
-                logger.info("Sandbox pool closed")
-            except Exception as e:
-                logger.warning(f"Error closing sandbox pool: {e}")
+
+    async def upload_workspace(
+        self,
+        workspace_dir: Path,
+        file_urls: Optional[Dict[str, str]] = None,
+    ):
+        """Upload workspace files to sandbox.
+
+        For uploaded files: uses file_urls (sandbox service fetches from SAS URLs).
+        For other dirs (downloads/, web/, extracted/): uploads from local disk.
+        """
+        langfuse = _get_langfuse()
+        if langfuse:
+            with langfuse.start_as_current_observation(
+                as_type="span",
+                name="sandbox:upload_workspace",
+                input={
+                    "file_url_count": len(file_urls) if file_urls else 0,
+                },
+            ):
+                await self._do_upload_workspace(workspace_dir, file_urls)
+        else:
+            await self._do_upload_workspace(workspace_dir, file_urls)
+
+    async def _do_upload_workspace(
+        self,
+        workspace_dir: Path,
+        file_urls: Optional[Dict[str, str]] = None,
+    ):
+        """Upload workspace files to sandbox (implementation)."""
+        # Fetch uploaded files via sandbox service (no local disk needed)
+        if file_urls:
+            for filename, url in file_urls.items():
+                try:
+                    await self._session.fetch_from_url(url, f"uploads/{filename}")
+                    logger.info(f"Sandbox fetched upload: {filename}")
+                except Exception as e:
+                    logger.warning(f"Failed to fetch {filename} into sandbox: {e}")
+
+        # Upload local dirs (downloads from browser, etc.)
+        for subdir in ["downloads", "web", "extracted"]:
+            src = workspace_dir / subdir
+            if src.exists() and any(src.iterdir()):
+                try:
+                    count = await self._session.upload_directory(src, dest_subdir=subdir)
+                    logger.info(f"Uploaded {count} files from {subdir}/ to sandbox")
+                except Exception as e:
+                    logger.warning(f"Failed to upload {subdir}/ to sandbox: {e}")
+
+    async def read_file(self, path: str) -> str:
+        """Read a file from the sandbox workspace (with Langfuse span)."""
+        langfuse = _get_langfuse()
+        if langfuse:
+            with langfuse.start_as_current_observation(
+                as_type="span",
+                name="sandbox:read_file",
+                input={"path": path},
+            ):
+                return await self._session.read_file(path)
+        return await self._session.read_file(path)
+
+    async def close(self):
+        """Destroy the session."""
+        try:
+            await self._client.destroy_session(self._session.session_id)
+            logger.info(f"Sandbox session {self._session.session_id} destroyed")
+        except Exception as e:
+            logger.warning(f"Error destroying sandbox session: {e}")

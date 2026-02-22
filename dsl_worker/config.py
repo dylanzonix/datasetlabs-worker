@@ -50,6 +50,9 @@ class WorkerSettings(BaseSettings):
     generation_model: str = "gpt-5.2"
     summarize_model: str = "gpt-5-nano"
 
+    # Sandbox service
+    sandbox_service_url: str = "http://localhost:8000"
+
     # Browser proxy (Bright Data residential, optional — leave blank to disable)
     browser_proxy_server: str = ""       # e.g. "http://brd.superproxy.io:22225"
     browser_proxy_username: str = ""     # includes geo-pin: brd-customer-XXX-zone-residential-country-us-state-newyork
