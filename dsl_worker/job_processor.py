@@ -255,7 +255,7 @@ class JobProcessor:
         self._workspace_dir = workspace_dir
 
         # Generate SAS URLs for uploaded files (sandbox service fetches them directly)
-        uploaded_file_urls = self._generate_file_urls(state)
+        uploaded_file_urls = self._generate_file_urls(db, project.id)
 
         # Initialize sandbox client
         self._sandbox = SandboxClient(settings.sandbox_service_url, timeout=150.0)
@@ -925,7 +925,7 @@ class JobProcessor:
         concurrency = settings.generation_parallel_samples
 
         # Generate SAS URLs for uploaded files (needed by row generators)
-        uploaded_file_urls = self._generate_file_urls(state)
+        uploaded_file_urls = self._generate_file_urls(db, project.id)
 
         pool = GenerationWorkerPool(
             workspace_dir=workspace_dir,
@@ -1004,22 +1004,31 @@ class JobProcessor:
 
         return history
 
-    def _generate_file_urls(self, state: ProjectState) -> Dict[str, str]:
+    def _generate_file_urls(self, db: Session, project_id) -> Dict[str, str]:
         """Generate short-lived SAS URLs for uploaded files (no local download needed).
 
         Returns dict of filename -> SAS URL. The sandbox service will fetch
         these URLs directly into the session workspace.
         """
-        if not state.files_snapshot:
+        project_files = (
+            db.query(ProjectFile)
+            .filter(
+                ProjectFile.project_id == project_id,
+                ProjectFile.deleted_at.is_(None),
+                ProjectFile.status == "uploaded",
+            )
+            .all()
+        )
+        if not project_files:
             logger.info("[Pipeline] No uploaded files")
             return {}
 
         urls: Dict[str, str] = {}
         container = settings.azure_storage_container_name
 
-        for f in state.files_snapshot:
-            filename = f.get("filename")
-            blob_path = f.get("blob_path")
+        for f in project_files:
+            filename = f.filename
+            blob_path = f.blob_path
             if not filename or not blob_path:
                 continue
 
