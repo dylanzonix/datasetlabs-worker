@@ -5,7 +5,8 @@ Handles saving and restoring pipeline state for pause/resume.
 
 Checkpoints are stored as JSON in Azure Blob Storage.
 
-V3: Work items replace seeds. Backward-compatible with v2 seed checkpoints.
+V4: Work items include context from topic agents. Backward-compatible
+with v2/v3 checkpoints.
 """
 
 import asyncio
@@ -54,7 +55,7 @@ class PipelineCheckpoint:
     updated_at: str = ""
 
     # Phase tracking
-    # 'orchestrator' | 'generation' | 'completed'
+    # 'orchestrator' | 'sample' | 'generation' | 'completed'
     current_phase: str = "orchestrator"
 
     # Work items (output of orchestrator, input to generation)
@@ -278,7 +279,9 @@ class CheckpointManager:
         async with self._lock:
             checkpoint_item = {
                 "instruction": work_item.get("instruction", ""),
+                "context": work_item.get("context", ""),
                 "schema": work_item.get("schema"),
+                "tags": work_item.get("tags", {}),
                 "status": "pending",
                 "row_id": None,
             }
@@ -349,13 +352,14 @@ def checkpoints_to_work_items(checkpoint_items: List[Dict]) -> List[Dict]:
     Convert checkpoint work item dicts to the format expected by
     GenerationWorkerPool.process_work_items().
 
-    Checkpoint format: {instruction, schema, status, row_id}
-    Pool format: {instruction, schema, tags}
+    Checkpoint format: {instruction, context, schema, tags, status, row_id}
+    Pool format: {instruction, context, schema, tags}
     """
     work_items = []
     for item in checkpoint_items:
         work_items.append({
             "instruction": item.get("instruction", ""),
+            "context": item.get("context", ""),
             "schema": item.get("schema"),
             "tags": item.get("tags", {}),
         })

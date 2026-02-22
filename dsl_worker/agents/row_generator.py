@@ -1,9 +1,10 @@
 """
-Row generator agent — generates a single dataset row from a work item instruction.
+Row generator agent — generates a single dataset row from an assignment.
 
-V3: Takes an instruction + schema + manifest, produces a GeneratedRow.
-Each row generator gets one work item and produces one row. The instruction
-tells it exactly what to do — read sources, do research, synthesize content.
+V4: Takes a filled instruction + context + schema, produces a GeneratedRow.
+Each row generator gets one assignment and produces one row. The instruction
+is a filled template (seed values substituted by the topic agent). Context
+is optional supplementary info from the topic agent.
 """
 
 from __future__ import annotations
@@ -42,22 +43,26 @@ class GeneratedRow:
 
 
 ROW_GENERATOR_SYSTEM_PROMPT = """\
-You are generating a single dataset row from a work item instruction.
+You are generating a single dataset row.
+
+## Your Assignment
 
 {instruction_section}
+
+{context_section}
+
+## Schema
 
 <schema>
 {schema_str}
 </schema>
-
-{manifest_section}
 
 ## Output — TOOLS ONLY
 
 You MUST deliver your output via tool calls. Text responses are discarded by the system.
 
 For each column in the schema, call set_column(name, value). Then call submit_row().
-If the work item is unusable, call skip(reason).
+If the assignment is unusable, call skip(reason).
 
 DO NOT write JSON, code blocks, or row content as text. Only tool calls are captured.
 
@@ -67,9 +72,9 @@ DO NOT write JSON, code blocks, or row content as text. Only tool calls are capt
 - append_to_column(name, value): Append to a column. For json columns, appends value as a list element. For string columns, concatenates with a newline.
 - clear_column(name): Clear a column value so you can start over.
 - submit_row(): Submit the completed row. Call after all columns are set.
-- skip(reason): Skip this work item (irrelevant, unusable, etc.)
+- skip(reason): Skip this assignment (irrelevant, unusable, etc.)
 - rng(options, weights): Pick a random option for controlled randomization
-- read_file(path): Read a source file from the workspace
+- read_file(path): Read a file from the workspace
 - brave_search(query): Search the web for information
 - open(ref_id_or_url, start_line): View a page or file
 - find(ref_id, pattern): Search within a loaded page
@@ -79,16 +84,15 @@ DO NOT write JSON, code blocks, or row content as text. Only tool calls are capt
 
 ## Process
 
-1. Read the instruction — this is your assignment
-2. If sources are referenced, use read_file to read them
-3. If the manifest lists relevant sources (by tags/description), read those too
-4. If the instruction asks for web research, use brave_search/open
+1. Read the assignment — this is your task
+2. If context is provided, use it — it has useful info from the topic manager
+3. If the assignment asks for web research, use brave_search/open
 5. Call set_column(name, value) for EACH column in the schema
 6. For json array columns, prefer append_to_column to build the list one element at a time
 7. Call submit_row() when done
-8. Call skip(reason) if the work item is truly unusable
+8. Call skip(reason) if the assignment is truly unusable
 
-Be accurate. Follow the instruction.
+Be accurate. Follow the assignment.
 """
 
 
@@ -107,7 +111,6 @@ class RowGeneratorAgent:
         result = await agent.generate(
             instruction="Write a tip about lean-peeking in DayZ. Consult sources tagged 'combat'.",
             schema=[{"name": "tip", "type": "string"}, ...],
-            manifest_summary="Source manifest (3 files):\\n...",
         )
 
         if result.success:
@@ -401,7 +404,7 @@ class RowGeneratorAgent:
 
         registry.add(
             name="read_file",
-            description="Read a file from the workspace. Use for reading source files referenced in the manifest or instruction.",
+            description="Read a file from the workspace.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -422,7 +425,7 @@ class RowGeneratorAgent:
         self,
         instruction: str,
         schema: List[Dict],
-        manifest_summary: str,
+        context: str = "",
     ) -> str:
         schema_lines = []
         for col in schema:
@@ -436,24 +439,29 @@ class RowGeneratorAgent:
 
         instruction_section = f"<instruction>\n{instruction}\n</instruction>"
 
-        manifest_section = ""
-        if manifest_summary and manifest_summary != "No sources saved yet.":
-            manifest_section = f"<manifest>\n{manifest_summary}\n</manifest>"
+        context_section = ""
+        if context:
+            context_section = f"## Context\n\n{context}"
 
         return ROW_GENERATOR_SYSTEM_PROMPT.format(
             instruction_section=instruction_section,
+            context_section=context_section,
             schema_str=schema_str,
-            manifest_section=manifest_section,
         )
 
     async def generate(
         self,
         instruction: str,
         schema: List[Dict],
-        manifest_summary: str = "",
+        context: str = "",
     ) -> GeneratedRow:
         """
-        Generate a single row from a work item instruction.
+        Generate a single row from an assignment.
+
+        Args:
+            instruction: The filled instruction (template with seed values substituted).
+            schema: Column definitions for the row.
+            context: Optional context notes from the topic agent.
 
         Creates a fresh AgentConversation per call so each row generation
         starts with a clean message history.
@@ -465,7 +473,7 @@ class RowGeneratorAgent:
         self._skip_reason = ""
         self._schema = schema
 
-        system_prompt = self._build_system_prompt(instruction, schema, manifest_summary)
+        system_prompt = self._build_system_prompt(instruction, schema, context)
 
         conversation = AgentConversation(
             openai_client=self.openai_client,
@@ -480,7 +488,7 @@ class RowGeneratorAgent:
         )
 
         result = await conversation.send(
-            "Generate a dataset row from the instruction above.",
+            "Generate a dataset row from the assignment above.",
             exit_condition=lambda: self._submitted or self._skipped,
         )
 

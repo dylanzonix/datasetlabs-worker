@@ -5,9 +5,9 @@ The actual row generation agent is in dsl_worker.agents.row_generator.
 This module provides the pool that manages parallel workers consuming
 work items from a queue.
 
-V3: Work items replace seeds. Each work item has an instruction string
-and optional schema override. No more BucketTracker — the orchestrator
-manages coverage directly.
+V4: Work items are assignments from topic agents. Each has an instruction
+(filled template), optional context (from topic agent), optional schema
+override, and optional tags.
 """
 
 import asyncio
@@ -70,13 +70,13 @@ class GenerationWorkerPool:
         self,
         work_items: List[Dict],
         default_schema: List[Dict],
-        manifest_summary: str = "",
     ) -> Tuple[int, int]:
         """
         Process work items in parallel. Returns (success_count, error_count).
 
         Each work item is a dict with:
-            - instruction: str (required) — what the row generator should do
+            - instruction: str (required) — the filled instruction template
+            - context: str (optional) — supplementary notes from topic agent
             - schema: List[Dict] (optional) — overrides default_schema for this item
             - tags: Dict (optional) — metadata tags to attach to the saved row
         """
@@ -125,6 +125,7 @@ class GenerationWorkerPool:
                         break
 
                     instruction = item.get("instruction", "")
+                    context = item.get("context", "")
                     schema = item.get("schema") or default_schema
                     tags = item.get("tags") or {}
 
@@ -141,7 +142,7 @@ class GenerationWorkerPool:
                         result = await agent.generate(
                             instruction=instruction,
                             schema=schema,
-                            manifest_summary=manifest_summary,
+                            context=context,
                         )
 
                         self._total_cost += result.cost_usd
