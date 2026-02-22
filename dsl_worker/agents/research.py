@@ -97,6 +97,7 @@ class ResearchAgent:
         blob_service_client: Optional[Any] = None,
         project_id: Optional[Any] = None,
         on_tool_call: Optional[Callable[[str, str], None]] = None,
+        uploaded_file_urls: Optional[Dict[str, str]] = None,
     ) -> None:
         self.workspace_dir = Path(workspace_dir)
 
@@ -116,6 +117,7 @@ class ResearchAgent:
             stop_checker=stop_checker,
             blob_service_client=blob_service_client,
             project_id=project_id,
+            uploaded_file_urls=uploaded_file_urls,
         )
         # Set a dummy scope for ResearchTools compatibility
         self._impl.set_scope(ResearchScope(

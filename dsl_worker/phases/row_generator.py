@@ -134,6 +134,7 @@ class GenerationWorkerPool:
         plan: Optional[Dict] = None,
         bucket_tracker: Optional[BucketTracker] = None,
         blob_service_client: Optional[Any] = None,
+        uploaded_file_urls: Optional[Dict[str, str]] = None,
     ):
         self.workspace_dir = Path(workspace_dir)
         self.openai_client = openai_client
@@ -150,6 +151,7 @@ class GenerationWorkerPool:
         self.plan = plan
         self.bucket_tracker = bucket_tracker
         self.blob_service_client = blob_service_client
+        self.uploaded_file_urls = uploaded_file_urls
 
         self._total_cost = 0.0
         self._rows_generated = 0
@@ -214,6 +216,7 @@ class GenerationWorkerPool:
                 stop_checker=self.stop_checker,
                 blob_service_client=self.blob_service_client,
                 project_id=self.project_id,
+                uploaded_file_urls=self.uploaded_file_urls,
             )
 
             try:

@@ -42,7 +42,7 @@ numpy==1.26.4
 browser-use 
 markdownify 
 httpx
-llm_sandbox
+sandbox-service
 
 langfuse
 
@@ -50,4 +50,3 @@ pdfplumber
 python-docx
 python-pptx
 openpyxl
-llm-sandbox[docker]

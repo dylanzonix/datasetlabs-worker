@@ -242,6 +242,7 @@ class OrchestratorAgent:
         blob_service_client: Optional[Any] = None,
         project_id: Optional[Any] = None,
         on_tool_call: Optional[Callable[[str, str], None]] = None,
+        uploaded_file_urls: Optional[Dict[str, str]] = None,
     ) -> None:
         self.chat_history = chat_history
         self.previous_recipe = previous_recipe
@@ -258,6 +259,7 @@ class OrchestratorAgent:
         self.blob_service_client = blob_service_client
         self.project_id = project_id
         self.on_tool_call = on_tool_call
+        self.uploaded_file_urls = uploaded_file_urls
 
         # State
         self.plan: Optional[Dict] = None
@@ -406,6 +408,7 @@ class OrchestratorAgent:
                 blob_service_client=self.blob_service_client,
                 project_id=self.project_id,
                 on_tool_call=self.on_tool_call,
+                uploaded_file_urls=self.uploaded_file_urls,
             )
             agent._conversation.label = f"research:{agent_id}"
             self._research_agents[agent_id] = agent
@@ -554,6 +557,7 @@ class OrchestratorAgent:
                     blob_service_client=self.blob_service_client,
                     project_id=self.project_id,
                     on_tool_call=self.on_tool_call,
+                    uploaded_file_urls=self.uploaded_file_urls,
                 )
                 self._generators[gen_id] = gen
 
