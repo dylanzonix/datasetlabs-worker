@@ -26,9 +26,9 @@ from dsl_worker.logging_setup import setup_logging
 # Use Langfuse-wrapped AsyncOpenAI if configured, otherwise plain OpenAI.
 # The wrapper auto-traces every responses.create() call with zero code changes.
 if settings.langfuse_secret_key:
-    from langfuse.openai import AsyncOpenAI
+    from langfuse.openai import AsyncAzureOpenAI
 else:
-    from openai import AsyncOpenAI
+    from openai import AsyncAzureOpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,11 @@ class Worker:
             settings.azure_service_bus_connection_string
         )
 
-        self.openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
+        self.openai_client = AsyncAzureOpenAI(
+            api_key=settings.azure_openai_api_key,
+            azure_endpoint=settings.azure_openai_endpoint,
+            api_version=settings.azure_openai_api_version,
+        )
 
         self.blob_service_client = BlobServiceClient(
             account_url=f"https://{settings.azure_storage_account_name}.blob.core.windows.net",

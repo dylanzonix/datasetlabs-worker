@@ -1,9 +1,13 @@
 """
-Row generation — worker pool and bucket tracking for the generation phase.
+Row generation — worker pool for the generation phase.
 
 The actual row generation agent is in dsl_worker.agents.row_generator.
-This module provides the pool that manages parallel workers and the
-bucket tracker for quota management.
+This module provides the pool that manages parallel workers consuming
+work items from a queue.
+
+V4: Work items are assignments from topic agents. Each has an instruction
+(filled template), optional context (from topic agent), optional schema
+override, and optional tags.
 """
 
 import asyncio
@@ -15,107 +19,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from dsl_worker.agents.row_generator import GeneratedRow, RowGeneratorAgent
 from dsl_worker.config import settings
-from dsl_worker.phases.research_tools import Seed
 
 logger = logging.getLogger(__name__)
 
 
-class BucketTracker:
-    """
-    Tracks per-bucket quotas during generation.
-
-    Quotas are computed from bucket weights and total num_samples.
-    Thread-safe via asyncio.Lock.
-    """
-
-    def __init__(self, plan: Dict, num_samples: int) -> None:
-        self._lock = asyncio.Lock()
-        self._quotas: Dict[str, int] = {}
-        self._counts: Dict[str, int] = {}
-        self._skips: Dict[str, int] = {}
-
-        buckets = plan.get("buckets", [])
-        if not buckets:
-            # No buckets — single implicit bucket
-            self._quotas["_default"] = num_samples
-            self._counts["_default"] = 0
-            self._skips["_default"] = 0
-            return
-
-        # Compute quotas from weights
-        total_weight = sum(b.get("weight", 1.0) for b in buckets)
-        allocated = 0
-        for i, b in enumerate(buckets):
-            bid = b.get("id", f"bucket_{i}")
-            weight = b.get("weight", 1.0)
-            quota = round(num_samples * weight / total_weight)
-            self._quotas[bid] = quota
-            self._counts[bid] = 0
-            self._skips[bid] = 0
-            allocated += quota
-
-        # Give remainder to last bucket
-        if allocated != num_samples and buckets:
-            last_id = buckets[-1].get("id", f"bucket_{len(buckets)-1}")
-            self._quotas[last_id] += num_samples - allocated
-
-    async def should_process(self, bucket_id: Optional[str]) -> bool:
-        """Check if a bucket still needs rows."""
-        async with self._lock:
-            bid = bucket_id or "_default"
-            if bid not in self._quotas:
-                # Unknown bucket — process it (don't silently drop)
-                return True
-            return self._counts[bid] < self._quotas[bid]
-
-    async def record_success(self, bucket_id: Optional[str]) -> None:
-        """Record a successful row for a bucket."""
-        async with self._lock:
-            bid = bucket_id or "_default"
-            if bid not in self._counts:
-                self._counts[bid] = 0
-            self._counts[bid] += 1
-
-    async def record_skip(self, bucket_id: Optional[str]) -> None:
-        """Record a skipped seed for a bucket."""
-        async with self._lock:
-            bid = bucket_id or "_default"
-            if bid not in self._skips:
-                self._skips[bid] = 0
-            self._skips[bid] += 1
-
-    async def is_complete(self) -> bool:
-        """Check if all bucket quotas are met."""
-        async with self._lock:
-            return all(
-                self._counts.get(bid, 0) >= quota
-                for bid, quota in self._quotas.items()
-            )
-
-    async def get_status(self) -> Dict:
-        """Get per-bucket status report."""
-        async with self._lock:
-            status = {}
-            for bid, quota in self._quotas.items():
-                status[bid] = {
-                    "quota": quota,
-                    "completed": self._counts.get(bid, 0),
-                    "skipped": self._skips.get(bid, 0),
-                    "remaining": max(0, quota - self._counts.get(bid, 0)),
-                }
-            return status
-
-    async def pre_populate(self, bucket_id: Optional[str], count: int) -> None:
-        """Pre-populate counts (for checkpoint resume)."""
-        async with self._lock:
-            bid = bucket_id or "_default"
-            if bid not in self._counts:
-                self._counts[bid] = 0
-            self._counts[bid] += count
-
-
 class GenerationWorkerPool:
-    """Pool of workers that process seeds using RowGeneratorAgent."""
+    """Pool of workers that process work items using RowGeneratorAgent."""
 
     def __init__(
         self,
@@ -131,10 +40,9 @@ class GenerationWorkerPool:
         stop_checker: Optional[Callable[[], bool]] = None,
         cost_tracker: Optional[Any] = None,
         checkpoint_callback: Optional[Callable[[int, bool, Optional[str]], Any]] = None,
-        plan: Optional[Dict] = None,
-        bucket_tracker: Optional[BucketTracker] = None,
         blob_service_client: Optional[Any] = None,
         uploaded_file_urls: Optional[Dict[str, str]] = None,
+        mcp_tools: Optional[List[Dict]] = None,
     ):
         self.workspace_dir = Path(workspace_dir)
         self.openai_client = openai_client
@@ -148,10 +56,9 @@ class GenerationWorkerPool:
         self.stop_checker = stop_checker
         self.cost_tracker = cost_tracker
         self.checkpoint_callback = checkpoint_callback
-        self.plan = plan
-        self.bucket_tracker = bucket_tracker
         self.blob_service_client = blob_service_client
         self.uploaded_file_urls = uploaded_file_urls
+        self.mcp_tools = mcp_tools or []
 
         self._total_cost = 0.0
         self._rows_generated = 0
@@ -161,43 +68,33 @@ class GenerationWorkerPool:
     def _should_stop(self) -> bool:
         return self.stop_checker and self.stop_checker()
 
-    def _get_pipeline_instructions(self, bucket_id: Optional[str]) -> str:
-        """Get pipeline instructions for a given bucket from the plan."""
-        if not self.plan:
-            return ""
+    async def process_work_items(
+        self,
+        work_items: List[Dict],
+        default_schema: List[Dict],
+    ) -> Tuple[int, int]:
+        """
+        Process work items in parallel. Returns (success_count, error_count).
 
-        pipelines = self.plan.get("pipelines", {})
-        buckets = self.plan.get("buckets", [])
-
-        # Find which pipeline this bucket uses
-        pipeline_id = None
-        for b in buckets:
-            if b.get("id") == bucket_id:
-                pipeline_id = b.get("pipeline_id")
-                break
-
-        # If no bucket match or no buckets, use first pipeline
-        if pipeline_id and pipeline_id in pipelines:
-            return pipelines[pipeline_id].get("instructions", "")
-        elif pipelines:
-            first_key = next(iter(pipelines))
-            return pipelines[first_key].get("instructions", "")
-
-        return ""
-
-    async def process_seeds(self, seeds: List[Seed], schema: List[Dict]) -> Tuple[int, int]:
-        """Process seeds directly. Returns (success_count, error_count)."""
-        if not seeds:
-            logger.warning("[GenerationPool] No seeds to process")
+        Each work item is a dict with:
+            - instruction: str (required) — the filled instruction template
+            - context: str (optional) — supplementary notes from topic agent
+            - schema: List[Dict] (optional) — overrides default_schema for this item
+            - tags: Dict (optional) — metadata tags to attach to the saved row
+        """
+        if not work_items:
+            logger.warning("[GenerationPool] No work items to process")
             return 0, 0
 
-        logger.info(f"[GenerationPool] Processing {len(seeds)} seeds with {self.num_workers} workers")
+        logger.info(
+            f"[GenerationPool] Processing {len(work_items)} work items "
+            f"with {self.num_workers} workers"
+        )
 
-        # Build work queue with (index, seed_content, pipeline_instructions, bucket_id, scope_id)
+        # Build work queue: (index, work_item)
         queue: asyncio.Queue = asyncio.Queue()
-        for i, seed in enumerate(seeds):
-            pipeline_instructions = self._get_pipeline_instructions(seed.bucket_id)
-            await queue.put((i, seed.content, pipeline_instructions, seed.bucket_id, seed.scope_id))
+        for i, item in enumerate(work_items):
+            await queue.put((i, item))
 
         success_count = 0
         error_count = 0
@@ -217,6 +114,7 @@ class GenerationWorkerPool:
                 blob_service_client=self.blob_service_client,
                 project_id=self.project_id,
                 uploaded_file_urls=self.uploaded_file_urls,
+                mcp_tools=self.mcp_tools,
             )
 
             try:
@@ -225,22 +123,29 @@ class GenerationWorkerPool:
                         break
 
                     try:
-                        index, seed_content, pipeline_instructions, bucket_id, scope_id = queue.get_nowait()
+                        index, item = queue.get_nowait()
                     except asyncio.QueueEmpty:
                         break
 
-                    # Check bucket quota before processing
-                    if self.bucket_tracker:
-                        if not await self.bucket_tracker.should_process(bucket_id):
-                            if self.checkpoint_callback:
-                                await self.checkpoint_callback(index, True, None)
-                            continue
+                    instruction = item.get("instruction", "")
+                    context = item.get("context", "")
+                    schema = item.get("schema") or default_schema
+                    tags = item.get("tags") or {}
+
+                    if not instruction:
+                        logger.warning(f"[GenerationPool] Empty instruction at index {index}")
+                        async with lock:
+                            error_count += 1
+                            self._errors += 1
+                        if self.checkpoint_callback:
+                            await self.checkpoint_callback(index, False, None)
+                        continue
 
                     try:
                         result = await agent.generate(
-                            seed=seed_content,
-                            pipeline_instructions=pipeline_instructions,
+                            instruction=instruction,
                             schema=schema,
+                            context=context,
                         )
 
                         self._total_cost += result.cost_usd
@@ -249,26 +154,21 @@ class GenerationWorkerPool:
                             async with lock:
                                 skip_count += 1
                                 self._skipped += 1
-                            if self.bucket_tracker:
-                                await self.bucket_tracker.record_skip(bucket_id)
                             logger.debug(f"[GenerationPool] Skipped: {result.skip_reason}")
                             if self.checkpoint_callback:
                                 await self.checkpoint_callback(index, True, None)
 
                         elif result.success and result.row:
-                            row_id = await self._save_row(
-                                result.row, bucket_id=bucket_id, scope_id=scope_id,
-                            )
-
-                            if self.bucket_tracker:
-                                await self.bucket_tracker.record_success(bucket_id)
+                            row_id = await self._save_row(result.row, tags=tags)
 
                             async with lock:
                                 success_count += 1
                                 self._rows_generated += 1
 
                             if success_count % 10 == 0:
-                                logger.info(f"[GenerationPool] Generated {success_count} rows...")
+                                logger.info(
+                                    f"[GenerationPool] Generated {success_count} rows..."
+                                )
 
                             if self.checkpoint_callback:
                                 await self.checkpoint_callback(index, True, row_id)
@@ -282,7 +182,7 @@ class GenerationWorkerPool:
                                 await self.checkpoint_callback(index, False, None)
 
                     except Exception as e:
-                        logger.error(f"[GenerationPool] Error processing seed: {e}")
+                        logger.error(f"[GenerationPool] Error processing work item: {e}")
                         async with lock:
                             error_count += 1
                             self._errors += 1
@@ -305,8 +205,7 @@ class GenerationWorkerPool:
     async def _save_row(
         self,
         row: Dict,
-        bucket_id: Optional[str] = None,
-        scope_id: Optional[str] = None,
+        tags: Optional[Dict] = None,
     ) -> Optional[str]:
         """Save generated row to database. Returns row ID."""
         from sqlalchemy import func as sql_func
@@ -330,19 +229,13 @@ class GenerationWorkerPool:
                 .scalar() or 0
             )
 
-            tags = {}
-            if bucket_id:
-                tags["bucket_id"] = bucket_id
-            if scope_id:
-                tags["scope_id"] = scope_id
-
             sample = Sample(
                 id=uuid.UUID(row_id),
                 project_id=self.project_id,
                 version_id=self.version_id,
                 seq=max_seq + 1,
                 row=clean_row,
-                tags=tags,
+                tags=tags or {},
             )
             self.db.add(sample)
 

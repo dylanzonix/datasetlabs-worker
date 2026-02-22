@@ -1,5 +1,5 @@
 """
-Phases module for the v3 pipeline.
+Phases module — infrastructure for the generation pipeline.
 """
 
 from .artifacts import (
@@ -12,15 +12,8 @@ from .artifacts import (
 from .research_tools import (
     ResearchTools,
     ResearchScope,
-    ResearchState,
-    Seed,
-)
-from .scope_processor import (
-    ScopeProcessor,
-    Scope,
 )
 from .row_generator import (
-    BucketTracker,
     GenerationWorkerPool,
 )
 from .sandbox import (
@@ -38,13 +31,7 @@ __all__ = [
     # Research
     "ResearchTools",
     "ResearchScope",
-    "ResearchState",
-    "Seed",
-    # Scope processor
-    "ScopeProcessor",
-    "Scope",
     # Row generation
-    "BucketTracker",
     "GenerationWorkerPool",
     # Sandbox
     "SandboxSession",

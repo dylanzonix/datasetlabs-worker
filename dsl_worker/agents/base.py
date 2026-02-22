@@ -98,6 +98,7 @@ class AgentConversation:
         continue_on_text: bool = False,
         context_window: int = 400_000,
         on_tool_call: Optional[Callable[[str, str], None]] = None,
+        extra_tools: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         self.openai_client = openai_client
         self.model = model
@@ -111,6 +112,8 @@ class AgentConversation:
         self.continue_on_text = continue_on_text
         self.context_window = context_window
         self.on_tool_call = on_tool_call
+        # Extra tool definitions (e.g. MCP connectors) passed directly to API
+        self.extra_tools = extra_tools or []
 
         # Conversation state — this IS the context sent to the API each turn.
         # Contains user messages, reasoning items, assistant messages,
@@ -248,11 +251,14 @@ class AgentConversation:
             if self.reasoning is not None:
                 create_kwargs["reasoning"] = self.reasoning
 
+            # Merge function tools with extra tools (MCP connectors, etc.)
+            all_tools = (self.tools.get_definitions() or []) + self.extra_tools
+
             try:
                 response, cost = await self.openai_client.responses_create(
                     model=self.model,
                     input=input_items,
-                    tools=self.tools.get_definitions() or None,
+                    tools=all_tools or None,
                     max_output_tokens=self.max_output_tokens,
                     **create_kwargs,
                 )

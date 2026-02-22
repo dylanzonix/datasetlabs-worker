@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, List
 
 from dsl_worker.agents.base import AgentConversation, AgentResult
 from dsl_worker.agents.tools import ToolRegistry
@@ -64,7 +64,6 @@ Call respond() with well-structured content:
 - Distinguish facts from inferences
 """
 
-
 class ResearchAgent:
     """
     Conversational research agent. The orchestrator sends questions,
@@ -98,6 +97,7 @@ class ResearchAgent:
         project_id: Optional[Any] = None,
         on_tool_call: Optional[Callable[[str, str], None]] = None,
         uploaded_file_urls: Optional[Dict[str, str]] = None,
+        mcp_tools: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         self.workspace_dir = Path(workspace_dir)
 
@@ -130,17 +130,20 @@ class ResearchAgent:
         registry = ToolRegistry()
         self._register_research_tools(registry)
 
+        effective_prompt = system_prompt or RESEARCH_SYSTEM_PROMPT
+
         # Create the conversation with reasoning enabled
         self._conversation = AgentConversation(
             openai_client=openai_client,
             model=model,
-            system_prompt=system_prompt or RESEARCH_SYSTEM_PROMPT,
+            system_prompt=effective_prompt,
             tools=registry,
             stop_checker=stop_checker,
             max_turns=max_turns,
             reasoning={"effort": "medium", "summary": "detailed"},
             label="research",
             on_tool_call=on_tool_call,
+            extra_tools=mcp_tools or [],
         )
 
     def _register_research_tools(self, registry: ToolRegistry) -> None:

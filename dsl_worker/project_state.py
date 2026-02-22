@@ -41,10 +41,6 @@ class ProjectState:
         self.generation_prompt = ""
         self.columns = []
 
-        # Version snapshot data
-        self.files_snapshot: List[dict] = []
-        self.examples_snapshot: List[dict] = []
-
         # Initial refresh
         self.refresh()
 
@@ -67,8 +63,6 @@ class ProjectState:
         self.num_samples = version.num_samples
         self.generation_prompt = version.generation_prompt
         self.columns = version.columns or []
-        self.files_snapshot = version.files_snapshot or []
-        self.examples_snapshot = version.examples_snapshot or []
 
         logger.debug(f"State refresh: paused={self.paused}, num_samples={self.num_samples}")
 

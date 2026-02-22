@@ -1,8 +1,10 @@
 """
-Row generator agent — generates a single dataset row from a seed.
+Row generator agent — generates a single dataset row from an assignment.
 
-Built on AgentConversation with full ResearchTools browsing stack.
-Takes a seed + pipeline instructions + schema, produces a GeneratedRow.
+V4: Takes a filled instruction + context + schema, produces a GeneratedRow.
+Each row generator gets one assignment and produces one row. The instruction
+is a filled template (seed values substituted by the topic agent). Context
+is optional supplementary info from the topic agent.
 """
 
 from __future__ import annotations
@@ -25,6 +27,9 @@ logger = logging.getLogger(__name__)
 
 MAX_GENERATION_TURNS = 30
 
+# Max chars for read_file results
+READ_FILE_LIMIT = 30_000
+
 
 @dataclass
 class GeneratedRow:
@@ -38,12 +43,15 @@ class GeneratedRow:
 
 
 ROW_GENERATOR_SYSTEM_PROMPT = """\
-You are generating a single dataset row from a seed.
+You are generating a single dataset row.
 
-{instructions_section}
-<seed>
-{seed}
-</seed>
+## Your Assignment
+
+{instruction_section}
+
+{context_section}
+
+## Schema
 
 <schema>
 {schema_str}
@@ -54,7 +62,7 @@ You are generating a single dataset row from a seed.
 You MUST deliver your output via tool calls. Text responses are discarded by the system.
 
 For each column in the schema, call set_column(name, value). Then call submit_row().
-If the seed is unusable, call skip_seed(reason).
+If the assignment is unusable, call skip(reason).
 
 IMPORTANT: Call set_column for ALL columns in a SINGLE response. Do not call set_column one at a time across multiple turns — batch all set_column calls together, then call submit_row in the same response or the next one.
 
@@ -63,11 +71,12 @@ DO NOT write JSON, code blocks, or row content as text. Only tool calls are capt
 ## Tools
 
 - set_column(name, value): Set a column value. Values are validated against the schema type.
-- append_to_column(name, value): Append to a column. For json columns, appends value as a list element. For string columns, concatenates with a newline. Use this for building up lists incrementally (e.g., multi-turn conversations) — it's more reliable than constructing a large JSON array in one shot.
+- append_to_column(name, value): Append to a column. For json columns, appends value as a list element. For string columns, concatenates with a newline.
 - clear_column(name): Clear a column value so you can start over.
 - submit_row(): Submit the completed row. Call after all columns are set.
-- skip_seed(reason): Skip this seed entirely (irrelevant, duplicate, bad data)
+- skip(reason): Skip this assignment (irrelevant, unusable, etc.)
 - rng(options, weights): Pick a random option for controlled randomization
+- read_file(path): Read a file from the workspace
 - brave_search(query): Search the web for information
 - open(ref_id_or_url, start_line): View a page or file
 - find(ref_id, pattern): Search within a loaded page
@@ -77,21 +86,21 @@ DO NOT write JSON, code blocks, or row content as text. Only tool calls are capt
 
 ## Process
 
-1. Read the seed — this is your source material
-2. Follow the pipeline instructions to transform the seed into a row
-3. If you need additional information, use brave_search/open/code_exec
-4. Call set_column(name, value) for EACH column in the schema
-5. For json array columns, prefer append_to_column to build the list one element at a time
-6. Call submit_row() when done
-7. Call skip_seed(reason) if the seed is unusable
+1. Read the assignment — this is your task
+2. If context is provided, use it — it has useful info from the topic manager
+3. If the assignment asks for web research, use brave_search/open
+5. Call set_column(name, value) for EACH column in the schema
+6. For json array columns, prefer append_to_column to build the list one element at a time
+7. Call submit_row() when done
+8. Call skip(reason) if the assignment is truly unusable
 
-Be accurate. Follow the pipeline instructions.
+Be accurate. Follow the assignment.
 """
 
 
 class RowGeneratorAgent:
     """
-    Generates a single dataset row from a seed using AgentConversation.
+    Generates a single dataset row from a work item instruction.
 
     Usage:
         agent = RowGeneratorAgent(
@@ -102,9 +111,8 @@ class RowGeneratorAgent:
         )
 
         result = await agent.generate(
-            seed='{"name": "Gandalf", "franchise": "Lord of the Rings"}',
-            pipeline_instructions="Generate a roleplay chat log...",
-            schema=[{"name": "system_prompt", "type": "string", ...}],
+            instruction="Write a tip about lean-peeking in DayZ. Consult sources tagged 'combat'.",
+            schema=[{"name": "tip", "type": "string"}, ...],
         )
 
         if result.success:
@@ -124,11 +132,13 @@ class RowGeneratorAgent:
         blob_service_client: Optional[Any] = None,
         project_id: Optional[Any] = None,
         uploaded_file_urls: Optional[Dict[str, str]] = None,
+        mcp_tools: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         self.openai_client = openai_client
         self.model = model
         self.workspace_dir = Path(workspace_dir)
         self.stop_checker = stop_checker
+        self.mcp_tools = mcp_tools or []
 
         # Tool state — reset per generate() call
         self._current_row: Dict[str, Any] = {}
@@ -256,7 +266,7 @@ class RowGeneratorAgent:
                 if name not in self._current_row:
                     self._current_row[name] = ""
                 if not isinstance(value, str):
-                    return f"Error: append value must be string for string column", 0.0
+                    return "Error: append value must be string for string column", 0.0
                 if self._current_row[name]:
                     self._current_row[name] += "\n" + value
                 else:
@@ -298,7 +308,6 @@ class RowGeneratorAgent:
         )
 
         async def submit_row(args: Dict) -> tuple[str, float]:
-            # Check for missing columns
             missing = [
                 col.get("name") for col in self._schema
                 if col.get("name") and col.get("name") not in self._current_row
@@ -306,7 +315,6 @@ class RowGeneratorAgent:
             if missing:
                 return f"Error: missing columns {missing}. Set them before submitting.", 0.0
 
-            # Validate json columns (catches append-built values)
             for col in self._schema:
                 col_name = col.get("name", "")
                 if col_name in self._current_row:
@@ -324,23 +332,23 @@ class RowGeneratorAgent:
             handler=submit_row,
         )
 
-        async def skip_seed(args: Dict) -> tuple[str, float]:
+        async def skip(args: Dict) -> tuple[str, float]:
             reason = args.get("reason", "No reason given")
             self._skipped = True
             self._skip_reason = reason
-            return f"Seed skipped: {reason}", 0.0
+            return f"Work item skipped: {reason}", 0.0
 
         registry.add(
-            name="skip_seed",
-            description="Skip this seed entirely. Use when the seed is irrelevant, a duplicate, or unusable.",
+            name="skip",
+            description="Skip this work item. Use when the instruction is unusable or irrelevant.",
             parameters={
                 "type": "object",
                 "properties": {
-                    "reason": {"type": "string", "description": "Why this seed is being skipped"},
+                    "reason": {"type": "string", "description": "Why this work item is being skipped"},
                 },
                 "required": ["reason"],
             },
-            handler=skip_seed,
+            handler=skip,
         )
 
         async def rng(args: Dict) -> tuple[str, float]:
@@ -376,14 +384,52 @@ class RowGeneratorAgent:
             handler=rng,
         )
 
+        # --- read_file tool (reads workspace files including sources) ---
+        async def read_file(args: Dict) -> tuple[str, float]:
+            path_str = args.get("path", "")
+            try:
+                path = Path(path_str)
+                if not path.is_absolute():
+                    # Try as relative to workspace first, then sources
+                    candidate = self.workspace_dir / path
+                    if not candidate.exists():
+                        candidate = self.workspace_dir / "sources" / path
+                    path = candidate
+
+                if not path.exists():
+                    return f"File not found: {path_str}", 0.0
+
+                content = path.read_text(encoding="utf-8")
+                if len(content) > READ_FILE_LIMIT:
+                    content = content[:READ_FILE_LIMIT] + f"\n\n[Truncated at {READ_FILE_LIMIT} chars]"
+                return content, 0.0
+            except Exception as e:
+                return f"Error reading file: {e}", 0.0
+
+        registry.add(
+            name="read_file",
+            description="Read a file from the workspace.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path (relative to workspace or sources directory)",
+                    },
+                },
+                "required": ["path"],
+            },
+            handler=read_file,
+        )
+
         # --- Research/browsing tools from ResearchTools ---
         impl.register_on(registry)
 
     def _build_system_prompt(
         self,
-        pipeline_instructions: str,
-        seed: str,
+        instruction: str,
         schema: List[Dict],
+        context: str = "",
     ) -> str:
         schema_lines = []
         for col in schema:
@@ -395,26 +441,31 @@ class RowGeneratorAgent:
             schema_lines.append(line)
         schema_str = "\n".join(schema_lines)
 
-        instructions_section = ""
-        if pipeline_instructions:
-            instructions_section = (
-                f"<pipeline_instructions>\n{pipeline_instructions}\n</pipeline_instructions>"
-            )
+        instruction_section = f"<instruction>\n{instruction}\n</instruction>"
+
+        context_section = ""
+        if context:
+            context_section = f"## Context\n\n{context}"
 
         return ROW_GENERATOR_SYSTEM_PROMPT.format(
-            instructions_section=instructions_section,
-            seed=seed,
+            instruction_section=instruction_section,
+            context_section=context_section,
             schema_str=schema_str,
         )
 
     async def generate(
         self,
-        seed: str,
-        pipeline_instructions: str,
+        instruction: str,
         schema: List[Dict],
+        context: str = "",
     ) -> GeneratedRow:
         """
-        Generate a single row from a seed.
+        Generate a single row from an assignment.
+
+        Args:
+            instruction: The filled instruction (template with seed values substituted).
+            schema: Column definitions for the row.
+            context: Optional context notes from the topic agent.
 
         Creates a fresh AgentConversation per call so each row generation
         starts with a clean message history.
@@ -426,7 +477,7 @@ class RowGeneratorAgent:
         self._skip_reason = ""
         self._schema = schema
 
-        system_prompt = self._build_system_prompt(pipeline_instructions, seed, schema)
+        system_prompt = self._build_system_prompt(instruction, schema, context)
 
         conversation = AgentConversation(
             openai_client=self.openai_client,
@@ -437,10 +488,11 @@ class RowGeneratorAgent:
             max_turns=MAX_GENERATION_TURNS,
             reasoning={"effort": "low", "summary": "auto"},
             label="row_generator",
+            extra_tools=self.mcp_tools,
         )
 
         result = await conversation.send(
-            "Generate a dataset row from the seed above.",
+            "Generate a dataset row from the assignment above.",
             exit_condition=lambda: self._submitted or self._skipped,
         )
 
@@ -461,7 +513,6 @@ class RowGeneratorAgent:
                 cost_usd=cost,
             )
 
-        # Loop ended without submit or skip (max_turns or text-only response)
         return GeneratedRow(
             success=False,
             error=f"Row generation did not complete ({conversation.total_turns} turns)",
