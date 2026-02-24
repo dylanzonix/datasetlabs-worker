@@ -1,13 +1,13 @@
 """
-Orchestrator agent — thin manager that delegates everything.
+Orchestrator agent — delegation layer that plans and delegates topic work.
 
-V4: The orchestrator finishes in ~5 turns:
-1. Delegates initial research to a subagent
-2. Uses code_exec for bulk operations (clone repos, process data)
-3. Creates the instruction template
-4. Breaks dataset into topics
-5. Delegates all topics in one delegate_topics() call
-6. Done
+V4: The orchestrator understands the request, does light research to figure
+out how to slice the work, plans, and delegates:
+1. Reads conversation history and uploaded files
+2. Light research via subagents or code_exec (bounded questions only)
+3. Plans: dataset brief, topics, targets
+4. Delegates all topics in one delegate_topics() call
+5. Done
 
 The orchestrator has NO browse tools — all research is delegated.
 """
@@ -33,114 +33,126 @@ READ_FILE_LIMIT = 30_000
 ORCHESTRATOR_SYSTEM_PROMPT = """\
 You are the orchestrator for a dataset generation system.
 
-## Your mission
+## Your Mission
 
-A user described a dataset through a consultation chat (below). Your job is to
-understand the request, delegate research, create an instruction template, break
-the dataset into topics, and delegate everything in one call.
+A user described a dataset through a consultation chat (below). Your job is to understand
+the request, plan how to slice it into topics, and delegate everything.
 
-## How to work (~5 turns)
+## How to Work
 
 1. **Understand the task.** Read the conversation history and any uploaded files.
 
-2. **Get the lay of the land.** If you need a high-level overview to figure out what
-   topic areas exist, delegate a quick research question to a subagent or use code_exec
-   to explore uploaded files. You're NOT doing deep research — just enough to know what
-   categories/topics to break the dataset into. Topic agents do the real research.
+2. **Light research.** If you need context to figure out what topic areas exist, delegate
+   bounded questions to subagents or use code_exec to explore uploaded data. You are NOT
+   doing deep research — just enough to know how to slice the work. Keep subagent questions
+   specific and bounded (e.g., "List the main categories of X" not "Research everything
+   about X").
 
-3. **Create the instruction template.** Write an instruction FOR the row generator.
-   It should have variable slots like {{topic}}, {{difficulty}} that seeds will fill.
-   The schema is presented separately to row generators — do NOT paraphrase it.
+   **IMPORTANT: Call multiple run_subagent() calls in a single response to run them in
+   parallel.** Don't wait for one subagent to finish before starting the next — batch all
+   your research questions into one turn. This is much faster.
 
-4. **Break into topics.** Identify logical topic areas that cover the dataset.
-   Write a briefing for each — what the topic agent should research and focus on.
+3. **Plan.** Call plan() to articulate your strategy: what the dataset brief should say,
+   what topics to create, how many rows each. This is your thinking step.
 
-5. **Delegate.** Call delegate_topics() with the instruction template, seed
-   variables, shared context, and all topics. This spawns topic agents in parallel.
+4. **Delegate.** Call delegate_topics() with a dataset brief, topics, and targets.
+   The system handles everything from here.
 
-6. **Done.** Call done() immediately after delegating.
+5. **Done.** Call done() immediately after delegating.
 
-## Instruction Template
+## Dataset Brief
 
-The instruction is written for the row generator — it's the assignment they execute.
-It has variable slots that topic agents fill with specific values (seeds).
+The brief is written for row generators — it describes what kind of row to produce.
+Unlike a template with {{variables}}, the brief describes the row holistically. Topic agents
+will write specific row assignments that build on this brief.
 
-Example:
+Example brief:
 ```
-Generate a single-turn Q&A about the browser-use Python library.
-A {{difficulty}} developer asks a {{question_style}} question about
-{{topic}}. An expert answers with code examples grounded in the
-actual library documentation. Research the real docs to verify.
+Generate a single-turn Q&A about the browser-use Python library. A developer asks a
+question and an expert answers with code examples grounded in the actual library
+documentation. Questions should vary in difficulty and style. Research the real docs.
 ```
-
-The row generator sees this with variables filled in:
-"A intermediate developer asks a 'how do I' question about proxy configuration..."
 
 Rules:
-- Write as a direct task for the row generator
-- Include variable slots for things that should vary per row
-- Do NOT describe the schema — it's shown separately
-- Do NOT include meta-instructions about the system — just the assignment
-- The row generator has browsing, search, code_exec, and file reading tools
+- Written as a direct task for the row generator
+- Describes the row format, quality expectations, and approach
+- Does NOT describe the schema — it's shown separately
+- Does NOT include meta-instructions about the system
+
+## Recognizing Dataset Types
+
+**Synthesis datasets** (most common): Rows must be invented/synthesized. The topic agent
+needs to figure out what assignments to create. Example: "Q&A about Python libraries" —
+each row needs a unique question invented by the topic agent.
+
+**Iteration datasets** (simpler): A source maps directly to rows. Delegation is just
+splitting the iteration. Example: "Convert this CSV into training pairs" — each row
+comes from a CSV row. Topics can be chunks of the source data.
+
+Tailor your brief and topics accordingly.
+
+## Topics and Scale
+
+Topics exist to divide large datasets into manageable chunks. Each topic agent holds its
+entire area in context, ensuring diversity and avoiding duplicates within that chunk.
+
+- For {num_samples} rows, create enough topics so each has ~10-30 rows
+- Small datasets (< 20 rows): 1-2 topics is fine
+- Don't fragment unnecessarily — a topic agent can handle a broad area
+- **Topic names must be short, natural language labels** (e.g., "Getting Started",
+  "Troubleshooting", "Advanced Workflows"). No numbering prefixes, no underscores,
+  no code-style names.
 
 ## Resources
 
+<resources>
 {resources_section}
+</resources>
 
 ## Column Schema
+
+<schema>
 {columns_description}
+</schema>
 
 ## Conversation History
+
+<conversation>
 {conversation_summary}
+</conversation>
 
 ## Tools
 
-**Research delegation:**
-- run_subagent(question): Spawn a research subagent. It can search and browse the
-  web. Returns a text summary of its findings. Use sparingly — just to get a
-  high-level overview for topic categorization, not deep research.
-
-**Bulk operations:**
-- code_exec(script, description): Execute Python. Use for cloning repos,
-  processing data, listing files — anything mechanical.
-
-**File reading:**
-- read_file(path): Read any file in the workspace (uploads, downloads, etc.)
-
-**Topic delegation:**
-- delegate_topics(instruction, seed_variables, shared_context, topics): Spawn
-  all topic agents in one call. Each topic gets a name, target seed count, and
-  briefing. The system handles everything from here.
-
-**Completion:**
+- run_subagent(question): Spawn a research subagent. Call MULTIPLE in one turn to run in parallel.
+- code_exec(script, description): Execute Python for bulk operations.
+- read_file(path): Read a workspace file.
+- plan(strategy): Articulate your plan before delegating. Describe the brief, topics, reasoning.
+- delegate_topics(dataset_brief, topics): Delegate all topics at once.
 - done(reason): Signal orchestration is complete.
 
 ## What Happens After You Delegate
 
-After you call delegate_topics(), the system runs a **sample phase**: each topic agent
-produces 1 row, then the user reviews the samples. If the user has feedback,
-the topic agents adjust. Then full generation proceeds. You don't participate
-after delegation — topic agents handle everything from there.
+After you call delegate_topics(), the system runs each topic agent to produce sample rows,
+then the user reviews them. If the user has feedback, the topic agents adjust. Then full
+generation proceeds. You don't participate after delegation.
 
 ## Principles
 
-- **You are a CEO, not a researcher.** Your job is to understand the request,
-  figure out what topic areas to break it into, and delegate. Topic agents do
-  the real research and produce the actual row assignments.
-- **~5 turns.** Understand, categorize, delegate, done. Don't linger.
-- **One instruction template.** It should capture what every row in the dataset
-  looks like. Topic agents handle variation through seeds.
-- **Briefings guide topic agents.** Write enough context that topic agents know
-  where to look and what to focus on. They do their own deep research.
-- **Don't over-research.** You only need to know enough to identify the right
-  topic areas. A quick subagent call or reading uploaded files is usually enough.
+- **You are a delegation layer.** Figure out the blueprint, don't do the work. Topic
+  agents handle the details, row generators do the heavy lifting.
+- **Research to delegate properly.** You need to know enough about the domain to create
+  good topic areas. But always light — a quick subagent question, reading an uploaded file.
+- **Bounded subagent questions.** Don't ask "research everything about X." Ask "what are
+  the 5 main categories of X?" The question itself controls depth.
+- **Plan proportionally.** Simple, clear requests need minimal planning. Ambiguous or
+  complex requests deserve more thought.
 - Target: {num_samples} rows total.
 """
 
 
 class OrchestratorAgent:
     """
-    V4 Orchestrator. Thin manager — delegates research and generation.
+    V4 Orchestrator. Delegation layer — plans and delegates topic work.
 
     Usage:
         orchestrator = OrchestratorAgent(
@@ -163,7 +175,6 @@ class OrchestratorAgent:
         model: str,
         workspace_dir: Path,
         on_delegate_topics: Callable[[Dict], Awaitable[Dict]],
-        source_manager: Optional[Any] = None,  # deprecated, unused
         uploaded_files: Optional[List[Dict[str, Any]]] = None,
         brave_api_key: Optional[str] = None,
         sandbox: Optional[Any] = None,
@@ -318,7 +329,7 @@ class OrchestratorAgent:
                 "properties": {
                     "question": {
                         "type": "string",
-                        "description": "What the subagent should research",
+                        "description": "What the subagent should research. Keep it bounded and specific.",
                     },
                 },
                 "required": ["question"],
@@ -327,8 +338,7 @@ class OrchestratorAgent:
         )
 
         # --- code_exec ---
-        # Re-use ResearchTools just for code_exec
-        from dsl_worker.phases.research_tools import ResearchTools, ResearchScope
+        from dsl_worker.infra.research_tools import ResearchTools, ResearchScope
 
         self._impl = ResearchTools(
             workspace_dir=self.workspace_dir,
@@ -414,17 +424,40 @@ class OrchestratorAgent:
             handler=read_file,
         )
 
+        # --- plan ---
+        async def plan(args: Dict) -> tuple[str, float]:
+            strategy = args.get("strategy", "")
+            return "Plan recorded. Now call delegate_topics() to execute.", 0.0
+
+        registry.add(
+            name="plan",
+            description=(
+                "Articulate your strategy before delegating. Describe the dataset "
+                "brief, topics, and reasoning. This is your thinking step."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "strategy": {
+                        "type": "string",
+                        "description": (
+                            "Your plan: what the dataset brief should say, what topics "
+                            "to create, how many rows each, and your reasoning."
+                        ),
+                    },
+                },
+                "required": ["strategy"],
+            },
+            handler=plan,
+        )
+
         # --- delegate_topics ---
         async def delegate_topics(args: Dict) -> tuple[str, float]:
-            instruction = args.get("instruction", "")
-            seed_variables = args.get("seed_variables", [])
-            shared_context = args.get("shared_context", "")
+            dataset_brief = args.get("dataset_brief", "")
             topics = args.get("topics", [])
 
-            if not instruction:
-                return "Error: instruction is required", 0.0
-            if not seed_variables:
-                return "Error: seed_variables is required (list of variable names)", 0.0
+            if not dataset_brief:
+                return "Error: dataset_brief is required", 0.0
             if not topics:
                 return "Error: at least one topic is required", 0.0
 
@@ -456,9 +489,7 @@ class OrchestratorAgent:
 
             # Dispatch via callback — the job processor handles spawning topic agents
             config = {
-                "instruction": instruction,
-                "seed_variables": seed_variables,
-                "shared_context": shared_context,
+                "dataset_brief": dataset_brief,
                 "topics": topics,
             }
 
@@ -468,7 +499,7 @@ class OrchestratorAgent:
 
             return (
                 f"Delegated {topic_count} topics ({total} total target rows). "
-                f"Topic agents will research, produce seeds, and dispatch row generators. "
+                f"Topic agents will research, produce assignments, and dispatch row generators. "
                 f"Your job is done — call done() now."
             ), 0.0
 
@@ -476,29 +507,18 @@ class OrchestratorAgent:
             name="delegate_topics",
             description=(
                 "Delegate all topics to topic agents in one call. "
-                "Specify the instruction template, seed variables, shared context, "
-                "and a list of topics with names, targets, and briefings. "
-                "Topic agents run in parallel and handle everything from here."
+                "Specify the dataset brief and a list of topics with names, "
+                "targets, and briefings. Topic agents run in parallel."
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "instruction": {
+                    "dataset_brief": {
                         "type": "string",
                         "description": (
-                            "The instruction template for row generators. "
-                            "Use {variable_name} for slots that seeds fill. "
-                            "Written as a direct task for the row generator."
+                            "Natural language brief for row generators. Describes "
+                            "what kind of row to produce — format, quality, approach."
                         ),
-                    },
-                    "seed_variables": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Variable names used in the instruction template (e.g., ['topic', 'difficulty'])",
-                    },
-                    "shared_context": {
-                        "type": "string",
-                        "description": "Context shared across all topics (e.g., 'Repo cloned at /workspace/repo')",
                     },
                     "topics": {
                         "type": "array",
@@ -512,13 +532,13 @@ class OrchestratorAgent:
                                 },
                                 "target": {
                                     "type": "integer",
-                                    "description": "Target number of seeds (rows) for this topic",
+                                    "description": "Target number of rows for this topic",
                                 },
                                 "briefing": {
                                     "type": "string",
                                     "description": (
                                         "What this topic covers. Guide the topic agent — "
-                                        "what to research, what subtopics to cover, key files to look at."
+                                        "what to research, what subtopics to cover."
                                     ),
                                 },
                             },
@@ -526,7 +546,7 @@ class OrchestratorAgent:
                         },
                     },
                 },
-                "required": ["instruction", "seed_variables", "topics"],
+                "required": ["dataset_brief", "topics"],
             },
             handler=delegate_topics,
         )
@@ -553,10 +573,10 @@ class OrchestratorAgent:
         )
 
     async def run(self) -> AgentResult:
-        """Run the orchestrator (~5 turns)."""
+        """Run the orchestrator."""
         result = await self._conversation.send(
-            "Begin. Read the conversation history and uploaded files, then research, "
-            "create an instruction template, break into topics, and delegate.",
+            "Begin. Read the conversation history and uploaded files, then plan, "
+            "delegate topics, and call done.",
             exit_condition=lambda: self._is_done,
         )
         return result

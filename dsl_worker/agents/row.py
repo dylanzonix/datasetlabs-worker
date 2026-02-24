@@ -1,10 +1,10 @@
 """
 Row generator agent — generates a single dataset row from an assignment.
 
-V4: Takes a filled instruction + context + schema, produces a GeneratedRow.
-Each row generator gets one assignment and produces one row. The instruction
-is a filled template (seed values substituted by the topic agent). Context
-is optional supplementary info from the topic agent.
+V4: Takes a dataset brief + row assignment + schema, produces a GeneratedRow.
+Each row generator gets one assignment and produces one row. The assignment
+is a natural language instruction written by the topic agent. The dataset
+brief provides overall context and quality expectations.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import jsonschema
 from dsl_worker.agents.base import AgentConversation
 from dsl_worker.agents.tools import ToolRegistry
 from dsl_worker.billing.tracked_client import TrackedOpenAIClient
-from dsl_worker.phases.research_tools import ResearchTools, ResearchScope
+from dsl_worker.infra.research_tools import ResearchTools, ResearchScope
 
 logger = logging.getLogger(__name__)
 
@@ -38,18 +38,18 @@ class GeneratedRow:
     row: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
     cost_usd: float = 0.0
-    skipped: bool = False
-    skip_reason: Optional[str] = None
 
 
 ROW_GENERATOR_SYSTEM_PROMPT = """\
 You are generating a single dataset row.
 
+## Dataset Brief
+
+{brief_section}
+
 ## Your Assignment
 
-{instruction_section}
-
-{context_section}
+{assignment_section}
 
 ## Schema
 
@@ -62,7 +62,6 @@ You are generating a single dataset row.
 You MUST deliver your output via tool calls. Text responses are discarded by the system.
 
 For each column in the schema, call set_column(name, value). Then call submit_row().
-If the assignment is unusable, call skip(reason).
 
 IMPORTANT: Call set_column for ALL columns in a SINGLE response. Do not call set_column one at a time across multiple turns — batch all set_column calls together, then call submit_row in the same response or the next one.
 
@@ -74,7 +73,6 @@ DO NOT write JSON, code blocks, or row content as text. Only tool calls are capt
 - append_to_column(name, value): Append to a column. For json columns, appends value as a list element. For string columns, concatenates with a newline.
 - clear_column(name): Clear a column value so you can start over.
 - submit_row(): Submit the completed row. Call after all columns are set.
-- skip(reason): Skip this assignment (irrelevant, unusable, etc.)
 - rng(options, weights): Pick a random option for controlled randomization
 - read_file(path): Read a file from the workspace
 - brave_search(query): Search the web for information
@@ -86,15 +84,14 @@ DO NOT write JSON, code blocks, or row content as text. Only tool calls are capt
 
 ## Process
 
-1. Read the assignment — this is your task
-2. If context is provided, use it — it has useful info from the topic manager
-3. If the assignment asks for web research, use brave_search/open
-5. Call set_column(name, value) for EACH column in the schema
-6. For json array columns, prefer append_to_column to build the list one element at a time
-7. Call submit_row() when done
-8. Call skip(reason) if the assignment is truly unusable
+1. Read the assignment — this is your specific task
+2. The dataset brief gives you the overall context and quality expectations
+3. Research as needed — use brave_search/open to find real information
+4. Call set_column(name, value) for EACH column in the schema
+5. For json array columns, prefer append_to_column to build the list one element at a time
+6. Call submit_row() when done
 
-Be accurate. Follow the assignment.
+Be accurate. Be thorough. Follow the assignment.
 """
 
 
@@ -143,8 +140,6 @@ class RowGeneratorAgent:
         # Tool state — reset per generate() call
         self._current_row: Dict[str, Any] = {}
         self._submitted: bool = False
-        self._skipped: bool = False
-        self._skip_reason: str = ""
         self._schema: List[Dict] = []
 
         # Create ResearchTools for browsing tool implementations
@@ -332,25 +327,6 @@ class RowGeneratorAgent:
             handler=submit_row,
         )
 
-        async def skip(args: Dict) -> tuple[str, float]:
-            reason = args.get("reason", "No reason given")
-            self._skipped = True
-            self._skip_reason = reason
-            return f"Work item skipped: {reason}", 0.0
-
-        registry.add(
-            name="skip",
-            description="Skip this work item. Use when the instruction is unusable or irrelevant.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "reason": {"type": "string", "description": "Why this work item is being skipped"},
-                },
-                "required": ["reason"],
-            },
-            handler=skip,
-        )
-
         async def rng(args: Dict) -> tuple[str, float]:
             options = args.get("options", [])
             weights = args.get("weights")
@@ -427,9 +403,9 @@ class RowGeneratorAgent:
 
     def _build_system_prompt(
         self,
-        instruction: str,
+        assignment: str,
         schema: List[Dict],
-        context: str = "",
+        dataset_brief: str = "",
     ) -> str:
         schema_lines = []
         for col in schema:
@@ -441,31 +417,31 @@ class RowGeneratorAgent:
             schema_lines.append(line)
         schema_str = "\n".join(schema_lines)
 
-        instruction_section = f"<instruction>\n{instruction}\n</instruction>"
+        brief_section = ""
+        if dataset_brief:
+            brief_section = f"<dataset_brief>\n{dataset_brief}\n</dataset_brief>"
 
-        context_section = ""
-        if context:
-            context_section = f"## Context\n\n{context}"
+        assignment_section = f"<assignment>\n{assignment}\n</assignment>"
 
         return ROW_GENERATOR_SYSTEM_PROMPT.format(
-            instruction_section=instruction_section,
-            context_section=context_section,
+            brief_section=brief_section,
+            assignment_section=assignment_section,
             schema_str=schema_str,
         )
 
     async def generate(
         self,
-        instruction: str,
+        assignment: str,
         schema: List[Dict],
-        context: str = "",
+        dataset_brief: str = "",
     ) -> GeneratedRow:
         """
         Generate a single row from an assignment.
 
         Args:
-            instruction: The filled instruction (template with seed values substituted).
+            assignment: The row assignment — a natural language instruction for this row.
             schema: Column definitions for the row.
-            context: Optional context notes from the topic agent.
+            dataset_brief: The dataset brief — overall context and quality expectations.
 
         Creates a fresh AgentConversation per call so each row generation
         starts with a clean message history.
@@ -473,11 +449,9 @@ class RowGeneratorAgent:
         # Reset state
         self._current_row = {}
         self._submitted = False
-        self._skipped = False
-        self._skip_reason = ""
         self._schema = schema
 
-        system_prompt = self._build_system_prompt(instruction, schema, context)
+        system_prompt = self._build_system_prompt(assignment, schema, dataset_brief)
 
         conversation = AgentConversation(
             openai_client=self.openai_client,
@@ -493,18 +467,10 @@ class RowGeneratorAgent:
 
         result = await conversation.send(
             "Generate a dataset row from the assignment above.",
-            exit_condition=lambda: self._submitted or self._skipped,
+            exit_condition=lambda: self._submitted,
         )
 
         cost = conversation.total_cost
-
-        if self._skipped:
-            return GeneratedRow(
-                success=False,
-                skipped=True,
-                skip_reason=self._skip_reason,
-                cost_usd=cost,
-            )
 
         if self._submitted:
             return GeneratedRow(

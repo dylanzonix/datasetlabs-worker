@@ -48,7 +48,7 @@ except ImportError:
     def _get_langfuse():
         return None
 
-from dsl_worker.phases.artifacts import (
+from dsl_worker.infra.artifacts import (
     ArtifactStore,
     SearchResults,
     SearchResult,
@@ -306,7 +306,7 @@ class ResearchTools:
                 # Load cookies from Azure Blob (global + per-project)
                 storage_state = None
                 if self.blob_service_client and self.project_id:
-                    from dsl_worker.phases.cookie_manager import load_cookies
+                    from dsl_worker.infra.cookie_manager import load_cookies
                     storage_state = load_cookies(
                         self.blob_service_client,
                         settings.azure_storage_container_name,
@@ -338,7 +338,7 @@ class ResearchTools:
         Lazy-creates a SandboxSession on first call, uploads workspace files
         once, and returns the same session for subsequent calls.
         """
-        from dsl_worker.phases.sandbox import SandboxSession
+        from dsl_worker.infra.sandbox import SandboxSession
         from sandbox_service.models import SessionConfig
 
         async with self._sandbox_session_lock:
@@ -387,7 +387,7 @@ class ResearchTools:
                 # Save project cookies to Azure Blob before stopping
                 if self.blob_service_client and self.project_id:
                     from dsl_worker.config import settings
-                    from dsl_worker.phases.cookie_manager import save_project_cookies
+                    from dsl_worker.infra.cookie_manager import save_project_cookies
                     try:
                         save_project_cookies(
                             self._browser,

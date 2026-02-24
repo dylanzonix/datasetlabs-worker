@@ -51,7 +51,7 @@ class WorkerSettings(BaseSettings):
     summarize_model: str = "gpt-5-nano"
 
     # Sandbox service
-    sandbox_service_url: str = "http://localhost:8000"
+    sandbox_service_url: str = "http://localhost:8010"
 
     # Browser proxy (Bright Data residential, optional — leave blank to disable)
     browser_proxy_server: str = ""       # e.g. "http://brd.superproxy.io:22225"

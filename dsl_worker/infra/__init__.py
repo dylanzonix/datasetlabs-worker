@@ -1,5 +1,5 @@
 """
-Phases module — infrastructure for the generation pipeline.
+Infrastructure module — shared services for the generation pipeline.
 """
 
 from .artifacts import (
@@ -13,7 +13,7 @@ from .research_tools import (
     ResearchTools,
     ResearchScope,
 )
-from .row_generator import (
+from .generation_pool import (
     GenerationWorkerPool,
 )
 from .sandbox import (

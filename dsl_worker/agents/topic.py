@@ -1,14 +1,13 @@
 """
-Topic agent — middle manager that researches a topic area, produces seeds,
-and dispatches row generators directly.
+Topic agent — delegation layer that maps a topic area and produces row assignments.
 
 V4: Topic agents are spawned by the orchestrator via delegate_topics.
 Each topic agent:
-1. Receives the instruction template, seed variable names, topic briefing, shared context
-2. Researches its topic area using browse/search/code tools
-3. Produces seeds (variable values that fill the instruction template)
-4. Optionally adds context notes for row generators
-5. Dispatches row generators with filled assignments
+1. Receives the dataset brief, topic briefing, and target count
+2. Does light research to understand the landscape of its topic
+3. Plans sub-areas for diversity
+4. Produces specific natural language row assignments
+5. Dispatches assignments to row generators
 6. Runs independently — doesn't report back to orchestrator
 """
 
@@ -29,29 +28,22 @@ READ_FILE_LIMIT = 30_000
 
 
 TOPIC_AGENT_SYSTEM_PROMPT = """\
-You are a topic agent in a dataset generation system. Your mission is to produce
-diverse, specific seeds and dispatch them as row assignments. Each seed fills
-the instruction template to create one row assignment for a row generator.
+You are a topic agent in a dataset generation system. You manage one topic area —
+your job is to produce row assignments that row generators will execute.
 
 ## Your Topic
 
 **Name:** {topic_name}
 **Briefing:** {topic_briefing}
-**Total target seeds:** {target_count}
+**Target rows:** {target_count}
 
-## Instruction Template
+## Dataset Brief
 
-This is the instruction each row generator will receive (with seed values filled in):
+This is what every row generator sees as context for what kind of row to produce:
 
-```
-{instruction_template}
-```
-
-The seed variables you need to produce values for: {seed_variables}
-
-## Shared Context
-
-{shared_context}
+<dataset_brief>
+{dataset_brief}
+</dataset_brief>
 
 ## Column Schema
 
@@ -59,38 +51,41 @@ The seed variables you need to produce values for: {seed_variables}
 
 ## How You Work
 
-You work in two phases. You'll start in the SAMPLE phase.
+You work in two phases. You'll start in the first phase.
 
-### SAMPLE phase
-Produce exactly **1 good, representative seed**. Do a quick search if needed to
-understand the landscape of your topic, but don't go deep — just enough to pick
-a solid first seed. Dispatch it and call done(). This sample row goes to the user
-for review.
+### Phase 1: Produce 1 row assignment
+Do a quick search if needed to understand the landscape of your topic. Pick one good,
+representative assignment. Dispatch it and call done().
 
-### FULL phase
-After the user approves (or gives feedback), you'll be asked to continue. Now
-produce all remaining seeds ({target_count} total minus however many you already
-dispatched). Use research to discover the breadth of your topic — what subtopics
-exist, what variations are possible — so you can produce diverse seeds. If the user
-gave feedback, adjust your approach accordingly. Dispatch them and call done().
+### Phase 2: Produce remaining assignments
+You'll be asked to continue. Now produce all remaining assignments ({target_count}
+total minus what you already dispatched).
 
-### In both phases
-1. **Figure out what seeds to produce.** Use search/browse if needed to understand
-   what's out there in your topic area. But keep it focused — you're mapping the
-   space, not becoming an expert.
-2. **Produce seeds** — each is a unique set of variable values for the instruction template.
-3. **Add context** (optional) — brief notes for row generators (key facts, gotchas).
-4. **Dispatch rows** — call dispatch_rows with your seeds and optional context.
-5. **Done** — call done() when finished with the current phase.
+In both phases:
+1. **Map the space.** Do light research to see what's out there in your topic area.
+   What subtopics exist? What variations are possible?
+2. **Plan internally.** Break your topic into sub-categories or dimensions, then produce
+   assignments that cover the space systematically for diversity.
+3. **Write assignments.** Each assignment is a natural language briefing that tells a row
+   generator exactly what row to produce. Be specific — include the particular angle,
+   entity, scenario, or data point. The row generator has search/browse/code tools and
+   will do its own research.
+4. **Dispatch.** Call dispatch_rows with your assignments.
+5. **Done.** Call done() when finished.
 
-## Seed Format
+## Writing Good Assignments
 
-Each seed is an object with keys matching the seed variables. Example:
-```json
-{{"topic": "proxy configuration", "difficulty": "intermediate", "question_style": "how do I"}}
-```
+Each assignment is a specific, natural language instruction for one row. It builds on the
+dataset brief (which the row generator also sees).
 
-Seeds should have good variety. Don't repeat similar combinations.
+Good assignments are specific:
+- "Write a Q&A about configuring Playwright's proxy settings for residential proxies"
+- "Generate a coding problem about implementing a binary search tree deletion operation, intermediate difficulty"
+- "Create a customer support conversation about a delayed international shipment with customs issues"
+
+Bad assignments are vague:
+- "Write a Q&A about Playwright" (too broad)
+- "Generate a coding problem" (no specifics)
 
 ## Tools
 
@@ -100,29 +95,25 @@ Seeds should have good variety. Don't repeat similar combinations.
 - click(ref_id, link_id): Follow a link
 - code_exec(script, description): Execute Python
 - read_file(path): Read workspace files
-- dispatch_rows(seeds, context): Send assignments to row generators
-- done(): Signal the current phase is complete
+- dispatch_rows(assignments): Send assignments to row generators
+- done(): Signal current phase is complete
 
 ## Principles
 
-- **Your output is seeds, not research.** Research is just a means to produce better
-  seeds. Don't go deep — row generators have their own search/browse tools and will
-  do their own research when executing the assignment.
-- **Map the space, don't master it.** A quick search to see what subtopics exist is
-  great. Reading 10 pages on one subtopic is overkill. You just need to know enough
-  to produce diverse, specific seed values.
-- **Seeds handle variation.** Each seed should produce a meaningfully different row.
-  Vary all seed variables, not just one.
-- **Context is brief and supplementary.** A sentence or two of tips for row generators.
-  Don't dump research findings — row generators will research on their own.
-- **Be efficient.** Sample phase: 1-3 turns. Full phase: 5-10 turns. If you're
-  spending more than a couple turns researching before dispatching, you're over-doing it.
+- **You are a delegation layer.** You figure out WHAT rows to produce. Row generators
+  figure out HOW — they do the deep research, truth-finding, and content creation.
+- **Research to delegate.** A quick search to see what exists in your topic area is
+  great. Reading 10 pages on one subtopic is overkill.
+- **Diversity through planning.** Break your topic into sub-areas, then systematically
+  produce assignments that cover each. Don't cluster on one subtopic.
+- **Specific assignments.** Each assignment should name the particular angle, entity, or
+  scenario. The row generator uses this as its starting point for research.
 """
 
 
 class TopicAgent:
     """
-    Topic agent — researches a topic area, produces seeds, dispatches row generators.
+    Topic agent — maps a topic area, produces row assignments, dispatches row generators.
 
     Spawned by the orchestrator via delegate_topics. Runs independently.
 
@@ -130,10 +121,8 @@ class TopicAgent:
         agent = TopicAgent(
             topic_name="Browser Configuration",
             topic_briefing="Covers proxy setup, headless mode, ...",
-            instruction_template="A {difficulty} developer asks ...",
-            seed_variables=["topic", "difficulty", "question_style"],
+            dataset_brief="Generate a Q&A about browser-use...",
             target_count=12,
-            shared_context="Repo at /workspace/repo",
             columns=[...],
             on_dispatch_rows=my_dispatch_callback,
             openai_client=tracked_client,
@@ -146,16 +135,13 @@ class TopicAgent:
         self,
         topic_name: str,
         topic_briefing: str,
-        instruction_template: str,
-        seed_variables: List[str],
+        dataset_brief: str,
         target_count: int,
-        shared_context: str,
         columns: List[Dict[str, Any]],
         openai_client: TrackedOpenAIClient,
         model: str,
         workspace_dir: Path,
-        on_dispatch_rows: Callable[[str, List[Dict], str, List[Dict], str], Awaitable[int]],
-        source_manager: Optional[Any] = None,  # deprecated, unused
+        on_dispatch_rows: Callable[[List[str], str, List[Dict], str], Awaitable[int]],
         brave_api_key: Optional[str] = None,
         sandbox: Optional[Any] = None,
         stop_checker: Optional[Callable[[], bool]] = None,
@@ -165,8 +151,7 @@ class TopicAgent:
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         self.topic_name = topic_name
-        self.instruction_template = instruction_template
-        self.seed_variables = seed_variables
+        self.dataset_brief = dataset_brief
         self.target_count = target_count
         self.columns = columns
         self.workspace_dir = Path(workspace_dir)
@@ -179,10 +164,10 @@ class TopicAgent:
 
         # State
         self._is_done = False
-        self._total_seeds_dispatched = 0
+        self._total_dispatched = 0
 
         # Build research tools
-        from dsl_worker.phases.research_tools import ResearchTools, ResearchScope
+        from dsl_worker.infra.research_tools import ResearchTools, ResearchScope
 
         self._impl = ResearchTools(
             workspace_dir=workspace_dir,
@@ -211,9 +196,7 @@ class TopicAgent:
             topic_name=topic_name,
             topic_briefing=topic_briefing,
             target_count=target_count,
-            instruction_template=instruction_template,
-            seed_variables=", ".join(seed_variables),
-            shared_context=shared_context or "(none)",
+            dataset_brief=dataset_brief,
             columns_description=columns_desc,
         )
 
@@ -291,64 +274,52 @@ class TopicAgent:
 
         # --- dispatch_rows ---
         async def dispatch_rows(args: Dict) -> tuple[str, float]:
-            seeds = args.get("seeds", [])
-            context = args.get("context", "")
+            assignments = args.get("assignments", [])
 
-            if not seeds:
-                return "Error: no seeds provided", 0.0
+            if not assignments:
+                return "Error: no assignments provided", 0.0
 
-            # Validate seeds have the right variables
+            # Validate assignments are non-empty strings
             errors = []
-            for i, seed in enumerate(seeds):
-                if not isinstance(seed, dict):
-                    errors.append(f"Seed {i}: must be an object")
-                    continue
-                missing = [v for v in self.seed_variables if v not in seed]
-                if missing:
-                    errors.append(f"Seed {i}: missing variables {missing}")
+            for i, assignment in enumerate(assignments):
+                if not isinstance(assignment, str) or not assignment.strip():
+                    errors.append(f"Assignment {i}: must be a non-empty string")
             if errors:
                 return "Validation errors:\n" + "\n".join(f"- {e}" for e in errors), 0.0
 
             # Dispatch via callback
             count = await self.on_dispatch_rows(
-                self.instruction_template,
-                seeds,
-                context,
+                assignments,
+                self.dataset_brief,
                 self.columns,
                 self.topic_name,
             )
-            self._total_seeds_dispatched += count
+            self._total_dispatched += count
 
             return (
                 f"Dispatched {count} row assignments. "
-                f"Total dispatched for this topic: {self._total_seeds_dispatched}/{self.target_count}."
+                f"Total dispatched: {self._total_dispatched}/{self.target_count}."
             ), 0.0
 
         registry.add(
             name="dispatch_rows",
             description=(
-                "Send row assignments to row generators. Each seed fills the "
-                "instruction template to create an assignment. Context is optional "
-                "notes that all row generators in this topic will see."
+                "Send row assignments to row generators. Each assignment is a "
+                "specific, natural language instruction for one row."
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "seeds": {
+                    "assignments": {
                         "type": "array",
-                        "description": "Seed objects, each with keys matching the seed variables",
-                        "items": {"type": "object"},
-                    },
-                    "context": {
-                        "type": "string",
+                        "items": {"type": "string"},
                         "description": (
-                            "Optional context notes for row generators. "
-                            "Info you discovered that helps them do their job — "
-                            "file paths, gotchas, key facts. Not the instruction itself."
+                            "List of row assignment strings. Each is a specific, "
+                            "natural language instruction for one row."
                         ),
                     },
                 },
-                "required": ["seeds"],
+                "required": ["assignments"],
             },
             handler=dispatch_rows,
         )
@@ -358,7 +329,7 @@ class TopicAgent:
             self._is_done = True
             return (
                 f"Topic '{self.topic_name}' complete. "
-                f"Dispatched {self._total_seeds_dispatched} row assignments."
+                f"Dispatched {self._total_dispatched} row assignments."
             ), 0.0
 
         registry.add(
@@ -369,31 +340,29 @@ class TopicAgent:
         )
 
     async def run(self) -> AgentResult:
-        """Run the topic agent — SAMPLE phase.
+        """Run the topic agent — first phase (1 assignment).
 
-        Produces 1 representative seed with thin research, dispatches it,
+        Produces 1 representative assignment with light research, dispatches it,
         and calls done(). The agent's conversation state is fully preserved
         so resume() can continue with all prior context.
         """
         result = await self._conversation.send(
-            f"Begin SAMPLE phase for topic '{self.topic_name}'. "
-            f"Do quick research, produce exactly 1 good representative seed, "
-            f"dispatch it, and call done().",
+            f"Begin. Research your topic area briefly, pick 1 good representative "
+            f"assignment, dispatch it, and call done().",
             exit_condition=lambda: self._is_done,
         )
         return result
 
     async def resume(self, feedback: Optional[str] = None) -> AgentResult:
-        """Resume the topic agent — FULL phase.
+        """Resume the topic agent — produce remaining assignments.
 
         Continues the same conversation (all research context preserved).
-        The agent produces remaining seeds at full depth.
 
         Args:
             feedback: Optional user feedback from sample review.
         """
         self._is_done = False
-        remaining = self.target_count - self._total_seeds_dispatched
+        remaining = self.target_count - self._total_dispatched
 
         if remaining <= 0:
             logger.info(f"[topic:{self.topic_name}] Already at target, nothing to resume")
@@ -401,15 +370,15 @@ class TopicAgent:
 
         if feedback:
             message = (
-                f"FULL phase. The user reviewed the sample and said: \"{feedback}\"\n\n"
+                f"Continue. The user reviewed samples and said: \"{feedback}\"\n\n"
                 f"Adjust your approach based on this feedback. "
-                f"Produce the remaining {remaining} seeds with good variety. "
+                f"Produce the remaining {remaining} assignments with good variety. "
                 f"Dispatch them and call done()."
             )
         else:
             message = (
-                f"FULL phase — sample approved. "
-                f"Produce the remaining {remaining} seeds with good variety. "
+                f"Continue — samples approved. "
+                f"Produce the remaining {remaining} assignments with good variety. "
                 f"Dispatch them and call done()."
             )
 

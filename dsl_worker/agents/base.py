@@ -92,6 +92,7 @@ class AgentConversation:
         tools: ToolRegistry,
         stop_checker: Optional[Callable[[], bool]] = None,
         max_turns: int = 100,
+        soft_turn_limit: int = 20,
         max_output_tokens: int = 16_000,
         reasoning: Optional[Dict[str, Any]] = None,
         label: str = "agent",
@@ -106,6 +107,7 @@ class AgentConversation:
         self.tools = tools
         self.stop_checker = stop_checker
         self.max_turns = max_turns
+        self.soft_turn_limit = soft_turn_limit
         self.max_output_tokens = max_output_tokens
         self.reasoning = reasoning if reasoning is not None else {"effort": "medium", "summary": "detailed"}
         self.label = label
@@ -121,6 +123,7 @@ class AgentConversation:
         self.messages: List[Dict[str, Any]] = []
         self.total_cost: float = 0.0
         self.total_turns: int = 0
+        self._warned_soft_limit: bool = False
 
     def _should_stop(self) -> bool:
         return self.stop_checker is not None and self.stop_checker()
@@ -238,6 +241,20 @@ class AgentConversation:
 
             # Trim oldest messages if approaching context window limit
             self._trim_context()
+
+            # Soft limit warning — nudge the agent to wrap up, but don't
+            # strip tools or force anything. It can keep going if needed.
+            if turn == self.soft_turn_limit and not self._warned_soft_limit:
+                self._warned_soft_limit = True
+                logger.info(f"[{self.label}] soft turn limit ({self.soft_turn_limit}) — injecting wrap-up nudge")
+                self.messages.append({
+                    "role": "user",
+                    "content": (
+                        "You've used a lot of turns. Try to wrap up soon — "
+                        "submit your answer with what you have unless you "
+                        "genuinely need more research."
+                    ),
+                })
 
             # Always build full input — system prompt + all messages
             input_items = (

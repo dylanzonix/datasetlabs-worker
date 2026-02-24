@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, Optional, List
 from dsl_worker.agents.base import AgentConversation, AgentResult
 from dsl_worker.agents.tools import ToolRegistry
 from dsl_worker.billing.tracked_client import TrackedOpenAIClient
-from dsl_worker.phases.research_tools import ResearchTools, ResearchScope
+from dsl_worker.infra.research_tools import ResearchTools, ResearchScope
 
 logger = logging.getLogger(__name__)
 
@@ -132,14 +132,16 @@ class ResearchAgent:
 
         effective_prompt = system_prompt or RESEARCH_SYSTEM_PROMPT
 
-        # Create the conversation with reasoning enabled
+        # Create the conversation with reasoning enabled.
+        # soft_turn_limit nudges the agent to wrap up; max_turns is the hard cap.
         self._conversation = AgentConversation(
             openai_client=openai_client,
             model=model,
             system_prompt=effective_prompt,
             tools=registry,
             stop_checker=stop_checker,
-            max_turns=max_turns,
+            max_turns=50,
+            soft_turn_limit=max_turns,
             reasoning={"effort": "medium", "summary": "detailed"},
             label="research",
             on_tool_call=on_tool_call,
@@ -202,7 +204,47 @@ class ResearchAgent:
         if self._response_text:
             result.text = self._response_text
 
+        # result.text is set by base.py from the final turn's text output.
+        # With the forced-text-on-last-turn mechanism, this should always
+        # have content. But as a safety net, if it's still empty, extract
+        # whatever we can from the conversation.
+        if not result.text:
+            logger.warning(
+                f"[{self._conversation.label}] finished without respond() or "
+                f"text output — extracting from conversation"
+            )
+            result.text = self._extract_fallback_text()
+
         return result
+
+    def _extract_fallback_text(self) -> str:
+        """Extract useful text from conversation history as a last resort."""
+        # Try to find any message-type output items with text
+        for msg in reversed(self._conversation.messages):
+            if not isinstance(msg, dict):
+                continue
+            # Responses API message items
+            if msg.get("type") == "message":
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    texts = [
+                        c.get("text", "") for c in content
+                        if isinstance(c, dict) and c.get("type") == "output_text"
+                    ]
+                    if any(texts):
+                        return "".join(texts)
+
+        # Last resort: collect reasoning summaries
+        summaries = []
+        for msg in self._conversation.messages:
+            if isinstance(msg, dict) and msg.get("type") == "reasoning":
+                for s in (msg.get("summary") or []):
+                    if isinstance(s, dict) and s.get("text"):
+                        summaries.append(s["text"])
+        if summaries:
+            return "\n\n".join(summaries[-3:])  # last few reasoning summaries
+
+        return ""
 
     @property
     def cost_usd(self) -> float:

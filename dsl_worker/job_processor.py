@@ -59,8 +59,8 @@ from dsl_worker.billing import CostTracker, TrackedOpenAIClient
 from dsl_worker.checkpoint import CheckpointManager, checkpoints_to_work_items
 
 from dsl_worker.agents import OrchestratorAgent
-from dsl_worker.agents.topic_agent import TopicAgent
-from dsl_worker.phases.row_generator import GenerationWorkerPool
+from dsl_worker.agents.topic import TopicAgent
+from dsl_worker.infra.generation_pool import GenerationWorkerPool
 from sandbox_service import SandboxClient
 
 logger = logging.getLogger(__name__)
@@ -377,30 +377,21 @@ class JobProcessor:
             return len(items)
 
         # --- Topic agent dispatch_rows callback ---
-        # Called by topic agents when they dispatch rows.
-        # Fills instruction template with seeds, adds context, creates work items.
+        # Called by topic agents when they dispatch row assignments.
 
         async def on_dispatch_rows(
-            instruction_template: str,
-            seeds: List[Dict],
-            context: str,
+            assignments: List[str],
+            dataset_brief: str,
             columns: List[Dict],
             topic_name: str,
         ) -> int:
-            """Build work items from seeds and dispatch them."""
+            """Build work items from assignments and dispatch them."""
             work_items = []
-            for seed in seeds:
-                # Fill instruction template with seed values
-                filled_instruction = instruction_template
-                for var_name, var_value in seed.items():
-                    filled_instruction = filled_instruction.replace(
-                        f"{{{var_name}}}", str(var_value)
-                    )
-
+            for assignment in assignments:
                 work_items.append({
-                    "instruction": filled_instruction,
-                    "context": context,
-                    "tags": {"topic": topic_name, **seed},
+                    "instruction": assignment,
+                    "context": dataset_brief,
+                    "tags": {"topic": topic_name},
                 })
 
             return await dispatch_work_items(work_items)
@@ -513,9 +504,7 @@ class JobProcessor:
             return False
 
         config = delegate_config
-        instruction_template = config["instruction"]
-        seed_variables = config["seed_variables"]
-        shared_context = config.get("shared_context", "")
+        dataset_brief = config["dataset_brief"]
         topics = config["topics"]
 
         logger.info(
@@ -537,10 +526,8 @@ class JobProcessor:
             agent = TopicAgent(
                 topic_name=topic["name"],
                 topic_briefing=topic["briefing"],
-                instruction_template=instruction_template,
-                seed_variables=seed_variables,
+                dataset_brief=dataset_brief,
                 target_count=topic.get("target", 10),
-                shared_context=shared_context,
                 columns=state.columns,
                 openai_client=tracked_client,
                 model=settings.research_model,
@@ -593,10 +580,8 @@ class JobProcessor:
             project_id=project.id,
             role="assistant",
             content=(
-                f"Sample phase complete! Generated {sample_count} sample rows "
-                f"({len(topics)} topics, 1 row each). "
-                f"Review the samples and reply with feedback, or say 'continue' to proceed "
-                f"with full generation."
+                f"I generated {sample_count} sample rows across {len(topics)} topics. "
+                f"Take a look and let me know if you'd like any changes before I generate the rest."
             ),
         )
         db.add(sample_msg)
@@ -632,7 +617,12 @@ class JobProcessor:
                 break
 
         if user_feedback is None:
-            logger.info("[Pipeline] No user feedback within timeout — continuing")
+            logger.info("[Pipeline] No user feedback within 30 min — pausing")
+            for agent in topic_agents:
+                await agent.cleanup()
+            await checkpoint_mgr.force_save()
+            self._handle_pause(db, project, version, cost_tracker)
+            return True
 
         # ====================================================================
         # Phase 3: GENERATE — Resume topic agents for remaining rows
@@ -987,7 +977,11 @@ class JobProcessor:
         return False
 
     def _load_chat_history(self, db: Session, project_id: UUID) -> List[Dict[str, str]]:
-        """Load chat messages and format for the orchestrator."""
+        """Load chat messages and format for the orchestrator.
+
+        Includes applied_changes data (plan, questions, columns) so the
+        orchestrator has full context from the consultation chat.
+        """
         messages = (
             db.query(ChatMessage)
             .filter(ChatMessage.project_id == project_id)
@@ -997,9 +991,52 @@ class JobProcessor:
 
         history = []
         for msg in messages:
+            if msg.role not in ("user", "assistant"):
+                continue
+
+            content = msg.content or ""
+
+            # Append structured data from applied_changes so the orchestrator
+            # sees the plan, questions, and column definitions from the chat.
+            if msg.applied_changes and isinstance(msg.applied_changes, dict):
+                changes = msg.applied_changes.get("changes", {})
+
+                if "plan" in changes:
+                    plan = changes["plan"]
+                    if isinstance(plan, dict):
+                        overview = plan.get("overview", "")
+                        if overview:
+                            content += f"\n\n<plan>\n{overview}\n</plan>"
+                    elif isinstance(plan, str):
+                        content += f"\n\n<plan>\n{plan}\n</plan>"
+
+                if "columns" in changes:
+                    cols = changes["columns"]
+                    if isinstance(cols, list):
+                        col_lines = []
+                        for c in cols:
+                            if isinstance(c, dict):
+                                col_lines.append(
+                                    f"  - {c.get('name', '?')} ({c.get('type', '?')})"
+                                )
+                        if col_lines:
+                            content += "\n\n<columns>\n" + "\n".join(col_lines) + "\n</columns>"
+
+                if "questions" in changes:
+                    qs = changes["questions"]
+                    if isinstance(qs, list):
+                        q_lines = []
+                        for q in qs:
+                            if isinstance(q, dict):
+                                q_lines.append(f"  - {q.get('question', q.get('label', '?'))}")
+                            elif isinstance(q, str):
+                                q_lines.append(f"  - {q}")
+                        if q_lines:
+                            content += "\n\n<questions>\n" + "\n".join(q_lines) + "\n</questions>"
+
             history.append({
                 "role": msg.role,
-                "content": msg.content,
+                "content": content,
             })
 
         return history

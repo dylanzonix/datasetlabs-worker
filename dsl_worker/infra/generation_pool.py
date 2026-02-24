@@ -1,13 +1,13 @@
 """
 Row generation — worker pool for the generation phase.
 
-The actual row generation agent is in dsl_worker.agents.row_generator.
+The actual row generation agent is in dsl_worker.agents.row.
 This module provides the pool that manages parallel workers consuming
 work items from a queue.
 
 V4: Work items are assignments from topic agents. Each has an instruction
-(filled template), optional context (from topic agent), optional schema
-override, and optional tags.
+(natural language row assignment), optional context (dataset brief),
+optional schema override, and optional tags.
 """
 
 import asyncio
@@ -17,7 +17,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from dsl_worker.agents.row_generator import GeneratedRow, RowGeneratorAgent
+from dsl_worker.agents.row import GeneratedRow, RowGeneratorAgent
 from dsl_worker.config import settings
 
 logger = logging.getLogger(__name__)
@@ -143,22 +143,14 @@ class GenerationWorkerPool:
 
                     try:
                         result = await agent.generate(
-                            instruction=instruction,
+                            assignment=instruction,
                             schema=schema,
-                            context=context,
+                            dataset_brief=context,
                         )
 
                         self._total_cost += result.cost_usd
 
-                        if result.skipped:
-                            async with lock:
-                                skip_count += 1
-                                self._skipped += 1
-                            logger.debug(f"[GenerationPool] Skipped: {result.skip_reason}")
-                            if self.checkpoint_callback:
-                                await self.checkpoint_callback(index, True, None)
-
-                        elif result.success and result.row:
+                        if result.success and result.row:
                             row_id = await self._save_row(result.row, tags=tags)
 
                             async with lock:
