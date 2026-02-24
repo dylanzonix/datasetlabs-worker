@@ -82,16 +82,18 @@ class ProjectState:
         if not pause_request:
             return False
 
-        # Check if already handled
-        paused_event = (
+        # Check if already handled — any state-changing event after the pause
+        # request means the system has moved past it (e.g. resumed, completed,
+        # or failed).
+        handled_event = (
             self.db.query(ProjectEvent)
             .filter(
                 ProjectEvent.project_id == self.project_id,
                 ProjectEvent.version_id == self.version_id,
-                ProjectEvent.event_type == "paused",
+                ProjectEvent.event_type.in_(["paused", "running", "completed", "failed"]),
                 ProjectEvent.created_at > pause_request.created_at
             )
             .first()
         )
 
-        return paused_event is None
+        return handled_event is None
