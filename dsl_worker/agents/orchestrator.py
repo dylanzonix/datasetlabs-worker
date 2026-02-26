@@ -4,17 +4,14 @@ Orchestrator agent — delegation layer that plans and delegates topic work.
 V4: The orchestrator understands the request, does light research to figure
 out how to slice the work, plans, and delegates:
 1. Reads conversation history and uploaded files
-2. Light research via subagents or code_exec (bounded questions only)
+2. Light research directly (search, browse, code) — just enough to plan
 3. Plans: dataset brief, topics, targets
 4. Delegates all topics in one delegate_topics() call
 5. Done
-
-The orchestrator has NO browse tools — all research is delegated.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from pathlib import Path
@@ -22,7 +19,6 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from dsl_worker.agents.base import AgentConversation, AgentResult
 from dsl_worker.agents.tools import ToolRegistry
-from dsl_worker.agents.research import ResearchAgent
 from dsl_worker.billing.tracked_client import TrackedOpenAIClient
 
 logger = logging.getLogger(__name__)
@@ -42,15 +38,11 @@ the request, plan how to slice it into topics, and delegate everything.
 
 1. **Understand the task.** Read the conversation history and any uploaded files.
 
-2. **Light research.** If you need context to figure out what topic areas exist, delegate
-   bounded questions to subagents or use code_exec to explore uploaded data. You are NOT
-   doing deep research — just enough to know how to slice the work. Keep subagent questions
-   specific and bounded (e.g., "List the main categories of X" not "Research everything
-   about X").
-
-   **IMPORTANT: Call multiple run_subagent() calls in a single response to run them in
-   parallel.** Don't wait for one subagent to finish before starting the next — batch all
-   your research questions into one turn. This is much faster.
+2. **Light research.** If you need context to figure out what topic areas exist, search
+   the web or browse sources directly. You are NOT doing deep research — just enough to
+   know how to slice the work. A few targeted searches and maybe opening 1-2 pages is
+   plenty. If you find yourself reading more than 3-4 pages, you're over-researching —
+   the topic agents and row generators will do the deep work.
 
 3. **Plan.** Call plan() to articulate your strategy: what the dataset brief should say,
    what topics to create, how many rows each. This is your thinking step.
@@ -123,8 +115,11 @@ entire area in context, ensuring diversity and avoiding duplicates within that c
 
 ## Tools
 
-- run_subagent(question): Spawn a research subagent. Call MULTIPLE in one turn to run in parallel.
-- code_exec(script, description): Execute Python for bulk operations.
+- brave_search(query): Search the web.
+- open(ref_id_or_url): View a page or search result.
+- find(ref_id, pattern): Search within a loaded page.
+- click(ref_id, link_id): Follow a link.
+- code_exec(script, description): Execute Python for data exploration.
 - read_file(path): Read a workspace file.
 - plan(strategy): Articulate your plan before delegating. Describe the brief, topics, reasoning.
 - delegate_topics(dataset_brief, topics): Delegate all topics at once.
@@ -141,12 +136,16 @@ generation proceeds. You don't participate after delegation.
 - **You are a delegation layer.** Figure out the blueprint, don't do the work. Topic
   agents handle the details, row generators do the heavy lifting.
 - **Research to delegate properly.** You need to know enough about the domain to create
-  good topic areas. But always light — a quick subagent question, reading an uploaded file.
-- **Bounded subagent questions.** Don't ask "research everything about X." Ask "what are
-  the 5 main categories of X?" The question itself controls depth.
+  good topic areas. But always light — a quick search, reading an uploaded file.
 - **Plan proportionally.** Simple, clear requests need minimal planning. Ambiguous or
   complex requests deserve more thought.
 - Target: {num_samples} rows total.
+
+## Feedback Iterations
+
+Sometimes you'll receive feedback about previously generated samples. Your initial message
+will contain the previous plan and user feedback. Re-plan based on the feedback — adjust
+the brief, topics, and targets as needed. The same tools and principles apply.
 """
 
 
@@ -185,7 +184,9 @@ class OrchestratorAgent:
         on_tool_call: Optional[Callable[[str, str], None]] = None,
         uploaded_file_urls: Optional[Dict[str, str]] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
+        feedback_context: Optional[Dict[str, Any]] = None,
     ) -> None:
+        self.feedback_context = feedback_context
         self.chat_history = chat_history
         self.columns = columns
         self.num_samples = num_samples
@@ -204,9 +205,7 @@ class OrchestratorAgent:
         self.mcp_tools = mcp_tools or []
 
         # State
-        self._subagents: Dict[str, ResearchAgent] = {}
         self._is_done = False
-        self._next_id = 0
 
         # Build tools
         registry = ToolRegistry()
@@ -238,25 +237,10 @@ class OrchestratorAgent:
             extra_tools=self.mcp_tools,
         )
 
-    def _new_id(self) -> str:
-        self._next_id += 1
-        return f"agent_{self._next_id}"
-
     def _format_columns(self) -> str:
         if not self.columns:
             return "(no columns defined)"
-
-        lines = ["| Name | Type | Details |", "|------|------|---------|"]
-        for col in self.columns:
-            name = col.get("name", "?")
-            ctype = col.get("type", "?")
-            details = ""
-            if ctype == "enum" and col.get("enum_values"):
-                details = f"values: {col['enum_values']}"
-            elif ctype == "json" and col.get("json_schema"):
-                details = "json_schema defined"
-            lines.append(f"| {name} | {ctype} | {details} |")
-        return "\n".join(lines)
+        return json.dumps(self.columns, indent=2)
 
     def _format_conversation(self) -> str:
         if not self.chat_history:
@@ -289,55 +273,9 @@ class OrchestratorAgent:
         return "\n".join(lines)
 
     def _register_tools(self, registry: ToolRegistry) -> None:
-        """Register orchestrator tools. No browse tools — delegation only."""
+        """Register orchestrator tools — research + delegation."""
 
-        # --- run_subagent ---
-        async def run_subagent(args: Dict) -> tuple[str, float]:
-            question = args.get("question", "")
-            agent_id = self._new_id()
-
-            agent = ResearchAgent(
-                openai_client=self.openai_client,
-                model=self.model,
-                workspace_dir=self.workspace_dir,
-                brave_api_key=self.brave_api_key,
-                sandbox=self.sandbox,
-                stop_checker=self.stop_checker,
-                blob_service_client=self.blob_service_client,
-                project_id=self.project_id,
-                on_tool_call=self.on_tool_call,
-                uploaded_file_urls=self.uploaded_file_urls,
-                mcp_tools=self.mcp_tools,
-            )
-            agent._conversation.label = f"subagent:{agent_id}"
-            self._subagents[agent_id] = agent
-
-            result = await agent.ask_full(question)
-            return (
-                f"[Subagent {agent_id}]\n{result.text}\n\n"
-                f"(cost: ${result.cost_usd:.4f}, {result.turns_taken} turns)"
-            ), result.cost_usd
-
-        registry.add(
-            name="run_subagent",
-            description=(
-                "Spawn a research subagent to investigate a question. It can search "
-                "the web, browse pages, and save sources. Returns a text summary."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "question": {
-                        "type": "string",
-                        "description": "What the subagent should research. Keep it bounded and specific.",
-                    },
-                },
-                "required": ["question"],
-            },
-            handler=run_subagent,
-        )
-
-        # --- code_exec ---
+        # --- Research tools (brave_search, open, find, click, code_exec, etc.) ---
         from dsl_worker.infra.research_tools import ResearchTools, ResearchScope
 
         self._impl = ResearchTools(
@@ -357,35 +295,7 @@ class OrchestratorAgent:
             description="",
             quota=0,
         ))
-
-        async def code_exec(args: Dict) -> tuple[str, float]:
-            return await self._impl.code_exec(
-                script=args.get("script", ""),
-                description=args.get("description", ""),
-            )
-
-        registry.add(
-            name="code_exec",
-            description=(
-                "Execute Python. Use for bulk operations: clone repos, "
-                "process data files, list directory contents, parse uploads."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "script": {
-                        "type": "string",
-                        "description": "Python script to execute",
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Brief description of what this script does",
-                    },
-                },
-                "required": ["script"],
-            },
-            handler=code_exec,
-        )
+        self._impl.register_on(registry)
 
         # --- read_file ---
         async def read_file(args: Dict) -> tuple[str, float]:
@@ -574,29 +484,42 @@ class OrchestratorAgent:
 
     async def run(self) -> AgentResult:
         """Run the orchestrator."""
+        if self.feedback_context:
+            prev = self.feedback_context["previous_config"]
+            feedback = self.feedback_context["user_feedback"]
+
+            topics_desc = "\n".join(
+                f"- {t['name']} ({t.get('target', '?')} rows): {t['briefing']}"
+                for t in prev.get("topics", [])
+            )
+            message = (
+                f"FEEDBACK ITERATION: The user reviewed sample rows and gave feedback.\n\n"
+                f"Previous dataset brief:\n{prev.get('dataset_brief', '')}\n\n"
+                f"Previous topics:\n{topics_desc}\n\n"
+                f"User feedback: \"{feedback}\"\n\n"
+                f"The previous samples were discarded. Re-plan based on this feedback. "
+                f"You can adjust the dataset brief, add/remove/modify topics, or change "
+                f"targets. Then call delegate_topics() and done()."
+            )
+        else:
+            message = (
+                "Begin. Read the conversation history and uploaded files, then plan, "
+                "delegate topics, and call done."
+            )
+
         result = await self._conversation.send(
-            "Begin. Read the conversation history and uploaded files, then plan, "
-            "delegate topics, and call done.",
+            message,
             exit_condition=lambda: self._is_done,
         )
         return result
 
     @property
     def cost_usd(self) -> float:
-        """Total cost across orchestrator + all sub-agents."""
-        total = self._conversation.total_cost
-        for agent in self._subagents.values():
-            total += agent.cost_usd
-        return total
+        """Total cost accumulated by the orchestrator."""
+        return self._conversation.total_cost
 
     async def cleanup(self) -> None:
-        """Clean up all sub-agents and resources."""
-        for agent in self._subagents.values():
-            try:
-                await agent.cleanup()
-            except Exception as e:
-                logger.warning(f"Subagent cleanup error: {e}")
-
+        """Clean up browser, sandbox, and other resources."""
         try:
             await self._impl.cleanup()
         except Exception as e:

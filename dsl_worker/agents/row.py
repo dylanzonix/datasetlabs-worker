@@ -82,16 +82,27 @@ DO NOT write JSON, code blocks, or row content as text. Only tool calls are capt
 - code_exec(script, description): Execute Python
 - interact(url_or_ref_id, task): Browser agent for complex interactions
 
+## Your Role
+
+You are the execution layer. An orchestrator planned the dataset and a topic agent wrote
+your specific assignment. Your job is to produce one high-quality row.
+
+Some assignments are straightforward — maybe the information is right there in the brief
+or a source file. Others require you to actually figure things out: search the web, read
+sources, run code to verify something, cross-reference claims. Use your judgment on what
+the assignment needs.
+
+The key thing: don't just make stuff up. If the assignment requires information you don't
+have, go find it. You have tools for this — web search, browsing, code execution. Think
+about what would actually give you the answer and use the right tool for that.
+
 ## Process
 
-1. Read the assignment — this is your specific task
-2. The dataset brief gives you the overall context and quality expectations
-3. Research as needed — use brave_search/open to find real information
-4. Call set_column(name, value) for EACH column in the schema
-5. For json array columns, prefer append_to_column to build the list one element at a time
-6. Call submit_row() when done
-
-Be accurate. Be thorough. Follow the assignment.
+1. Read the assignment and the dataset brief
+2. Figure out what you need to know and how to get it
+3. Call set_column(name, value) for EACH column in the schema
+4. For json array columns, prefer append_to_column to build the list one element at a time
+5. Call submit_row() when done
 """
 
 
@@ -407,15 +418,7 @@ class RowGeneratorAgent:
         schema: List[Dict],
         dataset_brief: str = "",
     ) -> str:
-        schema_lines = []
-        for col in schema:
-            line = f"- {col.get('name')} ({col.get('type', 'string')})"
-            if col.get("type") == "enum" and col.get("enum_values"):
-                line += f" — values: {col['enum_values']}"
-            if col.get("type") == "json" and col.get("json_schema"):
-                line += f" — json_schema: {json.dumps(col['json_schema'])}"
-            schema_lines.append(line)
-        schema_str = "\n".join(schema_lines)
+        schema_str = json.dumps(schema, indent=2)
 
         brief_section = ""
         if dataset_brief:

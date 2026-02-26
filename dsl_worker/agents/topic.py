@@ -216,18 +216,7 @@ class TopicAgent:
     def _format_columns(self) -> str:
         if not self.columns:
             return "(no columns defined)"
-
-        lines = ["| Name | Type | Details |", "|------|------|---------|"]
-        for col in self.columns:
-            name = col.get("name", "?")
-            ctype = col.get("type", "?")
-            details = ""
-            if ctype == "enum" and col.get("enum_values"):
-                details = f"values: {col['enum_values']}"
-            elif ctype == "json" and col.get("json_schema"):
-                details = "json_schema defined"
-            lines.append(f"| {name} | {ctype} | {details} |")
-        return "\n".join(lines)
+        return json.dumps(self.columns, indent=2)
 
     def _register_tools(self, registry: ToolRegistry) -> None:
         """Register topic agent tools."""

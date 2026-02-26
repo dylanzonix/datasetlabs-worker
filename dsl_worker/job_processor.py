@@ -513,87 +513,50 @@ class JobProcessor:
         )
 
         # ====================================================================
-        # Phase 2: SAMPLE — Each topic produces 1 row, then pause for review
+        # FEEDBACK LOOP: SAMPLE → REVIEW → (APPROVE → GENERATE | FEEDBACK → REPLAN)
         # ====================================================================
 
-        logger.info("[Pipeline] Phase 2: SAMPLE — running topic agents (1 row each)")
-        version.progress_detail = {"phase": "sampling", "topics": len(topics)}
-        db.commit()
-
-        # Create topic agents — these are preserved across sample → generate
-        topic_agents = []
-        for topic in topics:
-            agent = TopicAgent(
-                topic_name=topic["name"],
-                topic_briefing=topic["briefing"],
-                dataset_brief=dataset_brief,
-                target_count=topic.get("target", 10),
-                columns=state.columns,
-                openai_client=tracked_client,
-                model=settings.research_model,
-                workspace_dir=workspace_dir,
-                on_dispatch_rows=on_dispatch_rows,
-                brave_api_key=settings.brave_api_key,
-                sandbox=self._sandbox,
-                stop_checker=stop_checker,
-                blob_service_client=self.blob_service_client,
-                project_id=project.id,
-                on_tool_call=on_tool_call,
-                mcp_tools=mcp_tools,
+        iteration = 0
+        while True:
+            iteration += 1
+            logger.info(
+                f"[Pipeline] Iteration {iteration}: SAMPLE — "
+                f"running {len(topics)} topic agents (1 row each)"
             )
-            topic_agents.append(agent)
+            version.progress_detail = {"phase": "sampling", "topics": len(topics)}
+            db.commit()
 
-        # Run all topic agents in sample mode (each produces 1 seed)
-        sample_tasks = [
-            asyncio.create_task(self._run_topic_agent_safe(agent, cost_tracker))
-            for agent in topic_agents
-        ]
-        await asyncio.gather(*sample_tasks)
+            # Create topic agents for this iteration
+            topic_agents = []
+            for topic in topics:
+                agent = TopicAgent(
+                    topic_name=topic["name"],
+                    topic_briefing=topic["briefing"],
+                    dataset_brief=dataset_brief,
+                    target_count=topic.get("target", 10),
+                    columns=state.columns,
+                    openai_client=tracked_client,
+                    model=settings.research_model,
+                    workspace_dir=workspace_dir,
+                    on_dispatch_rows=on_dispatch_rows,
+                    brave_api_key=settings.brave_api_key,
+                    sandbox=self._sandbox,
+                    stop_checker=stop_checker,
+                    blob_service_client=self.blob_service_client,
+                    project_id=project.id,
+                    on_tool_call=on_tool_call,
+                    mcp_tools=mcp_tools,
+                )
+                topic_agents.append(agent)
 
-        # Check if we should stop
-        if stop_checker():
-            for agent in topic_agents:
-                await agent.cleanup()
-            await checkpoint_mgr.force_save()
-            self._handle_pause(db, project, version, cost_tracker)
-            return True
+            # Run all topic agents in sample mode (each produces 1 assignment)
+            sample_tasks = [
+                asyncio.create_task(self._run_topic_agent_safe(agent, cost_tracker))
+                for agent in topic_agents
+            ]
+            await asyncio.gather(*sample_tasks)
 
-        can_continue, stop_reason = cost_tracker.check_balance_and_charge()
-        if not can_continue:
-            for agent in topic_agents:
-                await agent.cleanup()
-            await checkpoint_mgr.force_save()
-            self._handle_force_stop(db, project, version, cost_tracker, stop_reason)
-            return False
-
-        # Wait for sample rows to be generated
-        # (give the generation consumer a moment to process queued items)
-        await asyncio.sleep(2)
-
-        # --- Pause for user review ---
-        logger.info("[Pipeline] SAMPLE phase complete — pausing for user review")
-
-        # Post sample notification to chat
-        db.refresh(version)
-        sample_count = version.generated_count or 0
-        sample_msg = ChatMessage(
-            project_id=project.id,
-            role="assistant",
-            content=(
-                f"I generated {sample_count} sample rows across {len(topics)} topics. "
-                f"Take a look and let me know if you'd like any changes before I generate the rest."
-            ),
-        )
-        db.add(sample_msg)
-        db.commit()
-
-        version.progress_detail = {"phase": "waiting_for_review", "sample_count": sample_count}
-        db.commit()
-
-        # Poll for user response (30 minute timeout for sample review)
-        user_feedback = None
-        for _ in range(1800):
-            await asyncio.sleep(1)
+            # Check if we should stop
             if stop_checker():
                 for agent in topic_agents:
                     await agent.cleanup()
@@ -601,64 +564,186 @@ class JobProcessor:
                 self._handle_pause(db, project, version, cost_tracker)
                 return True
 
-            new_msg = (
-                db.query(ChatMessage)
-                .filter(
-                    ChatMessage.project_id == project.id,
-                    ChatMessage.role == "user",
-                    ChatMessage.created_at > sample_msg.created_at,
-                )
-                .order_by(ChatMessage.created_at.asc())
-                .first()
-            )
-            if new_msg:
-                user_feedback = new_msg.content
-                logger.info(f"[Pipeline] Got user feedback ({len(user_feedback)} chars)")
-                break
+            can_continue, stop_reason = cost_tracker.check_balance_and_charge()
+            if not can_continue:
+                for agent in topic_agents:
+                    await agent.cleanup()
+                await checkpoint_mgr.force_save()
+                self._handle_force_stop(db, project, version, cost_tracker, stop_reason)
+                return False
 
-        if user_feedback is None:
-            logger.info("[Pipeline] No user feedback within 30 min — pausing")
+            # Drain generation consumer so sample rows are fully written
+            await self._drain_generation_consumer(work_item_queue, generation_task)
+            generation_task = None
+
+            # --- Pause for user review ---
+            db.refresh(version)
+            sample_count = version.generated_count or 0
+            logger.info(
+                f"[Pipeline] SAMPLE complete ({sample_count} rows) — "
+                f"waiting for review"
+            )
+
+            # Include cost transparency data for the sample review UI
+            cost_report = cost_tracker.get_sample_cost_report(
+                samples_generated=sample_count,
+                total_target_rows=version.num_samples,
+            )
+            version.progress_detail = {
+                "phase": "waiting_for_review",
+                "sample_count": sample_count,
+                "topics": len(topics),
+                **cost_report,
+            }
+            db.commit()
+
+            action, feedback_text = await self._wait_for_review(
+                db, project, version, stop_checker
+            )
+
+            if action in ("timeout", "paused"):
+                for agent in topic_agents:
+                    await agent.cleanup()
+                await checkpoint_mgr.force_save()
+                self._handle_pause(db, project, version, cost_tracker)
+                return True
+
+            if action == "approve":
+                # ---- GENERATE: resume topic agents for remaining rows ----
+                logger.info("[Pipeline] GENERATE — resuming topic agents")
+                version.progress_detail = {
+                    "phase": "generating",
+                    "topics": len(topics),
+                }
+                db.commit()
+
+                resume_tasks = [
+                    asyncio.create_task(
+                        self._resume_topic_agent_safe(agent, cost_tracker, None)
+                    )
+                    for agent in topic_agents
+                ]
+                await asyncio.gather(*resume_tasks)
+
+                for agent in topic_agents:
+                    await agent.cleanup()
+                break  # → COMPLETE
+
+            # ---- FEEDBACK: create new version, re-plan via orchestrator ----
+            logger.info("[Pipeline] Feedback received — creating new version")
             for agent in topic_agents:
                 await agent.cleanup()
-            await checkpoint_mgr.force_save()
-            self._handle_pause(db, project, version, cost_tracker)
-            return True
 
-        # ====================================================================
-        # Phase 3: GENERATE — Resume topic agents for remaining rows
-        # ====================================================================
+            # Finalize old version, create new one
+            old_version = version
+            version = self._create_feedback_version(db, project, old_version)
 
-        logger.info("[Pipeline] Phase 3: GENERATE — resuming topic agents")
-        version.progress_detail = {"phase": "generating", "topics": len(topics)}
-        db.commit()
+            # Reset shared state for new iteration
+            work_item_queue = asyncio.Queue()
+            generation_stats = {
+                "rows_generated": 0,
+                "errors": 0,
+                "skipped": 0,
+                "in_progress": 0,
+                "total_cost": 0.0,
+            }
+            generation_task = None
+            work_item_counter = [0]
+            delegate_config = None
+            delegate_event = asyncio.Event()
+            state = ProjectState(db, project.id, version.id)
+            stop_checker = self._make_stop_checker(state)
+            progress_counters.clear()
+            progress_counters["phase"] = "replanning"
+            last_progress_flush = time.time()
 
-        # Resume the SAME topic agents — all research context is preserved
-        resume_tasks = [
-            asyncio.create_task(
-                self._resume_topic_agent_safe(agent, cost_tracker, user_feedback)
+            checkpoint_mgr = CheckpointManager(
+                blob_service_client=self.blob_service_client,
+                container_name=settings.azure_storage_container_name,
+                project_id=project.id,
+                version_id=version.id,
             )
-            for agent in topic_agents
-        ]
-        await asyncio.gather(*resume_tasks)
+            await checkpoint_mgr.initialize()
 
-        # Now clean up topic agents
-        for agent in topic_agents:
-            await agent.cleanup()
+            # Cost check before re-planning
+            can_continue, stop_reason = cost_tracker.check_balance_and_charge()
+            if not can_continue:
+                self._handle_force_stop(
+                    db, project, version, cost_tracker, stop_reason
+                )
+                return False
 
-        # ====================================================================
-        # Phase 4: COMPLETE — Wait for generation to finish
-        # ====================================================================
+            # Run new orchestrator with feedback context
+            version.progress_detail = {"phase": "replanning"}
+            db.commit()
 
-        logger.info("[Pipeline] Phase 4: COMPLETE — waiting for generation to finish")
+            orchestrator = OrchestratorAgent(
+                chat_history=chat_history,
+                columns=state.columns,
+                num_samples=state.num_samples,
+                openai_client=tracked_client,
+                model=settings.research_model,
+                workspace_dir=workspace_dir,
+                on_delegate_topics=on_delegate_topics,
+                uploaded_files=uploaded_files if uploaded_files else None,
+                brave_api_key=settings.brave_api_key,
+                sandbox=self._sandbox,
+                stop_checker=stop_checker,
+                blob_service_client=self.blob_service_client,
+                project_id=project.id,
+                on_tool_call=on_tool_call,
+                uploaded_file_urls=(
+                    uploaded_file_urls if uploaded_file_urls else None
+                ),
+                mcp_tools=mcp_tools,
+                feedback_context={
+                    "previous_config": config,
+                    "user_feedback": feedback_text,
+                },
+            )
 
-        # Wait for remaining generation
-        if generation_task and not generation_task.done():
-            # Send poison pill to signal no more items coming
-            await work_item_queue.put(None)
             try:
-                await generation_task
-            except Exception as e:
-                logger.error(f"[Pipeline] Generation consumer error: {e}")
+                result = await orchestrator.run()
+                orch_cost = orchestrator.cost_usd
+                if orch_cost > 0:
+                    cost_tracker.add_cost(
+                        phase="orchestrator:feedback",
+                        cost_usd=orch_cost,
+                        model=settings.research_model,
+                    )
+                    await checkpoint_mgr.add_cost(orch_cost)
+                logger.info(
+                    f"[Pipeline] Feedback orchestrator done: "
+                    f"cost=${orch_cost:.4f}, turns={result.turns_taken}"
+                )
+            finally:
+                await orchestrator.cleanup()
+
+            if delegate_config is None:
+                self._handle_force_stop(
+                    db, project, version, cost_tracker,
+                    "Feedback orchestrator did not delegate any topics",
+                )
+                return False
+
+            config = delegate_config
+            dataset_brief = config["dataset_brief"]
+            topics = config["topics"]
+
+            logger.info(
+                f"[Pipeline] Feedback orchestrator delegated "
+                f"{len(topics)} topics: {[t['name'] for t in topics]}"
+            )
+            # loop back → new SAMPLE phase
+
+        # ====================================================================
+        # COMPLETE — Wait for generation to finish
+        # ====================================================================
+
+        logger.info("[Pipeline] COMPLETE — waiting for generation to finish")
+
+        # Drain generation consumer
+        await self._drain_generation_consumer(work_item_queue, generation_task)
 
         # Check final state
         state.refresh()
@@ -976,6 +1061,115 @@ class JobProcessor:
         self._handle_force_stop(db, project, version, cost_tracker, "No rows generated")
         return False
 
+    async def _drain_generation_consumer(
+        self,
+        work_item_queue: asyncio.Queue,
+        generation_task: Optional[asyncio.Task],
+    ) -> None:
+        """Drain the generation consumer by sending a poison pill and waiting."""
+        if generation_task and not generation_task.done():
+            await work_item_queue.put(None)  # poison pill
+            try:
+                await asyncio.wait_for(generation_task, timeout=120)
+            except asyncio.TimeoutError:
+                logger.warning("[Pipeline] Generation consumer drain timed out")
+            except Exception as e:
+                logger.warning(f"[Pipeline] Generation consumer drain error: {e}")
+
+    async def _wait_for_review(
+        self,
+        db: Session,
+        project: Project,
+        version: ProjectVersion,
+        stop_checker,
+    ) -> tuple:
+        """Wait for user to approve samples or give feedback.
+
+        Returns (action, text) where action is one of:
+        - "approve", None
+        - "feedback", feedback_text
+        - "timeout", None
+        - "paused", None
+        """
+        review_start = datetime.now(timezone.utc)
+
+        for _ in range(1800):  # 30 min
+            await asyncio.sleep(1)
+
+            if stop_checker():
+                return "paused", None
+
+            db.refresh(version)
+            pd = version.progress_detail or {}
+            if pd.get("user_action") == "approve":
+                return "approve", None
+
+            new_msg = (
+                db.query(ChatMessage)
+                .filter(
+                    ChatMessage.project_id == project.id,
+                    ChatMessage.role == "user",
+                    ChatMessage.created_at > review_start,
+                )
+                .order_by(ChatMessage.created_at.asc())
+                .first()
+            )
+            if new_msg:
+                logger.info(
+                    f"[Pipeline] Got user feedback ({len(new_msg.content)} chars)"
+                )
+                return "feedback", new_msg.content
+
+        logger.info("[Pipeline] No user response within 30 min — timing out")
+        return "timeout", None
+
+    def _create_feedback_version(
+        self,
+        db: Session,
+        project: Project,
+        old_version: ProjectVersion,
+    ) -> ProjectVersion:
+        """Create a new version for a feedback iteration.
+
+        The old version is finalized with status 'succeeded' — its sample
+        rows are preserved. The new version starts fresh.
+        """
+        from sqlalchemy import func as sql_func
+
+        max_num = (
+            db.query(sql_func.max(ProjectVersion.version_number))
+            .filter(ProjectVersion.project_id == project.id)
+            .scalar() or 0
+        )
+
+        new_version = ProjectVersion(
+            project_id=project.id,
+            version_number=max_num + 1,
+            num_samples=old_version.num_samples,
+            generation_prompt=old_version.generation_prompt,
+            columns=old_version.columns,
+            files_snapshot=old_version.files_snapshot,
+            examples_snapshot=old_version.examples_snapshot,
+            status="running",
+            started_at=datetime.now(timezone.utc),
+        )
+        db.add(new_version)
+        db.flush()
+
+        old_version.status = "succeeded"
+        old_version.finished_at = datetime.now(timezone.utc)
+        old_version.progress_detail = None
+
+        project.current_version_id = new_version.id
+        db.commit()
+
+        logger.info(
+            f"[Pipeline] Created feedback version {new_version.version_number} "
+            f"(old v{old_version.version_number} finalized)"
+        )
+
+        return new_version
+
     def _load_chat_history(self, db: Session, project_id: UUID) -> List[Dict[str, str]]:
         """Load chat messages and format for the orchestrator.
 
@@ -1012,27 +1206,30 @@ class JobProcessor:
 
                 if "columns" in changes:
                     cols = changes["columns"]
-                    if isinstance(cols, list):
-                        col_lines = []
-                        for c in cols:
-                            if isinstance(c, dict):
-                                col_lines.append(
-                                    f"  - {c.get('name', '?')} ({c.get('type', '?')})"
-                                )
-                        if col_lines:
-                            content += "\n\n<columns>\n" + "\n".join(col_lines) + "\n</columns>"
+                    if isinstance(cols, list) and cols:
+                        content += "\n\n<columns>\n" + json.dumps(cols, indent=2) + "\n</columns>"
 
                 if "questions" in changes:
                     qs = changes["questions"]
                     if isinstance(qs, list):
-                        q_lines = []
+                        q_blocks = []
                         for q in qs:
                             if isinstance(q, dict):
-                                q_lines.append(f"  - {q.get('question', q.get('label', '?'))}")
+                                question_text = q.get("question", q.get("label", "?"))
+                                q_type = q.get("type", "single_choice")
+                                options = q.get("options", [])
+                                block = question_text
+                                if q_type == "multi_choice":
+                                    block += " (pick all that apply)"
+                                if options:
+                                    block += "\n" + "\n".join(
+                                        f"  - {opt}" for opt in options
+                                    )
+                                q_blocks.append(block)
                             elif isinstance(q, str):
-                                q_lines.append(f"  - {q}")
-                        if q_lines:
-                            content += "\n\n<questions>\n" + "\n".join(q_lines) + "\n</questions>"
+                                q_blocks.append(q)
+                        if q_blocks:
+                            content += "\n\n<questions>\n" + "\n\n".join(q_blocks) + "\n</questions>"
 
             history.append({
                 "role": msg.role,

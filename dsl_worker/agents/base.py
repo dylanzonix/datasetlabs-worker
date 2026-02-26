@@ -92,7 +92,7 @@ class AgentConversation:
         tools: ToolRegistry,
         stop_checker: Optional[Callable[[], bool]] = None,
         max_turns: int = 100,
-        soft_turn_limit: int = 20,
+        soft_turn_limit: int = 50,
         max_output_tokens: int = 16_000,
         reasoning: Optional[Dict[str, Any]] = None,
         label: str = "agent",
