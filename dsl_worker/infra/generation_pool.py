@@ -152,46 +152,68 @@ class GenerationWorkerPool:
                             await self.checkpoint_callback(index, False, None)
                         continue
 
-                    try:
-                        result = await agent.generate(
-                            assignment=instruction,
-                            schema=schema,
-                            dataset_brief=context,
-                        )
+                    max_attempts = 2
+                    succeeded = False
 
-                        self._total_cost += result.cost_usd
+                    for attempt in range(max_attempts):
+                        try:
+                            result = await agent.generate(
+                                assignment=instruction,
+                                schema=schema,
+                                dataset_brief=context,
+                            )
 
-                        if result.success and result.row:
-                            row_id = await self._save_row(result.row, tags=tags)
+                            self._total_cost += result.cost_usd
 
-                            async with lock:
-                                success_count += 1
-                                self._rows_generated += 1
+                            if result.success and result.row:
+                                row_id = await self._save_row(result.row, tags=tags)
 
-                            if success_count % 10 == 0:
-                                logger.info(
-                                    f"[GenerationPool] Generated {success_count} rows..."
+                                async with lock:
+                                    success_count += 1
+                                    self._rows_generated += 1
+
+                                if success_count % 10 == 0:
+                                    logger.info(
+                                        f"[GenerationPool] Generated {success_count} rows..."
+                                    )
+
+                                if self.checkpoint_callback:
+                                    await self.checkpoint_callback(index, True, row_id)
+                                succeeded = True
+                                break
+                            else:
+                                if attempt < max_attempts - 1:
+                                    logger.warning(
+                                        f"[GenerationPool] Failed (attempt {attempt + 1}/"
+                                        f"{max_attempts}): {result.error} — retrying"
+                                    )
+                                else:
+                                    async with lock:
+                                        error_count += 1
+                                        self._errors += 1
+                                    logger.warning(
+                                        f"[GenerationPool] Failed after {max_attempts} "
+                                        f"attempts: {result.error}"
+                                    )
+                                    if self.checkpoint_callback:
+                                        await self.checkpoint_callback(index, False, None)
+
+                        except Exception as e:
+                            if attempt < max_attempts - 1:
+                                logger.warning(
+                                    f"[GenerationPool] Error (attempt {attempt + 1}/"
+                                    f"{max_attempts}): {e} — retrying"
                                 )
-
-                            if self.checkpoint_callback:
-                                await self.checkpoint_callback(index, True, row_id)
-                        else:
-                            async with lock:
-                                error_count += 1
-                                self._errors += 1
-                            logger.warning(f"[GenerationPool] Failed: {result.error}")
-
-                            if self.checkpoint_callback:
-                                await self.checkpoint_callback(index, False, None)
-
-                    except Exception as e:
-                        logger.error(f"[GenerationPool] Error processing work item: {e}")
-                        async with lock:
-                            error_count += 1
-                            self._errors += 1
-
-                        if self.checkpoint_callback:
-                            await self.checkpoint_callback(index, False, None)
+                            else:
+                                logger.error(
+                                    f"[GenerationPool] Error after {max_attempts} "
+                                    f"attempts: {e}"
+                                )
+                                async with lock:
+                                    error_count += 1
+                                    self._errors += 1
+                                if self.checkpoint_callback:
+                                    await self.checkpoint_callback(index, False, None)
             finally:
                 await agent.cleanup()
 

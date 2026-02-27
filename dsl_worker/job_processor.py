@@ -747,7 +747,7 @@ class JobProcessor:
             # loop back → new SAMPLE phase
 
         # ====================================================================
-        # COMPLETE — Wait for generation to finish
+        # COMPLETE — Wait for generation, then backfill if needed
         # ====================================================================
 
         logger.info("[Pipeline] COMPLETE — waiting for generation to finish")
@@ -768,8 +768,67 @@ class JobProcessor:
             self._handle_force_stop(db, project, version, cost_tracker, stop_reason)
             return False
 
+        # --- Backfill loop: guarantee generated_count == num_samples ---
+        MAX_BACKFILL_ROUNDS = 3
+        for backfill_round in range(MAX_BACKFILL_ROUNDS):
+            db.refresh(version)
+            generated = version.generated_count or 0
+            shortfall = state.num_samples - generated
+            if shortfall <= 0:
+                break
+
+            logger.info(
+                f"[Pipeline] Backfill round {backfill_round + 1}: "
+                f"{generated}/{state.num_samples} rows — "
+                f"generating {shortfall} more"
+            )
+
+            # Distribute backfill across topics for variety
+            backfill_items: List[Dict] = []
+            for i in range(shortfall):
+                topic = topics[i % len(topics)]
+                backfill_items.append({
+                    "instruction": (
+                        f"Generate a unique dataset row about '{topic['name']}'. "
+                        f"Topic context: {topic['briefing']}. "
+                        f"Pick an angle or example that hasn't been covered yet."
+                    ),
+                    "context": dataset_brief,
+                    "tags": {"topic": topic["name"]},
+                })
+
+            await self._process_work_item_batch(
+                backfill_items, state.columns, db, project, version,
+                tracked_client, cost_tracker, checkpoint_mgr,
+                workspace_dir, stop_checker, work_item_counter[0],
+                generation_stats, uploaded_file_urls=uploaded_file_urls,
+                langfuse_parent=langfuse_parent,
+            )
+            work_item_counter[0] += len(backfill_items)
+
+            # Re-check stop conditions before next round
+            state.refresh()
+            if state.paused:
+                await checkpoint_mgr.force_save()
+                self._handle_pause(db, project, version, cost_tracker)
+                return True
+
+            can_continue, stop_reason = cost_tracker.check_balance_and_charge()
+            if not can_continue:
+                await checkpoint_mgr.force_save()
+                self._handle_force_stop(
+                    db, project, version, cost_tracker, stop_reason
+                )
+                return False
+
         db.refresh(version)
-        if version.generated_count and version.generated_count > 0:
+        generated = version.generated_count or 0
+        if generated > 0:
+            if generated < state.num_samples:
+                logger.warning(
+                    f"[Pipeline] Completed with {generated}/{state.num_samples} "
+                    f"rows after {MAX_BACKFILL_ROUNDS} backfill rounds"
+                )
             await checkpoint_mgr.set_phase("completed")
             await checkpoint_mgr.force_save()
             self._handle_completion(db, project, version, cost_tracker)

@@ -271,18 +271,28 @@ class TopicAgent:
                 return "Error: no assignments provided", 0.0
 
             # Validate assignments are non-empty strings
-            errors = []
+            valid = []
             for i, assignment in enumerate(assignments):
-                if not isinstance(assignment, str) or not assignment.strip():
-                    errors.append(f"Assignment {i}: must be a non-empty string")
-            if errors:
-                return "Validation errors:\n" + "\n".join(f"- {e}" for e in errors), 0.0
+                if isinstance(assignment, str) and assignment.strip():
+                    valid.append(assignment)
+            if not valid:
+                return "Error: all assignments were empty strings", 0.0
+
+            # Cap to remaining target so topics never over-dispatch.
+            remaining = self.target_count - self._total_dispatched
+            if remaining <= 0:
+                return (
+                    f"Already at target ({self._total_dispatched}/{self.target_count}). "
+                    f"No more assignments needed — call done()."
+                ), 0.0
+            if len(valid) > remaining:
+                valid = valid[:remaining]
 
             # Dispatch via callback — pass the topic's langfuse span so
             # row_generator traces nest under this topic, not the job root.
             topic_span = getattr(self._conversation, "_current_langfuse_span", None)
             count = await self.on_dispatch_rows(
-                assignments,
+                valid,
                 self.dataset_brief,
                 self.columns,
                 self.topic_name,
@@ -290,9 +300,17 @@ class TopicAgent:
             )
             self._total_dispatched += count
 
+            remaining = self.target_count - self._total_dispatched
+            if remaining > 0:
+                return (
+                    f"Dispatched {count} row assignments. "
+                    f"Total dispatched: {self._total_dispatched}/{self.target_count}. "
+                    f"Still need {remaining} more — keep going."
+                ), 0.0
             return (
                 f"Dispatched {count} row assignments. "
-                f"Total dispatched: {self._total_dispatched}/{self.target_count}."
+                f"Target reached ({self._total_dispatched}/{self.target_count}). "
+                f"Call done() now."
             ), 0.0
 
         registry.add(
@@ -320,6 +338,13 @@ class TopicAgent:
 
         # --- done ---
         async def done(args: Dict) -> tuple[str, float]:
+            remaining = self.target_count - self._total_dispatched
+            if remaining > 0:
+                return (
+                    f"Cannot finish yet — still need {remaining} more assignments "
+                    f"({self._total_dispatched}/{self.target_count} dispatched). "
+                    f"Please dispatch the remaining assignments first."
+                ), 0.0
             self._is_done = True
             return (
                 f"Topic '{self.topic_name}' complete. "
@@ -337,13 +362,13 @@ class TopicAgent:
         """Run the topic agent — first phase (1 assignment).
 
         Produces 1 representative assignment with light research, dispatches it,
-        and calls done(). The agent's conversation state is fully preserved
-        so resume() can continue with all prior context.
+        and calls done(). The exit condition is count-based: the conversation
+        ends when at least 1 assignment has been dispatched.
         """
         result = await self._conversation.send(
             f"Begin. Research your topic area briefly, pick 1 good representative "
             f"assignment, dispatch it, and call done().",
-            exit_condition=lambda: self._is_done,
+            exit_condition=lambda: self._total_dispatched >= 1,
         )
         return result
 
@@ -351,6 +376,9 @@ class TopicAgent:
         """Resume the topic agent — produce remaining assignments.
 
         Continues the same conversation (all research context preserved).
+        The exit condition is count-based: the conversation keeps running
+        until ``target_count`` assignments have been dispatched.  The
+        ``done()`` tool also enforces this — it rejects early exits.
 
         Args:
             feedback: Optional user feedback from sample review.
@@ -378,8 +406,15 @@ class TopicAgent:
 
         result = await self._conversation.send(
             message,
-            exit_condition=lambda: self._is_done,
+            exit_condition=lambda: self._total_dispatched >= self.target_count,
         )
+
+        if self._total_dispatched < self.target_count:
+            logger.warning(
+                f"[topic:{self.topic_name}] hit max_turns with only "
+                f"{self._total_dispatched}/{self.target_count} dispatched"
+            )
+
         return result
 
     @property
