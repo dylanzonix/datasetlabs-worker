@@ -230,7 +230,8 @@ class AgentConversation:
             as_type="span",
             name=self.label,
             metadata={"model": self.model, "max_turns": self.max_turns},
-        ):
+        ) as span:
+            self._current_langfuse_span = span
             result = await self._run_loop_inner(exit_condition)
             return result
 

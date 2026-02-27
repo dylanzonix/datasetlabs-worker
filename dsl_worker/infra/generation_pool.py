@@ -135,6 +135,14 @@ class GenerationWorkerPool:
                     schema = item.get("schema") or default_schema
                     tags = item.get("tags") or {}
 
+                    # Use per-item langfuse parent (topic span) so
+                    # row_generator traces nest under their topic.
+                    item_parent = item.get("langfuse_parent")
+                    if item_parent is not None:
+                        agent.langfuse_parent = item_parent
+                    else:
+                        agent.langfuse_parent = self.langfuse_parent
+
                     if not instruction:
                         logger.warning(f"[GenerationPool] Empty instruction at index {index}")
                         async with lock:

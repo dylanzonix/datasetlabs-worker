@@ -387,15 +387,19 @@ class JobProcessor:
             dataset_brief: str,
             columns: List[Dict],
             topic_name: str,
+            langfuse_parent: Optional[Any] = None,
         ) -> int:
             """Build work items from assignments and dispatch them."""
             work_items = []
             for assignment in assignments:
-                work_items.append({
+                item: Dict[str, Any] = {
                     "instruction": assignment,
                     "context": dataset_brief,
                     "tags": {"topic": topic_name},
-                })
+                }
+                if langfuse_parent is not None:
+                    item["langfuse_parent"] = langfuse_parent
+                work_items.append(item)
 
             return await dispatch_work_items(work_items)
 

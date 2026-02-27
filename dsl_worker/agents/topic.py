@@ -141,7 +141,7 @@ class TopicAgent:
         openai_client: TrackedOpenAIClient,
         model: str,
         workspace_dir: Path,
-        on_dispatch_rows: Callable[[List[str], str, List[Dict], str], Awaitable[int]],
+        on_dispatch_rows: Callable[..., Awaitable[int]],
         brave_api_key: Optional[str] = None,
         sandbox: Optional[Any] = None,
         stop_checker: Optional[Callable[[], bool]] = None,
@@ -278,12 +278,15 @@ class TopicAgent:
             if errors:
                 return "Validation errors:\n" + "\n".join(f"- {e}" for e in errors), 0.0
 
-            # Dispatch via callback
+            # Dispatch via callback — pass the topic's langfuse span so
+            # row_generator traces nest under this topic, not the job root.
+            topic_span = getattr(self._conversation, "_current_langfuse_span", None)
             count = await self.on_dispatch_rows(
                 assignments,
                 self.dataset_brief,
                 self.columns,
                 self.topic_name,
+                langfuse_parent=topic_span,
             )
             self._total_dispatched += count
 
