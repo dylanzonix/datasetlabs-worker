@@ -39,7 +39,7 @@ class WorkerSettings(BaseSettings):
     generation_parallel_samples: int = 30  # Number of samples to generate in parallel
 
     # Billing settings
-    billing_margin_multiplier: float = 4.0  # 2x = 100% margin (charge $2 for $1 cost)
+    compute_cost_per_credit: float = 0.10  # How much raw OpenAI spend 1 credit covers
     billing_charge_threshold_cents: int = 100  # $1 - charge when accumulated
     billing_charge_interval_seconds: int = 60  # Charge at least every 60 seconds
 

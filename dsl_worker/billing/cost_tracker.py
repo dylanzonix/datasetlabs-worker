@@ -7,8 +7,8 @@ Handles:
 - Checking if user has sufficient balance
 - THREAD-SAFE for concurrent workers
 
-Credits: 1 credit = $0.25. Costs are tracked in USD internally,
-then converted to credits when charging.
+Credits are consumed based on raw OpenAI cost divided by a configurable
+compute_cost_per_credit rate (e.g. $0.10 means 1 credit = $0.10 of compute).
 """
 
 import logging
@@ -25,11 +25,9 @@ from sqlalchemy.orm import Session
 from dsl_api.models.balance_ledger import BalanceLedger
 from dsl_api.models.account import Account
 from dsl_api.credits import consume_credits, get_total_credits
+from dsl_api.plans import CENTS_PER_CREDIT
 
 logger = logging.getLogger(__name__)
-
-# 1 credit = $0.25
-CREDIT_VALUE_USD = 0.25
 
 
 @dataclass
@@ -62,8 +60,8 @@ class CostTracker:
         db: Database session
         user_id: User being charged
         project_id: Project generating costs
-        margin_multiplier: Multiply raw costs by this (e.g., 4.0 for 300% margin)
-        charge_threshold_credits: Charge when accumulated costs reach this many credits
+        compute_cost_per_credit: Raw OpenAI USD cost that 1 credit covers
+        charge_threshold_cents: Charge when accumulated costs reach this (in ledger cents)
         charge_interval_seconds: Charge at least this often
     """
 
@@ -72,16 +70,16 @@ class CostTracker:
         db: Session,
         user_id: UUID,
         project_id: UUID,
-        margin_multiplier: float = 4.0,
+        compute_cost_per_credit: float = 0.10,
         charge_threshold_cents: int = 100,  # Keep param name for backward compat
         charge_interval_seconds: int = 60,
     ):
         self.db = db
         self.user_id = user_id
         self.project_id = project_id
-        self.margin_multiplier = margin_multiplier
-        # Convert cents threshold to credits: 100 cents = 4 credits at $0.25/credit
-        self.charge_threshold_credits = charge_threshold_cents / (CREDIT_VALUE_USD * 100)
+        self.compute_cost_per_credit = compute_cost_per_credit
+        # Convert cents threshold to credits
+        self.charge_threshold_credits = charge_threshold_cents / CENTS_PER_CREDIT
         self.charge_interval_seconds = charge_interval_seconds
 
         # Append-only lists
@@ -115,7 +113,7 @@ class CostTracker:
         """Total spend on this project including current run (in cents for backward compat)."""
         with self._lock:
             charged_credits = sum(c.amount_credits for c in self._charges)
-            charged_cents = int(charged_credits * CREDIT_VALUE_USD * 100)
+            charged_cents = int(charged_credits * CENTS_PER_CREDIT)
             return self._cumulative_spend_at_start + charged_cents
 
     def add_cost(
@@ -127,16 +125,14 @@ class CostTracker:
         output_tokens: int = 0,
         model: str = "",
     ) -> None:
-        """Add a cost entry."""
+        """Add a cost entry. cost_usd is the raw OpenAI cost."""
         if cost_usd <= 0:
             return
-
-        cost_with_margin = cost_usd * self.margin_multiplier
 
         entry = CostEntry(
             timestamp=datetime.now(timezone.utc),
             phase=phase,
-            cost_usd=cost_with_margin,
+            cost_usd=cost_usd,
             description=description,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -149,13 +145,13 @@ class CostTracker:
             total_output = sum(c.output_tokens for c in self._costs)
             total_cost_credits = self._total_costs_credits_unlocked()
 
-        cost_credits = cost_with_margin / CREDIT_VALUE_USD
+        cost_credits = cost_usd / self.compute_cost_per_credit
         total_tokens = input_tokens + output_tokens
         if model:
             logger.info(
                 f"💰 Cost: {phase} | {model} | "
                 f"in={input_tokens:,} out={output_tokens:,} ({total_tokens:,} total) | "
-                f"${cost_usd:.4f} raw → ${cost_with_margin:.4f} w/margin → {cost_credits:.2f} credits | "
+                f"${cost_usd:.4f} raw → {cost_credits:.2f} credits | "
                 f"running total: {total_cost_credits:.2f} credits ({total_input:,}+{total_output:,} tokens)"
             )
 
@@ -163,7 +159,7 @@ class CostTracker:
         return sum(c.cost_usd for c in self._costs)
 
     def _total_costs_credits_unlocked(self) -> float:
-        return self._total_costs_usd_unlocked() / CREDIT_VALUE_USD
+        return self._total_costs_usd_unlocked() / self.compute_cost_per_credit
 
     def _total_charged_credits_unlocked(self) -> float:
         return sum(c.amount_credits for c in self._charges)
@@ -184,7 +180,7 @@ class CostTracker:
     # Backward compat
     @property
     def total_costs_cents(self) -> int:
-        return int(self.total_costs_usd * 100)
+        return int(self.total_costs_credits * CENTS_PER_CREDIT)
 
     @property
     def total_charged_credits(self) -> float:
@@ -193,7 +189,7 @@ class CostTracker:
 
     @property
     def total_charged_cents(self) -> int:
-        return int(self.total_charged_credits * CREDIT_VALUE_USD * 100)
+        return int(self.total_charged_credits * CENTS_PER_CREDIT)
 
     @property
     def uncharged_credits(self) -> float:
@@ -203,7 +199,7 @@ class CostTracker:
     # Backward compat
     @property
     def uncharged_cents(self) -> int:
-        return int(self.uncharged_credits * CREDIT_VALUE_USD * 100)
+        return int(self.uncharged_credits * CENTS_PER_CREDIT)
 
     def should_charge(self) -> bool:
         """Check if we should charge now."""
@@ -257,7 +253,7 @@ class CostTracker:
             record = ChargeRecord(
                 timestamp=datetime.now(timezone.utc),
                 amount_credits=credits_to_charge,
-                amount_cents=int(credits_to_charge * CREDIT_VALUE_USD * 100),
+                amount_cents=int(credits_to_charge * CENTS_PER_CREDIT),
             )
             self._charges.append(record)
             self._last_charge_time = datetime.now(timezone.utc)
@@ -278,7 +274,7 @@ class CostTracker:
 
     # Backward compat
     def get_user_balance_cents(self) -> int:
-        return int(self.get_user_balance_credits() * CREDIT_VALUE_USD * 100)
+        return int(self.get_user_balance_credits() * CENTS_PER_CREDIT)
 
     def has_sufficient_balance(self) -> bool:
         """Check if user has enough balance to continue."""
@@ -332,9 +328,9 @@ class CostTracker:
             "total_charged_credits": round(total_charged_credits, 2),
             "uncharged_credits": round(uncharged_credits, 2),
             # Backward compat in cents
-            "total_costs_cents": int(total_costs_credits * CREDIT_VALUE_USD * 100),
-            "total_charged_cents": int(total_charged_credits * CREDIT_VALUE_USD * 100),
-            "uncharged_cents": int(uncharged_credits * CREDIT_VALUE_USD * 100),
+            "total_costs_cents": int(total_costs_credits * CENTS_PER_CREDIT),
+            "total_charged_cents": int(total_charged_credits * CENTS_PER_CREDIT),
+            "uncharged_cents": int(uncharged_credits * CENTS_PER_CREDIT),
             "cumulative_project_spend_cents": self.cumulative_spend_cents,
             "num_cost_entries": num_costs,
             "num_charges": num_charges,

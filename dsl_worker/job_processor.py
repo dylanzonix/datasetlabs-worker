@@ -168,7 +168,7 @@ class JobProcessor:
                 db=db,
                 user_id=project.user_id,
                 project_id=project_id,
-                margin_multiplier=settings.billing_margin_multiplier,
+                compute_cost_per_credit=settings.compute_cost_per_credit,
                 charge_threshold_cents=settings.billing_charge_threshold_cents,
                 charge_interval_seconds=settings.billing_charge_interval_seconds,
             )
