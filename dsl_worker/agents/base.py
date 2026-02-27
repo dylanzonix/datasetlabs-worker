@@ -100,6 +100,7 @@ class AgentConversation:
         context_window: int = 400_000,
         on_tool_call: Optional[Callable[[str, str], None]] = None,
         extra_tools: Optional[List[Dict[str, Any]]] = None,
+        langfuse_parent: Optional[Any] = None,
     ) -> None:
         self.openai_client = openai_client
         self.model = model
@@ -116,6 +117,9 @@ class AgentConversation:
         self.on_tool_call = on_tool_call
         # Extra tool definitions (e.g. MCP connectors) passed directly to API
         self.extra_tools = extra_tools or []
+        # Explicit Langfuse parent span — avoids context-var inference issues
+        # across asyncio.create_task() boundaries.
+        self.langfuse_parent = langfuse_parent
 
         # Conversation state — this IS the context sent to the API each turn.
         # Contains user messages, reasoning items, assistant messages,
@@ -203,18 +207,26 @@ class AgentConversation:
         exit_condition: Optional[Callable[[], bool]] = None,
     ) -> AgentResult:
         """Core agent loop. Calls API, handles tools, repeats."""
-        langfuse = _get_langfuse()
-        if langfuse:
-            return await self._run_loop_traced(langfuse, exit_condition)
+        # Use explicit parent if provided, otherwise fall back to context-var
+        # inference via the global Langfuse client.
+        parent = self.langfuse_parent or _get_langfuse()
+        if parent:
+            return await self._run_loop_traced(parent, exit_condition)
         return await self._run_loop_inner(exit_condition)
 
     async def _run_loop_traced(
         self,
-        langfuse,
+        langfuse_parent,
         exit_condition: Optional[Callable[[], bool]] = None,
     ) -> AgentResult:
-        """Wrapper that creates a Langfuse span around the agent loop."""
-        with langfuse.start_as_current_observation(
+        """Wrapper that creates a Langfuse span around the agent loop.
+
+        Calls start_as_current_observation on the parent — this creates
+        an explicit child span AND sets it as the current observation in
+        contextvars, so the OpenAI auto-wrapper and tool spans nest
+        correctly underneath.
+        """
+        with langfuse_parent.start_as_current_observation(
             as_type="span",
             name=self.label,
             metadata={"model": self.model, "max_turns": self.max_turns},

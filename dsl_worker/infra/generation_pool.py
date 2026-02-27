@@ -43,6 +43,7 @@ class GenerationWorkerPool:
         blob_service_client: Optional[Any] = None,
         uploaded_file_urls: Optional[Dict[str, str]] = None,
         mcp_tools: Optional[List[Dict]] = None,
+        langfuse_parent: Optional[Any] = None,
     ):
         self.workspace_dir = Path(workspace_dir)
         self.openai_client = openai_client
@@ -59,6 +60,7 @@ class GenerationWorkerPool:
         self.blob_service_client = blob_service_client
         self.uploaded_file_urls = uploaded_file_urls
         self.mcp_tools = mcp_tools or []
+        self.langfuse_parent = langfuse_parent
 
         self._total_cost = 0.0
         self._rows_generated = 0
@@ -115,6 +117,7 @@ class GenerationWorkerPool:
                 project_id=self.project_id,
                 uploaded_file_urls=self.uploaded_file_urls,
                 mcp_tools=self.mcp_tools,
+                langfuse_parent=self.langfuse_parent,
             )
 
             try:

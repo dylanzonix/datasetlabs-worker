@@ -141,12 +141,14 @@ class RowGeneratorAgent:
         project_id: Optional[Any] = None,
         uploaded_file_urls: Optional[Dict[str, str]] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
+        langfuse_parent: Optional[Any] = None,
     ) -> None:
         self.openai_client = openai_client
         self.model = model
         self.workspace_dir = Path(workspace_dir)
         self.stop_checker = stop_checker
         self.mcp_tools = mcp_tools or []
+        self.langfuse_parent = langfuse_parent
 
         # Tool state — reset per generate() call
         self._current_row: Dict[str, Any] = {}
@@ -466,6 +468,7 @@ class RowGeneratorAgent:
             reasoning={"effort": "low", "summary": "auto"},
             label="row_generator",
             extra_tools=self.mcp_tools,
+            langfuse_parent=self.langfuse_parent,
         )
 
         result = await conversation.send(

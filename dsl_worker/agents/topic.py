@@ -149,6 +149,7 @@ class TopicAgent:
         project_id: Optional[Any] = None,
         on_tool_call: Optional[Callable[[str, str], None]] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
+        langfuse_parent: Optional[Any] = None,
     ) -> None:
         self.topic_name = topic_name
         self.dataset_brief = dataset_brief
@@ -211,6 +212,7 @@ class TopicAgent:
             label=f"topic:{topic_name}",
             on_tool_call=on_tool_call,
             extra_tools=self.mcp_tools,
+            langfuse_parent=langfuse_parent,
         )
 
     def _format_columns(self) -> str:

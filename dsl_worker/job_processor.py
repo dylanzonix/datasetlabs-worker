@@ -201,9 +201,10 @@ class JobProcessor:
                     with langfuse.start_as_current_observation(
                         as_type="span",
                         name=f"job:{project.name} v{version.version_number}",
-                    ):
+                    ) as job_span:
                         result = await self._run_pipeline(
-                            db, project, version, state, tracked_client, cost_tracker
+                            db, project, version, state, tracked_client, cost_tracker,
+                            langfuse_parent=job_span,
                         )
                 else:
                     result = await self._run_pipeline(
@@ -245,6 +246,7 @@ class JobProcessor:
         state: ProjectState,
         tracked_client: TrackedOpenAIClient,
         cost_tracker: CostTracker,
+        langfuse_parent: Optional[Any] = None,
     ) -> bool:
         """Run the V4 three-tier pipeline."""
 
@@ -371,6 +373,7 @@ class JobProcessor:
                             schema=state.columns,
                             generation_stats=generation_stats,
                             uploaded_file_urls=uploaded_file_urls,
+                            langfuse_parent=langfuse_parent,
                         )
                     )
 
@@ -471,6 +474,7 @@ class JobProcessor:
             on_tool_call=on_tool_call,
             uploaded_file_urls=uploaded_file_urls if uploaded_file_urls else None,
             mcp_tools=mcp_tools,
+            langfuse_parent=langfuse_parent,
         )
 
         try:
@@ -546,6 +550,7 @@ class JobProcessor:
                     project_id=project.id,
                     on_tool_call=on_tool_call,
                     mcp_tools=mcp_tools,
+                    langfuse_parent=langfuse_parent,
                 )
                 topic_agents.append(agent)
 
@@ -700,6 +705,7 @@ class JobProcessor:
                     "previous_config": config,
                     "user_feedback": feedback_text,
                 },
+                langfuse_parent=langfuse_parent,
             )
 
             try:
@@ -834,7 +840,8 @@ class JobProcessor:
         stop_checker,
         schema: List[Dict],
         generation_stats: Dict,
-            uploaded_file_urls: Optional[Dict[str, str]] = None,
+        uploaded_file_urls: Optional[Dict[str, str]] = None,
+        langfuse_parent: Optional[Any] = None,
     ) -> None:
         """
         Background consumer: dequeue work items, batch them, and run
@@ -862,6 +869,7 @@ class JobProcessor:
                             tracked_client, cost_tracker, checkpoint_mgr,
                             workspace_dir, stop_checker, batch_start_index,
                             generation_stats, uploaded_file_urls=uploaded_file_urls,
+                            langfuse_parent=langfuse_parent,
                         )
                         batch_start_index += len(batch)
                         batch = []
@@ -875,6 +883,7 @@ class JobProcessor:
                             tracked_client, cost_tracker, checkpoint_mgr,
                             workspace_dir, stop_checker, batch_start_index,
                             generation_stats, uploaded_file_urls=uploaded_file_urls,
+                            langfuse_parent=langfuse_parent,
                         )
                         batch_start_index += len(batch)
                         batch = []
@@ -888,6 +897,7 @@ class JobProcessor:
                         tracked_client, cost_tracker, checkpoint_mgr,
                         workspace_dir, stop_checker, batch_start_index,
                         generation_stats, uploaded_file_urls=uploaded_file_urls,
+                        langfuse_parent=langfuse_parent,
                     )
                     batch_start_index += len(batch)
                     batch = []
@@ -916,7 +926,8 @@ class JobProcessor:
         stop_checker,
         start_index: int,
         generation_stats: Dict,
-            uploaded_file_urls: Optional[Dict[str, str]] = None,
+        uploaded_file_urls: Optional[Dict[str, str]] = None,
+        langfuse_parent: Optional[Any] = None,
     ) -> None:
         """Process a batch of work items through the generation pool."""
 
@@ -945,6 +956,7 @@ class JobProcessor:
             blob_service_client=self.blob_service_client,
             uploaded_file_urls=uploaded_file_urls,
             mcp_tools=self._mcp_tools,
+            langfuse_parent=langfuse_parent,
         )
 
         success, errors = await pool.process_work_items(batch, schema)
@@ -1002,6 +1014,7 @@ class JobProcessor:
         # Generate SAS URLs for uploaded files (needed by row generators)
         uploaded_file_urls = self._generate_file_urls(db, project.id)
 
+        # Langfuse parent not available for checkpoint resume (no active span)
         pool = GenerationWorkerPool(
             workspace_dir=workspace_dir,
             openai_client=tracked_client,

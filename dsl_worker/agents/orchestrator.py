@@ -185,6 +185,7 @@ class OrchestratorAgent:
         uploaded_file_urls: Optional[Dict[str, str]] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
         feedback_context: Optional[Dict[str, Any]] = None,
+        langfuse_parent: Optional[Any] = None,
     ) -> None:
         self.feedback_context = feedback_context
         self.chat_history = chat_history
@@ -235,6 +236,7 @@ class OrchestratorAgent:
             continue_on_text=True,
             on_tool_call=on_tool_call,
             extra_tools=self.mcp_tools,
+            langfuse_parent=langfuse_parent,
         )
 
     def _format_columns(self) -> str:
