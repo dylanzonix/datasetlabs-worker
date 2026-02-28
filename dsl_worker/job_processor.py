@@ -20,7 +20,7 @@ import socket
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from uuid import UUID
 
 from openai import AsyncOpenAI
@@ -274,17 +274,33 @@ class JobProcessor:
 
         stop_checker = self._make_stop_checker(state)
 
+        # Per-turn cost callback — fires on every API call in every agent.
+        # Feeds costs to the tracker live so charging happens incrementally.
+        async def on_cost(cost_usd: float, label: str):
+            try:
+                cost_tracker.add_cost(phase=label, cost_usd=cost_usd)
+                cost_tracker.charge_if_needed()
+                await checkpoint_mgr.add_cost(cost_usd)
+            except Exception as e:
+                logger.error(f"[Billing] on_cost callback error: {e}")
+
         # Check if resuming from generation phase
         if checkpoint.current_phase == "generation" and checkpoint.work_items:
             logger.info(
                 f"[Pipeline] Resuming generation: "
                 f"{len(checkpoint.processed_indices)}/{len(checkpoint.work_items)} done"
             )
+
+            # Recover costs tracked before the crash/restart
+            if checkpoint.total_cost_usd > 0:
+                cost_tracker.seed_from_checkpoint(checkpoint.total_cost_usd)
+
             version.progress_detail = {"phase": "generating"}
             db.commit()
             return await self._run_generation_from_checkpoint(
                 db, project, version, state, tracked_client, cost_tracker,
                 checkpoint_mgr, checkpoint, workspace_dir, stop_checker,
+                on_cost=on_cost,
             )
 
         # --- Fresh run: V4 three-tier flow ---
@@ -373,6 +389,7 @@ class JobProcessor:
                             schema=state.columns,
                             generation_stats=generation_stats,
                             uploaded_file_urls=uploaded_file_urls,
+                            on_cost=on_cost,
                             langfuse_parent=langfuse_parent,
                         )
                     )
@@ -476,6 +493,7 @@ class JobProcessor:
             blob_service_client=self.blob_service_client,
             project_id=project.id,
             on_tool_call=on_tool_call,
+            on_cost=on_cost,
             uploaded_file_urls=uploaded_file_urls if uploaded_file_urls else None,
             mcp_tools=mcp_tools,
             langfuse_parent=langfuse_parent,
@@ -484,19 +502,9 @@ class JobProcessor:
         try:
             result = await orchestrator.run()
 
-            # Track orchestrator cost
-            orch_cost = orchestrator.cost_usd
-            if orch_cost > 0:
-                cost_tracker.add_cost(
-                    phase="orchestrator",
-                    cost_usd=orch_cost,
-                    model=settings.research_model,
-                )
-                await checkpoint_mgr.add_cost(orch_cost)
-
             logger.info(
                 f"[Pipeline] Orchestrator finished: "
-                f"cost=${orch_cost:.4f}, turns={result.turns_taken}"
+                f"cost=${orchestrator.cost_usd:.4f}, turns={result.turns_taken}"
             )
 
         finally:
@@ -553,6 +561,7 @@ class JobProcessor:
                     blob_service_client=self.blob_service_client,
                     project_id=project.id,
                     on_tool_call=on_tool_call,
+                    on_cost=on_cost,
                     mcp_tools=mcp_tools,
                     langfuse_parent=langfuse_parent,
                 )
@@ -701,6 +710,7 @@ class JobProcessor:
                 blob_service_client=self.blob_service_client,
                 project_id=project.id,
                 on_tool_call=on_tool_call,
+                on_cost=on_cost,
                 uploaded_file_urls=(
                     uploaded_file_urls if uploaded_file_urls else None
                 ),
@@ -714,17 +724,9 @@ class JobProcessor:
 
             try:
                 result = await orchestrator.run()
-                orch_cost = orchestrator.cost_usd
-                if orch_cost > 0:
-                    cost_tracker.add_cost(
-                        phase="orchestrator:feedback",
-                        cost_usd=orch_cost,
-                        model=settings.research_model,
-                    )
-                    await checkpoint_mgr.add_cost(orch_cost)
                 logger.info(
                     f"[Pipeline] Feedback orchestrator done: "
-                    f"cost=${orch_cost:.4f}, turns={result.turns_taken}"
+                    f"cost=${orchestrator.cost_usd:.4f}, turns={result.turns_taken}"
                 )
             finally:
                 await orchestrator.cleanup()
@@ -802,6 +804,7 @@ class JobProcessor:
                 tracked_client, cost_tracker, checkpoint_mgr,
                 workspace_dir, stop_checker, work_item_counter[0],
                 generation_stats, uploaded_file_urls=uploaded_file_urls,
+                on_cost=on_cost,
                 langfuse_parent=langfuse_parent,
             )
             work_item_counter[0] += len(backfill_items)
@@ -844,21 +847,13 @@ class JobProcessor:
         agent: TopicAgent,
         cost_tracker: CostTracker,
     ) -> None:
-        """Run a topic agent (sample phase) with error handling and cost tracking."""
+        """Run a topic agent (sample phase) with error handling."""
         try:
             result = await agent.run()
 
-            topic_cost = agent.cost_usd
-            if topic_cost > 0:
-                cost_tracker.add_cost(
-                    phase=f"topic:{agent.topic_name}:sample",
-                    cost_usd=topic_cost,
-                    model=settings.research_model,
-                )
-
             logger.info(
                 f"[Pipeline] Topic '{agent.topic_name}' sample done: "
-                f"cost=${topic_cost:.4f}, turns={result.turns_taken}"
+                f"cost=${agent.cost_usd:.4f}, turns={result.turns_taken}"
             )
         except Exception as e:
             logger.error(f"[Pipeline] Topic '{agent.topic_name}' sample error: {e}")
@@ -869,20 +864,13 @@ class JobProcessor:
         cost_tracker: CostTracker,
         user_feedback: Optional[str],
     ) -> None:
-        """Resume a topic agent (full phase) with error handling and cost tracking."""
+        """Resume a topic agent (full phase) with error handling."""
         cost_before = agent.cost_usd
 
         try:
             result = await agent.resume(feedback=user_feedback)
 
             phase_cost = agent.cost_usd - cost_before
-            if phase_cost > 0:
-                cost_tracker.add_cost(
-                    phase=f"topic:{agent.topic_name}:generate",
-                    cost_usd=phase_cost,
-                    model=settings.research_model,
-                )
-
             logger.info(
                 f"[Pipeline] Topic '{agent.topic_name}' generate done: "
                 f"cost=${phase_cost:.4f}, turns={result.turns_taken}"
@@ -904,6 +892,7 @@ class JobProcessor:
         schema: List[Dict],
         generation_stats: Dict,
         uploaded_file_urls: Optional[Dict[str, str]] = None,
+        on_cost: Optional[Callable] = None,
         langfuse_parent: Optional[Any] = None,
     ) -> None:
         """
@@ -932,6 +921,7 @@ class JobProcessor:
                             tracked_client, cost_tracker, checkpoint_mgr,
                             workspace_dir, stop_checker, batch_start_index,
                             generation_stats, uploaded_file_urls=uploaded_file_urls,
+                            on_cost=on_cost,
                             langfuse_parent=langfuse_parent,
                         )
                         batch_start_index += len(batch)
@@ -946,6 +936,7 @@ class JobProcessor:
                             tracked_client, cost_tracker, checkpoint_mgr,
                             workspace_dir, stop_checker, batch_start_index,
                             generation_stats, uploaded_file_urls=uploaded_file_urls,
+                            on_cost=on_cost,
                             langfuse_parent=langfuse_parent,
                         )
                         batch_start_index += len(batch)
@@ -960,6 +951,7 @@ class JobProcessor:
                         tracked_client, cost_tracker, checkpoint_mgr,
                         workspace_dir, stop_checker, batch_start_index,
                         generation_stats, uploaded_file_urls=uploaded_file_urls,
+                        on_cost=on_cost,
                         langfuse_parent=langfuse_parent,
                     )
                     batch_start_index += len(batch)
@@ -990,6 +982,7 @@ class JobProcessor:
         start_index: int,
         generation_stats: Dict,
         uploaded_file_urls: Optional[Dict[str, str]] = None,
+        on_cost: Optional[Callable] = None,
         langfuse_parent: Optional[Any] = None,
     ) -> None:
         """Process a batch of work items through the generation pool."""
@@ -1019,6 +1012,7 @@ class JobProcessor:
             blob_service_client=self.blob_service_client,
             uploaded_file_urls=uploaded_file_urls,
             mcp_tools=self._mcp_tools,
+            on_cost=on_cost,
             langfuse_parent=langfuse_parent,
         )
 
@@ -1029,16 +1023,6 @@ class JobProcessor:
         generation_stats["rows_generated"] += success
         generation_stats["errors"] += errors
         generation_stats["skipped"] += stats["skipped"]
-        generation_stats["total_cost"] += stats["total_cost"]
-
-        # Track generation cost
-        if stats["total_cost"] > 0:
-            cost_tracker.add_cost(
-                phase="generation",
-                cost_usd=stats["total_cost"],
-                model=settings.generation_model,
-            )
-            await checkpoint_mgr.add_cost(stats["total_cost"])
 
     async def _run_generation_from_checkpoint(
         self,
@@ -1052,6 +1036,7 @@ class JobProcessor:
         checkpoint,
         workspace_dir: Path,
         stop_checker,
+        on_cost: Optional[Callable] = None,
     ) -> bool:
         """Resume generation from a saved checkpoint."""
 
@@ -1096,21 +1081,12 @@ class JobProcessor:
             blob_service_client=self.blob_service_client,
             uploaded_file_urls=uploaded_file_urls if uploaded_file_urls else None,
             mcp_tools=self._mcp_tools,
+            on_cost=on_cost,
         )
 
         total_success, total_errors = await pool.process_work_items(
             pending_items, state.columns
         )
-
-        # Track cost
-        stats = pool.get_stats()
-        if stats["total_cost"] > 0:
-            cost_tracker.add_cost(
-                phase="generation",
-                cost_usd=stats["total_cost"],
-                model=settings.generation_model,
-            )
-            await checkpoint_mgr.add_cost(stats["total_cost"])
 
         # Check balance
         can_continue, stop_reason = cost_tracker.check_balance_and_charge()

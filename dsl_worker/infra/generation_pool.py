@@ -43,6 +43,7 @@ class GenerationWorkerPool:
         blob_service_client: Optional[Any] = None,
         uploaded_file_urls: Optional[Dict[str, str]] = None,
         mcp_tools: Optional[List[Dict]] = None,
+        on_cost: Optional[Callable] = None,
         langfuse_parent: Optional[Any] = None,
     ):
         self.workspace_dir = Path(workspace_dir)
@@ -60,6 +61,7 @@ class GenerationWorkerPool:
         self.blob_service_client = blob_service_client
         self.uploaded_file_urls = uploaded_file_urls
         self.mcp_tools = mcp_tools or []
+        self.on_cost = on_cost
         self.langfuse_parent = langfuse_parent
 
         self._total_cost = 0.0
@@ -117,6 +119,7 @@ class GenerationWorkerPool:
                 project_id=self.project_id,
                 uploaded_file_urls=self.uploaded_file_urls,
                 mcp_tools=self.mcp_tools,
+                on_cost=self.on_cost,
                 langfuse_parent=self.langfuse_parent,
             )
 
@@ -162,8 +165,6 @@ class GenerationWorkerPool:
                                 schema=schema,
                                 dataset_brief=context,
                             )
-
-                            self._total_cost += result.cost_usd
 
                             if result.success and result.row:
                                 row_id = await self._save_row(result.row, tags=tags)

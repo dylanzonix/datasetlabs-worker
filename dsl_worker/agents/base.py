@@ -16,7 +16,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from dsl_worker.agents.tools import ToolRegistry
 from dsl_worker.billing.tracked_client import TrackedOpenAIClient
@@ -99,6 +99,7 @@ class AgentConversation:
         continue_on_text: bool = False,
         context_window: int = 400_000,
         on_tool_call: Optional[Callable[[str, str], None]] = None,
+        on_cost: Optional[Callable[[float, str], Awaitable[None]]] = None,
         extra_tools: Optional[List[Dict[str, Any]]] = None,
         langfuse_parent: Optional[Any] = None,
     ) -> None:
@@ -115,6 +116,7 @@ class AgentConversation:
         self.continue_on_text = continue_on_text
         self.context_window = context_window
         self.on_tool_call = on_tool_call
+        self.on_cost = on_cost
         # Extra tool definitions (e.g. MCP connectors) passed directly to API
         self.extra_tools = extra_tools or []
         # Explicit Langfuse parent span — avoids context-var inference issues
@@ -302,6 +304,8 @@ class AgentConversation:
 
             self.total_cost += cost.total_cost_usd
             result.cost_usd = self.total_cost
+            if self.on_cost and cost.total_cost_usd > 0:
+                await self.on_cost(cost.total_cost_usd, self.label)
             self.total_turns += 1
             result.turns_taken = self.total_turns
 
@@ -376,6 +380,8 @@ class AgentConversation:
                 result_text, tool_cost = await self._execute_tool(tc)
                 self.total_cost += tool_cost
                 result.cost_usd = self.total_cost
+                if self.on_cost and tool_cost > 0:
+                    await self.on_cost(tool_cost, self.label)
 
                 self.messages.append({
                     "type": "function_call_output",
@@ -448,6 +454,8 @@ class AgentConversation:
                 _, output_text, tool_cost = r
                 self.total_cost += tool_cost
                 result.cost_usd = self.total_cost
+                if self.on_cost and tool_cost > 0:
+                    await self.on_cost(tool_cost, self.label)
                 output_text = output_text[:TOOL_OUTPUT_LIMIT]
 
             self.messages.append({

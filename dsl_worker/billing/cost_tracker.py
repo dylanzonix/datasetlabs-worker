@@ -96,6 +96,61 @@ class CostTracker:
         # Thread-safe lock
         self._lock = threading.Lock()
 
+    def seed_from_checkpoint(self, total_cost_usd: float) -> None:
+        """Seed tracker with costs from a prior run (crash recovery).
+
+        On worker restart, the CostTracker is created fresh with $0.
+        This method restores the cost state from the checkpoint so that
+        uncharged costs are correctly computed and charged.
+        """
+        if total_cost_usd <= 0:
+            return
+
+        # Record the total cost incurred before the crash
+        with self._lock:
+            self._costs.append(CostEntry(
+                timestamp=datetime.now(timezone.utc),
+                phase="recovered",
+                cost_usd=total_cost_usd,
+                description="Recovered from checkpoint after restart",
+            ))
+
+        # Figure out how much was already charged by querying the ledger
+        # for debits on this project since the tracker was created.
+        already_charged_cents = self._query_charged_since_start()
+        if already_charged_cents > 0:
+            already_charged_credits = already_charged_cents / CENTS_PER_CREDIT
+            with self._lock:
+                self._charges.append(ChargeRecord(
+                    timestamp=datetime.now(timezone.utc),
+                    amount_credits=already_charged_credits,
+                    amount_cents=already_charged_cents,
+                ))
+
+        uncharged = self.uncharged_credits
+        logger.info(
+            f"[CostTracker] Seeded from checkpoint: "
+            f"${total_cost_usd:.4f} total, "
+            f"{already_charged_cents / CENTS_PER_CREDIT:.2f} already charged, "
+            f"{uncharged:.2f} uncharged credits"
+        )
+
+        # Charge the uncharged remainder now
+        self.charge_if_needed()
+
+    def _query_charged_since_start(self) -> int:
+        """Query cents already charged for this project since tracker start."""
+        result = (
+            self.db.query(sql_func.sum(sql_func.abs(BalanceLedger.amount)))
+            .filter(
+                BalanceLedger.project_id == self.project_id,
+                BalanceLedger.amount < 0,
+                BalanceLedger.created_at >= self._start_time,
+            )
+            .scalar()
+        )
+        return int(result) if result else 0
+
     def _query_cumulative_project_spend(self) -> int:
         """Query total spend on this project from all previous runs (in cents)."""
         result = (

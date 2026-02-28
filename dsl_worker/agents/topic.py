@@ -148,6 +148,7 @@ class TopicAgent:
         blob_service_client: Optional[Any] = None,
         project_id: Optional[Any] = None,
         on_tool_call: Optional[Callable[[str, str], None]] = None,
+        on_cost: Optional[Callable] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
         langfuse_parent: Optional[Any] = None,
     ) -> None:
@@ -161,6 +162,7 @@ class TopicAgent:
         self.on_dispatch_rows = on_dispatch_rows
         self.stop_checker = stop_checker
         self.on_tool_call = on_tool_call
+        self.on_cost = on_cost
         self.mcp_tools = mcp_tools or []
 
         # State
@@ -211,6 +213,7 @@ class TopicAgent:
             reasoning={"effort": "medium", "summary": "detailed"},
             label=f"topic:{topic_name}",
             on_tool_call=on_tool_call,
+            on_cost=on_cost,
             extra_tools=self.mcp_tools,
             langfuse_parent=langfuse_parent,
         )

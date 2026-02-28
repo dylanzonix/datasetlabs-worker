@@ -182,6 +182,7 @@ class OrchestratorAgent:
         blob_service_client: Optional[Any] = None,
         project_id: Optional[Any] = None,
         on_tool_call: Optional[Callable[[str, str], None]] = None,
+        on_cost: Optional[Callable] = None,
         uploaded_file_urls: Optional[Dict[str, str]] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
         feedback_context: Optional[Dict[str, Any]] = None,
@@ -202,6 +203,7 @@ class OrchestratorAgent:
         self.blob_service_client = blob_service_client
         self.project_id = project_id
         self.on_tool_call = on_tool_call
+        self.on_cost = on_cost
         self.uploaded_file_urls = uploaded_file_urls
         self.mcp_tools = mcp_tools or []
 
@@ -235,6 +237,7 @@ class OrchestratorAgent:
             label="orchestrator",
             continue_on_text=True,
             on_tool_call=on_tool_call,
+            on_cost=on_cost,
             extra_tools=self.mcp_tools,
             langfuse_parent=langfuse_parent,
         )

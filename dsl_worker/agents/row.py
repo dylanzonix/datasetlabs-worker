@@ -141,6 +141,7 @@ class RowGeneratorAgent:
         project_id: Optional[Any] = None,
         uploaded_file_urls: Optional[Dict[str, str]] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
+        on_cost: Optional[Callable] = None,
         langfuse_parent: Optional[Any] = None,
     ) -> None:
         self.openai_client = openai_client
@@ -148,6 +149,7 @@ class RowGeneratorAgent:
         self.workspace_dir = Path(workspace_dir)
         self.stop_checker = stop_checker
         self.mcp_tools = mcp_tools or []
+        self.on_cost = on_cost
         self.langfuse_parent = langfuse_parent
 
         # Tool state — reset per generate() call
@@ -467,6 +469,7 @@ class RowGeneratorAgent:
             max_turns=MAX_GENERATION_TURNS,
             reasoning={"effort": "low", "summary": "auto"},
             label="row_generator",
+            on_cost=self.on_cost,
             extra_tools=self.mcp_tools,
             langfuse_parent=self.langfuse_parent,
         )
