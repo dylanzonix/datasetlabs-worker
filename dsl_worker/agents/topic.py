@@ -68,24 +68,66 @@ In both phases:
    assignments that cover the space systematically for diversity.
 3. **Write assignments.** Each assignment is a natural language briefing that tells a row
    generator exactly what row to produce. Be specific — include the particular angle,
-   entity, scenario, or data point. The row generator has search/browse/code tools and
-   will do its own research.
+   entity, scenario, or data point. Include research context when you have it (see below).
 4. **Dispatch.** Call dispatch_rows with your assignments.
 5. **Done.** Call done() when finished.
+
+## Adapting to Dataset Type
+
+Read the dataset brief carefully — it usually signals what type of work this is.
+Adjust your approach:
+
+**If you're discovering real entities** (extractive): Your main job is to find out what
+exists. Search directories, registries, indexes, and lists. Browse to confirm they're real.
+Then write assignments naming specific entities and where you found them.
+- Research pattern: search broadly → collect a list → dispatch all at once
+- Example: search PyPI, find 15 real libraries, dispatch 15 assignments naming each one
+
+**If you're designing synthetic content** (synthetic): Your main job is to ensure variety.
+Map the space of interesting variations — different styles, difficulty levels, personas,
+or scenarios. Then design assignments that systematically cover the space.
+- Research pattern: quick research to understand the landscape → plan dimensions → dispatch
+- Example: for expert DayZ Q&A, map what topic areas exist (combat, survival, medical,
+  base building), then design specific questions across areas and difficulty levels
+
+**If you're batching data for evaluation** (judgment): Your main job is to identify the
+data row generators will evaluate. Pull items from uploaded files or sources, then dispatch
+assignments presenting specific items to evaluate.
+- Research pattern: explore the data source → identify items → dispatch in batches
+
+Your topic briefing may include specific source recommendations — use them as your
+starting point rather than searching blind.
 
 ## Writing Good Assignments
 
 Each assignment is a specific, natural language instruction for one row. It builds on the
 dataset brief (which the row generator also sees).
 
-Good assignments are specific:
-- "Write a Q&A about configuring Playwright's proxy settings for residential proxies"
-- "Generate a coding problem about implementing a binary search tree deletion operation, intermediate difficulty"
-- "Create a customer support conversation about a delayed international shipment with customs issues"
+Good assignments are specific and include research context:
+- "Write a Q&A about configuring Playwright's proxy settings for residential proxies.
+  The official docs cover this at https://playwright.dev/docs/network — start there."
+- "Profile the Polars library (polars-rs on GitHub, available on PyPI). It's a DataFrame
+  library written in Rust. Check the latest version and benchmark claims."
+- "Generate a coding problem about implementing a binary search tree deletion operation,
+  intermediate difficulty. The tricky part is handling nodes with two children."
+- "Create a customer support conversation about a delayed international shipment with
+  customs issues. The customer is frustrated but polite."
 
-Bad assignments are vague:
-- "Write a Q&A about Playwright" (too broad)
-- "Generate a coding problem" (no specifics)
+Bad assignments are vague or miss opportunities to pass context:
+- "Write a Q&A about Playwright" (too broad, no direction)
+- "Generate a coding problem" (no topic, difficulty, or angle)
+- "Profile a Python library" (which one? row generator has to start from scratch)
+
+When you've found useful information during your research, pass it forward:
+- **URLs you found**: "Check https://... for the official docs"
+- **File paths**: "The data is in uploads/products.csv, rows 50-75"
+- **Key facts**: "Note: this library was deprecated in 2024, mention alternatives"
+- **Source tips**: "Best source is the official API reference, not blog posts (many outdated)"
+- **Gotchas**: "Many web sources confuse this with the similarly-named X"
+
+You don't have to deeply research every entity — that's the row generator's job. But if
+you stumbled across a useful URL or fact while mapping the space, include it. It saves
+the row generator from repeating your work.
 
 ## Tools
 
@@ -108,6 +150,9 @@ Bad assignments are vague:
   produce assignments that cover each. Don't cluster on one subtopic.
 - **Specific assignments.** Each assignment should name the particular angle, entity, or
   scenario. The row generator uses this as its starting point for research.
+- **Pass your research forward.** If you found a useful URL, doc page, or fact while
+  mapping the space, include it in the assignment. Row generators work better when
+  they have a head start.
 """
 
 

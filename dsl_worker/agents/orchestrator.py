@@ -36,21 +36,29 @@ the request, plan how to slice it into topics, and delegate everything.
 
 ## How to Work
 
-1. **Understand the task.** Read the conversation history and any uploaded files.
+1. **Plan FIRST.** Call plan() as your very first action. You already have the conversation
+   history, uploaded files, and schema — that's enough to plan from. Think about:
+   - **Dataset type**: Is this extractive (rows are real entities to find), synthetic
+     (rows are designed content), judgment (rows evaluate existing data), or hybrid?
+   - **Where knowledge lives**: What sources are most authoritative for this domain?
+     Uploaded files, specific websites, code repos, APIs, MCP servers, or the model's
+     own knowledge? Don't go explore these yourself — reason about them and tell
+     downstream agents where to look.
+   - **Research approach**: What should topic agents focus on? What should row generators
+     verify vs. trust? Should they go to specific platforms, read actual code, or is
+     web search sufficient?
+   - **Topics, targets, and briefings**: How to slice the work, how many rows each,
+     and what each topic agent needs to know.
 
-2. **Light research.** If you need context to figure out what topic areas exist, search
-   the web or browse sources directly. You are NOT doing deep research — just enough to
-   know how to slice the work. A few targeted searches and maybe opening 1-2 pages is
-   plenty. If you find yourself reading more than 3-4 pages, you're over-researching —
-   the topic agents and row generators will do the deep work.
+2. **Optional: quick lookup.** If your plan revealed something you're genuinely unsure
+   about (e.g., you don't know what sub-areas exist for a niche domain), do ONE targeted
+   search to fill the gap. But most of the time you can go straight to delegating. Do NOT
+   browse extensively — topic agents and row generators do the real research.
 
-3. **Plan.** Call plan() to articulate your strategy: what the dataset brief should say,
-   what topics to create, how many rows each. This is your thinking step.
-
-4. **Delegate.** Call delegate_topics() with a dataset brief, topics, and targets.
+3. **Delegate.** Call delegate_topics() with a dataset brief, topics, and targets.
    The system handles everything from here.
 
-5. **Done.** Call done() immediately after delegating.
+4. **Done.** Call done() immediately after delegating.
 
 ## Dataset Brief
 
@@ -58,30 +66,96 @@ The brief is written for row generators — it describes what kind of row to pro
 Unlike a template with {{variables}}, the brief describes the row holistically. Topic agents
 will write specific row assignments that build on this brief.
 
-Example brief:
+A good brief has two parts:
+1. **Row description** — what each row looks like, format, quality expectations
+2. **Research approach** — how row generators should find and verify information
+
+Example brief (extractive):
 ```
-Generate a single-turn Q&A about the browser-use Python library. A developer asks a
-question and an expert answers with code examples grounded in the actual library
-documentation. Questions should vary in difficulty and style. Research the real docs.
+Generate a row profiling a real open-source Python library. Each row should include the
+library name, description, primary use case, and a realistic code example.
+
+Research approach: Look up the actual library on PyPI and its GitHub repo. Read the real
+README and docs — don't guess at APIs. Verify the latest version number. Code examples
+should be tested against the real library interface, not invented. Prefer official docs
+over blog posts.
+```
+
+Example brief (synthetic):
+```
+Generate a single-turn expert Q&A about DayZ. A player asks a question and an expert
+answers with specific, accurate game knowledge. The expert should sound like someone who
+actually plays, not a wiki article.
+
+Research approach: Ground your answers in real game mechanics. Look up actual stats,
+crafting recipes, and game mechanics on the DayZ wiki or community resources like WOBO's
+data sheets. Don't rely on what you know from training — game balance changes with patches.
+Cross-check any specific numbers (damage values, spawn rates) against recent sources.
+```
+
+Example brief (judgment):
+```
+Score each user message for explicitness on a 0-1 scale with reasoning.
+
+Research approach: No external research needed. Apply your judgment to the provided
+message text. The value is in your reasoning, not in looking things up.
 ```
 
 Rules:
 - Written as a direct task for the row generator
 - Describes the row format, quality expectations, and approach
+- MUST include a "Research approach" section — this tells row generators where to look,
+  what to verify, and when research is unnecessary
 - Does NOT describe the schema — it's shown separately
 - Does NOT include meta-instructions about the system
 
 ## Recognizing Dataset Types
 
-**Synthesis datasets** (most common): Rows must be invented/synthesized. The topic agent
-needs to figure out what assignments to create. Example: "Q&A about Python libraries" —
-each row needs a unique question invented by the topic agent.
+Think about what kind of dataset this is. Different types need very different approaches.
 
-**Iteration datasets** (simpler): A source maps directly to rows. Delegation is just
-splitting the iteration. Example: "Convert this CSV into training pairs" — each row
-comes from a CSV row. Topics can be chunks of the source data.
+**Extractive datasets** — rows describe real things that exist in the world.
+- Examples: company profiles, library documentation, product listings, event histories
+- Topic agents discover what entities exist and name specific ones in assignments
+- Row generators must research each entity and report real facts — no fabrication
+- Brief should emphasize: verify at primary sources, check freshness
+- Topic briefings should say where to find entities (directories, registries, indexes)
 
-Tailor your brief and topics accordingly.
+**Synthetic datasets** — rows are invented/designed content.
+- Examples: training conversations, Q&A pairs, creative writing, hypothetical scenarios
+- Topic agents map the variation space and design diverse assignments
+- Row generators create content — they may research to ground details in reality, but
+  the content itself is original
+- Brief should emphasize: diversity of angle/difficulty/style, realistic feel
+- Topic briefings should describe what sub-areas to cover and what variety to aim for
+
+**Judgment datasets** — rows evaluate, score, or classify existing data.
+- Examples: content ratings, code quality assessments, annotation tasks
+- Topic agents batch the data to evaluate (from uploaded files, MCP, or generated input)
+- Row generators analyze what's presented — they rarely need external research
+- Brief should emphasize: consistent criteria, rubric clarity
+- Topic briefings should describe what data to pull from and evaluation criteria
+
+**Hybrid datasets** — combine types. A codebase expert dataset is extractive (discover
+what's in the code) + synthetic (design conversations about it). Note which parts
+are which in the brief so row generators know when to research vs. create.
+
+Tailor your brief, topics, and topic briefings based on the type.
+
+## Topic Briefings
+
+Each topic briefing guides a topic agent. Good briefings include:
+- What this topic covers (scope boundaries)
+- Where to find information or entities (specific sites, file paths, registries, MCP tools)
+- What kind of diversity to aim for within this topic
+- Whether this topic is extractive, synthetic, or judgment work
+
+Example (extractive): "Cover Python web frameworks. Find real frameworks by checking
+PyPI, GitHub trending, and awesome-python lists. Include popular and lesser-known ones.
+Each assignment should name a specific real framework."
+
+Example (synthetic): "Cover beginner-level Python questions. Design questions about
+variables, loops, conditionals, functions. Mix styles: how-do-I, what's-wrong-with-this,
+explain-the-difference. Aim for questions a first-week student would actually ask."
 
 ## Topics and Scale
 
@@ -139,6 +213,10 @@ generation proceeds. You don't participate after delegation.
   good topic areas. But always light — a quick search, reading an uploaded file.
 - **Plan proportionally.** Simple, clear requests need minimal planning. Ambiguous or
   complex requests deserve more thought.
+- **Think about research strategy.** Your most important contribution isn't just splitting
+  rows into topics — it's telling downstream agents where to look and what to verify.
+  A dataset about real Python libraries needs completely different research guidance than
+  a dataset of synthetic customer support conversations.
 - Target: {num_samples} rows total.
 
 ## Feedback Iterations
@@ -342,7 +420,12 @@ class OrchestratorAgent:
         # --- plan ---
         async def plan(args: Dict) -> tuple[str, float]:
             strategy = args.get("strategy", "")
-            return "Plan recorded. Now call delegate_topics() to execute.", 0.0
+            return (
+                "Plan recorded. Before you delegate, make sure your dataset brief "
+                "includes a 'Research approach' section telling row generators where "
+                "to look and what to verify. And include source guidance in each "
+                "topic's briefing."
+            ), 0.0
 
         registry.add(
             name="plan",
