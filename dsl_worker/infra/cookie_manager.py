@@ -152,30 +152,19 @@ def load_cookies(
     return merged
 
 
-def save_project_cookies(
-    browser_session: Any,
+async def save_project_cookies_from_context(
+    browser_context: Any,
     blob_service_client: Any,
     container: str,
     project_id: str,
 ) -> None:
-    """Save current browser cookies to per-project blob path.
+    """Save cookies from a Playwright BrowserContext to per-project blob path.
 
-    Accesses Playwright's storage_state through browser-use's BrowserSession.
+    Works with both local Playwright contexts and remote CDP-connected contexts.
     Does NOT overwrite global cookies — those are managed out-of-band.
     """
-    # browser-use's BrowserSession wraps Playwright. Access the underlying
-    # BrowserContext to get storage_state synchronously.
     try:
-        context = getattr(browser_session, '_context', None)
-        if context is None:
-            # Try alternate access paths
-            context = getattr(browser_session, 'context', None)
-        if context is None:
-            logger.warning("[CookieManager] Could not access browser context for cookie save")
-            return
-
-        # Playwright's storage_state() is sync when called without a path
-        state = context.storage_state()
+        state = await browser_context.storage_state()
     except Exception as e:
         logger.warning(f"[CookieManager] Could not extract storage state: {e}")
         return

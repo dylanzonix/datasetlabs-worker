@@ -5,8 +5,9 @@ Handles saving and restoring pipeline state for pause/resume.
 
 Checkpoints are stored as JSON in Azure Blob Storage.
 
-V4: Work items include context from topic agents. Backward-compatible
-with v2/v3 checkpoints.
+V5: Work items include template + seed values + filter findings.
+Phases: orchestrator | execution | completed.
+Backward-compatible with v2/v3/v4 checkpoints.
 """
 
 import asyncio
@@ -55,7 +56,8 @@ class PipelineCheckpoint:
     updated_at: str = ""
 
     # Phase tracking
-    # 'orchestrator' | 'sample' | 'generation' | 'completed'
+    # V5: 'orchestrator' | 'execution' | 'completed'
+    # V4 compat: 'sample' and 'generation' are treated as 'execution'
     current_phase: str = "orchestrator"
 
     # Work items (output of orchestrator, input to generation)
@@ -90,6 +92,9 @@ class PipelineCheckpoint:
         # Handle legacy phase names
         if data.get("current_phase") == "research":
             data["current_phase"] = "orchestrator"
+        # V4 phases map to V5
+        if data.get("current_phase") in ("sample", "generation"):
+            data["current_phase"] = "execution"
 
         # Handle legacy field names
         if "processed_seed_indices" in data and "processed_indices" not in data:
@@ -275,16 +280,28 @@ class CheckpointManager:
                 raise
 
     async def add_work_item(self, work_item: Dict) -> None:
-        """Add a work item to the checkpoint."""
+        """Add a work item to the checkpoint. Handles both V4 and V5 formats."""
         async with self._lock:
-            checkpoint_item = {
-                "instruction": work_item.get("instruction", ""),
-                "context": work_item.get("context", ""),
-                "schema": work_item.get("schema"),
-                "tags": work_item.get("tags", {}),
-                "status": "pending",
-                "row_id": None,
-            }
+            # V5 format has "template" key, V4 has "instruction"
+            if "template" in work_item:
+                checkpoint_item = {
+                    "template": work_item.get("template", ""),
+                    "seed_values": work_item.get("seed_values", {}),
+                    "filter_findings": work_item.get("filter_findings", ""),
+                    "metadata": work_item.get("metadata", {}),
+                    "tags": work_item.get("tags", {}),
+                    "status": "pending",
+                    "row_id": None,
+                }
+            else:
+                checkpoint_item = {
+                    "instruction": work_item.get("instruction", ""),
+                    "context": work_item.get("context", ""),
+                    "schema": work_item.get("schema"),
+                    "tags": work_item.get("tags", {}),
+                    "status": "pending",
+                    "row_id": None,
+                }
             self._checkpoint.add_work_item(checkpoint_item)
             self._pending_updates += 1
 
@@ -352,17 +369,29 @@ def checkpoints_to_work_items(checkpoint_items: List[Dict]) -> List[Dict]:
     Convert checkpoint work item dicts to the format expected by
     GenerationWorkerPool.process_work_items().
 
-    Checkpoint format: {instruction, context, schema, tags, status, row_id}
-    Pool format: {instruction, context, schema, tags}
+    V5 checkpoint: {template, seed_values, filter_findings, metadata, tags, status, row_id}
+    V4 checkpoint: {instruction, context, schema, tags, status, row_id}
+    Pool format: {template, seed_values, filter_findings, tags} or {instruction, context, schema, tags}
     """
     work_items = []
     for item in checkpoint_items:
-        work_items.append({
-            "instruction": item.get("instruction", ""),
-            "context": item.get("context", ""),
-            "schema": item.get("schema"),
-            "tags": item.get("tags", {}),
-        })
+        if "template" in item:
+            # V5 format
+            work_items.append({
+                "template": item.get("template", ""),
+                "seed_values": item.get("seed_values", {}),
+                "filter_findings": item.get("filter_findings", ""),
+                "metadata": item.get("metadata", {}),
+                "tags": item.get("tags", {}),
+            })
+        else:
+            # V4 format
+            work_items.append({
+                "instruction": item.get("instruction", ""),
+                "context": item.get("context", ""),
+                "schema": item.get("schema"),
+                "tags": item.get("tags", {}),
+            })
     return work_items
 
 

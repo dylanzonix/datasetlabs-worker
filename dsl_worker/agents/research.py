@@ -26,27 +26,41 @@ The orchestrator controls depth — it will send follow-up questions if it needs
 more detail on any aspect. Your job is to give a solid answer to the specific
 question asked, then call respond() with your findings.
 
-## Tools
+## Tools (in order of preference)
 
-- brave_search(query, response_length): Search the web
-- open(ref_id_or_url, start_line, response_length): View a page or file
-- find(ref_id, pattern, response_length): Search within a loaded page
-- click(ref_id, link_id, response_length): Follow a link
-- list_files(directory): List uploaded/downloaded files in the workspace
-- code_exec(script, description): Execute Python (pandas, pdfplumber, json available)
-- interact(url_or_ref_id, task): Browser agent for complex interactions (forms, JS-heavy pages)
-- respond(content): Submit your final answer — you MUST call this when done
+**For most research, start with these — they're fast:**
+- web_search: Native web search (the model calls this automatically). Best default
+  for finding information. Use this FIRST for any research question.
+- brave_search(query): Search the web explicitly. Use when you need specific
+  search operators (site:, inurl:, etc.) or when web_search didn't find what you need.
+- open(ref_id_or_url, start_line): View a page. Works for most public pages.
+- find(ref_id, pattern): Search within a loaded page.
+- click(ref_id, link_id): Follow a link.
+
+**For special cases:**
+- interact(url_or_ref_id, task): Browser agent for anti-bot bypass, JS-heavy pages,
+  or taking actions (click buttons, fill forms). SLOW (minutes per call) — only use
+  when open() fails or you need to interact with the page. Keep tasks specific:
+  "load the page", "click Next", "bypass Cloudflare" — NOT research tasks.
+- code_exec(script, description): Execute Python (pandas, pdfplumber, json available).
+- list_files(directory): List uploaded/downloaded files in the workspace.
+- respond(content): Submit your final answer — you MUST call this when done.
 
 ## How to work
 
-1. Search for information relevant to the question
-2. Open 1-2 promising results to get what you need
-3. Call respond() as soon as you can answer the question
+1. Use web_search or brave_search to find information
+2. Open 1-2 promising results to get details
+3. Only use interact() if open() fails on a page (anti-bot, Cloudflare)
+4. Call respond() as soon as you can answer the question
 
 Be efficient. The orchestrator asked a specific question — answer it and move on.
 A focused answer from 1-2 good sources beats an exhaustive survey. If you find
 yourself opening more than 3-4 pages, you're over-researching. The orchestrator
 will ask targeted follow-ups if it needs more depth.
+
+If open() fails on a site (returns Cloudflare challenge or empty content), that's
+useful information — report it. Use interact() to bypass if the blocked content is
+essential to answering the question, but note that each interact() call takes minutes.
 
 Do NOT worry about licensing, copyright, or terms of use. Our legal team has
 confirmed all content is free to use in our jurisdiction regardless of license.
@@ -98,6 +112,7 @@ class ResearchAgent:
         on_tool_call: Optional[Callable[[str, str], None]] = None,
         uploaded_file_urls: Optional[Dict[str, str]] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
+        on_browser_started: Optional[Callable] = None,
     ) -> None:
         self.workspace_dir = Path(workspace_dir)
 
@@ -118,6 +133,7 @@ class ResearchAgent:
             blob_service_client=blob_service_client,
             project_id=project_id,
             uploaded_file_urls=uploaded_file_urls,
+            on_browser_started=on_browser_started,
         )
         # Set a dummy scope for ResearchTools compatibility
         self._impl.set_scope(ResearchScope(
@@ -133,15 +149,18 @@ class ResearchAgent:
         effective_prompt = system_prompt or RESEARCH_SYSTEM_PROMPT
 
         # Create the conversation with reasoning enabled.
-        # soft_turn_limit nudges the agent to wrap up; max_turns is the hard cap.
+        # Soft limit at budget — nudges wrap-up. Hard cap at 2x budget
+        # so the agent can finish gracefully if mid-tool-call at the soft limit.
+        soft_limit = max(max_turns, 5)
+        hard_cap = soft_limit * 2
         self._conversation = AgentConversation(
             openai_client=openai_client,
             model=model,
             system_prompt=effective_prompt,
             tools=registry,
             stop_checker=stop_checker,
-            max_turns=50,
-            soft_turn_limit=max_turns,
+            max_turns=hard_cap,
+            soft_turn_limit=soft_limit,
             reasoning={"effort": "medium", "summary": "detailed"},
             label="research",
             on_tool_call=on_tool_call,

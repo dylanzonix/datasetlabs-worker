@@ -1,8 +1,9 @@
 """
 Research Tools - ChatGPT-style browsing for research agent.
 
-Each ResearchTools instance has its OWN browser (one per scope).
-Browser is lazy-initialized on first use, cleaned up when scope ends.
+Each ResearchTools instance has its OWN cloud browser (one per scope).
+Browser runs on Browser Use Cloud, controlled via Playwright CDP.
+Lazy-initialized on first use, cleaned up when scope ends.
 
 Tools:
 - brave_search(query, response_length) → search results artifact
@@ -64,15 +65,14 @@ from dsl_worker.infra.artifacts import (
 
 logger = logging.getLogger(__name__)
 
-# Browser-use imports
+# Browser Use Cloud SDK
 try:
-    from browser_use import BrowserSession, Agent
-    from browser_use.llm.openai.chat import ChatOpenAI
+    from browser_use_sdk import AsyncBrowserUse
+    from playwright.async_api import async_playwright
     BROWSER_AVAILABLE = True
 except ImportError:
-    BrowserSession = None
-    Agent = None
-    ChatOpenAI = None
+    AsyncBrowserUse = None
+    async_playwright = None
     BROWSER_AVAILABLE = False
 
 
@@ -206,6 +206,7 @@ class ResearchTools:
         blob_service_client: Optional[Any] = None,
         project_id: Optional[str] = None,
         uploaded_file_urls: Optional[Dict[str, str]] = None,
+        on_browser_started: Optional[Callable] = None,
     ):
         self.workspace_dir = Path(workspace_dir)
         self.schema = schema
@@ -217,14 +218,21 @@ class ResearchTools:
         self.blob_service_client = blob_service_client
         self.project_id = str(project_id) if project_id else None
         self.uploaded_file_urls = uploaded_file_urls
+        self._on_browser_started = on_browser_started
 
         # Ensure downloads dir exists (uploads go direct to sandbox via SAS URLs)
         (self.workspace_dir / "downloads").mkdir(parents=True, exist_ok=True)
-        
-        # Browser - lazy initialized, owned by this instance
-        self._browser: Optional[Any] = None
+
+        # Browser Use Cloud - lazy initialized, owned by this instance
+        self._browser_context: Optional[Any] = None  # Playwright BrowserContext
         self._browser_init_lock = asyncio.Lock()
-        self._open_pages: Dict[str, Any] = {}  # ref_id -> page
+        self._cloud_client: Optional[Any] = None      # AsyncBrowserUse SDK client
+        self._cloud_session_id: Optional[str] = None   # Cloud browser session ID
+        self._cdp_url: Optional[str] = None             # CDP URL for shared session
+        self._live_url: Optional[str] = None            # Live debugging URL
+        self._playwright: Optional[Any] = None          # Playwright instance
+        self._cloud_files_seen: set = set()             # Track known remote files
+        self._bu_agent: Optional[Any] = None             # Persistent Browser Use agent
 
         # Sandbox session - lazy initialized, owned by this instance
         self._sandbox_session: Optional[Any] = None
@@ -280,31 +288,54 @@ class ResearchTools:
     # =========================================================================
     
     async def _get_browser(self) -> Any:
-        """Get or create BrowserSession for this scope.
+        """Get or create a cloud browser session via Browser Use Cloud.
 
-        Uses a lock so parallel open() calls don't race through init
-        (the browser is assigned before start() awaits, so without a lock
-        a second caller would see a non-None but not-yet-started session).
+        Creates a cloud browser, connects Playwright via CDP, and injects
+        cookies. Returns a Playwright BrowserContext for tab management.
+
+        Uses a lock so parallel open() calls don't race through init.
         """
         if not BROWSER_AVAILABLE:
-            raise RuntimeError("browser-use not installed")
+            raise RuntimeError("browser-use-sdk or playwright not installed")
 
         async with self._browser_init_lock:
-            if self._browser is None:
+            if self._browser_context is None:
                 from dsl_worker.config import settings
 
-                # Build proxy settings if configured (Bright Data residential)
-                proxy = None
-                if settings.browser_proxy_server:
-                    from browser_use.browser import ProxySettings
-                    proxy = ProxySettings(
-                        server=settings.browser_proxy_server,
-                        username=settings.browser_proxy_username or None,
-                        password=settings.browser_proxy_password or None,
-                    )
+                # Create cloud browser session via Browser Use SDK
+                self._cloud_client = AsyncBrowserUse(
+                    api_key=settings.browser_use_api_key,
+                )
+                cloud_browser = await self._cloud_client.browsers.create_browser_session(
+                    proxy_country_code=settings.browser_use_proxy_country,
+                )
+                self._cloud_session_id = cloud_browser.id
+                self._cdp_url = cloud_browser.cdp_url
+                self._live_url = cloud_browser.live_url
 
-                # Load cookies from Azure Blob (global + per-project)
-                storage_state = None
+                scope_id = self.scope.id if self.scope else "unknown"
+                logger.info(
+                    f"[ResearchTools] Cloud browser created for scope {scope_id}. "
+                    f"Live URL: {self._live_url}"
+                )
+
+                # Notify caller about live URL (for progress_detail surfacing)
+                if self._on_browser_started:
+                    try:
+                        result = self._on_browser_started(self._live_url, self._cloud_session_id)
+                        if asyncio.iscoroutine(result):
+                            await result
+                    except Exception as e:
+                        logger.warning(f"[ResearchTools] on_browser_started callback failed: {e}")
+
+                # Connect Playwright to cloud browser via CDP
+                self._playwright = await async_playwright().start()
+                browser = await self._playwright.chromium.connect_over_cdp(
+                    cloud_browser.cdp_url,
+                )
+                self._browser_context = browser.contexts[0]
+
+                # Inject cookies from Azure Blob (global + per-project)
                 if self.blob_service_client and self.project_id:
                     from dsl_worker.infra.cookie_manager import load_cookies
                     storage_state = load_cookies(
@@ -313,20 +344,10 @@ class ResearchTools:
                         self.project_id,
                         settings.browser_global_cookies_blob_path,
                     )
+                    if storage_state and storage_state.get("cookies"):
+                        await self._browser_context.add_cookies(storage_state["cookies"])
 
-                self._browser = BrowserSession(
-                    headless=False,
-                    downloads_path=str(self.workspace_dir / "downloads"),
-                    auto_download_pdfs=True,
-                    keep_alive=True,
-                    proxy=proxy,
-                    storage_state=storage_state,
-                )
-                await self._browser.start()
-                scope_id = self.scope.id if self.scope else "unknown"
-                logger.info(f"[ResearchTools] BrowserSession started for scope {scope_id}")
-
-        return self._browser
+        return self._browser_context
     
     # =========================================================================
     # Sandbox Session Management
@@ -370,7 +391,16 @@ class ResearchTools:
         return self._sandbox_session
 
     async def cleanup(self):
-        """Cleanup browser and sandbox sessions."""
+        """Cleanup browser, BU agent, and sandbox sessions."""
+        # Cleanup persistent BU agent
+        if self._bu_agent:
+            try:
+                await self._bu_agent.close()
+                logger.info("[ResearchTools] BU agent closed")
+            except Exception as e:
+                logger.warning(f"[ResearchTools] Error closing BU agent: {e}")
+            self._bu_agent = None
+
         # Cleanup sandbox session
         if self._sandbox_session:
             try:
@@ -381,29 +411,45 @@ class ResearchTools:
                 logger.warning(f"[ResearchTools] Error closing sandbox session: {e}")
             self._sandbox_session = None
 
-        # Cleanup browser session
-        if self._browser:
+        # Cleanup cloud browser session
+        if self._browser_context:
             try:
                 # Save project cookies to Azure Blob before stopping
                 if self.blob_service_client and self.project_id:
                     from dsl_worker.config import settings
-                    from dsl_worker.infra.cookie_manager import save_project_cookies
+                    from dsl_worker.infra.cookie_manager import save_project_cookies_from_context
                     try:
-                        save_project_cookies(
-                            self._browser,
+                        await save_project_cookies_from_context(
+                            self._browser_context,
                             self.blob_service_client,
                             settings.azure_storage_container_name,
                             self.project_id,
                         )
                     except Exception as e:
                         logger.warning(f"[ResearchTools] Failed to save cookies: {e}")
-
-                await self._browser.stop()
-                scope_id = self.scope.id if self.scope else "unknown"
-                logger.info(f"[ResearchTools] BrowserSession closed for scope {scope_id}")
             except Exception as e:
-                logger.warning(f"[ResearchTools] Error stopping BrowserSession: {e}")
-            self._browser = None
+                logger.warning(f"[ResearchTools] Error during cookie save: {e}")
+
+            # Close Playwright connection
+            try:
+                if self._playwright:
+                    await self._playwright.stop()
+            except Exception as e:
+                logger.warning(f"[ResearchTools] Error stopping Playwright: {e}")
+            self._playwright = None
+            self._browser_context = None
+
+            # Stop cloud browser session
+            if self._cloud_client and self._cloud_session_id:
+                try:
+                    await self._cloud_client.browsers.update_browser_session(
+                        self._cloud_session_id, action="stop",
+                    )
+                    scope_id = self.scope.id if self.scope else "unknown"
+                    logger.info(f"[ResearchTools] Cloud browser session stopped for scope {scope_id}")
+                except Exception as e:
+                    logger.warning(f"[ResearchTools] Error stopping cloud session: {e}")
+                self._cloud_session_id = None
     
     # =========================================================================
     # brave_search
@@ -491,7 +537,7 @@ class ResearchTools:
 
         Each call opens a NEW browser tab so multiple open() calls can run
         in parallel without fighting over the same page. Tabs are closed
-        when done. All tabs share the same BrowserSession (shared cookies).
+        when done. All tabs share the same cloud browser session (shared cookies).
         """
         config = self._get_config(response_length)
         num_lines = config["lines"]
@@ -529,36 +575,63 @@ class ResearchTools:
             logger.error(f"[ResearchTools] open failed for {url}: {e}")
             return f"Failed to open {url}: {e}", 0.0
 
+    async def _get_cloud_files(self) -> set:
+        """Get the set of file names currently on the cloud browser session."""
+        if not self._cloud_client or not self._cloud_session_id:
+            return set()
+        try:
+            files = await self._cloud_client.sessions.files(
+                self._cloud_session_id, include_urls=True,
+            )
+            return {(f.name, getattr(f, 'url', None)) for f in files} if files else set()
+        except Exception:
+            return set()
+
+    async def _download_remote_file(self, name: str, url: str) -> Path:
+        """Download a file from cloud browser session to local workspace."""
+        local_path = self.workspace_dir / "downloads" / name
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, timeout=60.0)
+            resp.raise_for_status()
+            local_path.write_bytes(resp.content)
+        logger.info(f"[ResearchTools] Downloaded remote file: {name} ({len(resp.content)} bytes)")
+        return local_path
+
     async def _open_in_new_tab(
         self, url: str, start_line: int, num_lines: int,
     ) -> Tuple[str, float]:
-        """Open a URL in a new browser tab, extract content, close tab."""
-        session = await self._get_browser()
+        """Open a URL in a new browser tab, extract content, close tab.
+
+        The browser runs on Browser Use Cloud. Playwright controls it via CDP.
+        """
+        context = await self._get_browser()
         page = None
 
         try:
-            # Track downloads before navigation (session-level)
-            downloads_before = set(session.downloaded_files) if session.downloaded_files else set()
+            # Snapshot cloud files before navigation (for download detection)
+            files_before = await self._get_cloud_files()
 
-            # Create a blank tab, then navigate with proper load-waiting.
-            # new_page(url) fires-and-forgets; page.goto() waits for
-            # networkIdle/load lifecycle events so fast pages return fast
-            # and slow pages get the time they need.
-            page = await session.new_page()
+            # Create a new tab and navigate
+            page = await context.new_page()
             try:
-                await page.goto(url)
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             except Exception as nav_error:
                 # Timeout is expected for PDF downloads — continue and check
                 logger.debug(f"[ResearchTools] Navigation exception (may be expected): {nav_error}")
 
-            # Check for new downloads
-            downloads_after = set(session.downloaded_files) if session.downloaded_files else set()
-            new_downloads = downloads_after - downloads_before
+            # Check for new downloads on cloud session
+            await asyncio.sleep(1.0)
+            files_after = await self._get_cloud_files()
+            new_files = files_after - files_before
 
-            if new_downloads:
-                return await self._handle_download(
-                    new_downloads, url, start_line, num_lines,
-                )
+            if new_files:
+                name, file_url = list(new_files)[0]
+                if file_url:
+                    local_path = await self._download_remote_file(name, file_url)
+                    self._upload_download_to_blob(local_path)
+                    return await self._handle_download(
+                        {str(local_path)}, url, start_line, num_lines,
+                    )
 
             # Try to extract HTML content from this tab
             markdown = ""
@@ -577,13 +650,17 @@ class ResearchTools:
             if not markdown:
                 # One more check for late downloads (e.g. PDF redirect)
                 await asyncio.sleep(2.0)
-                downloads_after = set(session.downloaded_files) if session.downloaded_files else set()
-                new_downloads = downloads_after - downloads_before
+                files_after = await self._get_cloud_files()
+                new_files = files_after - files_before
 
-                if new_downloads:
-                    return await self._handle_download(
-                        new_downloads, url, start_line, num_lines,
-                    )
+                if new_files:
+                    name, file_url = list(new_files)[0]
+                    if file_url:
+                        local_path = await self._download_remote_file(name, file_url)
+                        self._upload_download_to_blob(local_path)
+                        return await self._handle_download(
+                            {str(local_path)}, url, start_line, num_lines,
+                        )
 
                 markdown = "Page loaded but no content extracted"
 
@@ -608,7 +685,7 @@ class ResearchTools:
             # Always close the tab to prevent leaks
             if page is not None:
                 try:
-                    await session.close_page(page)
+                    await page.close()
                 except Exception:
                     pass
 
@@ -1223,22 +1300,209 @@ if os.path.exists(_seeds_path):
     # interact (Browser Agent)
     # =========================================================================
     
+    # BU system prompt extension — set once when the agent is created.
+    # BU keeps its own navigation/DOM prompt; this just clarifies its role.
+    _BU_SYSTEM_PROMPT = (
+        "\n\n## Your Role\n\n"
+        "You are a navigation assistant inside a larger system. A senior AI agent "
+        "is controlling you — it can see the page directly and makes all decisions.\n\n"
+        "Your job is simple: execute the specific navigation task you're given, then "
+        "call done(). That's it.\n\n"
+        "Rules:\n"
+        "- Do exactly what's asked. No more, no less.\n"
+        "- Do NOT summarize, describe, or extract page content — the controller "
+        "sees the page and doesn't need your interpretation.\n"
+        "- Do NOT research, explore links, or investigate beyond the task.\n"
+        "- Do NOT make decisions about what to do next — you'll be given the next task.\n"
+        "- Keep done() messages brief: \"Done — clicked Next\", \"Done — page loaded\", "
+        "\"Failed — button not found\".\n"
+    )
+
+    async def _get_or_create_bu_agent(self, task: str) -> Any:
+        """Get the persistent BU agent, creating it on first call.
+
+        Subsequent calls reuse the same agent via add_new_task() — same
+        browser session, same agent memory, same chauffeur.
+        """
+        from browser_use import Agent
+        from browser_use.browser.profile import BrowserProfile
+
+        if self._bu_agent is not None:
+            # Reuse existing agent with new task
+            self._bu_agent.add_new_task(task)
+            return self._bu_agent
+
+        # First call — create the agent
+        from dsl_worker.config import settings
+        import os
+        os.environ.setdefault("BROWSER_USE_API_KEY", settings.browser_use_api_key)
+
+        # Connect to our existing cloud browser. keep_alive=True so
+        # agent.close() doesn't kill the browser — we manage that in cleanup().
+        profile = BrowserProfile(
+            cdp_url=self._cdp_url,
+            keep_alive=True,
+        )
+
+        # Disable search action — BU should never navigate to Google/DuckDuckGo.
+        # Keep extract enabled — BU may need it to see the page for navigation
+        # decisions, but our agent always gets raw markdown regardless.
+        try:
+            from browser_use.tools.service import Tools as BUTools
+            bu_tools = BUTools(exclude_actions=['search'])
+        except ImportError:
+            bu_tools = None
+
+        async def should_stop():
+            return bool(self.stop_checker and self.stop_checker())
+
+        agent_kwargs = dict(
+            task=task,
+            browser_profile=profile,
+            extend_system_message=self._BU_SYSTEM_PROMPT,
+            register_should_stop_callback=should_stop,
+            max_actions_per_step=3,
+        )
+        if bu_tools is not None:
+            agent_kwargs["tools"] = bu_tools
+
+        self._bu_agent = Agent(**agent_kwargs)
+        return self._bu_agent
+
+    def _make_bu_supervisor(self, soft_limit: int = 15) -> Callable:
+        """Create an on_step_end callback for non-intrusive BU supervision.
+
+        The callback silently observes BU's state after each step. If BU
+        appears stuck or has exceeded its step budget, it sets
+        agent.state.stopped = True — which cleanly exits the run loop
+        without injecting any messages into BU's conversation. BU never
+        knows it was stopped.
+
+        Args:
+            soft_limit: Number of steps before the supervisor starts
+                considering whether to stop BU. BU can exceed this if
+                it's making progress (new URLs, no errors).
+        """
+        _recent_urls: list = []
+
+        async def on_step_end(agent) -> None:
+            step = agent.state.n_steps
+
+            # 1. External stop check (job cancelled, etc.)
+            if self.stop_checker and self.stop_checker():
+                agent.state.stopped = True
+                logger.info(f"[BU supervisor] Stopped at step {step}: external stop requested")
+                return
+
+            # 2. Consecutive failures — BU is stuck
+            if agent.state.consecutive_failures >= 3:
+                agent.state.stopped = True
+                logger.info(f"[BU supervisor] Stopped at step {step}: {agent.state.consecutive_failures} consecutive failures")
+                return
+
+            # 3. Track URL history for loop detection
+            current_url = None
+            if agent.history and agent.history.history:
+                last = agent.history.history[-1]
+                if hasattr(last, 'state') and last.state:
+                    current_url = last.state.url
+            _recent_urls.append(current_url)
+
+            # 4. Under soft limit — let BU work freely
+            if step < soft_limit:
+                return
+
+            # 5. Over soft limit — check if still making progress
+            # URL loop: same URL for last 4 steps = spinning
+            if len(_recent_urls) >= 4:
+                last_4 = _recent_urls[-4:]
+                if all(u == last_4[0] for u in last_4) and last_4[0] is not None:
+                    agent.state.stopped = True
+                    logger.info(f"[BU supervisor] Stopped at step {step}: URL loop on {last_4[0]}")
+                    return
+
+            # 6. Hard ceiling — regardless of progress
+            if step >= soft_limit * 2:
+                agent.state.stopped = True
+                logger.info(f"[BU supervisor] Stopped at step {step}: hard ceiling ({soft_limit * 2})")
+                return
+
+        return on_step_end
+
+    async def _extract_page_content(self, target_url: str) -> Tuple[Optional[str], Optional[str]]:
+        """Extract page content from our Playwright connection after BU acts.
+
+        Returns (formatted_content, ref_id) or (None, None) if extraction fails.
+        """
+        context = self._browser_context
+        if not context or not context.pages:
+            return None, None
+
+        # Find the best page: prefer one matching target URL,
+        # otherwise use the last page (most recently active/opened)
+        page = context.pages[-1]
+        for p in context.pages:
+            try:
+                p_url = p.url
+                if target_url in p_url:
+                    page = p
+                    break
+            except Exception:
+                continue
+
+        current_url = page.url
+
+        html = ""
+        for attempt in range(3):
+            if self.stop_checker and self.stop_checker():
+                break
+            try:
+                html = await page.evaluate('() => document.body.innerHTML')
+                if html and len(html.strip()) > 100:
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+
+        if not html or len(html.strip()) == 0:
+            return None, None
+
+        markdown = md(html, heading_style='ATX')
+        lines = markdown.split('\n')
+        links = extract_links_from_markdown(markdown, current_url)
+
+        page_view = PageView(
+            url=current_url,
+            fetched_at=datetime.now(timezone.utc).isoformat(),
+            lines=lines,
+            total_lines=len(lines),
+            links=links,
+        )
+        ref_id = self.artifacts.store_page(page_view)
+
+        viewport = format_viewport(lines, 0, 150, ref_id, current_url)
+        links_table = format_links_table(links)
+
+        return f"{viewport}\n{links_table}", ref_id
+
     async def interact(self, url_or_ref_id: str, task: str) -> Tuple[str, float]:
         """
-        Use Browser Agent for complex interactions on a page.
+        Use Browser Use agent to perform an action on the shared cloud browser.
 
-        Uses the SAME browser session as open() — session persists after
-        completion (keep_alive=True), so cookies, auth state, and page
-        context are preserved for subsequent open()/click() calls.
+        interact() shares the same cloud browser session as open()/find()/click().
+        A persistent BU agent handles navigation — same chauffeur for the whole
+        agent lifetime, reused via add_new_task().
+
+        After BU finishes each task, we extract raw page content via our own
+        Playwright connection and return line-numbered markdown (same format as open()).
+
+        BU is a chauffeur — it drives to the destination. Our agent looks out
+        the window with its own eyes.
         """
-        if not BROWSER_AVAILABLE:
+        try:
+            from browser_use import Agent
+        except ImportError:
             return "browser-use not installed", 0.0
-
-        if not self.openai_client:
-            return "OpenAI client not initialized for interact()", 0.0
-
-        # Get our browser session
-        session = await self._get_browser()
 
         # Resolve URL
         url = url_or_ref_id
@@ -1248,73 +1512,57 @@ if os.path.exists(_seeds_path):
         elif not url.startswith(("http://", "https://")):
             url = "https://" + url
 
-        total_cost = 0.0
-
         try:
-            # Create browser-use LLM
-            browser_llm = ChatOpenAI(model=self.model)
+            # Ensure shared cloud browser exists (reuses existing session)
+            await self._get_browser()
 
-            agent = Agent(
-                task=f"Navigate to {url} and: {task}",
-                browser_session=session,
-                llm=browser_llm,
-                calculate_cost=True,
+            if not self._cdp_url:
+                return "No cloud browser session available", 0.0
+
+            # Build task string for BU
+            bu_task = (
+                f"Navigate to {url} and: {task}\n\n"
+                "Stay on the target site. Do not search the web."
             )
 
-            history = await agent.run(max_steps=30)
+            # Get or create persistent BU agent
+            agent = await self._get_or_create_bu_agent(bu_task)
 
-            # Get cost
-            if hasattr(history, 'usage') and history.usage:
-                if hasattr(history.usage, 'total_cost'):
-                    total_cost += history.usage.total_cost
+            # Non-intrusive supervision: set max_steps high and let the
+            # on_step_end callback silently observe. If BU is stuck or over
+            # budget, the callback sets agent.state.stopped = True — no
+            # messages injected, BU never knows it was stopped.
+            supervisor = self._make_bu_supervisor(soft_limit=15)
+            result = await agent.run(max_steps=100, on_step_end=supervisor)
+            bu_summary = result.final_result() if result.final_result() else "action completed"
 
-            # Clean up extra tabs the agent may have opened (prevent leaks)
+            # Extract raw page content via our Playwright connection.
+            # BU changed the browser state; Playwright sees the same browser.
             try:
-                pages = await session.get_pages()
-                if len(pages) > 1:
-                    for extra_page in pages[1:]:
-                        try:
-                            await session.close_page(extra_page)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+                content, ref_id = await self._extract_page_content(url)
+                if content:
+                    return (
+                        f"Browser action: {bu_summary}\n\n"
+                        f"{content}"
+                    ), 0.0
 
-            # Capture final page state as artifact
-            try:
-                current_page = await session.get_current_page()
-                if current_page:
-                    current_url = await current_page.evaluate('() => window.location.href')
-                    html = await current_page.evaluate('() => document.body.innerHTML')
-                    markdown = md(html, heading_style='ATX')
+                return f"Browser action: {bu_summary} (no page content extracted)", 0.0
 
-                    lines = markdown.split('\n')
-                    links = extract_links_from_markdown(markdown, current_url)
-
-                    page_view = PageView(
-                        url=current_url,
-                        fetched_at=datetime.now(timezone.utc).isoformat(),
-                        lines=lines,
-                        total_lines=len(lines),
-                        links=links,
-                    )
-                    final_ref_id = self.artifacts.store_page(page_view)
-
-                    return f"Browser session completed. Final page stored as {final_ref_id}", total_cost
-            except Exception as e:
-                logger.warning(f"[interact] Could not capture final state: {e}")
-
-            return "Browser session completed", total_cost
+            except Exception as extract_err:
+                logger.warning(f"[interact] Content extraction failed: {extract_err}")
+                return f"Browser action: {bu_summary} (extraction failed: {extract_err})", 0.0
 
         except Exception as e:
-            logger.error(f"[interact] Browser agent failed: {e}")
-            return f"Browser agent error: {e}", total_cost
+            logger.error(f"[interact] Browser agent failed: {e}", exc_info=True)
+            # If the agent itself is broken, reset it so next call creates fresh
+            self._bu_agent = None
+            return f"Browser agent error: {e}", 0.0
     
     # =========================================================================
     # Tool Registration for Agent Framework
     # =========================================================================
 
-    def register_on(self, registry: 'ToolRegistry') -> None:
+    def register_on(self, registry: 'ToolRegistry', exclude: Optional[List[str]] = None) -> None:
         """
         Register browsing/research tools onto an agent ToolRegistry.
 
@@ -1322,9 +1570,14 @@ if os.path.exists(_seeds_path):
         interact. Skips scope-dependent tools (note, conclude_research,
         submit_seed, breakdown, done).
 
+        Args:
+            registry: The tool registry to add tools to.
+            exclude: Optional list of tool names to skip (e.g. ["open", "find", "click"]).
+
         This is the single place adapter functions live — agents call this
         instead of duplicating the boilerplate.
         """
+        exclude = set(exclude or [])
         # Adapter closures that translate args dict -> method calls
         handlers = {
             "brave_search": lambda args: self.brave_search(
@@ -1365,13 +1618,20 @@ if os.path.exists(_seeds_path):
 
         for defn in self._research_tools():
             name = defn.get("name")
-            if name in handlers:
+            if name in handlers and name not in exclude:
                 registry.add(
                     name=name,
                     description=defn.get("description", ""),
                     parameters=defn.get("parameters", {}),
                     handler=handlers[name],
                 )
+
+        # Add OpenAI native web search tool — the model can use this to read
+        # web pages directly without going through Browser Use Cloud.
+        registry.add_builtin({
+            "type": "web_search_preview",
+            "search_context_size": "medium",
+        })
 
     # =========================================================================
     # Tool Definitions for LLM
@@ -1579,7 +1839,7 @@ Working directory is /workspace. Files at /workspace/uploads/ and /workspace/dow
             {
                 "type": "function",
                 "name": "interact",
-                "description": "Use Browser Agent for complex page interactions (login, forms, captchas, JS-heavy pages, pagination). Browser session persists — cookies and state are preserved for subsequent open()/click() calls.",
+                "description": "Take an action on a page using a browser agent. Same browser session as open() — shared cookies and state. Use when open() fails (Cloudflare, anti-bot) or when you need to interact with the page (click buttons, fill forms, scroll to load content, bypass login). Returns page content as line-numbered markdown (same as open). Keep tasks specific: 'load the page and bypass any challenge', 'click the Next button', 'fill the search box with X'. Do NOT use for web research — use brave_search or web_search for that.",
                 "parameters": {
                     "type": "object",
                     "properties": {

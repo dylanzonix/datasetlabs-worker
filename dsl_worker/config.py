@@ -50,13 +50,21 @@ class WorkerSettings(BaseSettings):
     generation_model: str = "gpt-5.2"
     summarize_model: str = "gpt-5-nano"
 
+    # V6 pipeline settings
+    research_subagent_model: str = "gpt-5.2"    # model for research subagents
+    filter_model: str = "gpt-5-nano"             # model for simple filters
+    seed_yielder_model: str = "gpt-5.2"          # model for seed yielders
+    max_research_subagents: int = 10             # cap on parallel research
+    max_seed_yielders: int = 10                  # cap on parallel seed yielders
+    orchestrator_max_turns: int = 40             # hard cap on orchestrator turns
+    orchestrator_soft_limit: int = 25            # soft nudge to wrap up
+
     # Sandbox service
     sandbox_service_url: str = "http://localhost:8010"
 
-    # Browser proxy (Bright Data residential, optional — leave blank to disable)
-    browser_proxy_server: str = ""       # e.g. "http://brd.superproxy.io:22225"
-    browser_proxy_username: str = ""     # includes geo-pin: brd-customer-XXX-zone-residential-country-us-state-newyork
-    browser_proxy_password: str = ""
+    # Browser Use Cloud (https://cloud.browser-use.com)
+    browser_use_api_key: str = ""                  # API key from cloud.browser-use.com/settings
+    browser_use_proxy_country: str = "us"          # Residential proxy country code (us, gb, de, etc.)
 
     # Cookie persistence blob path (global pre-auth cookies shared across all projects)
     browser_global_cookies_blob_path: str = "browser/global_cookies.json"

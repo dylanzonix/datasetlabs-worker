@@ -1,17 +1,26 @@
 """
-Orchestrator agent — delegation layer that plans and delegates topic work.
+Orchestrator agent — coordinates dataset generation.
 
-V4: The orchestrator understands the request, does light research to figure
-out how to slice the work, plans, and delegates:
-1. Reads conversation history and uploaded files
-2. Light research directly (search, browse, code) — just enough to plan
-3. Plans: dataset brief, topics, targets
-4. Delegates all topics in one delegate_topics() call
-5. Done
+V6: The orchestrator stays in the loop throughout execution. Instead of
+designing a pipeline and exiting (V5), it dispatches typed subagents
+incrementally, sees results, and adapts.
+
+Tools:
+- research(question, ...) — spawn research subagent
+- write_template(instructions, variables) — set row generation template
+- submit_seeds(seeds) — submit preset seeds directly
+- spawn_yielder(sources, quota, ...) — launch iterative seed generator
+- spawn_synthesizer(topic, quota, ...) — launch synthetic seed generator
+- set_filter(name, description, ...) — add seed validation filter
+- set_dedup(strategy, field, ...) — configure deduplication
+- get_status() — check pipeline progress
+- brave_search, read_file, code_exec — utility tools
+- done() — signal completion
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -20,6 +29,14 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 from dsl_worker.agents.base import AgentConversation, AgentResult
 from dsl_worker.agents.tools import ToolRegistry
 from dsl_worker.billing.tracked_client import TrackedOpenAIClient
+from dsl_worker.infra.pipeline import (
+    DedupConfig,
+    FilterConfig,
+    PipelineConfig,
+    Seed,
+    SeedProcessor,
+    VariableConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,216 +44,143 @@ READ_FILE_LIMIT = 30_000
 
 
 ORCHESTRATOR_SYSTEM_PROMPT = """\
-You are the orchestrator for a dataset generation system.
+You are the orchestrator for a dataset generation system. A user described a dataset
+they want. Your job is to figure out the best strategy and coordinate execution.
 
-## Your Mission
+You stay in the loop throughout — dispatch research, write the row template, produce
+seeds, and adapt based on results.
 
-A user described a dataset through a consultation chat (below). Your job is to understand
-the request, plan how to slice it into topics, and delegate everything.
+## Dataset Archetypes
 
-## How to Work
+Identify which pattern fits — it determines your approach:
 
-1. **Plan FIRST.** Call plan() as your very first action. You already have the conversation
-   history, uploaded files, and schema — that's enough to plan from. Think about:
-   - **Dataset type**: Is this extractive (rows are real entities to find), synthetic
-     (rows are designed content), judgment (rows evaluate existing data), or hybrid?
-   - **Where knowledge lives**: What sources are most authoritative for this domain?
-     Uploaded files, specific websites, code repos, APIs, MCP servers, or the model's
-     own knowledge? Don't go explore these yourself — reason about them and tell
-     downstream agents where to look.
-   - **Research approach**: What should topic agents focus on? What should row generators
-     verify vs. trust? Should they go to specific platforms, read actual code, or is
-     web search sufficient?
-   - **Topics, targets, and briefings**: How to slice the work, how many rows each,
-     and what each topic agent needs to know.
+**Extraction** — rows scraped from real sources (job listings, products, directories)
+  Research: light — figure out access patterns (URLs, pagination, anti-bot).
+  Seeds: URLs or identifiers via spawn_yielder(). Row generator visits each and extracts.
 
-2. **Optional: quick lookup.** If your plan revealed something you're genuinely unsure
-   about (e.g., you don't know what sub-areas exist for a niche domain), do ONE targeted
-   search to fill the gap. But most of the time you can go straight to delegating. Do NOT
-   browse extensively — topic agents and row generators do the real research.
+**Condensation** — rows synthesize info around topics (wiki tips, guide summaries)
+  Research: moderate — discover what topics exist and where sources live.
+  Seeds: topics via submit_seeds() (from your research) or spawn_synthesizer().
 
-3. **Delegate.** Call delegate_topics() with a dataset brief, topics, and targets.
-   The system handles everything from here.
+**Enrichment** — rows already exist (CSV, database), need additional columns
+  Research: minimal — data is provided. Seeds from input data via submit_seeds().
 
-4. **Done.** Call done() immediately after delegating.
+**Fan-out** — one source becomes many rows (code repo → Q&A, textbook → flashcards)
+  Research: moderate — understand the source structure.
+  Seeds: source elements via spawn_yielder() on the source.
 
-## Dataset Brief
+**Synthesis** — rows invented from domain knowledge (training data, scenarios)
+  Research: heavy — build a taxonomy so seeds have structural diversity.
+  Seeds: taxonomy nodes via spawn_synthesizer() or submit_seeds().
 
-The brief is written for row generators — it describes what kind of row to produce.
-Unlike a template with {{variables}}, the brief describes the row holistically. Topic agents
-will write specific row assignments that build on this brief.
+## Your Workflow
 
-A good brief has two parts:
-1. **Row description** — what each row looks like, format, quality expectations
-2. **Research approach** — how row generators should find and verify information
+1. REASON — What archetype? What unknowns need resolving?
 
-Example brief (extractive):
-```
-Generate a row profiling a real open-source Python library. Each row should include the
-library name, description, primary use case, and a realistic code example.
+2. RESEARCH — Dispatch research agents to explore the landscape.
+   - Call research() with specific questions, output_format, appropriate budget
+   - Call multiple in parallel for different aspects
+   - Read results, then do targeted follow-ups if gaps remain
+   - CRITICAL: Do NOT investigate yourself after research returns. If findings are
+     insufficient, dispatch another research() agent.
 
-Research approach: Look up the actual library on PyPI and its GitHub repo. Read the real
-README and docs — don't guess at APIs. Verify the latest version number. Code examples
-should be tested against the real library interface, not invented. Prefer official docs
-over blog posts.
-```
+3. WRITE TEMPLATE — Call write_template() with:
+   - Row generation instructions with {{variable}} placeholders
+   - Variable definitions (name, description)
+   - Include a "Research approach" section if row generators need to look things up
 
-Example brief (synthetic):
-```
-Generate a single-turn expert Q&A about DayZ. A player asks a question and an expert
-answers with specific, accurate game knowledge. The expert should sound like someone who
-actually plays, not a wiki article.
+4. CONFIGURE — Optionally call:
+   - set_dedup() — usually "exact" on the main variable
+   - set_filter() — only if seeds need validation beyond dedup
 
-Research approach: Ground your answers in real game mechanics. Look up actual stats,
-crafting recipes, and game mechanics on the DayZ wiki or community resources like WOBO's
-data sheets. Don't rely on what you know from training — game balance changes with patches.
-Cross-check any specific numbers (damage values, spawn rates) against recent sources.
-```
+5. PRODUCE SEEDS — Use one or more:
 
-Example brief (judgment):
-```
-Score each user message for explicitness on a 0-1 scale with reasoning.
+   submit_seeds(seeds) — For items you already know from research.
+     Best for: specific topics, URLs, or items discovered during research.
+     Example: you researched DayZ tips → submit 50 tip topics directly.
 
-Research approach: No external research needed. Apply your judgment to the provided
-message text. The value is in your reasoning, not in looking things up.
-```
+   spawn_yielder(sources, quota, instructions) — For iterating known sources.
+     Best for: paginated pages, directories, search results to crawl.
+     Each yielder gets specific sources and a quota. Call multiple in parallel
+     for different source partitions.
 
-Rules:
-- Written as a direct task for the row generator
-- Describes the row format, quality expectations, and approach
-- MUST include a "Research approach" section — this tells row generators where to look,
-  what to verify, and when research is unnecessary
-- Does NOT describe the schema — it's shown separately
-- Does NOT include meta-instructions about the system
+   spawn_synthesizer(topic, quota, instructions) — For discovering seeds via research.
+     Best for: domains where seeds need to be discovered, not just listed.
+     The synthesizer does its own research to find items, then yields seeds.
 
-## Recognizing Dataset Types
+6. REACT — After subagents return, check results via get_status():
+   - If enough seeds: call done()
+   - If shortfall: dispatch more yielders/synthesizers with different sources
+   - If high filter rejection: adjust approach or submit different seeds
+   - If sources exhausted: try different sources or submit synthetic seeds
 
-Think about what kind of dataset this is. Different types need very different approaches.
+7. DONE — Call done() when satisfied. Row generation continues in the background.
 
-**Extractive datasets** — rows describe real things that exist in the world.
-- Examples: company profiles, library documentation, product listings, event histories
-- Topic agents discover what entities exist and name specific ones in assignments
-- Row generators must research each entity and report real facts — no fabrication
-- Brief should emphasize: verify at primary sources, check freshness
-- Topic briefings should say where to find entities (directories, registries, indexes)
+## Key Principles
 
-**Synthetic datasets** — rows are invented/designed content.
-- Examples: training conversations, Q&A pairs, creative writing, hypothetical scenarios
-- Topic agents map the variation space and design diverse assignments
-- Row generators create content — they may research to ground details in reality, but
-  the content itself is original
-- Brief should emphasize: diversity of angle/difficulty/style, realistic feel
-- Topic briefings should describe what sub-areas to cover and what variety to aim for
-
-**Judgment datasets** — rows evaluate, score, or classify existing data.
-- Examples: content ratings, code quality assessments, annotation tasks
-- Topic agents batch the data to evaluate (from uploaded files, MCP, or generated input)
-- Row generators analyze what's presented — they rarely need external research
-- Brief should emphasize: consistent criteria, rubric clarity
-- Topic briefings should describe what data to pull from and evaluation criteria
-
-**Hybrid datasets** — combine types. A codebase expert dataset is extractive (discover
-what's in the code) + synthetic (design conversations about it). Note which parts
-are which in the brief so row generators know when to research vs. create.
-
-Tailor your brief, topics, and topic briefings based on the type.
-
-## Topic Briefings
-
-Each topic briefing guides a topic agent. Good briefings include:
-- What this topic covers (scope boundaries)
-- Where to find information or entities (specific sites, file paths, registries, MCP tools)
-- What kind of diversity to aim for within this topic
-- Whether this topic is extractive, synthetic, or judgment work
-
-Example (extractive): "Cover Python web frameworks. Find real frameworks by checking
-PyPI, GitHub trending, and awesome-python lists. Include popular and lesser-known ones.
-Each assignment should name a specific real framework."
-
-Example (synthetic): "Cover beginner-level Python questions. Design questions about
-variables, loops, conditionals, functions. Mix styles: how-do-I, what's-wrong-with-this,
-explain-the-difference. Aim for questions a first-week student would actually ask."
-
-## Topics and Scale
-
-Topics exist to divide large datasets into manageable chunks. Each topic agent holds its
-entire area in context, ensuring diversity and avoiding duplicates within that chunk.
-
-- For {num_samples} rows, create enough topics so each has ~10-30 rows
-- Small datasets (< 20 rows): 1-2 topics is fine
-- Don't fragment unnecessarily — a topic agent can handle a broad area
-- **Topic names must be short, natural language labels** (e.g., "Getting Started",
-  "Troubleshooting", "Advanced Workflows"). No numbering prefixes, no underscores,
-  no code-style names.
-
-## Resources
-
-<resources>
-{resources_section}
-</resources>
-
-## Column Schema
-
-<schema>
-{columns_description}
-</schema>
-
-## Conversation History
+- Start simple. Try preset seeds or 1-2 yielders first. Scale up if needed.
+- Each yielder/synthesizer gets a FOCUSED scope. "Search these 3 pages" not "find everything."
+- React to results. If a yielder found 10/50, try different sources or approaches.
+- After research returns: synthesize → write_template → produce seeds. No detours.
+- Diversity comes from sources, not artificial imposition. Don't invent categories
+  or distributions the user didn't ask for.
 
 <conversation>
 {conversation_summary}
 </conversation>
 
+<schema>
+{columns_description}
+</schema>
+
+<resources>
+{resources_section}
+</resources>
+
+Target: {num_samples} rows.
+
 ## Tools
 
-- brave_search(query): Search the web.
-- open(ref_id_or_url): View a page or search result.
-- find(ref_id, pattern): Search within a loaded page.
-- click(ref_id, link_id): Follow a link.
+- research(question, scope, budget, output_format): Spawn a research subagent.
+  Returns findings (also saved to workspace files). Call multiple in one response
+  for parallel research. Budget controls tool calls (5=quick, 10-15=moderate, 20=deep).
+  Subagents have full browsing capabilities (open, interact, code_exec, etc.).
+- write_template(instructions, variables): Set the row generation template. Must be
+  called before spawning yielders or submitting seeds.
+- submit_seeds(seeds): Submit preset seed values directly. Each entry is a dict of
+  variable_name → value.
+- spawn_yielder(sources, quota, instructions): Launch an iterative seed generator.
+  Blocks until it finishes. Call multiple in parallel for different source partitions.
+- spawn_synthesizer(topic, quota, instructions, research_context): Launch a synthetic
+  seed generator that researches and discovers seeds. Blocks until it finishes.
+- set_filter(name, description, complexity): Add a seed validation filter.
+- set_dedup(strategy, field, threshold): Configure seed deduplication.
+- get_status(): Check current pipeline progress (seeds accepted, rows generated, etc.).
+- brave_search(query): Quick web search for simple fact-checks ONLY. For any real
+  investigation, use research().
 - code_exec(script, description): Execute Python for data exploration.
-- read_file(path): Read a workspace file.
-- plan(strategy): Articulate your plan before delegating. Describe the brief, topics, reasoning.
-- delegate_topics(dataset_brief, topics): Delegate all topics at once.
-- done(reason): Signal orchestration is complete.
+- read_file(path): Read a workspace file (uploads, research findings, etc.).
+- done(reason): Signal that orchestration is complete.
 
-## What Happens After You Delegate
+You do NOT have browsing tools (open, find, click, interact). All browsing goes
+through research() subagents or spawned yielders/synthesizers.
 
-After you call delegate_topics(), the system runs each topic agent to produce sample rows,
-then the user reviews them. If the user has feedback, the topic agents adjust. Then full
-generation proceeds. You don't participate after delegation.
-
-## Principles
-
-- **You are a delegation layer.** Figure out the blueprint, don't do the work. Topic
-  agents handle the details, row generators do the heavy lifting.
-- **Research to delegate properly.** You need to know enough about the domain to create
-  good topic areas. But always light — a quick search, reading an uploaded file.
-- **Plan proportionally.** Simple, clear requests need minimal planning. Ambiguous or
-  complex requests deserve more thought.
-- **Think about research strategy.** Your most important contribution isn't just splitting
-  rows into topics — it's telling downstream agents where to look and what to verify.
-  A dataset about real Python libraries needs completely different research guidance than
-  a dataset of synthetic customer support conversations.
-- Target: {num_samples} rows total.
-
-## Feedback Iterations
-
-Sometimes you'll receive feedback about previously generated samples. Your initial message
-will contain the previous plan and user feedback. Re-plan based on the feedback — adjust
-the brief, topics, and targets as needed. The same tools and principles apply.
+{feedback_section}
 """
 
 
 class OrchestratorAgent:
     """
-    V4 Orchestrator. Delegation layer — plans and delegates topic work.
+    V6 Orchestrator. Stays in the loop, dispatches typed subagents,
+    sees results, adapts. Replaces V5's fire-and-forget pipeline design.
 
     Usage:
         orchestrator = OrchestratorAgent(
             chat_history=[...],
             columns=[...],
             num_samples=100,
-            on_delegate_topics=my_callback,
+            seed_processor=seed_processor,
+            generation_stats=generation_stats,
             openai_client=tracked_client,
             ...
         )
@@ -251,7 +195,8 @@ class OrchestratorAgent:
         openai_client: TrackedOpenAIClient,
         model: str,
         workspace_dir: Path,
-        on_delegate_topics: Callable[[Dict], Awaitable[Dict]],
+        seed_processor: SeedProcessor,
+        generation_stats: Dict[str, Any],
         uploaded_files: Optional[List[Dict[str, Any]]] = None,
         brave_api_key: Optional[str] = None,
         sandbox: Optional[Any] = None,
@@ -265,6 +210,11 @@ class OrchestratorAgent:
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
         feedback_context: Optional[Dict[str, Any]] = None,
         langfuse_parent: Optional[Any] = None,
+        on_browser_started: Optional[Callable] = None,
+        # V6: model for spawned subagents
+        yielder_model: str = "",
+        # V6: filter callback for SeedProcessor
+        on_filter: Optional[Callable] = None,
     ) -> None:
         self.feedback_context = feedback_context
         self.chat_history = chat_history
@@ -273,7 +223,6 @@ class OrchestratorAgent:
         self.workspace_dir = Path(workspace_dir)
         self.openai_client = openai_client
         self.model = model
-        self.on_delegate_topics = on_delegate_topics
         self.brave_api_key = brave_api_key
         self.sandbox = sandbox
         self.stop_checker = stop_checker
@@ -284,9 +233,24 @@ class OrchestratorAgent:
         self.on_cost = on_cost
         self.uploaded_file_urls = uploaded_file_urls
         self.mcp_tools = mcp_tools or []
+        self.on_browser_started = on_browser_started
+        self.langfuse_parent = langfuse_parent
+        self.on_filter = on_filter
+        self.yielder_model = yielder_model or model
 
-        # State
+        # V6 state
         self._is_done = False
+        self._research_counter = 0
+        self._yielder_counter = 0
+        self._seed_processor = seed_processor
+        self._generation_stats = generation_stats
+
+        # Pipeline config built incrementally
+        self._template: Optional[str] = None
+        self._variables: List[VariableConfig] = []
+        self._filters: List[FilterConfig] = []
+        self._dedup: DedupConfig = DedupConfig()
+        self._research_context: str = ""
 
         # Build tools
         registry = ToolRegistry()
@@ -296,13 +260,21 @@ class OrchestratorAgent:
         columns_desc = self._format_columns()
         convo_summary = self._format_conversation()
         resources_section = self._format_resources(uploaded_files)
+        feedback_section = self._format_feedback()
 
         system_prompt = ORCHESTRATOR_SYSTEM_PROMPT.format(
             num_samples=num_samples,
             columns_description=columns_desc,
             conversation_summary=convo_summary,
             resources_section=resources_section,
+            feedback_section=feedback_section,
         )
+
+        # V6: Higher turn limits since orchestrator stays in the loop
+        # and waits for blocking subagent calls.
+        from dsl_worker.config import settings
+        max_turns = getattr(settings, 'orchestrator_max_turns', 40)
+        soft_limit = getattr(settings, 'orchestrator_soft_limit', 25)
 
         self._conversation = AgentConversation(
             openai_client=openai_client,
@@ -310,7 +282,8 @@ class OrchestratorAgent:
             system_prompt=system_prompt,
             tools=registry,
             stop_checker=stop_checker,
-            max_turns=30,
+            max_turns=max_turns,
+            soft_turn_limit=soft_limit,
             reasoning={"effort": "high", "summary": "detailed"},
             label="orchestrator",
             continue_on_text=True,
@@ -355,10 +328,25 @@ class OrchestratorAgent:
             lines.append("No uploaded files.")
         return "\n".join(lines)
 
-    def _register_tools(self, registry: ToolRegistry) -> None:
-        """Register orchestrator tools — research + delegation."""
+    def _format_feedback(self) -> str:
+        if not self.feedback_context:
+            return ""
 
-        # --- Research tools (brave_search, open, find, click, code_exec, etc.) ---
+        prev = self.feedback_context.get("previous_config", {})
+        feedback = self.feedback_context.get("user_feedback", "")
+
+        return (
+            f"**Previous pipeline config:**\n"
+            f"```json\n{json.dumps(prev, indent=2)}\n```\n\n"
+            f"**User feedback:** \"{feedback}\"\n\n"
+            f"The previous results were discarded. Design a new pipeline "
+            f"based on this feedback."
+        )
+
+    def _register_tools(self, registry: ToolRegistry) -> None:
+        """Register V6 orchestrator tools."""
+
+        # --- Research tools (brave_search, code_exec + web_search_preview) ---
         from dsl_worker.infra.research_tools import ResearchTools, ResearchScope
 
         self._impl = ResearchTools(
@@ -372,13 +360,19 @@ class OrchestratorAgent:
             blob_service_client=self.blob_service_client,
             project_id=self.project_id,
             uploaded_file_urls=self.uploaded_file_urls,
+            on_browser_started=self.on_browser_started,
         )
         self._impl.set_scope(ResearchScope(
             id="orchestrator",
             description="",
             quota=0,
         ))
-        self._impl.register_on(registry)
+        # Only give orchestrator quick-check tools. Deep browsing (open, find,
+        # click, interact) should go through research() subagents — otherwise
+        # the orchestrator falls into rabbit holes post-research.
+        self._impl.register_on(registry, exclude=[
+            "open", "find", "click", "interact", "list_files", "shell_exec",
+        ])
 
         # --- read_file ---
         async def read_file(args: Dict) -> tuple[str, float]:
@@ -417,147 +411,586 @@ class OrchestratorAgent:
             handler=read_file,
         )
 
-        # --- plan ---
-        async def plan(args: Dict) -> tuple[str, float]:
-            strategy = args.get("strategy", "")
+        # --- research ---
+        async def research(args: Dict) -> tuple[str, float]:
+            """Spawn a research subagent to explore a question."""
+            from dsl_worker.agents.research import ResearchAgent
+
+            question = args.get("question", "")
+            scope = args.get("scope", "")
+            budget = args.get("budget", 10)
+            output_format = args.get("output_format", "")
+
+            if not question:
+                return "Error: question is required", 0.0
+
+            # Get the current langfuse span for nesting
+            langfuse_span = getattr(self._conversation, "_current_langfuse_span", None)
+
+            agent = ResearchAgent(
+                openai_client=self.openai_client,
+                model=self.model,
+                workspace_dir=self.workspace_dir,
+                brave_api_key=self.brave_api_key,
+                sandbox=self.sandbox,
+                stop_checker=self.stop_checker,
+                max_turns=budget,
+                blob_service_client=self.blob_service_client,
+                project_id=self.project_id,
+                on_browser_started=self.on_browser_started,
+            )
+            # Override langfuse parent so subagent traces nest under orchestrator
+            if langfuse_span:
+                agent._conversation.langfuse_parent = langfuse_span
+
+            full_question = question
+            if scope:
+                full_question += f"\n\nScope: {scope}"
+            if output_format:
+                full_question += f"\n\nExpected output format: {output_format}"
+
+            try:
+                result = await agent.ask_full(full_question)
+            finally:
+                await agent.cleanup()
+
+            # Track subagent cost
+            if self.on_cost and result.cost_usd > 0:
+                await self.on_cost(result.cost_usd, "research_subagent")
+
+            # Save research results to workspace file
+            n = self._research_counter
+            self._research_counter += 1
+            research_dir = self.workspace_dir / "research"
+            research_dir.mkdir(exist_ok=True)
+            filepath = research_dir / f"finding_{n}.md"
+            try:
+                filepath.write_text(
+                    f"# Research: {question}\n\n{result.text}",
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                logger.warning(f"Failed to save research finding: {e}")
+
             return (
-                "Plan recorded. Before you delegate, make sure your dataset brief "
-                "includes a 'Research approach' section telling row generators where "
-                "to look and what to verify. And include source guidance in each "
-                "topic's briefing."
+                f"[Saved to research/finding_{n}.md]\n\n{result.text}"
+            ), result.cost_usd
+
+        registry.add(
+            name="research",
+            description=(
+                "Spawn a research subagent to explore a question. Returns findings "
+                "(also saved to research/finding_N.md). Call multiple in one response "
+                "for parallel research."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "Specific research question to investigate",
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": (
+                            "Focus area for the research "
+                            "(e.g., 'focus on official documentation')"
+                        ),
+                    },
+                    "budget": {
+                        "type": "integer",
+                        "description": (
+                            "Max tool calls for the subagent (default 10). "
+                            "Use 5 for quick lookups, 10-15 for moderate, 20 for deep."
+                        ),
+                    },
+                    "output_format": {
+                        "type": "string",
+                        "description": (
+                            "Expected format for the answer (e.g., 'Return a bulleted "
+                            "list of URL parameters with names and descriptions', "
+                            "'Return a JSON mapping of field names to CSS selectors')"
+                        ),
+                    },
+                },
+                "required": ["question"],
+            },
+            handler=research,
+        )
+
+        # --- write_template (V6 — replaces define_pipeline) ---
+        async def write_template(args: Dict) -> tuple[str, float]:
+            """Set the row generation template and declare variables."""
+            template = args.get("instructions", "")
+            variables_raw = args.get("variables", [])
+
+            if not template:
+                return "Error: instructions is required", 0.0
+
+            try:
+                variables = [VariableConfig(**v) for v in variables_raw]
+            except (TypeError, KeyError) as e:
+                return f"Error parsing variables: {e}", 0.0
+
+            self._template = template
+            self._variables = variables
+
+            # Update SeedProcessor
+            self._seed_processor.set_template(template)
+            self._seed_processor.set_variables(variables)
+            if self._research_context:
+                self._seed_processor.set_research_context(self._research_context)
+
+            var_names = [v.name for v in variables]
+            return (
+                f"Template set with {len(variables)} variable(s): "
+                f"{', '.join(var_names) if var_names else '(none)'}. "
+                f"You can now submit_seeds, spawn_yielder, or spawn_synthesizer."
             ), 0.0
 
         registry.add(
-            name="plan",
+            name="write_template",
             description=(
-                "Articulate your strategy before delegating. Describe the dataset "
-                "brief, topics, and reasoning. This is your thinking step."
+                "Set the row generation template. This becomes each row generator's "
+                "instructions. Use {variable_name} placeholders for values that change "
+                "per row. Must be called before submitting seeds or spawning yielders."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "instructions": {
+                        "type": "string",
+                        "description": (
+                            "Row generation instructions with {variable} placeholders. "
+                            "Include a 'Research approach' section if row generators "
+                            "need to do additional per-row research."
+                        ),
+                    },
+                    "variables": {
+                        "type": "array",
+                        "description": "Variables that change per row (used in template as {name})",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {
+                                    "type": "string",
+                                    "description": "Variable name (used in template as {name})",
+                                },
+                                "description": {
+                                    "type": "string",
+                                    "description": "What this variable represents",
+                                },
+                            },
+                            "required": ["name", "description"],
+                        },
+                    },
+                },
+                "required": ["instructions"],
+            },
+            handler=write_template,
+        )
+
+        # --- submit_seeds (V6) ---
+        async def submit_seeds(args: Dict) -> tuple[str, float]:
+            """Submit preset seed values directly."""
+            seeds = args.get("seeds", [])
+            if not self._template:
+                return "Error: call write_template first", 0.0
+            if not seeds:
+                return "Error: seeds array is empty", 0.0
+
+            accepted = 0
+            rejected_reasons = []
+            for seed_values in seeds:
+                seed = Seed(values=seed_values, metadata={"source": "orchestrator_preset"})
+                status = await self._seed_processor.submit_seed(seed)
+                if status["accepted"]:
+                    accepted += 1
+                else:
+                    rejected_reasons.append(status.get("reason", "unknown"))
+
+            stats = self._seed_processor.stats
+            result = (
+                f"{accepted}/{len(seeds)} seeds accepted. "
+                f"Pipeline: {stats['accepted']} total accepted, "
+                f"{stats['remaining']} remaining."
+            )
+            if rejected_reasons:
+                from collections import Counter
+                counts = Counter(rejected_reasons)
+                result += f" Rejections: {dict(counts)}"
+            return result, 0.0
+
+        registry.add(
+            name="submit_seeds",
+            description=(
+                "Submit preset seed values directly. Each entry is a dict of "
+                "variable_name → value. Requires write_template() to be called first."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "seeds": {
+                        "type": "array",
+                        "description": (
+                            "Array of seed value dicts. Each dict maps variable names "
+                            "to their values for one row."
+                        ),
+                        "items": {"type": "object"},
+                    },
+                },
+                "required": ["seeds"],
+            },
+            handler=submit_seeds,
+        )
+
+        # --- spawn_yielder (V6) ---
+        async def spawn_yielder(args: Dict) -> tuple[str, float]:
+            """Launch an iterative seed yielder. Blocks until it finishes."""
+            from dsl_worker.agents.seed_yielder import SeedYielderAgent
+
+            sources = args.get("sources", [])
+            quota = args.get("quota", 20)
+            instructions = args.get("instructions", "")
+
+            if not self._template:
+                return "Error: call write_template first", 0.0
+
+            # Build a PipelineConfig for this yielder
+            variables = []
+            for v in self._variables:
+                variables.append(VariableConfig(
+                    name=v.name,
+                    description=v.description,
+                    seed_strategy="iterate",
+                    seed_sources=sources,
+                    seed_instructions=instructions,
+                ))
+
+            config = PipelineConfig(
+                template=self._template,
+                variables=variables,
+                filters=self._filters,
+                dedup=self._dedup,
+                target_rows=quota,
+                research_context=self._research_context,
+            )
+
+            idx = self._yielder_counter
+            self._yielder_counter += 1
+
+            langfuse_span = getattr(self._conversation, "_current_langfuse_span", None)
+
+            yielder = SeedYielderAgent(
+                pipeline_config=config,
+                yielder_index=idx,
+                total_yielders=1,
+                openai_client=self.openai_client,
+                model=self.yielder_model,
+                workspace_dir=self.workspace_dir,
+                on_yield_seed=self._seed_processor.submit_seed,
+                brave_api_key=self.brave_api_key,
+                sandbox=self.sandbox,
+                stop_checker=self.stop_checker,
+                blob_service_client=self.blob_service_client,
+                project_id=self.project_id,
+                on_tool_call=self.on_tool_call,
+                on_cost=self.on_cost,
+                mcp_tools=self.mcp_tools,
+                langfuse_parent=langfuse_span,
+                on_browser_started=self.on_browser_started,
+            )
+
+            try:
+                result = await yielder.run()
+            finally:
+                await yielder.cleanup()
+
+            if self.on_cost and yielder.cost_usd > 0:
+                await self.on_cost(yielder.cost_usd, f"yielder:{idx}")
+
+            stats = self._seed_processor.stats
+            return (
+                f"Yielder {idx} finished: {result.turns_taken} turns, "
+                f"cost=${yielder.cost_usd:.3f}. "
+                f"Pipeline: {stats['accepted']} accepted, "
+                f"{stats['remaining']} remaining."
+            ), yielder.cost_usd
+
+        registry.add(
+            name="spawn_yielder",
+            description=(
+                "Launch an iterative seed yielder that browses/iterates sources and "
+                "yields seeds. Blocks until it finishes. Call multiple in parallel for "
+                "different source partitions."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "sources": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "URLs, file paths, or search queries to iterate. "
+                            "The yielder will browse these and yield seeds."
+                        ),
+                    },
+                    "quota": {
+                        "type": "integer",
+                        "description": (
+                            "How many accepted seeds this yielder should aim for "
+                            "(default 20). Set based on how many items you expect "
+                            "the sources to contain."
+                        ),
+                    },
+                    "instructions": {
+                        "type": "string",
+                        "description": (
+                            "Specific instructions for this yielder "
+                            "(e.g., 'Extract job title and URL from each listing')"
+                        ),
+                    },
+                },
+                "required": ["sources"],
+            },
+            handler=spawn_yielder,
+        )
+
+        # --- spawn_synthesizer (V6) ---
+        async def spawn_synthesizer(args: Dict) -> tuple[str, float]:
+            """Launch a synthetic seed generator. Blocks until it finishes."""
+            from dsl_worker.agents.seed_yielder import SeedYielderAgent
+
+            topic = args.get("topic", "")
+            quota = args.get("quota", 20)
+            instructions = args.get("instructions", "")
+            research_context = args.get("research_context", "")
+
+            if not self._template:
+                return "Error: call write_template first", 0.0
+
+            # Build a PipelineConfig for this synthesizer
+            variables = []
+            for v in self._variables:
+                variables.append(VariableConfig(
+                    name=v.name,
+                    description=v.description,
+                    seed_strategy="synthetic",
+                    seed_context=topic,
+                    seed_instructions=instructions,
+                ))
+
+            effective_context = research_context or self._research_context
+            config = PipelineConfig(
+                template=self._template,
+                variables=variables,
+                filters=self._filters,
+                dedup=self._dedup,
+                target_rows=quota,
+                research_context=effective_context,
+            )
+
+            idx = self._yielder_counter
+            self._yielder_counter += 1
+
+            langfuse_span = getattr(self._conversation, "_current_langfuse_span", None)
+
+            yielder = SeedYielderAgent(
+                pipeline_config=config,
+                yielder_index=idx,
+                total_yielders=1,
+                openai_client=self.openai_client,
+                model=self.yielder_model,
+                workspace_dir=self.workspace_dir,
+                on_yield_seed=self._seed_processor.submit_seed,
+                brave_api_key=self.brave_api_key,
+                sandbox=self.sandbox,
+                stop_checker=self.stop_checker,
+                blob_service_client=self.blob_service_client,
+                project_id=self.project_id,
+                on_tool_call=self.on_tool_call,
+                on_cost=self.on_cost,
+                mcp_tools=self.mcp_tools,
+                langfuse_parent=langfuse_span,
+                on_browser_started=self.on_browser_started,
+            )
+
+            try:
+                result = await yielder.run()
+            finally:
+                await yielder.cleanup()
+
+            if self.on_cost and yielder.cost_usd > 0:
+                await self.on_cost(yielder.cost_usd, f"synthesizer:{idx}")
+
+            stats = self._seed_processor.stats
+            return (
+                f"Synthesizer {idx} finished: {result.turns_taken} turns, "
+                f"cost=${yielder.cost_usd:.3f}. "
+                f"Pipeline: {stats['accepted']} accepted, "
+                f"{stats['remaining']} remaining."
+            ), yielder.cost_usd
+
+        registry.add(
+            name="spawn_synthesizer",
+            description=(
+                "Launch a synthetic seed generator that researches and discovers seeds. "
+                "Blocks until it finishes. Use when seeds need to be discovered through "
+                "research, not just iterated from a known source."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": (
+                            "Topic area for the synthesizer to research and generate "
+                            "seeds from (e.g., 'DayZ survival mechanics', "
+                            "'AI companies in Minnesota')"
+                        ),
+                    },
+                    "quota": {
+                        "type": "integer",
+                        "description": "How many accepted seeds to aim for (default 20)",
+                    },
+                    "instructions": {
+                        "type": "string",
+                        "description": "Specific instructions for this synthesizer",
+                    },
+                    "research_context": {
+                        "type": "string",
+                        "description": (
+                            "Research findings to seed the synthesizer with. "
+                            "If not provided, uses accumulated research context."
+                        ),
+                    },
+                },
+                "required": ["topic"],
+            },
+            handler=spawn_synthesizer,
+        )
+
+        # --- set_filter (V6) ---
+        async def set_filter(args: Dict) -> tuple[str, float]:
+            """Add a seed validation filter."""
+            name = args.get("name", "")
+            description = args.get("description", "")
+            complexity = args.get("complexity", "simple")
+
+            if not name or not description:
+                return "Error: name and description are required", 0.0
+
+            filter_config = FilterConfig(
+                name=name,
+                description=description,
+                complexity=complexity,
+            )
+            self._filters.append(filter_config)
+            self._seed_processor.set_filters(self._filters)
+            return f"Filter '{name}' added ({complexity}). {len(self._filters)} total.", 0.0
+
+        registry.add(
+            name="set_filter",
+            description=(
+                "Add a seed validation filter. Seeds will be checked against this "
+                "criteria before being accepted. Use 'simple' for quick classification, "
+                "'judgment' for multi-turn research-based validation."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Filter name"},
+                    "description": {
+                        "type": "string",
+                        "description": "What to check (e.g., 'Job posting must be from the last 30 days')",
+                    },
+                    "complexity": {
+                        "type": "string",
+                        "enum": ["simple", "judgment"],
+                        "description": "'simple' for single-turn, 'judgment' for multi-turn with research",
+                    },
+                },
+                "required": ["name", "description"],
+            },
+            handler=set_filter,
+        )
+
+        # --- set_dedup (V6) ---
+        async def set_dedup(args: Dict) -> tuple[str, float]:
+            """Configure seed deduplication."""
+            strategy = args.get("strategy", "exact")
+            dedup_field = args.get("field", "")
+            threshold = args.get("threshold", 0.85)
+
+            self._dedup = DedupConfig(
+                strategy=strategy,
+                field=dedup_field,
+                threshold=threshold,
+            )
+            self._seed_processor.set_dedup(self._dedup)
+            return f"Dedup set: {strategy} on '{dedup_field}'", 0.0
+
+        registry.add(
+            name="set_dedup",
+            description=(
+                "Configure seed deduplication. Usually 'exact' on the main variable. "
+                "Call before submitting seeds or spawning yielders."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "strategy": {
                         "type": "string",
-                        "description": (
-                            "Your plan: what the dataset brief should say, what topics "
-                            "to create, how many rows each, and your reasoning."
-                        ),
+                        "enum": ["none", "exact", "embedding_similarity"],
+                        "description": "Dedup strategy",
+                    },
+                    "field": {
+                        "type": "string",
+                        "description": "Variable name to dedup on (empty = all values)",
+                    },
+                    "threshold": {
+                        "type": "number",
+                        "description": "Similarity threshold for embedding strategy (default 0.85)",
                     },
                 },
-                "required": ["strategy"],
             },
-            handler=plan,
+            handler=set_dedup,
         )
 
-        # --- delegate_topics ---
-        async def delegate_topics(args: Dict) -> tuple[str, float]:
-            dataset_brief = args.get("dataset_brief", "")
-            topics = args.get("topics", [])
-
-            if not dataset_brief:
-                return "Error: dataset_brief is required", 0.0
-            if not topics:
-                return "Error: at least one topic is required", 0.0
-
-            # Validate topics
-            errors = []
-            total_target = 0
-            for i, topic in enumerate(topics):
-                if not isinstance(topic, dict):
-                    errors.append(f"Topic {i}: must be an object")
-                    continue
-                if not topic.get("name"):
-                    errors.append(f"Topic {i}: 'name' is required")
-                if not topic.get("briefing"):
-                    errors.append(f"Topic {i}: 'briefing' is required")
-                target = topic.get("target", 10)
-                total_target += target
-            if errors:
-                return "Validation errors:\n" + "\n".join(f"- {e}" for e in errors), 0.0
-
-            # Normalize targets to match num_samples
-            if total_target != self.num_samples and total_target > 0:
-                ratio = self.num_samples / total_target
-                for topic in topics:
-                    topic["target"] = max(1, round(topic.get("target", 10) * ratio))
-                # Adjust the last topic to hit exact target
-                adjusted_total = sum(t.get("target", 10) for t in topics)
-                if adjusted_total != self.num_samples:
-                    topics[-1]["target"] += self.num_samples - adjusted_total
-
-            # Dispatch via callback — the job processor handles spawning topic agents
-            config = {
-                "dataset_brief": dataset_brief,
-                "topics": topics,
-            }
-
-            await self.on_delegate_topics(config)
-            topic_count = len(topics)
-            total = sum(t.get("target", 10) for t in topics)
-
+        # --- get_status (V6) ---
+        async def get_status(args: Dict) -> tuple[str, float]:
+            """Check current pipeline progress."""
+            stats = self._seed_processor.stats
+            gen = self._generation_stats
             return (
-                f"Delegated {topic_count} topics ({total} total target rows). "
-                f"Topic agents will research, produce assignments, and dispatch row generators. "
-                f"Your job is done — call done() now."
+                f"Seeds: {stats['accepted']} accepted, {stats['remaining']} remaining, "
+                f"{stats['rejected_dedup']} dedup rejected, "
+                f"{stats['rejected_filter']} filter rejected, "
+                f"{stats['submitted_total']} total submitted.\n"
+                f"Rows: {gen.get('rows_generated', 0)} generated, "
+                f"{gen.get('errors', 0)} errors."
             ), 0.0
 
         registry.add(
-            name="delegate_topics",
-            description=(
-                "Delegate all topics to topic agents in one call. "
-                "Specify the dataset brief and a list of topics with names, "
-                "targets, and briefings. Topic agents run in parallel."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "dataset_brief": {
-                        "type": "string",
-                        "description": (
-                            "Natural language brief for row generators. Describes "
-                            "what kind of row to produce — format, quality, approach."
-                        ),
-                    },
-                    "topics": {
-                        "type": "array",
-                        "description": "Topics to delegate",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "name": {
-                                    "type": "string",
-                                    "description": "Topic name",
-                                },
-                                "target": {
-                                    "type": "integer",
-                                    "description": "Target number of rows for this topic",
-                                },
-                                "briefing": {
-                                    "type": "string",
-                                    "description": (
-                                        "What this topic covers. Guide the topic agent — "
-                                        "what to research, what subtopics to cover."
-                                    ),
-                                },
-                            },
-                            "required": ["name", "target", "briefing"],
-                        },
-                    },
-                },
-                "required": ["dataset_brief", "topics"],
-            },
-            handler=delegate_topics,
+            name="get_status",
+            description="Check current pipeline progress (seeds accepted, rows generated, etc.).",
+            parameters={"type": "object", "properties": {}},
+            handler=get_status,
         )
 
         # --- done ---
         async def done(args: Dict) -> tuple[str, float]:
             reason = args.get("reason", "complete")
             self._is_done = True
+
+            # Save final config as recipe for checkpoint
+            self._save_recipe()
+
             return f"Orchestrator done: {reason}", 0.0
 
         registry.add(
             name="done",
-            description="Signal that orchestration is complete. Call after delegate_topics.",
+            description="Signal that orchestration is complete. Row generation continues in the background.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -570,29 +1003,45 @@ class OrchestratorAgent:
             handler=done,
         )
 
+    def _save_recipe(self) -> None:
+        """Save current pipeline config as a recipe file for checkpoint/resume."""
+        try:
+            recipe = {
+                "template": self._template,
+                "variables": [
+                    {"name": v.name, "description": v.description,
+                     "seed_strategy": v.seed_strategy}
+                    for v in self._variables
+                ],
+                "filters": [
+                    {"name": f.name, "description": f.description,
+                     "complexity": f.complexity}
+                    for f in self._filters
+                ],
+                "dedup": {
+                    "strategy": self._dedup.strategy,
+                    "field": self._dedup.field,
+                    "threshold": self._dedup.threshold,
+                },
+                "research_context": self._research_context,
+                "target_rows": self.num_samples,
+            }
+            recipe_path = self.workspace_dir / "pipeline_recipe.json"
+            recipe_path.write_text(json.dumps(recipe, indent=2), encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"Failed to save recipe: {e}")
+
     async def run(self) -> AgentResult:
         """Run the orchestrator."""
         if self.feedback_context:
-            prev = self.feedback_context["previous_config"]
-            feedback = self.feedback_context["user_feedback"]
-
-            topics_desc = "\n".join(
-                f"- {t['name']} ({t.get('target', '?')} rows): {t['briefing']}"
-                for t in prev.get("topics", [])
-            )
             message = (
-                f"FEEDBACK ITERATION: The user reviewed sample rows and gave feedback.\n\n"
-                f"Previous dataset brief:\n{prev.get('dataset_brief', '')}\n\n"
-                f"Previous topics:\n{topics_desc}\n\n"
-                f"User feedback: \"{feedback}\"\n\n"
-                f"The previous samples were discarded. Re-plan based on this feedback. "
-                f"You can adjust the dataset brief, add/remove/modify topics, or change "
-                f"targets. Then call delegate_topics() and done()."
+                "Begin. The user reviewed previous results and gave feedback "
+                "(shown in system prompt). Research as needed and design a new pipeline."
             )
         else:
             message = (
-                "Begin. Read the conversation history and uploaded files, then plan, "
-                "delegate topics, and call done."
+                "Begin. Read the conversation history and resources, reason about "
+                "strategy, research the landscape, then write a template and produce seeds."
             )
 
         result = await self._conversation.send(

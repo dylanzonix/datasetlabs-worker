@@ -1,14 +1,15 @@
 """
-Job Processor — V4 three-tier pipeline
+Job Processor — V6 pipeline
 
 Flow:
 1. Load conversation history and uploaded files
-2. Run orchestrator (~5 turns): research, create instruction, delegate_topics
-3. SAMPLE phase: each topic agent produces 1 row, system pauses for user review
-4. GENERATE phase: topic agents resume, produce remaining rows
-5. COMPLETE: all done
+2. Create shared infrastructure (SeedProcessor, generation consumer)
+3. Run orchestrator: research, write template, spawn yielders/synthesizers, submit seeds
+4. Drain generation, backfill if needed
+5. COMPLETE
 
-Three tiers: orchestrator → topic agents → row generators
+V6: Single phase — the orchestrator stays in the loop and coordinates everything.
+Generation runs in the background as seeds flow in.
 """
 
 import asyncio
@@ -59,7 +60,8 @@ from dsl_worker.billing import CostTracker, TrackedOpenAIClient
 from dsl_worker.checkpoint import CheckpointManager, checkpoints_to_work_items
 
 from dsl_worker.agents import OrchestratorAgent
-from dsl_worker.agents.topic import TopicAgent
+from dsl_worker.agents.filter_agent import FilterAgent
+from dsl_worker.infra.pipeline import PipelineConfig, Seed, SeedProcessor, FilterConfig
 from dsl_worker.infra.generation_pool import GenerationWorkerPool
 from sandbox_service import SandboxClient
 
@@ -73,10 +75,11 @@ GENERATION_BATCH_SIZE = 5
 
 class JobProcessor:
     """
-    Job processor for the V4 three-tier pipeline.
+    Job processor for the V6 pipeline.
 
-    Flow: orchestrator → topic agents (parallel) → row generators (parallel)
-    Phases: PLAN → SAMPLE → GENERATE → COMPLETE
+    Flow: orchestrator (dispatches subagents internally) → row generators (parallel)
+    The orchestrator stays in the loop, spawning yielders/synthesizers and submitting
+    seeds. Generation runs in the background as seeds flow in.
     Checkpoints saved to Azure Blob for pause/resume.
     """
 
@@ -248,7 +251,7 @@ class JobProcessor:
         cost_tracker: CostTracker,
         langfuse_parent: Optional[Any] = None,
     ) -> bool:
-        """Run the V4 three-tier pipeline."""
+        """Run the V5 pipeline: orchestrator → seed yielders → row generators."""
 
         # Create workspace (only downloads/ needed locally — uploads go direct to sandbox)
         workspace_dir = Path(f"./workspace_{project.id}_{version.id}")
@@ -275,7 +278,6 @@ class JobProcessor:
         stop_checker = self._make_stop_checker(state)
 
         # Per-turn cost callback — fires on every API call in every agent.
-        # Feeds costs to the tracker live so charging happens incrementally.
         async def on_cost(cost_usd: float, label: str):
             try:
                 cost_tracker.add_cost(phase=label, cost_usd=cost_usd)
@@ -284,14 +286,13 @@ class JobProcessor:
             except Exception as e:
                 logger.error(f"[Billing] on_cost callback error: {e}")
 
-        # Check if resuming from generation phase
-        if checkpoint.current_phase == "generation" and checkpoint.work_items:
+        # Check if resuming from execution phase
+        if checkpoint.current_phase == "execution" and checkpoint.work_items:
             logger.info(
-                f"[Pipeline] Resuming generation: "
+                f"[Pipeline] Resuming execution: "
                 f"{len(checkpoint.processed_indices)}/{len(checkpoint.work_items)} done"
             )
 
-            # Recover costs tracked before the crash/restart
             if checkpoint.total_cost_usd > 0:
                 cost_tracker.seed_from_checkpoint(checkpoint.total_cost_usd)
 
@@ -303,7 +304,7 @@ class JobProcessor:
                 on_cost=on_cost,
             )
 
-        # --- Fresh run: V4 three-tier flow ---
+        # --- Fresh run ---
 
         # Load conversation history
         chat_history = self._load_chat_history(db, project.id)
@@ -339,7 +340,7 @@ class JobProcessor:
         mcp_tools = self._build_mcp_tools(connectors)
         self._mcp_tools = mcp_tools
 
-        logger.info(f"[Pipeline] Starting V4 pipeline with {len(chat_history)} chat messages")
+        logger.info(f"[Pipeline] Starting V6 pipeline with {len(chat_history)} chat messages")
 
         # === Shared state ===
         work_item_queue: asyncio.Queue = asyncio.Queue()
@@ -350,118 +351,66 @@ class JobProcessor:
             "in_progress": 0,
             "total_cost": 0.0,
         }
-        generation_task: Optional[asyncio.Task] = None
-        generation_lock = asyncio.Lock()
-        topic_agents: List[TopicAgent] = []
-        # Will be set when orchestrator calls delegate_topics
-        delegate_config: Optional[Dict] = None
-        delegate_event = asyncio.Event()
-
-        # Work item index counter for checkpointing
         work_item_counter = [0]
 
-        # --- Helper: dispatch work items from topic agents ---
+        # Feedback context for re-planning iterations
+        feedback_context = None
 
-        async def dispatch_work_items(items: List[Dict]) -> int:
-            """Queue work items for generation, checkpoint them."""
-            nonlocal generation_task
-
-            for item in items:
-                await checkpoint_mgr.add_work_item(item)
-                await work_item_queue.put(item)
-                work_item_counter[0] += 1
-
-            # Start/continue the generation consumer if not running
-            async with generation_lock:
-                if generation_task is None or generation_task.done():
-                    await checkpoint_mgr.set_phase("generation")
-                    generation_task = asyncio.create_task(
-                        self._run_generation_consumer(
-                            db=db,
-                            project=project,
-                            version=version,
-                            tracked_client=tracked_client,
-                            cost_tracker=cost_tracker,
-                            checkpoint_mgr=checkpoint_mgr,
-                            work_item_queue=work_item_queue,
-                            workspace_dir=workspace_dir,
-                            stop_checker=stop_checker,
-                            schema=state.columns,
-                            generation_stats=generation_stats,
-                            uploaded_file_urls=uploaded_file_urls,
-                            on_cost=on_cost,
-                            langfuse_parent=langfuse_parent,
-                        )
+        # Check if this is a feedback iteration (version has previous config in recipe)
+        if checkpoint.recipe:
+            try:
+                prev_config = json.loads(checkpoint.recipe)
+                # Check for user feedback messages since version started
+                feedback_msg = (
+                    db.query(ChatMessage)
+                    .filter(
+                        ChatMessage.project_id == project.id,
+                        ChatMessage.role == "user",
+                        ChatMessage.created_at > version.started_at,
                     )
-
-            return len(items)
-
-        # --- Topic agent dispatch_rows callback ---
-        # Called by topic agents when they dispatch row assignments.
-
-        async def on_dispatch_rows(
-            assignments: List[str],
-            dataset_brief: str,
-            columns: List[Dict],
-            topic_name: str,
-            langfuse_parent: Optional[Any] = None,
-        ) -> int:
-            """Build work items from assignments and dispatch them."""
-            work_items = []
-            for assignment in assignments:
-                item: Dict[str, Any] = {
-                    "instruction": assignment,
-                    "context": dataset_brief,
-                    "tags": {"topic": topic_name},
-                }
-                if langfuse_parent is not None:
-                    item["langfuse_parent"] = langfuse_parent
-                work_items.append(item)
-
-            return await dispatch_work_items(work_items)
-
-        # --- Orchestrator delegate_topics callback ---
-
-        async def on_delegate_topics(config: Dict) -> Dict:
-            """Store the delegation config and signal the pipeline to proceed."""
-            nonlocal delegate_config
-            delegate_config = config
-
-            # Save the config as recipe for checkpoint debugging
-            await checkpoint_mgr.set_recipe(json.dumps(config, indent=2))
-
-            delegate_event.set()
-            return {"status": "delegated", "topics": len(config.get("topics", []))}
+                    .order_by(ChatMessage.created_at.desc())
+                    .first()
+                )
+                if feedback_msg:
+                    feedback_context = {
+                        "previous_config": prev_config,
+                        "user_feedback": feedback_msg.content,
+                    }
+            except (json.JSONDecodeError, Exception):
+                pass
 
         # --- Progress tracking ---
-        progress_counters: Dict[str, Any] = {"phase": "planning"}
+        progress_counters: Dict[str, Any] = {"phase": "orchestrating"}
         last_progress_flush = time.time()
 
         def on_tool_call(agent_label: str, tool_name: str):
             nonlocal last_progress_flush
 
-            # Phase transitions
             phase_map = {
-                "run_subagent": "researching",
-                "delegate_topics": "delegating",
-                "done": "delegating",
-                "dispatch_rows": "generating",
+                "research": "researching",
+                "write_template": "designing_template",
+                "spawn_yielder": "yielding_seeds",
+                "spawn_synthesizer": "synthesizing_seeds",
+                "submit_seeds": "submitting_seeds",
+                "done": "finishing",
+                "yield_seed": "yielding_seeds",
             }
             if tool_name in phase_map:
                 progress_counters["phase"] = phase_map[tool_name]
 
-            # Counter increments
             counter_map = {
                 "brave_search": "searches",
                 "open": "pages_viewed",
                 "code_exec": "code_runs",
-                "dispatch_rows": "topics_dispatched",
+                "research": "research_subagents",
+                "yield_seed": "seeds_yielded",
+                "spawn_yielder": "yielders_spawned",
+                "spawn_synthesizer": "synthesizers_spawned",
             }
             if tool_name in counter_map:
                 key = counter_map[tool_name]
                 progress_counters[key] = progress_counters.get(key, 0) + 1
 
-            # Throttled DB flush (every 2s)
             now = time.time()
             if now - last_progress_flush >= 2.0:
                 merged = {**progress_counters, **generation_stats}
@@ -469,14 +418,93 @@ class JobProcessor:
                 db.commit()
                 last_progress_flush = now
 
-        version.progress_detail = {"phase": "planning"}
+        # --- Browser session tracking ---
+        browser_sessions: Dict[str, Dict[str, str]] = {}
+
+        def on_browser_started(live_url: str, session_id: str):
+            browser_sessions[session_id] = {
+                "live_url": live_url,
+                "session_id": session_id,
+            }
+            progress_counters["browser_sessions"] = list(browser_sessions.values())
+            logger.info(f"[Pipeline] Cloud browser started: {live_url}")
+
+        version.progress_detail = {"phase": "orchestrating"}
         db.commit()
 
         # ====================================================================
-        # Phase 1: PLAN — Run orchestrator (~5 turns)
+        # V6: Create shared infrastructure BEFORE orchestrator
         # ====================================================================
 
-        logger.info("[Pipeline] Phase 1: PLAN — running orchestrator")
+        # --- Filter callback for SeedProcessor ---
+
+        async def run_filter(seed: Seed, filter_config: FilterConfig):
+            if filter_config.complexity == "judgment":
+                passed, findings, cost = await FilterAgent.run_judgment(
+                    seed=seed,
+                    filter_config=filter_config,
+                    openai_client=tracked_client,
+                    model=settings.research_model,
+                    workspace_dir=workspace_dir,
+                    brave_api_key=settings.brave_api_key,
+                    sandbox=self._sandbox,
+                    stop_checker=stop_checker,
+                    blob_service_client=self.blob_service_client,
+                    project_id=project.id,
+                    on_browser_started=on_browser_started,
+                )
+            else:
+                passed, findings, cost = await FilterAgent.run_simple(
+                    seed=seed,
+                    filter_config=filter_config,
+                    openai_client=tracked_client,
+                    model=settings.filter_model,
+                )
+            if cost > 0:
+                await on_cost(cost, f"filter:{filter_config.name}")
+            return passed, findings
+
+        # --- Checkpoint callback for SeedProcessor ---
+
+        async def on_seed_checkpoint(work_item: Dict):
+            await checkpoint_mgr.add_work_item(work_item)
+            work_item_counter[0] += 1
+
+        # Create seed processor (V6: created before orchestrator, configured incrementally)
+        seed_processor = SeedProcessor(
+            work_queue=work_item_queue,
+            on_filter=run_filter,
+            on_checkpoint=on_seed_checkpoint,
+            target_rows=state.num_samples,
+        )
+
+        # Start generation consumer (runs in background the entire time)
+        generation_task = asyncio.create_task(
+            self._run_generation_consumer(
+                db=db,
+                project=project,
+                version=version,
+                tracked_client=tracked_client,
+                cost_tracker=cost_tracker,
+                checkpoint_mgr=checkpoint_mgr,
+                work_item_queue=work_item_queue,
+                workspace_dir=workspace_dir,
+                stop_checker=stop_checker,
+                schema=state.columns,
+                generation_stats=generation_stats,
+                uploaded_file_urls=uploaded_file_urls,
+                on_cost=on_cost,
+                langfuse_parent=langfuse_parent,
+                on_browser_started=on_browser_started,
+            )
+        )
+
+        # ====================================================================
+        # V6: Run orchestrator (it does everything — research, template,
+        # spawning yielders/synthesizers, submitting seeds)
+        # ====================================================================
+
+        logger.info("[Pipeline] Running V6 orchestrator")
 
         orchestrator = OrchestratorAgent(
             chat_history=chat_history,
@@ -485,7 +513,9 @@ class JobProcessor:
             openai_client=tracked_client,
             model=settings.research_model,
             workspace_dir=workspace_dir,
-            on_delegate_topics=on_delegate_topics,
+            seed_processor=seed_processor,
+            generation_stats=generation_stats,
+            yielder_model=settings.seed_yielder_model,
             uploaded_files=uploaded_files if uploaded_files else None,
             brave_api_key=settings.brave_api_key,
             sandbox=self._sandbox,
@@ -496,268 +526,40 @@ class JobProcessor:
             on_cost=on_cost,
             uploaded_file_urls=uploaded_file_urls if uploaded_file_urls else None,
             mcp_tools=mcp_tools,
+            feedback_context=feedback_context,
             langfuse_parent=langfuse_parent,
+            on_browser_started=on_browser_started,
         )
 
         try:
             result = await orchestrator.run()
-
             logger.info(
                 f"[Pipeline] Orchestrator finished: "
                 f"cost=${orchestrator.cost_usd:.4f}, turns={result.turns_taken}"
             )
-
         finally:
             await orchestrator.cleanup()
 
-        # Check if orchestrator delegated topics
-        if delegate_config is None:
-            logger.error("[Pipeline] Orchestrator did not call delegate_topics")
-            self._handle_force_stop(
-                db, project, version, cost_tracker,
-                "Orchestrator did not delegate any topics"
-            )
-            return False
-
-        config = delegate_config
-        dataset_brief = config["dataset_brief"]
-        topics = config["topics"]
+        # Save recipe for checkpoint
+        await checkpoint_mgr.set_phase("execution")
 
         logger.info(
-            f"[Pipeline] Orchestrator delegated {len(topics)} topics: "
-            f"{[t['name'] for t in topics]}"
+            f"[Pipeline] Orchestrator complete. Seeds: {seed_processor.stats}"
         )
 
-        # ====================================================================
-        # FEEDBACK LOOP: SAMPLE → REVIEW → (APPROVE → GENERATE | FEEDBACK → REPLAN)
-        # ====================================================================
-
-        iteration = 0
-        while True:
-            iteration += 1
-            logger.info(
-                f"[Pipeline] Iteration {iteration}: SAMPLE — "
-                f"running {len(topics)} topic agents (1 row each)"
-            )
-            version.progress_detail = {"phase": "sampling", "topics": len(topics)}
-            db.commit()
-
-            # Create topic agents for this iteration
-            topic_agents = []
-            for topic in topics:
-                agent = TopicAgent(
-                    topic_name=topic["name"],
-                    topic_briefing=topic["briefing"],
-                    dataset_brief=dataset_brief,
-                    target_count=topic.get("target", 10),
-                    columns=state.columns,
-                    openai_client=tracked_client,
-                    model=settings.research_model,
-                    workspace_dir=workspace_dir,
-                    on_dispatch_rows=on_dispatch_rows,
-                    brave_api_key=settings.brave_api_key,
-                    sandbox=self._sandbox,
-                    stop_checker=stop_checker,
-                    blob_service_client=self.blob_service_client,
-                    project_id=project.id,
-                    on_tool_call=on_tool_call,
-                    on_cost=on_cost,
-                    mcp_tools=mcp_tools,
-                    langfuse_parent=langfuse_parent,
-                )
-                topic_agents.append(agent)
-
-            # Run all topic agents in sample mode (each produces 1 assignment)
-            sample_tasks = [
-                asyncio.create_task(self._run_topic_agent_safe(agent, cost_tracker))
-                for agent in topic_agents
-            ]
-            await asyncio.gather(*sample_tasks)
-
-            # Check if we should stop
-            if stop_checker():
-                for agent in topic_agents:
-                    await agent.cleanup()
-                await checkpoint_mgr.force_save()
-                self._handle_pause(db, project, version, cost_tracker)
-                return True
-
-            can_continue, stop_reason = cost_tracker.check_balance_and_charge()
-            if not can_continue:
-                for agent in topic_agents:
-                    await agent.cleanup()
-                await checkpoint_mgr.force_save()
-                self._handle_force_stop(db, project, version, cost_tracker, stop_reason)
-                return False
-
-            # Drain generation consumer so sample rows are fully written
-            await self._drain_generation_consumer(work_item_queue, generation_task)
-            generation_task = None
-
-            # --- Pause for user review ---
-            db.refresh(version)
-            sample_count = version.generated_count or 0
-            logger.info(
-                f"[Pipeline] SAMPLE complete ({sample_count} rows) — "
-                f"waiting for review"
-            )
-
-            # Include cost transparency data for the sample review UI
-            cost_report = cost_tracker.get_sample_cost_report(
-                samples_generated=sample_count,
-                total_target_rows=version.num_samples,
-            )
-            version.progress_detail = {
-                "phase": "waiting_for_review",
-                "sample_count": sample_count,
-                "topics": len(topics),
-                **cost_report,
-            }
-            db.commit()
-
-            action, feedback_text = await self._wait_for_review(
-                db, project, version, stop_checker
-            )
-
-            if action in ("timeout", "paused"):
-                for agent in topic_agents:
-                    await agent.cleanup()
-                await checkpoint_mgr.force_save()
-                self._handle_pause(db, project, version, cost_tracker)
-                return True
-
-            if action == "approve":
-                # ---- GENERATE: resume topic agents for remaining rows ----
-                logger.info("[Pipeline] GENERATE — resuming topic agents")
-                version.progress_detail = {
-                    "phase": "generating",
-                    "topics": len(topics),
-                }
-                db.commit()
-
-                resume_tasks = [
-                    asyncio.create_task(
-                        self._resume_topic_agent_safe(agent, cost_tracker, None)
-                    )
-                    for agent in topic_agents
-                ]
-                await asyncio.gather(*resume_tasks)
-
-                for agent in topic_agents:
-                    await agent.cleanup()
-                break  # → COMPLETE
-
-            # ---- FEEDBACK: create new version, re-plan via orchestrator ----
-            logger.info("[Pipeline] Feedback received — creating new version")
-            for agent in topic_agents:
-                await agent.cleanup()
-
-            # Finalize old version, create new one
-            old_version = version
-            version = self._create_feedback_version(db, project, old_version)
-
-            # Reset shared state for new iteration
-            work_item_queue = asyncio.Queue()
-            generation_stats = {
-                "rows_generated": 0,
-                "errors": 0,
-                "skipped": 0,
-                "in_progress": 0,
-                "total_cost": 0.0,
-            }
-            generation_task = None
-            work_item_counter = [0]
-            delegate_config = None
-            delegate_event = asyncio.Event()
-            state = ProjectState(db, project.id, version.id)
-            stop_checker = self._make_stop_checker(state)
-            progress_counters.clear()
-            progress_counters["phase"] = "replanning"
-            last_progress_flush = time.time()
-
-            checkpoint_mgr = CheckpointManager(
-                blob_service_client=self.blob_service_client,
-                container_name=settings.azure_storage_container_name,
-                project_id=project.id,
-                version_id=version.id,
-            )
-            await checkpoint_mgr.initialize()
-
-            # Cost check before re-planning
-            can_continue, stop_reason = cost_tracker.check_balance_and_charge()
-            if not can_continue:
-                self._handle_force_stop(
-                    db, project, version, cost_tracker, stop_reason
-                )
-                return False
-
-            # Run new orchestrator with feedback context
-            version.progress_detail = {"phase": "replanning"}
-            db.commit()
-
-            orchestrator = OrchestratorAgent(
-                chat_history=chat_history,
-                columns=state.columns,
-                num_samples=state.num_samples,
-                openai_client=tracked_client,
-                model=settings.research_model,
-                workspace_dir=workspace_dir,
-                on_delegate_topics=on_delegate_topics,
-                uploaded_files=uploaded_files if uploaded_files else None,
-                brave_api_key=settings.brave_api_key,
-                sandbox=self._sandbox,
-                stop_checker=stop_checker,
-                blob_service_client=self.blob_service_client,
-                project_id=project.id,
-                on_tool_call=on_tool_call,
-                on_cost=on_cost,
-                uploaded_file_urls=(
-                    uploaded_file_urls if uploaded_file_urls else None
-                ),
-                mcp_tools=mcp_tools,
-                feedback_context={
-                    "previous_config": config,
-                    "user_feedback": feedback_text,
-                },
-                langfuse_parent=langfuse_parent,
-            )
-
-            try:
-                result = await orchestrator.run()
-                logger.info(
-                    f"[Pipeline] Feedback orchestrator done: "
-                    f"cost=${orchestrator.cost_usd:.4f}, turns={result.turns_taken}"
-                )
-            finally:
-                await orchestrator.cleanup()
-
-            if delegate_config is None:
-                self._handle_force_stop(
-                    db, project, version, cost_tracker,
-                    "Feedback orchestrator did not delegate any topics",
-                )
-                return False
-
-            config = delegate_config
-            dataset_brief = config["dataset_brief"]
-            topics = config["topics"]
-
-            logger.info(
-                f"[Pipeline] Feedback orchestrator delegated "
-                f"{len(topics)} topics: {[t['name'] for t in topics]}"
-            )
-            # loop back → new SAMPLE phase
+        # Signal generation consumer to drain
+        await work_item_queue.put(None)  # poison pill
+        try:
+            await asyncio.wait_for(generation_task, timeout=300)
+        except asyncio.TimeoutError:
+            logger.warning("[Pipeline] Generation consumer drain timed out")
+        except Exception as e:
+            logger.warning(f"[Pipeline] Generation consumer error: {e}")
 
         # ====================================================================
-        # COMPLETE — Wait for generation, then backfill if needed
+        # COMPLETE — Check results, backfill if needed
         # ====================================================================
 
-        logger.info("[Pipeline] COMPLETE — waiting for generation to finish")
-
-        # Drain generation consumer
-        await self._drain_generation_consumer(work_item_queue, generation_task)
-
-        # Check final state
         state.refresh()
         if state.paused:
             await checkpoint_mgr.force_save()
@@ -770,7 +572,7 @@ class JobProcessor:
             self._handle_force_stop(db, project, version, cost_tracker, stop_reason)
             return False
 
-        # --- Backfill loop: guarantee generated_count == num_samples ---
+        # --- Backfill loop ---
         MAX_BACKFILL_ROUNDS = 3
         for backfill_round in range(MAX_BACKFILL_ROUNDS):
             db.refresh(version)
@@ -785,18 +587,20 @@ class JobProcessor:
                 f"generating {shortfall} more"
             )
 
-            # Distribute backfill across topics for variety
+            # Build backfill work items using the pipeline template
+            template = seed_processor._template or "Generate a row for this dataset."
             backfill_items: List[Dict] = []
             for i in range(shortfall):
-                topic = topics[i % len(topics)]
                 backfill_items.append({
-                    "instruction": (
-                        f"Generate a unique dataset row about '{topic['name']}'. "
-                        f"Topic context: {topic['briefing']}. "
-                        f"Pick an angle or example that hasn't been covered yet."
+                    "template": (
+                        f"{template}\n\n"
+                        f"(Backfill row — generate a unique row that hasn't been "
+                        f"covered yet. Use your judgment for variable values.)"
                     ),
-                    "context": dataset_brief,
-                    "tags": {"topic": topic["name"]},
+                    "seed_values": {},
+                    "filter_findings": "",
+                    "research_context": seed_processor._research_context or "",
+                    "tags": {"backfill": True},
                 })
 
             await self._process_work_item_batch(
@@ -806,10 +610,10 @@ class JobProcessor:
                 generation_stats, uploaded_file_urls=uploaded_file_urls,
                 on_cost=on_cost,
                 langfuse_parent=langfuse_parent,
+                on_browser_started=on_browser_started,
             )
             work_item_counter[0] += len(backfill_items)
 
-            # Re-check stop conditions before next round
             state.refresh()
             if state.paused:
                 await checkpoint_mgr.force_save()
@@ -837,46 +641,9 @@ class JobProcessor:
             self._handle_completion(db, project, version, cost_tracker)
             return True
 
-        # No rows generated
         await checkpoint_mgr.force_save()
         self._handle_force_stop(db, project, version, cost_tracker, "No rows generated")
         return False
-
-    async def _run_topic_agent_safe(
-        self,
-        agent: TopicAgent,
-        cost_tracker: CostTracker,
-    ) -> None:
-        """Run a topic agent (sample phase) with error handling."""
-        try:
-            result = await agent.run()
-
-            logger.info(
-                f"[Pipeline] Topic '{agent.topic_name}' sample done: "
-                f"cost=${agent.cost_usd:.4f}, turns={result.turns_taken}"
-            )
-        except Exception as e:
-            logger.error(f"[Pipeline] Topic '{agent.topic_name}' sample error: {e}")
-
-    async def _resume_topic_agent_safe(
-        self,
-        agent: TopicAgent,
-        cost_tracker: CostTracker,
-        user_feedback: Optional[str],
-    ) -> None:
-        """Resume a topic agent (full phase) with error handling."""
-        cost_before = agent.cost_usd
-
-        try:
-            result = await agent.resume(feedback=user_feedback)
-
-            phase_cost = agent.cost_usd - cost_before
-            logger.info(
-                f"[Pipeline] Topic '{agent.topic_name}' generate done: "
-                f"cost=${phase_cost:.4f}, turns={result.turns_taken}"
-            )
-        except Exception as e:
-            logger.error(f"[Pipeline] Topic '{agent.topic_name}' generate error: {e}")
 
     async def _run_generation_consumer(
         self,
@@ -894,6 +661,7 @@ class JobProcessor:
         uploaded_file_urls: Optional[Dict[str, str]] = None,
         on_cost: Optional[Callable] = None,
         langfuse_parent: Optional[Any] = None,
+        on_browser_started: Optional[Callable] = None,
     ) -> None:
         """
         Background consumer: dequeue work items, batch them, and run
@@ -923,6 +691,7 @@ class JobProcessor:
                             generation_stats, uploaded_file_urls=uploaded_file_urls,
                             on_cost=on_cost,
                             langfuse_parent=langfuse_parent,
+                            on_browser_started=on_browser_started,
                         )
                         batch_start_index += len(batch)
                         batch = []
@@ -938,6 +707,7 @@ class JobProcessor:
                             generation_stats, uploaded_file_urls=uploaded_file_urls,
                             on_cost=on_cost,
                             langfuse_parent=langfuse_parent,
+                            on_browser_started=on_browser_started,
                         )
                         batch_start_index += len(batch)
                         batch = []
@@ -953,6 +723,7 @@ class JobProcessor:
                         generation_stats, uploaded_file_urls=uploaded_file_urls,
                         on_cost=on_cost,
                         langfuse_parent=langfuse_parent,
+                        on_browser_started=on_browser_started,
                     )
                     batch_start_index += len(batch)
                     batch = []
@@ -984,6 +755,7 @@ class JobProcessor:
         uploaded_file_urls: Optional[Dict[str, str]] = None,
         on_cost: Optional[Callable] = None,
         langfuse_parent: Optional[Any] = None,
+        on_browser_started: Optional[Callable] = None,
     ) -> None:
         """Process a batch of work items through the generation pool."""
 
@@ -1014,6 +786,7 @@ class JobProcessor:
             mcp_tools=self._mcp_tools,
             on_cost=on_cost,
             langfuse_parent=langfuse_parent,
+            on_browser_started=on_browser_started,
         )
 
         success, errors = await pool.process_work_items(batch, schema)
@@ -1127,53 +900,6 @@ class JobProcessor:
                 logger.warning("[Pipeline] Generation consumer drain timed out")
             except Exception as e:
                 logger.warning(f"[Pipeline] Generation consumer drain error: {e}")
-
-    async def _wait_for_review(
-        self,
-        db: Session,
-        project: Project,
-        version: ProjectVersion,
-        stop_checker,
-    ) -> tuple:
-        """Wait for user to approve samples or give feedback.
-
-        Returns (action, text) where action is one of:
-        - "approve", None
-        - "feedback", feedback_text
-        - "timeout", None
-        - "paused", None
-        """
-        review_start = datetime.now(timezone.utc)
-
-        for _ in range(1800):  # 30 min
-            await asyncio.sleep(1)
-
-            if stop_checker():
-                return "paused", None
-
-            db.refresh(version)
-            pd = version.progress_detail or {}
-            if pd.get("user_action") == "approve":
-                return "approve", None
-
-            new_msg = (
-                db.query(ChatMessage)
-                .filter(
-                    ChatMessage.project_id == project.id,
-                    ChatMessage.role == "user",
-                    ChatMessage.created_at > review_start,
-                )
-                .order_by(ChatMessage.created_at.asc())
-                .first()
-            )
-            if new_msg:
-                logger.info(
-                    f"[Pipeline] Got user feedback ({len(new_msg.content)} chars)"
-                )
-                return "feedback", new_msg.content
-
-        logger.info("[Pipeline] No user response within 30 min — timing out")
-        return "timeout", None
 
     def _create_feedback_version(
         self,

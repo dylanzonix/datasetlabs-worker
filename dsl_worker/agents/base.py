@@ -134,6 +134,39 @@ class AgentConversation:
     def _should_stop(self) -> bool:
         return self.stop_checker is not None and self.stop_checker()
 
+    async def _api_call_with_stop_check(self, **kwargs):
+        """Wrap an API call so we can detect stop/pause within a few seconds.
+
+        Races the API call against a periodic stop_checker poll. If stop is
+        detected, cancels the API task and returns None. The caller should
+        check _should_stop() after this returns.
+        """
+        api_task = asyncio.create_task(
+            self.openai_client.responses_create(**kwargs)
+        )
+
+        # If no stop_checker, just await normally
+        if not self.stop_checker:
+            return await api_task
+
+        # Poll stop_checker every 2s while API call is in flight
+        while not api_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(api_task), timeout=2.0)
+            except asyncio.TimeoutError:
+                if self._should_stop():
+                    api_task.cancel()
+                    try:
+                        await api_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    return None
+            except Exception:
+                # Let the actual await below surface the error
+                break
+
+        return await api_task
+
     def _trim_context(self) -> None:
         """Drop oldest messages if total context would exceed the window limit."""
         # Reserve space for system prompt + output
@@ -287,13 +320,19 @@ class AgentConversation:
             all_tools = (self.tools.get_definitions() or []) + self.extra_tools
 
             try:
-                response, cost = await self.openai_client.responses_create(
+                api_result = await self._api_call_with_stop_check(
                     model=self.model,
                     input=input_items,
                     tools=all_tools or None,
                     max_output_tokens=self.max_output_tokens,
                     **create_kwargs,
                 )
+                if api_result is None:
+                    # Cancelled by stop_checker
+                    logger.info(f"[{self.label}] API call cancelled by stop_checker at turn {turn}")
+                    result.stopped = True
+                    break
+                response, cost = api_result
             except Exception as e:
                 logger.error(f"API call failed: {e}", exc_info=True)
                 self.messages.append({

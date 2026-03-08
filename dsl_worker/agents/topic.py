@@ -196,6 +196,7 @@ class TopicAgent:
         on_cost: Optional[Callable] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
         langfuse_parent: Optional[Any] = None,
+        on_browser_started: Optional[Callable] = None,
     ) -> None:
         self.topic_name = topic_name
         self.dataset_brief = dataset_brief
@@ -227,6 +228,7 @@ class TopicAgent:
             stop_checker=stop_checker,
             blob_service_client=blob_service_client,
             project_id=project_id,
+            on_browser_started=on_browser_started,
         )
         self._impl.set_scope(ResearchScope(
             id=f"topic:{topic_name}",

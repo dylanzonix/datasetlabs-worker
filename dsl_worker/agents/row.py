@@ -1,10 +1,12 @@
 """
 Row generator agent — generates a single dataset row from an assignment.
 
-V4: Takes a dataset brief + row assignment + schema, produces a GeneratedRow.
-Each row generator gets one assignment and produces one row. The assignment
-is a natural language instruction written by the topic agent. The dataset
-brief provides overall context and quality expectations.
+V5: Takes a filled template + seed values + filter findings + schema.
+V4 compat: Still accepts assignment + dataset_brief for backward compatibility.
+
+Each row generator gets one work item and produces one row. In V5, the work
+item contains a filled template (variables already substituted) plus seed
+values and filter findings as reference context.
 """
 
 from __future__ import annotations
@@ -157,6 +159,60 @@ rather than making something up.
 """
 
 
+ROW_GENERATOR_V5_SYSTEM_PROMPT = """\
+You are generating a single dataset row.
+
+## Instructions
+
+{template_with_filled_variables}
+
+## Research Context
+
+{research_context_section}
+
+## Additional Context
+
+{filter_findings_section}
+
+## Schema
+
+<schema>
+{schema_str}
+</schema>
+
+## Output — TOOLS ONLY
+
+You MUST deliver your output via tool calls. Text responses are discarded by the system.
+
+For each column in the schema, call set_column(name, value). Then call submit_row().
+
+IMPORTANT: Call set_column for ALL columns in a SINGLE response. Do not call set_column one at a time across multiple turns — batch all set_column calls together, then call submit_row in the same response or the next one.
+
+DO NOT write JSON, code blocks, or row content as text. Only tool calls are captured.
+
+## Research
+
+Your seed and filter findings may already contain much of what you need.
+Check what you have before searching. Only research if the instructions
+require verification or additional information beyond what was provided.
+
+## Tools
+
+- set_column(name, value): Set a column value. Values are validated against the schema type.
+- append_to_column(name, value): Append to a column. For json columns, appends value as a list element. For string columns, concatenates with a newline.
+- clear_column(name): Clear a column value so you can start over.
+- submit_row(): Submit the completed row. Call after all columns are set.
+- rng(options, weights): Pick a random option for controlled randomization
+- read_file(path): Read a file from the workspace
+- brave_search(query): Search the web for information
+- open(ref_id_or_url, start_line): View a page or file
+- find(ref_id, pattern): Search within a loaded page
+- click(ref_id, link_id): Follow a link
+- code_exec(script, description): Execute Python
+- interact(url_or_ref_id, task): Browser agent for complex interactions
+"""
+
+
 class RowGeneratorAgent:
     """
     Generates a single dataset row from a work item instruction.
@@ -194,6 +250,7 @@ class RowGeneratorAgent:
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
         on_cost: Optional[Callable] = None,
         langfuse_parent: Optional[Any] = None,
+        on_browser_started: Optional[Callable] = None,
     ) -> None:
         self.openai_client = openai_client
         self.model = model
@@ -220,6 +277,7 @@ class RowGeneratorAgent:
             blob_service_client=blob_service_client,
             project_id=project_id,
             uploaded_file_urls=uploaded_file_urls,
+            on_browser_started=on_browser_started,
         )
         # Set a dummy scope for ResearchTools compatibility
         self._impl.set_scope(ResearchScope(
@@ -487,29 +545,71 @@ class RowGeneratorAgent:
             schema_str=schema_str,
         )
 
+    def _build_v5_prompt(
+        self,
+        template: str,
+        seed: Optional[Dict],
+        filter_findings: Optional[str],
+        schema: List[Dict],
+        research_context: Optional[str] = None,
+    ) -> str:
+        """Build V5 system prompt from filled template + seed + filter findings."""
+        schema_str = json.dumps(schema, indent=2)
+
+        filter_section = ""
+        if filter_findings:
+            filter_section = f"<filter_findings>\n{filter_findings}\n</filter_findings>"
+        else:
+            filter_section = "(no filter findings)"
+
+        research_section = ""
+        if research_context:
+            research_section = f"<research_context>\n{research_context}\n</research_context>"
+        else:
+            research_section = "(no research context)"
+
+        return ROW_GENERATOR_V5_SYSTEM_PROMPT.format(
+            template_with_filled_variables=template,
+            research_context_section=research_section,
+            filter_findings_section=filter_section,
+            schema_str=schema_str,
+        )
+
     async def generate(
         self,
-        assignment: str,
-        schema: List[Dict],
+        # V5 interface
+        template: str = "",
+        seed: Optional[Dict] = None,
+        filter_findings: Optional[str] = None,
+        research_context: Optional[str] = None,
+        schema: Optional[List[Dict]] = None,
+        # V4 backward compat
+        assignment: str = "",
         dataset_brief: str = "",
     ) -> GeneratedRow:
         """
-        Generate a single row from an assignment.
+        Generate a single row.
 
-        Args:
-            assignment: The row assignment — a natural language instruction for this row.
-            schema: Column definitions for the row.
-            dataset_brief: The dataset brief — overall context and quality expectations.
+        V5: Pass template (filled), seed, filter_findings, research_context, schema.
+        V4: Pass assignment, schema, dataset_brief.
 
         Creates a fresh AgentConversation per call so each row generation
         starts with a clean message history.
         """
+        if schema is None:
+            schema = []
+
         # Reset state
         self._current_row = {}
         self._submitted = False
         self._schema = schema
 
-        system_prompt = self._build_system_prompt(assignment, schema, dataset_brief)
+        if template:
+            system_prompt = self._build_v5_prompt(
+                template, seed, filter_findings, schema, research_context
+            )
+        else:
+            system_prompt = self._build_system_prompt(assignment, schema, dataset_brief)
 
         conversation = AgentConversation(
             openai_client=self.openai_client,

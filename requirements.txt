@@ -39,9 +39,10 @@ psycopg2-binary
 pgvector==0.3.6
 numpy==1.26.4
 
-browser-use 
-markdownify 
+browser-use-sdk
+markdownify
 httpx
+playwright
 sandbox-service
 
 langfuse

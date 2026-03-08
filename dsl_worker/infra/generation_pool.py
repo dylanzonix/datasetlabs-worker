@@ -5,9 +5,9 @@ The actual row generation agent is in dsl_worker.agents.row.
 This module provides the pool that manages parallel workers consuming
 work items from a queue.
 
-V4: Work items are assignments from topic agents. Each has an instruction
-(natural language row assignment), optional context (dataset brief),
-optional schema override, and optional tags.
+V5: Work items are filled templates from the pipeline. Each has a template
+(filled with seed values), seed_values, filter_findings, and tags.
+V4 compat: Also handles V4 format (instruction, context, schema, tags).
 """
 
 import asyncio
@@ -45,6 +45,7 @@ class GenerationWorkerPool:
         mcp_tools: Optional[List[Dict]] = None,
         on_cost: Optional[Callable] = None,
         langfuse_parent: Optional[Any] = None,
+        on_browser_started: Optional[Callable] = None,
     ):
         self.workspace_dir = Path(workspace_dir)
         self.openai_client = openai_client
@@ -63,6 +64,7 @@ class GenerationWorkerPool:
         self.mcp_tools = mcp_tools or []
         self.on_cost = on_cost
         self.langfuse_parent = langfuse_parent
+        self.on_browser_started = on_browser_started
 
         self._total_cost = 0.0
         self._rows_generated = 0
@@ -80,11 +82,17 @@ class GenerationWorkerPool:
         """
         Process work items in parallel. Returns (success_count, error_count).
 
-        Each work item is a dict with:
-            - instruction: str (required) — the filled instruction template
-            - context: str (optional) — supplementary notes from topic agent
-            - schema: List[Dict] (optional) — overrides default_schema for this item
-            - tags: Dict (optional) — metadata tags to attach to the saved row
+        V5 work item format:
+            - template: str — filled template (variables substituted)
+            - seed_values: Dict — resolved variable values
+            - filter_findings: str — findings from filter agents
+            - tags: Dict — metadata tags
+
+        V4 work item format (backward compat):
+            - instruction: str — the filled instruction template
+            - context: str — supplementary notes from topic agent
+            - schema: List[Dict] — overrides default_schema for this item
+            - tags: Dict — metadata tags
         """
         if not work_items:
             logger.warning("[GenerationPool] No work items to process")
@@ -121,6 +129,7 @@ class GenerationWorkerPool:
                 mcp_tools=self.mcp_tools,
                 on_cost=self.on_cost,
                 langfuse_parent=self.langfuse_parent,
+                on_browser_started=self.on_browser_started,
             )
 
             try:
@@ -133,20 +142,27 @@ class GenerationWorkerPool:
                     except asyncio.QueueEmpty:
                         break
 
-                    instruction = item.get("instruction", "")
-                    context = item.get("context", "")
-                    schema = item.get("schema") or default_schema
+                    # Detect V5 vs V4 format
+                    is_v5 = "template" in item
                     tags = item.get("tags") or {}
 
-                    # Use per-item langfuse parent (topic span) so
-                    # row_generator traces nest under their topic.
+                    # Use per-item langfuse parent so traces nest correctly
                     item_parent = item.get("langfuse_parent")
                     if item_parent is not None:
                         agent.langfuse_parent = item_parent
                     else:
                         agent.langfuse_parent = self.langfuse_parent
 
-                    if not instruction:
+                    # Validate work item has content
+                    if is_v5 and not item.get("template"):
+                        logger.warning(f"[GenerationPool] Empty template at index {index}")
+                        async with lock:
+                            error_count += 1
+                            self._errors += 1
+                        if self.checkpoint_callback:
+                            await self.checkpoint_callback(index, False, None)
+                        continue
+                    elif not is_v5 and not item.get("instruction"):
                         logger.warning(f"[GenerationPool] Empty instruction at index {index}")
                         async with lock:
                             error_count += 1
@@ -160,11 +176,20 @@ class GenerationWorkerPool:
 
                     for attempt in range(max_attempts):
                         try:
-                            result = await agent.generate(
-                                assignment=instruction,
-                                schema=schema,
-                                dataset_brief=context,
-                            )
+                            if is_v5:
+                                result = await agent.generate(
+                                    template=item["template"],
+                                    seed=item.get("seed_values"),
+                                    filter_findings=item.get("filter_findings"),
+                                    research_context=item.get("research_context"),
+                                    schema=default_schema,
+                                )
+                            else:
+                                result = await agent.generate(
+                                    assignment=item.get("instruction", ""),
+                                    schema=item.get("schema") or default_schema,
+                                    dataset_brief=item.get("context", ""),
+                                )
 
                             if result.success and result.row:
                                 row_id = await self._save_row(result.row, tags=tags)
