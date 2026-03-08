@@ -40,6 +40,8 @@ class GeneratedRow:
     row: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
     cost_usd: float = 0.0
+    skipped: bool = False
+    skip_reason: str = ""
 
 
 ROW_GENERATOR_SYSTEM_PROMPT = """\
@@ -170,10 +172,6 @@ You are generating a single dataset row.
 
 {research_context_section}
 
-## Additional Context
-
-{filter_findings_section}
-
 ## Schema
 
 <schema>
@@ -192,7 +190,7 @@ DO NOT write JSON, code blocks, or row content as text. Only tool calls are capt
 
 ## Research
 
-Your seed and filter findings may already contain much of what you need.
+Your seed values and research context may already contain much of what you need.
 Check what you have before searching. Only research if the instructions
 require verification or additional information beyond what was provided.
 
@@ -202,6 +200,9 @@ require verification or additional information beyond what was provided.
 - append_to_column(name, value): Append to a column. For json columns, appends value as a list element. For string columns, concatenates with a newline.
 - clear_column(name): Clear a column value so you can start over.
 - submit_row(): Submit the completed row. Call after all columns are set.
+- skip_row(reason): Skip this row entirely. Use when the seed turns out to be a dead end \
+(broken URL, unavailable content, doesn't meet quality standards). Only skip if you genuinely \
+cannot produce a good row — don't skip just because research is hard.
 - rng(options, weights): Pick a random option for controlled randomization
 - read_file(path): Read a file from the workspace
 - brave_search(query): Search the web for information
@@ -263,6 +264,8 @@ class RowGeneratorAgent:
         # Tool state — reset per generate() call
         self._current_row: Dict[str, Any] = {}
         self._submitted: bool = False
+        self._skipped: bool = False
+        self._skip_reason: str = ""
         self._schema: List[Dict] = []
 
         # Create ResearchTools for browsing tool implementations
@@ -451,6 +454,32 @@ class RowGeneratorAgent:
             handler=submit_row,
         )
 
+        async def skip_row(args: Dict) -> tuple[str, float]:
+            reason = args.get("reason", "")
+            self._skipped = True
+            self._skip_reason = reason
+            return f"Row skipped: {reason}", 0.0
+
+        registry.add(
+            name="skip_row",
+            description=(
+                "Skip this row entirely. Use when the seed turns out to be a dead end "
+                "(broken URL, unavailable content, doesn't meet quality standards). "
+                "Only skip if you genuinely cannot produce a good row."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Why this row is being skipped",
+                    },
+                },
+                "required": ["reason"],
+            },
+            handler=skip_row,
+        )
+
         async def rng(args: Dict) -> tuple[str, float]:
             options = args.get("options", [])
             weights = args.get("weights")
@@ -549,18 +578,11 @@ class RowGeneratorAgent:
         self,
         template: str,
         seed: Optional[Dict],
-        filter_findings: Optional[str],
         schema: List[Dict],
         research_context: Optional[str] = None,
     ) -> str:
-        """Build V5 system prompt from filled template + seed + filter findings."""
+        """Build V5 system prompt from filled template + seed."""
         schema_str = json.dumps(schema, indent=2)
-
-        filter_section = ""
-        if filter_findings:
-            filter_section = f"<filter_findings>\n{filter_findings}\n</filter_findings>"
-        else:
-            filter_section = "(no filter findings)"
 
         research_section = ""
         if research_context:
@@ -571,7 +593,6 @@ class RowGeneratorAgent:
         return ROW_GENERATOR_V5_SYSTEM_PROMPT.format(
             template_with_filled_variables=template,
             research_context_section=research_section,
-            filter_findings_section=filter_section,
             schema_str=schema_str,
         )
 
@@ -580,7 +601,6 @@ class RowGeneratorAgent:
         # V5 interface
         template: str = "",
         seed: Optional[Dict] = None,
-        filter_findings: Optional[str] = None,
         research_context: Optional[str] = None,
         schema: Optional[List[Dict]] = None,
         # V4 backward compat
@@ -590,7 +610,7 @@ class RowGeneratorAgent:
         """
         Generate a single row.
 
-        V5: Pass template (filled), seed, filter_findings, research_context, schema.
+        V5+: Pass template (filled), seed, research_context, schema.
         V4: Pass assignment, schema, dataset_brief.
 
         Creates a fresh AgentConversation per call so each row generation
@@ -602,11 +622,13 @@ class RowGeneratorAgent:
         # Reset state
         self._current_row = {}
         self._submitted = False
+        self._skipped = False
+        self._skip_reason = ""
         self._schema = schema
 
         if template:
             system_prompt = self._build_v5_prompt(
-                template, seed, filter_findings, schema, research_context
+                template, seed, schema, research_context
             )
         else:
             system_prompt = self._build_system_prompt(assignment, schema, dataset_brief)
@@ -627,10 +649,18 @@ class RowGeneratorAgent:
 
         result = await conversation.send(
             "Generate a dataset row from the assignment above.",
-            exit_condition=lambda: self._submitted,
+            exit_condition=lambda: self._submitted or self._skipped,
         )
 
         cost = conversation.total_cost
+
+        if self._skipped:
+            return GeneratedRow(
+                success=False,
+                skipped=True,
+                skip_reason=self._skip_reason,
+                cost_usd=cost,
+            )
 
         if self._submitted:
             return GeneratedRow(

@@ -60,8 +60,7 @@ from dsl_worker.billing import CostTracker, TrackedOpenAIClient
 from dsl_worker.checkpoint import CheckpointManager, checkpoints_to_work_items
 
 from dsl_worker.agents import OrchestratorAgent
-from dsl_worker.agents.filter_agent import FilterAgent
-from dsl_worker.infra.pipeline import PipelineConfig, Seed, SeedProcessor, FilterConfig
+from dsl_worker.infra.pipeline import SeedProcessor
 from dsl_worker.infra.generation_pool import GenerationWorkerPool
 from sandbox_service import SandboxClient
 
@@ -389,9 +388,8 @@ class JobProcessor:
             phase_map = {
                 "research": "researching",
                 "write_template": "designing_template",
-                "spawn_yielder": "yielding_seeds",
-                "spawn_synthesizer": "synthesizing_seeds",
-                "submit_seeds": "submitting_seeds",
+                "parse_seeds": "parsing_seeds",
+                "synthesize_seeds": "synthesizing_seeds",
                 "done": "finishing",
                 "yield_seed": "yielding_seeds",
             }
@@ -404,8 +402,8 @@ class JobProcessor:
                 "code_exec": "code_runs",
                 "research": "research_subagents",
                 "yield_seed": "seeds_yielded",
-                "spawn_yielder": "yielders_spawned",
-                "spawn_synthesizer": "synthesizers_spawned",
+                "parse_seeds": "parsers_spawned",
+                "synthesize_seeds": "synthesizers_spawned",
             }
             if tool_name in counter_map:
                 key = counter_map[tool_name]
@@ -436,34 +434,6 @@ class JobProcessor:
         # V6: Create shared infrastructure BEFORE orchestrator
         # ====================================================================
 
-        # --- Filter callback for SeedProcessor ---
-
-        async def run_filter(seed: Seed, filter_config: FilterConfig):
-            if filter_config.complexity == "judgment":
-                passed, findings, cost = await FilterAgent.run_judgment(
-                    seed=seed,
-                    filter_config=filter_config,
-                    openai_client=tracked_client,
-                    model=settings.research_model,
-                    workspace_dir=workspace_dir,
-                    brave_api_key=settings.brave_api_key,
-                    sandbox=self._sandbox,
-                    stop_checker=stop_checker,
-                    blob_service_client=self.blob_service_client,
-                    project_id=project.id,
-                    on_browser_started=on_browser_started,
-                )
-            else:
-                passed, findings, cost = await FilterAgent.run_simple(
-                    seed=seed,
-                    filter_config=filter_config,
-                    openai_client=tracked_client,
-                    model=settings.filter_model,
-                )
-            if cost > 0:
-                await on_cost(cost, f"filter:{filter_config.name}")
-            return passed, findings
-
         # --- Checkpoint callback for SeedProcessor ---
 
         async def on_seed_checkpoint(work_item: Dict):
@@ -473,7 +443,6 @@ class JobProcessor:
         # Create seed processor (V6: created before orchestrator, configured incrementally)
         seed_processor = SeedProcessor(
             work_queue=work_item_queue,
-            on_filter=run_filter,
             on_checkpoint=on_seed_checkpoint,
             target_rows=state.num_samples,
         )
@@ -598,7 +567,6 @@ class JobProcessor:
                         f"covered yet. Use your judgment for variable values.)"
                     ),
                     "seed_values": {},
-                    "filter_findings": "",
                     "research_context": seed_processor._research_context or "",
                     "tags": {"backfill": True},
                 })

@@ -2,7 +2,7 @@
 Pipeline configuration and seed processing.
 
 V6: SeedProcessor is created before the orchestrator and configured incrementally.
-The orchestrator sets template, variables, filters, and dedup via tools rather than
+The orchestrator sets template, variables, and dedup via tools rather than
 designing a monolithic PipelineConfig upfront.
 
 PipelineConfig still exists as a data structure — used for:
@@ -10,7 +10,7 @@ PipelineConfig still exists as a data structure — used for:
 - Constructing per-yielder configs when the orchestrator spawns subagents
 - Backward compatibility with V4/V5 checkpoint resume
 
-Seeds flow through: yielder → dedup gate → filters → work item queue → row generators.
+Seeds flow through: yielder → dedup gate → work item queue → row generators.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field, asdict
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -34,14 +34,6 @@ class VariableConfig:
     seed_sources: List[str] = field(default_factory=list)   # URLs, file paths, search queries
     seed_context: str = ""              # accumulated research context (for synthetic)
     seed_instructions: str = ""         # specific instructions for seed yielders
-
-
-@dataclass
-class FilterConfig:
-    """Configuration for a seed filter."""
-    name: str                           # e.g., "active_and_recent"
-    description: str                    # what to check
-    complexity: str = "simple"          # "simple" | "judgment"
 
 
 @dataclass
@@ -62,7 +54,6 @@ class PipelineConfig:
     """
     template: str                       # row generation instructions with {var} placeholders
     variables: List[VariableConfig]     # what changes per row
-    filters: List[FilterConfig] = field(default_factory=list)
     dedup: DedupConfig = field(default_factory=DedupConfig)
     distribution: Dict[str, Dict[str, float]] = field(default_factory=dict)
     target_rows: int = 100
@@ -77,12 +68,10 @@ class PipelineConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> PipelineConfig:
         variables = [VariableConfig(**v) for v in data.get("variables", [])]
-        filters = [FilterConfig(**f) for f in data.get("filters", [])]
         dedup = DedupConfig(**data.get("dedup", {}))
         return cls(
             template=data["template"],
             variables=variables,
-            filters=filters,
             dedup=dedup,
             distribution=data.get("distribution", {}),
             target_rows=data.get("target_rows", 100),
@@ -122,7 +111,7 @@ class SeedProcessor:
     Thread-safe for concurrent seed yielders submitting seeds.
 
     V6: Can be created with just a target_rows count, then configured incrementally
-    via set_template(), set_variables(), set_filters(), set_dedup(). This allows
+    via set_template(), set_variables(), set_dedup(). This allows
     the orchestrator to set things up gradually through tool calls.
 
     Also accepts a full PipelineConfig for V5-compat (checkpoint resume, etc.).
@@ -131,7 +120,6 @@ class SeedProcessor:
     def __init__(
         self,
         work_queue: asyncio.Queue,
-        on_filter: Optional[Callable[[Seed, FilterConfig], Awaitable[Tuple[bool, Dict]]]] = None,
         on_checkpoint: Optional[Callable[[Dict], Awaitable[None]]] = None,
         # V6: configure incrementally
         target_rows: int = 100,
@@ -139,14 +127,12 @@ class SeedProcessor:
         config: Optional[PipelineConfig] = None,
     ) -> None:
         self._work_queue = work_queue
-        self._on_filter = on_filter
         self._on_checkpoint = on_checkpoint
 
         # V6 mutable state — set via methods or from PipelineConfig
         if config is not None:
             self._template: Optional[str] = config.template
             self._variables: List[VariableConfig] = list(config.variables)
-            self._filters: List[FilterConfig] = list(config.filters)
             self._dedup: DedupConfig = config.dedup
             self._target_rows: int = config.target_rows
             self._research_context: str = config.research_context or ""
@@ -154,7 +140,6 @@ class SeedProcessor:
         else:
             self._template = None
             self._variables = []
-            self._filters = []
             self._dedup = DedupConfig()
             self._target_rows = target_rows
             self._research_context = ""
@@ -166,10 +151,8 @@ class SeedProcessor:
 
         # Counters
         self._accepted = 0
-        self._processing = 0        # seeds currently being filtered
         self._submitted_total = 0   # total submit_seed calls
         self._rejected_dedup = 0
-        self._rejected_filter = 0
 
         # Distribution tracking (informational, not enforced)
         self._distribution: Dict[str, Dict[str, int]] = {}
@@ -183,10 +166,6 @@ class SeedProcessor:
     def set_variables(self, variables: List[VariableConfig]) -> None:
         """Set or update the pipeline variables."""
         self._variables = list(variables)
-
-    def set_filters(self, filters: List[FilterConfig]) -> None:
-        """Set or update the filter list."""
-        self._filters = list(filters)
 
     def set_dedup(self, dedup: DedupConfig) -> None:
         """Set or update the dedup config."""
@@ -204,9 +183,7 @@ class SeedProcessor:
     def stats(self) -> Dict[str, Any]:
         return {
             "accepted": self._accepted,
-            "processing": self._processing,
             "rejected_dedup": self._rejected_dedup,
-            "rejected_filter": self._rejected_filter,
             "submitted_total": self._submitted_total,
             "target": self._target_rows,
             "remaining": max(0, self._target_rows - self._accepted),
@@ -222,7 +199,7 @@ class SeedProcessor:
 
     async def submit_seed(self, seed: Seed, yielder_id: str = "") -> Dict[str, Any]:
         """
-        Process a seed: dedup → filter → queue for generation.
+        Process a seed: dedup → queue for generation.
 
         Returns a rich status dict: {accepted, reason, stats}.
         Called by seed yielders (possibly concurrently).
@@ -237,28 +214,11 @@ class SeedProcessor:
                 self._rejected_dedup += 1
                 logger.debug(f"[SeedProcessor] Seed rejected by dedup: {seed.values}")
                 return self._build_status(False, "duplicate")
-            self._processing += 1
-
-        # --- Filters (no lock — can be slow) ---
-        for filter_config in self._filters:
-            passed, findings = await self._run_filter(seed, filter_config)
-            if not passed:
-                async with self._lock:
-                    self._processing -= 1
-                    self._rejected_filter += 1
-                logger.info(
-                    f"[SeedProcessor] Seed rejected by filter '{filter_config.name}': "
-                    f"{findings.get('reason', 'no reason')}"
-                )
-                return self._build_status(False, f"filter:{filter_config.name}")
-            # Merge findings into seed for downstream use
-            seed.filter_findings[filter_config.name] = findings
 
         # --- Accept ---
         work_item = self._build_work_item(seed)
 
         async with self._lock:
-            self._processing -= 1
             self._accepted += 1
             self._track_distribution(seed)
 
@@ -299,33 +259,13 @@ class SeedProcessor:
 
         return True
 
-    async def _run_filter(self, seed: Seed, filter_config: FilterConfig) -> Tuple[bool, Dict]:
-        """Run a filter on a seed. Returns (passed, findings)."""
-        if self._on_filter:
-            return await self._on_filter(seed, filter_config)
-        # No filter handler configured — pass everything
-        return True, {}
-
     def _build_work_item(self, seed: Seed) -> Dict[str, Any]:
         """Fill template with seed values, build work item for row generator."""
         filled_template = self._fill_template(seed.values)
 
-        # Build filter findings section
-        filter_findings_text = ""
-        if seed.filter_findings:
-            parts = []
-            for name, findings in seed.filter_findings.items():
-                if isinstance(findings, dict):
-                    findings_str = json.dumps(findings, indent=2, ensure_ascii=False)
-                else:
-                    findings_str = str(findings)
-                parts.append(f"### {name}\n{findings_str}")
-            filter_findings_text = "\n\n".join(parts)
-
         return {
             "template": filled_template,
             "seed_values": seed.values,
-            "filter_findings": filter_findings_text,
             "research_context": self._research_context,
             "metadata": seed.metadata,
             "tags": seed.metadata.get("tags", {}),

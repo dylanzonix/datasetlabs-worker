@@ -5,8 +5,8 @@ The actual row generation agent is in dsl_worker.agents.row.
 This module provides the pool that manages parallel workers consuming
 work items from a queue.
 
-V5: Work items are filled templates from the pipeline. Each has a template
-(filled with seed values), seed_values, filter_findings, and tags.
+V5+: Work items are filled templates from the pipeline. Each has a template
+(filled with seed values), seed_values, research_context, and tags.
 V4 compat: Also handles V4 format (instruction, context, schema, tags).
 """
 
@@ -85,7 +85,7 @@ class GenerationWorkerPool:
         V5 work item format:
             - template: str — filled template (variables substituted)
             - seed_values: Dict — resolved variable values
-            - filter_findings: str — findings from filter agents
+            - research_context: str — orchestrator research findings
             - tags: Dict — metadata tags
 
         V4 work item format (backward compat):
@@ -180,7 +180,6 @@ class GenerationWorkerPool:
                                 result = await agent.generate(
                                     template=item["template"],
                                     seed=item.get("seed_values"),
-                                    filter_findings=item.get("filter_findings"),
                                     research_context=item.get("research_context"),
                                     schema=default_schema,
                                 )
@@ -205,6 +204,18 @@ class GenerationWorkerPool:
 
                                 if self.checkpoint_callback:
                                     await self.checkpoint_callback(index, True, row_id)
+                                succeeded = True
+                                break
+                            elif result.skipped:
+                                async with lock:
+                                    skip_count += 1
+                                    self._skipped += 1
+                                logger.info(
+                                    f"[GenerationPool] Row skipped at index {index}: "
+                                    f"{result.skip_reason}"
+                                )
+                                if self.checkpoint_callback:
+                                    await self.checkpoint_callback(index, True, None)
                                 succeeded = True
                                 break
                             else:

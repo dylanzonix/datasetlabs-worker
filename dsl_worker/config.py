@@ -52,7 +52,6 @@ class WorkerSettings(BaseSettings):
 
     # V6 pipeline settings
     research_subagent_model: str = "gpt-5.2"    # model for research subagents
-    filter_model: str = "gpt-5-nano"             # model for simple filters
     seed_yielder_model: str = "gpt-5.2"          # model for seed yielders
     max_research_subagents: int = 10             # cap on parallel research
     max_seed_yielders: int = 10                  # cap on parallel seed yielders

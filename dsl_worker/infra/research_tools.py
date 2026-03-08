@@ -390,11 +390,75 @@ class ResearchTools:
 
         return self._sandbox_session
 
+    async def _disconnect_playwright(self):
+        """Disconnect Playwright from the cloud browser.
+
+        Used before BU Agent runs to avoid dual CDP connections.
+        The cloud browser session stays alive — only the Playwright
+        CDP connection is dropped.
+        """
+        if self._playwright:
+            try:
+                await self._playwright.stop()
+            except Exception as e:
+                logger.debug(f"[ResearchTools] Error disconnecting Playwright: {e}")
+            self._playwright = None
+            self._browser_context = None
+
+    async def _reconnect_playwright(self):
+        """Reconnect Playwright to the cloud browser after BU Agent finishes.
+
+        Assumes the cloud browser session is still alive. If connection
+        fails (e.g., browser died), nullifies state so _get_browser()
+        will create a fresh session on next call.
+        """
+        if not self._cdp_url:
+            return
+        try:
+            self._playwright = await async_playwright().start()
+            browser = await self._playwright.chromium.connect_over_cdp(
+                self._cdp_url,
+            )
+            self._browser_context = browser.contexts[0]
+        except Exception as e:
+            logger.warning(f"[ResearchTools] Failed to reconnect Playwright: {e}")
+            # Browser session likely died — clear state so _get_browser()
+            # creates a fresh session on next call
+            self._playwright = None
+            self._browser_context = None
+            self._cdp_url = None
+            self._cloud_session_id = None
+
+    async def _stop_bu_cdp_client(self, agent: Any) -> None:
+        """Force-stop the BU Agent's internal CDPClient.
+
+        With keep_alive=True, agent.close() does NOT stop the CDPClient.
+        We must reach in and stop it explicitly to avoid a lingering CDP
+        WebSocket connection that conflicts with Playwright's.
+
+        CRITICAL: Must set _intentional_stop=True BEFORE stopping the
+        CDPClient. Otherwise BU's auto-reconnect callback fires when
+        the WebSocket drops and reconnects the CDPClient within seconds.
+        """
+        try:
+            session = getattr(agent, 'browser_session', None)
+            if session is None:
+                return
+            # Prevent auto-reconnect (3 retries) when WebSocket drops
+            session._intentional_stop = True
+            cdp_client = getattr(session, '_cdp_client_root', None)
+            if cdp_client is not None:
+                await cdp_client.stop()
+                logger.debug("[ResearchTools] BU CDPClient stopped")
+        except Exception as e:
+            logger.debug(f"[ResearchTools] Error stopping BU CDPClient: {e}")
+
     async def cleanup(self):
         """Cleanup browser, BU agent, and sandbox sessions."""
-        # Cleanup persistent BU agent
+        # Cleanup BU agent — stop its CDPClient first, then close
         if self._bu_agent:
             try:
+                await self._stop_bu_cdp_client(self._bu_agent)
                 await self._bu_agent.close()
                 logger.info("[ResearchTools] BU agent closed")
             except Exception as e:
@@ -412,34 +476,27 @@ class ResearchTools:
             self._sandbox_session = None
 
         # Cleanup cloud browser session
-        if self._browser_context:
-            try:
-                # Save project cookies to Azure Blob before stopping
-                if self.blob_service_client and self.project_id:
-                    from dsl_worker.config import settings
-                    from dsl_worker.infra.cookie_manager import save_project_cookies_from_context
-                    try:
-                        await save_project_cookies_from_context(
-                            self._browser_context,
-                            self.blob_service_client,
-                            settings.azure_storage_container_name,
-                            self.project_id,
-                        )
-                    except Exception as e:
-                        logger.warning(f"[ResearchTools] Failed to save cookies: {e}")
-            except Exception as e:
-                logger.warning(f"[ResearchTools] Error during cookie save: {e}")
+        if self._browser_context or self._cloud_session_id:
+            # Save project cookies before stopping
+            if self._browser_context:
+                try:
+                    if self.blob_service_client and self.project_id:
+                        from dsl_worker.config import settings
+                        from dsl_worker.infra.cookie_manager import save_project_cookies_from_context
+                        try:
+                            await save_project_cookies_from_context(
+                                self._browser_context,
+                                self.blob_service_client,
+                                settings.azure_storage_container_name,
+                                self.project_id,
+                            )
+                        except Exception as e:
+                            logger.warning(f"[ResearchTools] Failed to save cookies: {e}")
+                except Exception as e:
+                    logger.warning(f"[ResearchTools] Error during cookie save: {e}")
 
-            # Close Playwright connection
-            try:
-                if self._playwright:
-                    await self._playwright.stop()
-            except Exception as e:
-                logger.warning(f"[ResearchTools] Error stopping Playwright: {e}")
-            self._playwright = None
-            self._browser_context = None
-
-            # Stop cloud browser session
+            # Stop cloud browser session FIRST (before disconnecting Playwright)
+            # so the API call goes through while we still have connectivity
             if self._cloud_client and self._cloud_session_id:
                 try:
                     await self._cloud_client.browsers.update_browser_session(
@@ -450,7 +507,45 @@ class ResearchTools:
                 except Exception as e:
                     logger.warning(f"[ResearchTools] Error stopping cloud session: {e}")
                 self._cloud_session_id = None
+
+            # Close Playwright connection (cloud session already stopped above)
+            try:
+                if self._playwright:
+                    await self._playwright.stop()
+            except Exception as e:
+                logger.warning(f"[ResearchTools] Error stopping Playwright: {e}")
+            self._playwright = None
+            self._browser_context = None
     
+    def _is_browser_dead(self, error: Exception) -> bool:
+        """Check if an exception indicates the browser session has died."""
+        err_str = str(error).lower()
+        dead_signals = [
+            "target closed",
+            "target detached",
+            "connection closed",
+            "browser has been closed",
+            "cdp session closed",
+            "websocket",
+            "not found",
+            "session closed",
+        ]
+        return any(signal in err_str for signal in dead_signals)
+
+    async def _reset_browser_state(self):
+        """Reset all browser state so _get_browser() creates a fresh session."""
+        try:
+            if self._playwright:
+                await self._playwright.stop()
+        except Exception:
+            pass
+        self._playwright = None
+        self._browser_context = None
+        self._cdp_url = None
+        self._cloud_session_id = None
+        self._bu_agent = None
+        logger.info("[ResearchTools] Browser state reset — next operation will create fresh session")
+
     # =========================================================================
     # brave_search
     # =========================================================================
@@ -563,17 +658,26 @@ class ResearchTools:
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
 
-        try:
-            return await asyncio.wait_for(
-                self._open_in_new_tab(url, start_line, num_lines),
-                timeout=self.OPEN_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(f"[ResearchTools] open() timed out after {self.OPEN_TIMEOUT}s for {url}")
-            return f"Timed out loading {url} after {self.OPEN_TIMEOUT}s", 0.0
-        except Exception as e:
-            logger.error(f"[ResearchTools] open failed for {url}: {e}")
-            return f"Failed to open {url}: {e}", 0.0
+        for attempt in range(2):
+            try:
+                return await asyncio.wait_for(
+                    self._open_in_new_tab(url, start_line, num_lines),
+                    timeout=self.OPEN_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"[ResearchTools] open() timed out after {self.OPEN_TIMEOUT}s for {url}")
+                return f"Timed out loading {url} after {self.OPEN_TIMEOUT}s", 0.0
+            except Exception as e:
+                if attempt == 0 and self._is_browser_dead(e):
+                    logger.warning(
+                        f"[ResearchTools] Browser session appears dead ({e}), "
+                        "creating fresh session and retrying"
+                    )
+                    await self._reset_browser_state()
+                    continue
+                logger.error(f"[ResearchTools] open failed for {url}: {e}")
+                return f"Failed to open {url}: {e}", 0.0
+        return f"Failed to open {url} after session recovery", 0.0
 
     async def _get_cloud_files(self) -> set:
         """Get the set of file names currently on the cloud browser session."""
@@ -1490,14 +1594,15 @@ if os.path.exists(_seeds_path):
         Use Browser Use agent to perform an action on the shared cloud browser.
 
         interact() shares the same cloud browser session as open()/find()/click().
-        A persistent BU agent handles navigation — same chauffeur for the whole
-        agent lifetime, reused via add_new_task().
+        A fresh BU agent is created per call to avoid lingering CDP connections.
 
-        After BU finishes each task, we extract raw page content via our own
-        Playwright connection and return line-numbered markdown (same format as open()).
+        CRITICAL: Playwright and BU's CDPClient MUST NOT be connected to the
+        same browser simultaneously. Both use Target.setAutoAttach which causes
+        CDP target management conflicts, leading to "Target.detachedFromTarget"
+        crashes. We disconnect Playwright before BU runs, then reconnect after.
 
-        BU is a chauffeur — it drives to the destination. Our agent looks out
-        the window with its own eyes.
+        After BU finishes, we extract raw page content via our Playwright
+        connection and return line-numbered markdown (same format as open()).
         """
         try:
             from browser_use import Agent
@@ -1519,22 +1624,47 @@ if os.path.exists(_seeds_path):
             if not self._cdp_url:
                 return "No cloud browser session available", 0.0
 
+            # CRITICAL: Disconnect Playwright before BU runs.
+            # Having both Playwright AND BU's CDPClient connected to the same
+            # Chrome browser causes CDP target management conflicts that crash
+            # the browser session ("Target.detachedFromTarget").
+            await self._disconnect_playwright()
+
             # Build task string for BU
             bu_task = (
                 f"Navigate to {url} and: {task}\n\n"
                 "Stay on the target site. Do not search the web."
             )
 
-            # Get or create persistent BU agent
-            agent = await self._get_or_create_bu_agent(bu_task)
+            bu_summary = "action failed"
+            try:
+                # Create fresh BU agent each time (no persistent agent).
+                # Persistent agents leave CDPClient WebSocket connections alive
+                # even after close() with keep_alive=True, causing dual-CDP
+                # conflicts on subsequent open() calls.
+                agent = await self._get_or_create_bu_agent(bu_task)
 
-            # Non-intrusive supervision: set max_steps high and let the
-            # on_step_end callback silently observe. If BU is stuck or over
-            # budget, the callback sets agent.state.stopped = True — no
-            # messages injected, BU never knows it was stopped.
-            supervisor = self._make_bu_supervisor(soft_limit=15)
-            result = await agent.run(max_steps=100, on_step_end=supervisor)
-            bu_summary = result.final_result() if result.final_result() else "action completed"
+                # Non-intrusive supervision: set max_steps high and let the
+                # on_step_end callback silently observe. If BU is stuck or over
+                # budget, the callback sets agent.state.stopped = True — no
+                # messages injected, BU never knows it was stopped.
+                supervisor = self._make_bu_supervisor(soft_limit=15)
+                result = await agent.run(max_steps=100, on_step_end=supervisor)
+                bu_summary = result.final_result() if result.final_result() else "action completed"
+            finally:
+                # Force-stop BU's CDPClient to ensure clean state before
+                # reconnecting Playwright. With keep_alive=True, agent.close()
+                # does NOT stop the CDPClient — we must do it explicitly.
+                if self._bu_agent:
+                    await self._stop_bu_cdp_client(self._bu_agent)
+                    try:
+                        await self._bu_agent.close()
+                    except Exception:
+                        pass
+                    self._bu_agent = None
+
+                # Reconnect Playwright (sole CDP connection now)
+                await self._reconnect_playwright()
 
             # Extract raw page content via our Playwright connection.
             # BU changed the browser state; Playwright sees the same browser.
@@ -1554,7 +1684,6 @@ if os.path.exists(_seeds_path):
 
         except Exception as e:
             logger.error(f"[interact] Browser agent failed: {e}", exc_info=True)
-            # If the agent itself is broken, reset it so next call creates fresh
             self._bu_agent = None
             return f"Browser agent error: {e}", 0.0
     

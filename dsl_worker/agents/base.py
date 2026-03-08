@@ -298,9 +298,9 @@ class AgentConversation:
                 self.messages.append({
                     "role": "user",
                     "content": (
-                        "You've used a lot of turns. Try to wrap up soon — "
-                        "submit your answer with what you have unless you "
-                        "genuinely need more research."
+                        "WRAP UP NOW. You are at your turn budget. Call respond() "
+                        "immediately with your findings so far. Do not make more "
+                        "tool calls — submit what you have."
                     ),
                 })
 

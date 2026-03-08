@@ -1,21 +1,19 @@
 """
 Orchestrator agent — coordinates dataset generation.
 
-V6: The orchestrator stays in the loop throughout execution. Instead of
-designing a pipeline and exiting (V5), it dispatches typed subagents
-incrementally, sees results, and adapts.
+V6.1: Pure strategist. The orchestrator stays in the loop throughout execution,
+dispatching typed subagents incrementally, seeing results, and adapting.
+No low-level tools (browsing, search, code, files) — all investigation
+goes through research() subagents.
 
 Tools:
 - research(question, ...) — spawn research subagent
 - write_template(instructions, variables) — set row generation template
-- submit_seeds(seeds) — submit preset seeds directly
-- spawn_yielder(sources, quota, ...) — launch iterative seed generator
-- spawn_synthesizer(topic, quota, ...) — launch synthetic seed generator
-- set_filter(name, description, ...) — add seed validation filter
+- parse_seeds(sources, quota, ...) — launch iterative seed generator
+- synthesize_seeds(topic, quota, ...) — launch discovery seed generator
 - set_dedup(strategy, field, ...) — configure deduplication
 - get_status() — check pipeline progress
-- brave_search, read_file, code_exec — utility tools
-- done() — signal completion
+- done() — signal completion (sources exhausted)
 """
 
 from __future__ import annotations
@@ -31,99 +29,88 @@ from dsl_worker.agents.tools import ToolRegistry
 from dsl_worker.billing.tracked_client import TrackedOpenAIClient
 from dsl_worker.infra.pipeline import (
     DedupConfig,
-    FilterConfig,
     PipelineConfig,
-    Seed,
     SeedProcessor,
     VariableConfig,
 )
 
 logger = logging.getLogger(__name__)
 
-READ_FILE_LIMIT = 30_000
-
 
 ORCHESTRATOR_SYSTEM_PROMPT = """\
-You are the orchestrator for a dataset generation system. A user described a dataset
-they want. Your job is to figure out the best strategy and coordinate execution.
+You are the orchestrator for a dataset generation system. A user described a dataset \
+they want. Your job is to figure out how to produce it and coordinate execution.
 
-You stay in the loop throughout — dispatch research, write the row template, produce
-seeds, and adapt based on results.
+You stay in the loop throughout — dispatch research, write the row template, launch \
+seed producers, see results, and adapt.
 
-## Dataset Archetypes
+## Your Subagents
 
-Identify which pattern fits — it determines your approach:
+You coordinate three types of subagents:
 
-**Extraction** — rows scraped from real sources (job listings, products, directories)
-  Research: light — figure out access patterns (URLs, pagination, anti-bot).
-  Seeds: URLs or identifiers via spawn_yielder(). Row generator visits each and extracts.
+**research(question, ...)** — Recon agents that investigate specific questions. \
+They can browse the web, search, run code, and read files. They return findings. \
+Use these to understand the landscape before writing a template.
 
-**Condensation** — rows synthesize info around topics (wiki tips, guide summaries)
-  Research: moderate — discover what topics exist and where sources live.
-  Seeds: topics via submit_seeds() (from your research) or spawn_synthesizer().
+**parse_seeds(sources, quota, instructions)** — Source iterators that crawl known \
+sources (URLs, search results, paginated pages) and yield seeds. Each seed becomes \
+one row. Use when you have concrete sources to iterate.
 
-**Enrichment** — rows already exist (CSV, database), need additional columns
-  Research: minimal — data is provided. Seeds from input data via submit_seeds().
+**synthesize_seeds(topic, quota, instructions)** — Discovery agents that research \
+a topic area and yield seeds as they discover items. Use when seeds need to be \
+found through research, not just extracted from a known list.
 
-**Fan-out** — one source becomes many rows (code repo → Q&A, textbook → flashcards)
-  Research: moderate — understand the source structure.
-  Seeds: source elements via spawn_yielder() on the source.
+## Common Patterns
+
+**Extraction** — rows from real sources (job listings, products, directories)
+  Quick recon to understand the site structure, then parse_seeds on listing URLs.
+
+**Condensation** — rows synthesize info around topics (tips, summaries, guides)
+  Research to discover what topics exist, then synthesize_seeds to find and yield them.
+
+**Enrichment** — rows already exist (CSV upload), need additional columns
+  Read the file via research(), then parse_seeds to iterate its rows.
+
+**Fan-out** — one source becomes many rows (repo → Q&A, textbook → flashcards)
+  Understand the source structure, then parse_seeds to iterate its elements.
 
 **Synthesis** — rows invented from domain knowledge (training data, scenarios)
-  Research: heavy — build a taxonomy so seeds have structural diversity.
-  Seeds: taxonomy nodes via spawn_synthesizer() or submit_seeds().
+  Research to build a taxonomy for diversity, then synthesize_seeds to discover items.
 
-## Your Workflow
+## Workflow
 
-1. REASON — What archetype? What unknowns need resolving?
+1. **Reason** — Which pattern? What unknowns need resolving?
 
-2. RESEARCH — Dispatch research agents to explore the landscape.
-   - Call research() with specific questions, output_format, appropriate budget
-   - Call multiple in parallel for different aspects
-   - Read results, then do targeted follow-ups if gaps remain
-   - CRITICAL: Do NOT investigate yourself after research returns. If findings are
-     insufficient, dispatch another research() agent.
+2. **Research** (if needed) — Dispatch research() agents for specific questions.
+   - Ask focused questions: "What fields are on an Upwork job listing page?"
+   - Call multiple in parallel for different questions.
+   - Once findings come back, MOVE ON. Don't over-research.
 
-3. WRITE TEMPLATE — Call write_template() with:
-   - Row generation instructions with {{variable}} placeholders
-   - Variable definitions (name, description)
-   - Include a "Research approach" section if row generators need to look things up
+3. **Write template** — Call write_template() with row generation instructions + \
+variable definitions. Variables are the things that change per row (the seed values). \
+Include a research approach section if row generators need to look things up.
 
-4. CONFIGURE — Optionally call:
-   - set_dedup() — usually "exact" on the main variable
-   - set_filter() — only if seeds need validation beyond dedup
+4. **Produce seeds** — Launch subagents:
+   - parse_seeds() for iterating known sources (URLs, files, search results)
+   - synthesize_seeds() for discovering seeds via research
+   - Call multiple in parallel for different source partitions or topics.
 
-5. PRODUCE SEEDS — Use one or more:
+5. **React** — Check get_status(). If short on seeds, launch more subagents with \
+different sources or topics. If enough, call done().
 
-   submit_seeds(seeds) — For items you already know from research.
-     Best for: specific topics, URLs, or items discovered during research.
-     Example: you researched DayZ tips → submit 50 tip topics directly.
+## Principles
 
-   spawn_yielder(sources, quota, instructions) — For iterating known sources.
-     Best for: paginated pages, directories, search results to crawl.
-     Each yielder gets specific sources and a quota. Call multiple in parallel
-     for different source partitions.
-
-   spawn_synthesizer(topic, quota, instructions) — For discovering seeds via research.
-     Best for: domains where seeds need to be discovered, not just listed.
-     The synthesizer does its own research to find items, then yields seeds.
-
-6. REACT — After subagents return, check results via get_status():
-   - If enough seeds: call done()
-   - If shortfall: dispatch more yielders/synthesizers with different sources
-   - If high filter rejection: adjust approach or submit different seeds
-   - If sources exhausted: try different sources or submit synthetic seeds
-
-7. DONE — Call done() when satisfied. Row generation continues in the background.
-
-## Key Principles
-
-- Start simple. Try preset seeds or 1-2 yielders first. Scale up if needed.
-- Each yielder/synthesizer gets a FOCUSED scope. "Search these 3 pages" not "find everything."
-- React to results. If a yielder found 10/50, try different sources or approaches.
-- After research returns: synthesize → write_template → produce seeds. No detours.
-- Diversity comes from sources, not artificial imposition. Don't invent categories
-  or distributions the user didn't ask for.
+- Move fast. Don't over-research. For extraction, one research agent to understand \
+the source is usually enough.
+- Each subagent gets a FOCUSED scope — specific URLs or queries, not "find everything."
+- The row generator has full browsing capabilities. It can visit pages, research, and \
+extract. Your job is to give it good seeds and clear instructions.
+- Our browsing stack handles anti-bot, CAPTCHAs, and JS-heavy pages automatically.
+- After research returns, synthesize findings → write template → produce seeds. No detours.
+- For expert or fast-moving topics, prefer real data and sources over your own knowledge. \
+Research what actually exists rather than guessing.
+- Row generators will skip rows that turn out to be dead ends (broken URLs, unavailable \
+content). Overshoot seed count slightly to account for this.
 
 <conversation>
 {conversation_summary}
@@ -141,29 +128,21 @@ Target: {num_samples} rows.
 
 ## Tools
 
-- research(question, scope, budget, output_format): Spawn a research subagent.
-  Returns findings (also saved to workspace files). Call multiple in one response
-  for parallel research. Budget controls tool calls (5=quick, 10-15=moderate, 20=deep).
-  Subagents have full browsing capabilities (open, interact, code_exec, etc.).
-- write_template(instructions, variables): Set the row generation template. Must be
-  called before spawning yielders or submitting seeds.
-- submit_seeds(seeds): Submit preset seed values directly. Each entry is a dict of
-  variable_name → value.
-- spawn_yielder(sources, quota, instructions): Launch an iterative seed generator.
-  Blocks until it finishes. Call multiple in parallel for different source partitions.
-- spawn_synthesizer(topic, quota, instructions, research_context): Launch a synthetic
-  seed generator that researches and discovers seeds. Blocks until it finishes.
-- set_filter(name, description, complexity): Add a seed validation filter.
-- set_dedup(strategy, field, threshold): Configure seed deduplication.
-- get_status(): Check current pipeline progress (seeds accepted, rows generated, etc.).
-- brave_search(query): Quick web search for simple fact-checks ONLY. For any real
-  investigation, use research().
-- code_exec(script, description): Execute Python for data exploration.
-- read_file(path): Read a workspace file (uploads, research findings, etc.).
-- done(reason): Signal that orchestration is complete.
+- research(question, scope, budget, output_format): Spawn a research subagent. \
+Returns findings. Call multiple in parallel.
+- write_template(instructions, variables): Set row generation instructions with \
+{{variable}} placeholders. Must call before launching seed producers.
+- parse_seeds(sources, quota, instructions): Launch a seed producer that iterates \
+sources. Blocks until done. Call multiple in parallel.
+- synthesize_seeds(topic, quota, instructions, research_context): Launch a seed \
+producer that discovers seeds via research. Blocks until done.
+- set_dedup(strategy, field, threshold): Configure deduplication.
+- get_status(): Check pipeline progress.
+- done(reason): Signal completion — all seed sources have been dispatched. \
+Row generation continues in background.
 
-You do NOT have browsing tools (open, find, click, interact). All browsing goes
-through research() subagents or spawned yielders/synthesizers.
+You do NOT have browsing, search, code execution, or file reading tools. \
+All investigation goes through research() subagents.
 
 {feedback_section}
 """
@@ -213,8 +192,6 @@ class OrchestratorAgent:
         on_browser_started: Optional[Callable] = None,
         # V6: model for spawned subagents
         yielder_model: str = "",
-        # V6: filter callback for SeedProcessor
-        on_filter: Optional[Callable] = None,
     ) -> None:
         self.feedback_context = feedback_context
         self.chat_history = chat_history
@@ -235,20 +212,18 @@ class OrchestratorAgent:
         self.mcp_tools = mcp_tools or []
         self.on_browser_started = on_browser_started
         self.langfuse_parent = langfuse_parent
-        self.on_filter = on_filter
         self.yielder_model = yielder_model or model
 
         # V6 state
         self._is_done = False
         self._research_counter = 0
-        self._yielder_counter = 0
+        self._subagent_counter = 0
         self._seed_processor = seed_processor
         self._generation_stats = generation_stats
 
         # Pipeline config built incrementally
         self._template: Optional[str] = None
         self._variables: List[VariableConfig] = []
-        self._filters: List[FilterConfig] = []
         self._dedup: DedupConfig = DedupConfig()
         self._research_context: str = ""
 
@@ -344,72 +319,7 @@ class OrchestratorAgent:
         )
 
     def _register_tools(self, registry: ToolRegistry) -> None:
-        """Register V6 orchestrator tools."""
-
-        # --- Research tools (brave_search, code_exec + web_search_preview) ---
-        from dsl_worker.infra.research_tools import ResearchTools, ResearchScope
-
-        self._impl = ResearchTools(
-            workspace_dir=self.workspace_dir,
-            schema=[],
-            brave_api_key=self.brave_api_key,
-            openai_client=self.openai_client,
-            model=self.model,
-            sandbox=self.sandbox,
-            stop_checker=self.stop_checker,
-            blob_service_client=self.blob_service_client,
-            project_id=self.project_id,
-            uploaded_file_urls=self.uploaded_file_urls,
-            on_browser_started=self.on_browser_started,
-        )
-        self._impl.set_scope(ResearchScope(
-            id="orchestrator",
-            description="",
-            quota=0,
-        ))
-        # Only give orchestrator quick-check tools. Deep browsing (open, find,
-        # click, interact) should go through research() subagents — otherwise
-        # the orchestrator falls into rabbit holes post-research.
-        self._impl.register_on(registry, exclude=[
-            "open", "find", "click", "interact", "list_files", "shell_exec",
-        ])
-
-        # --- read_file ---
-        async def read_file(args: Dict) -> tuple[str, float]:
-            path_str = args.get("path", "")
-            try:
-                path = Path(path_str)
-                if not path.is_absolute():
-                    candidate = self.workspace_dir / path
-                    if not candidate.exists():
-                        candidate = self.workspace_dir / "sources" / path
-                    path = candidate
-
-                if not path.exists():
-                    return f"File not found: {path_str}", 0.0
-
-                content = path.read_text(encoding="utf-8")
-                if len(content) > READ_FILE_LIMIT:
-                    content = content[:READ_FILE_LIMIT] + f"\n\n[Truncated at {READ_FILE_LIMIT} chars]"
-                return content, 0.0
-            except Exception as e:
-                return f"Error reading file: {e}", 0.0
-
-        registry.add(
-            name="read_file",
-            description="Read a file from the workspace (uploads, downloads, etc.).",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "File path (relative to workspace)",
-                    },
-                },
-                "required": ["path"],
-            },
-            handler=read_file,
-        )
+        """Register V6.1 orchestrator tools — pure coordination, no low-level tools."""
 
         # --- research ---
         async def research(args: Dict) -> tuple[str, float]:
@@ -545,7 +455,7 @@ class OrchestratorAgent:
             return (
                 f"Template set with {len(variables)} variable(s): "
                 f"{', '.join(var_names) if var_names else '(none)'}. "
-                f"You can now submit_seeds, spawn_yielder, or spawn_synthesizer."
+                f"You can now parse_seeds or synthesize_seeds."
             ), 0.0
 
         registry.add(
@@ -590,63 +500,9 @@ class OrchestratorAgent:
             handler=write_template,
         )
 
-        # --- submit_seeds (V6) ---
-        async def submit_seeds(args: Dict) -> tuple[str, float]:
-            """Submit preset seed values directly."""
-            seeds = args.get("seeds", [])
-            if not self._template:
-                return "Error: call write_template first", 0.0
-            if not seeds:
-                return "Error: seeds array is empty", 0.0
-
-            accepted = 0
-            rejected_reasons = []
-            for seed_values in seeds:
-                seed = Seed(values=seed_values, metadata={"source": "orchestrator_preset"})
-                status = await self._seed_processor.submit_seed(seed)
-                if status["accepted"]:
-                    accepted += 1
-                else:
-                    rejected_reasons.append(status.get("reason", "unknown"))
-
-            stats = self._seed_processor.stats
-            result = (
-                f"{accepted}/{len(seeds)} seeds accepted. "
-                f"Pipeline: {stats['accepted']} total accepted, "
-                f"{stats['remaining']} remaining."
-            )
-            if rejected_reasons:
-                from collections import Counter
-                counts = Counter(rejected_reasons)
-                result += f" Rejections: {dict(counts)}"
-            return result, 0.0
-
-        registry.add(
-            name="submit_seeds",
-            description=(
-                "Submit preset seed values directly. Each entry is a dict of "
-                "variable_name → value. Requires write_template() to be called first."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "seeds": {
-                        "type": "array",
-                        "description": (
-                            "Array of seed value dicts. Each dict maps variable names "
-                            "to their values for one row."
-                        ),
-                        "items": {"type": "object"},
-                    },
-                },
-                "required": ["seeds"],
-            },
-            handler=submit_seeds,
-        )
-
-        # --- spawn_yielder (V6) ---
-        async def spawn_yielder(args: Dict) -> tuple[str, float]:
-            """Launch an iterative seed yielder. Blocks until it finishes."""
+        # --- parse_seeds (iterates known sources) ---
+        async def parse_seeds(args: Dict) -> tuple[str, float]:
+            """Launch an iterative seed producer. Blocks until it finishes."""
             from dsl_worker.agents.seed_yielder import SeedYielderAgent
 
             sources = args.get("sources", [])
@@ -670,14 +526,13 @@ class OrchestratorAgent:
             config = PipelineConfig(
                 template=self._template,
                 variables=variables,
-                filters=self._filters,
                 dedup=self._dedup,
                 target_rows=quota,
                 research_context=self._research_context,
             )
 
-            idx = self._yielder_counter
-            self._yielder_counter += 1
+            idx = self._subagent_counter
+            self._subagent_counter += 1
 
             langfuse_span = getattr(self._conversation, "_current_langfuse_span", None)
 
@@ -707,22 +562,22 @@ class OrchestratorAgent:
                 await yielder.cleanup()
 
             if self.on_cost and yielder.cost_usd > 0:
-                await self.on_cost(yielder.cost_usd, f"yielder:{idx}")
+                await self.on_cost(yielder.cost_usd, f"parse_seeds:{idx}")
 
             stats = self._seed_processor.stats
             return (
-                f"Yielder {idx} finished: {result.turns_taken} turns, "
+                f"Parser {idx} finished: {result.turns_taken} turns, "
                 f"cost=${yielder.cost_usd:.3f}. "
                 f"Pipeline: {stats['accepted']} accepted, "
                 f"{stats['remaining']} remaining."
             ), yielder.cost_usd
 
         registry.add(
-            name="spawn_yielder",
+            name="parse_seeds",
             description=(
-                "Launch an iterative seed yielder that browses/iterates sources and "
-                "yields seeds. Blocks until it finishes. Call multiple in parallel for "
-                "different source partitions."
+                "Launch a seed producer that iterates known sources (URLs, pages, "
+                "search results) and yields seeds. Blocks until it finishes. "
+                "Call multiple in parallel for different source partitions."
             ),
             parameters={
                 "type": "object",
@@ -732,33 +587,32 @@ class OrchestratorAgent:
                         "items": {"type": "string"},
                         "description": (
                             "URLs, file paths, or search queries to iterate. "
-                            "The yielder will browse these and yield seeds."
+                            "The agent will browse these and yield seeds."
                         ),
                     },
                     "quota": {
                         "type": "integer",
                         "description": (
-                            "How many accepted seeds this yielder should aim for "
-                            "(default 20). Set based on how many items you expect "
-                            "the sources to contain."
+                            "How many accepted seeds to aim for (default 20). "
+                            "Set based on how many items you expect the sources to contain."
                         ),
                     },
                     "instructions": {
                         "type": "string",
                         "description": (
-                            "Specific instructions for this yielder "
+                            "Specific instructions for this agent "
                             "(e.g., 'Extract job title and URL from each listing')"
                         ),
                     },
                 },
                 "required": ["sources"],
             },
-            handler=spawn_yielder,
+            handler=parse_seeds,
         )
 
-        # --- spawn_synthesizer (V6) ---
-        async def spawn_synthesizer(args: Dict) -> tuple[str, float]:
-            """Launch a synthetic seed generator. Blocks until it finishes."""
+        # --- synthesize_seeds (discovers seeds via research) ---
+        async def synthesize_seeds(args: Dict) -> tuple[str, float]:
+            """Launch a discovery seed producer. Blocks until it finishes."""
             from dsl_worker.agents.seed_yielder import SeedYielderAgent
 
             topic = args.get("topic", "")
@@ -784,14 +638,13 @@ class OrchestratorAgent:
             config = PipelineConfig(
                 template=self._template,
                 variables=variables,
-                filters=self._filters,
                 dedup=self._dedup,
                 target_rows=quota,
                 research_context=effective_context,
             )
 
-            idx = self._yielder_counter
-            self._yielder_counter += 1
+            idx = self._subagent_counter
+            self._subagent_counter += 1
 
             langfuse_span = getattr(self._conversation, "_current_langfuse_span", None)
 
@@ -821,7 +674,7 @@ class OrchestratorAgent:
                 await yielder.cleanup()
 
             if self.on_cost and yielder.cost_usd > 0:
-                await self.on_cost(yielder.cost_usd, f"synthesizer:{idx}")
+                await self.on_cost(yielder.cost_usd, f"synthesize_seeds:{idx}")
 
             stats = self._seed_processor.stats
             return (
@@ -832,11 +685,11 @@ class OrchestratorAgent:
             ), yielder.cost_usd
 
         registry.add(
-            name="spawn_synthesizer",
+            name="synthesize_seeds",
             description=(
-                "Launch a synthetic seed generator that researches and discovers seeds. "
-                "Blocks until it finishes. Use when seeds need to be discovered through "
-                "research, not just iterated from a known source."
+                "Launch a discovery agent that researches a topic area and yields "
+                "seeds as it discovers items. Blocks until it finishes. Use when seeds "
+                "need to be found through research, not just iterated from a known source."
             ),
             parameters={
                 "type": "object",
@@ -844,8 +697,8 @@ class OrchestratorAgent:
                     "topic": {
                         "type": "string",
                         "description": (
-                            "Topic area for the synthesizer to research and generate "
-                            "seeds from (e.g., 'DayZ survival mechanics', "
+                            "Topic area to research and discover seeds from "
+                            "(e.g., 'DayZ survival mechanics', "
                             "'AI companies in Minnesota')"
                         ),
                     },
@@ -855,67 +708,22 @@ class OrchestratorAgent:
                     },
                     "instructions": {
                         "type": "string",
-                        "description": "Specific instructions for this synthesizer",
+                        "description": "Specific instructions for this agent",
                     },
                     "research_context": {
                         "type": "string",
                         "description": (
-                            "Research findings to seed the synthesizer with. "
+                            "Research findings to seed the agent with. "
                             "If not provided, uses accumulated research context."
                         ),
                     },
                 },
                 "required": ["topic"],
             },
-            handler=spawn_synthesizer,
+            handler=synthesize_seeds,
         )
 
-        # --- set_filter (V6) ---
-        async def set_filter(args: Dict) -> tuple[str, float]:
-            """Add a seed validation filter."""
-            name = args.get("name", "")
-            description = args.get("description", "")
-            complexity = args.get("complexity", "simple")
-
-            if not name or not description:
-                return "Error: name and description are required", 0.0
-
-            filter_config = FilterConfig(
-                name=name,
-                description=description,
-                complexity=complexity,
-            )
-            self._filters.append(filter_config)
-            self._seed_processor.set_filters(self._filters)
-            return f"Filter '{name}' added ({complexity}). {len(self._filters)} total.", 0.0
-
-        registry.add(
-            name="set_filter",
-            description=(
-                "Add a seed validation filter. Seeds will be checked against this "
-                "criteria before being accepted. Use 'simple' for quick classification, "
-                "'judgment' for multi-turn research-based validation."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Filter name"},
-                    "description": {
-                        "type": "string",
-                        "description": "What to check (e.g., 'Job posting must be from the last 30 days')",
-                    },
-                    "complexity": {
-                        "type": "string",
-                        "enum": ["simple", "judgment"],
-                        "description": "'simple' for single-turn, 'judgment' for multi-turn with research",
-                    },
-                },
-                "required": ["name", "description"],
-            },
-            handler=set_filter,
-        )
-
-        # --- set_dedup (V6) ---
+        # --- set_dedup ---
         async def set_dedup(args: Dict) -> tuple[str, float]:
             """Configure seed deduplication."""
             strategy = args.get("strategy", "exact")
@@ -934,7 +742,7 @@ class OrchestratorAgent:
             name="set_dedup",
             description=(
                 "Configure seed deduplication. Usually 'exact' on the main variable. "
-                "Call before submitting seeds or spawning yielders."
+                "Call before launching seed producers."
             ),
             parameters={
                 "type": "object",
@@ -957,7 +765,7 @@ class OrchestratorAgent:
             handler=set_dedup,
         )
 
-        # --- get_status (V6) ---
+        # --- get_status ---
         async def get_status(args: Dict) -> tuple[str, float]:
             """Check current pipeline progress."""
             stats = self._seed_processor.stats
@@ -965,9 +773,9 @@ class OrchestratorAgent:
             return (
                 f"Seeds: {stats['accepted']} accepted, {stats['remaining']} remaining, "
                 f"{stats['rejected_dedup']} dedup rejected, "
-                f"{stats['rejected_filter']} filter rejected, "
                 f"{stats['submitted_total']} total submitted.\n"
                 f"Rows: {gen.get('rows_generated', 0)} generated, "
+                f"{gen.get('skipped', 0)} skipped, "
                 f"{gen.get('errors', 0)} errors."
             ), 0.0
 
@@ -990,13 +798,16 @@ class OrchestratorAgent:
 
         registry.add(
             name="done",
-            description="Signal that orchestration is complete. Row generation continues in the background.",
+            description=(
+                "Signal orchestration is complete — all seed sources have been "
+                "dispatched or exhausted. Row generation continues in background."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
                     "reason": {
                         "type": "string",
-                        "description": "Why orchestration is done",
+                        "description": "Why orchestration is done (e.g., 'all sources dispatched')",
                     },
                 },
             },
@@ -1012,11 +823,6 @@ class OrchestratorAgent:
                     {"name": v.name, "description": v.description,
                      "seed_strategy": v.seed_strategy}
                     for v in self._variables
-                ],
-                "filters": [
-                    {"name": f.name, "description": f.description,
-                     "complexity": f.complexity}
-                    for f in self._filters
                 ],
                 "dedup": {
                     "strategy": self._dedup.strategy,
@@ -1056,8 +862,7 @@ class OrchestratorAgent:
         return self._conversation.total_cost
 
     async def cleanup(self) -> None:
-        """Clean up browser, sandbox, and other resources."""
-        try:
-            await self._impl.cleanup()
-        except Exception as e:
-            logger.warning(f"Orchestrator cleanup error: {e}")
+        """Clean up resources."""
+        # Orchestrator has no browser/sandbox resources of its own —
+        # subagents (research, yielders) clean up after themselves.
+        pass

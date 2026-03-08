@@ -61,8 +61,6 @@ submit seeds — specific variable values that will each become one row in the d
 {research_context}
 </research_context>
 
-{filters_context}
-
 ## How to Work
 
 1. Start from your assigned sources. Search, browse, or iterate through them.
@@ -70,7 +68,7 @@ submit seeds — specific variable values that will each become one row in the d
    Do NOT accumulate items mentally — yield each one as soon as you have the values.
 3. yield_seed() returns a status with accepted/rejected counts. Use this to guide your work:
    - If rejection rate is high, try different sources or approaches.
-   - If many seeds are processing (being filtered), you can slow down briefly.
+   - If many seeds are being rejected by dedup, try different sources.
 4. Keep going until you hit your quota of {target_seeds} ACCEPTED seeds, or your sources \
 are exhausted.
 5. Call done() when finished or when sources are exhausted.
@@ -79,7 +77,7 @@ are exhausted.
 
 - Focus on QUANTITY. Your job is to find items matching the variable descriptions and yield them.
 - Basic quality filtering is fine (skip obviously broken or irrelevant items), but do not \
-research or deeply evaluate each seed — that's what filter agents do.
+research or deeply evaluate each seed — the row generator will decide whether to use or skip it.
 - If a seed gets rejected, move on. Try a different source or query.
 - Do not yield duplicates of seeds you've already submitted.
 
@@ -292,19 +290,6 @@ class SeedYielderAgent:
         # Seed instructions
         seed_instructions = self.pipeline_config.seed_yielder_instructions or "(no additional instructions)"
 
-        # Filters context — informational only, yielder does NOT execute these
-        filters_context = ""
-        if self.pipeline_config.filters:
-            filter_lines = ["<filters>", "Seeds you yield will be validated by filter agents:"]
-            for f in self.pipeline_config.filters:
-                filter_lines.append(f"- {f.name}: {f.description}")
-            filter_lines.append(
-                "You do NOT need to check these yourself. Just yield candidates "
-                "and the filters will validate them."
-            )
-            filter_lines.append("</filters>")
-            filters_context = "\n".join(filter_lines)
-
         return SEED_YIELDER_SYSTEM_PROMPT.format(
             template=self.pipeline_config.template,
             variables_description=variables_description,
@@ -312,7 +297,6 @@ class SeedYielderAgent:
             strategy_description=strategy_description,
             seed_instructions=seed_instructions,
             research_context=self.pipeline_config.research_context or "(no research context provided)",
-            filters_context=filters_context,
             target_seeds=self.target_seeds,
         )
 
@@ -384,13 +368,12 @@ class SeedYielderAgent:
             stats = status["stats"]
             accepted_count = stats["accepted"]
             remaining = stats["remaining"]
-            processing = stats["processing"]
 
             if not status["accepted"]:
                 return (
                     f"Seed REJECTED ({status['reason']}). "
-                    f"Pipeline: {accepted_count} accepted, {remaining} remaining, "
-                    f"{processing} processing. Try a different seed."
+                    f"Pipeline: {accepted_count} accepted, {remaining} remaining. "
+                    f"Try a different seed."
                 ), 0.0
 
             self._accepted_count += 1
@@ -403,10 +386,8 @@ class SeedYielderAgent:
 
             my_remaining = self.target_seeds - self._accepted_count
             advice = ""
-            if processing > remaining and remaining > 0:
-                advice = " Many seeds in filter queue — consider slowing down."
-            elif stats.get("rejected_filter", 0) > accepted_count and accepted_count > 0:
-                advice = " High filter rejection rate — try different sources/approaches."
+            if stats.get("rejected_dedup", 0) > accepted_count and accepted_count > 0:
+                advice = " High dedup rejection — try different sources/approaches."
 
             return (
                 f"Seed accepted. You: {self._accepted_count}/{self.target_seeds}. "

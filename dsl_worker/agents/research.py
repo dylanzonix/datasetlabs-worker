@@ -149,10 +149,10 @@ class ResearchAgent:
         effective_prompt = system_prompt or RESEARCH_SYSTEM_PROMPT
 
         # Create the conversation with reasoning enabled.
-        # Soft limit at budget — nudges wrap-up. Hard cap at 2x budget
-        # so the agent can finish gracefully if mid-tool-call at the soft limit.
+        # Soft limit at budget — nudges wrap-up. Hard cap gives a few extra
+        # turns to call respond() after the nudge, but NOT double the budget.
         soft_limit = max(max_turns, 5)
-        hard_cap = soft_limit * 2
+        hard_cap = soft_limit + 5
         self._conversation = AgentConversation(
             openai_client=openai_client,
             model=model,
