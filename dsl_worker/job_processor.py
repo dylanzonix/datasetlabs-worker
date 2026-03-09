@@ -60,6 +60,7 @@ from dsl_worker.billing import CostTracker, TrackedOpenAIClient
 from dsl_worker.checkpoint import CheckpointManager, checkpoints_to_work_items
 
 from dsl_worker.agents import OrchestratorAgent
+from dsl_worker.agents.row import RowGeneratorAgent
 from dsl_worker.infra.pipeline import SeedProcessor
 from dsl_worker.infra.generation_pool import GenerationWorkerPool
 from sandbox_service import SandboxClient
@@ -67,9 +68,6 @@ from sandbox_service import SandboxClient
 logger = logging.getLogger(__name__)
 
 WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
-
-# Batch size for work item queue → generation pool.
-GENERATION_BATCH_SIZE = 5
 
 
 class JobProcessor:
@@ -571,15 +569,36 @@ class JobProcessor:
                     "tags": {"backfill": True},
                 })
 
-            await self._process_work_item_batch(
-                backfill_items, state.columns, db, project, version,
-                tracked_client, cost_tracker, checkpoint_mgr,
-                workspace_dir, stop_checker, work_item_counter[0],
-                generation_stats, uploaded_file_urls=uploaded_file_urls,
+            backfill_start = work_item_counter[0]
+            pool = GenerationWorkerPool(
+                workspace_dir=workspace_dir,
+                openai_client=tracked_client,
+                db_session=db,
+                project_id=project.id,
+                version_id=version.id,
+                model=settings.generation_model,
+                brave_api_key=settings.brave_api_key,
+                sandbox=self._sandbox,
+                num_workers=settings.generation_parallel_samples,
+                stop_checker=stop_checker,
+                cost_tracker=cost_tracker,
+                checkpoint_callback=lambda idx, success, row_id: asyncio.create_task(
+                    checkpoint_mgr.mark_processed(backfill_start + idx, success, row_id)
+                ),
+                blob_service_client=self.blob_service_client,
+                uploaded_file_urls=uploaded_file_urls,
+                mcp_tools=self._mcp_tools,
                 on_cost=on_cost,
                 langfuse_parent=langfuse_parent,
                 on_browser_started=on_browser_started,
             )
+            success, errors = await pool.process_work_items(
+                backfill_items, state.columns,
+            )
+            stats = pool.get_stats()
+            generation_stats["rows_generated"] += success
+            generation_stats["errors"] += errors
+            generation_stats["skipped"] += stats["skipped"]
             work_item_counter[0] += len(backfill_items)
 
             state.refresh()
@@ -632,11 +651,144 @@ class JobProcessor:
         on_browser_started: Optional[Callable] = None,
     ) -> None:
         """
-        Background consumer: dequeue work items, batch them, and run
-        through GenerationWorkerPool. Updates generation_stats in place.
+        Background consumer: dequeue work items and process them with a
+        semaphore for concurrency control. Each item starts immediately
+        when a slot is available — no batching, no head-of-line blocking.
         """
-        batch: List[Dict] = []
-        batch_start_index = 0
+        concurrency = settings.generation_parallel_samples
+        semaphore = asyncio.Semaphore(concurrency)
+        in_flight: list[asyncio.Task] = []
+        item_index = 0
+        save_lock = asyncio.Lock()
+
+        # Shared row saver (DB writes must be serialized)
+        row_saver = GenerationWorkerPool(
+            workspace_dir=workspace_dir,
+            openai_client=tracked_client,
+            db_session=db,
+            project_id=project.id,
+            version_id=version.id,
+        )
+
+        async def process_one(index: int, item: Dict):
+            """Process a single work item under the semaphore."""
+            async with semaphore:
+                if stop_checker():
+                    return
+
+                agent = RowGeneratorAgent(
+                    openai_client=tracked_client,
+                    model=settings.generation_model,
+                    workspace_dir=workspace_dir,
+                    brave_api_key=settings.brave_api_key,
+                    sandbox=self._sandbox,
+                    stop_checker=stop_checker,
+                    blob_service_client=self.blob_service_client,
+                    project_id=project.id,
+                    uploaded_file_urls=uploaded_file_urls,
+                    mcp_tools=self._mcp_tools,
+                    on_cost=on_cost,
+                    langfuse_parent=item.get("langfuse_parent") or langfuse_parent,
+                    on_browser_started=on_browser_started,
+                )
+
+                try:
+                    is_v5 = "template" in item
+                    tags = item.get("tags") or {}
+
+                    # Validate
+                    if is_v5 and not item.get("template"):
+                        logger.warning(f"[Generation] Empty template at index {index}")
+                        generation_stats["errors"] += 1
+                        if checkpoint_mgr:
+                            await checkpoint_mgr.mark_processed(index, False, None)
+                        return
+                    elif not is_v5 and not item.get("instruction"):
+                        logger.warning(f"[Generation] Empty instruction at index {index}")
+                        generation_stats["errors"] += 1
+                        if checkpoint_mgr:
+                            await checkpoint_mgr.mark_processed(index, False, None)
+                        return
+
+                    max_attempts = 2
+                    for attempt in range(max_attempts):
+                        try:
+                            if is_v5:
+                                result = await agent.generate(
+                                    template=item["template"],
+                                    seed=item.get("seed_values"),
+                                    research_context=item.get("research_context"),
+                                    schema=schema,
+                                )
+                            else:
+                                result = await agent.generate(
+                                    assignment=item.get("instruction", ""),
+                                    schema=item.get("schema") or schema,
+                                    dataset_brief=item.get("context", ""),
+                                )
+
+                            if result.success and result.row:
+                                async with save_lock:
+                                    row_id = await row_saver._save_row(
+                                        result.row, tags=tags,
+                                    )
+                                generation_stats["rows_generated"] += 1
+
+                                if generation_stats["rows_generated"] % 10 == 0:
+                                    logger.info(
+                                        f"[Generation] Generated "
+                                        f"{generation_stats['rows_generated']} rows..."
+                                    )
+
+                                if checkpoint_mgr:
+                                    await checkpoint_mgr.mark_processed(index, True, row_id)
+                                break
+
+                            elif result.skipped:
+                                generation_stats["skipped"] += 1
+                                logger.info(
+                                    f"[Generation] Row skipped at index {index}: "
+                                    f"{result.skip_reason}"
+                                )
+                                if checkpoint_mgr:
+                                    await checkpoint_mgr.mark_processed(index, True, None)
+                                break
+
+                            else:
+                                if attempt < max_attempts - 1:
+                                    logger.warning(
+                                        f"[Generation] Failed (attempt {attempt + 1}/"
+                                        f"{max_attempts}): {result.error} — retrying"
+                                    )
+                                else:
+                                    generation_stats["errors"] += 1
+                                    logger.warning(
+                                        f"[Generation] Failed after {max_attempts} "
+                                        f"attempts: {result.error}"
+                                    )
+                                    if checkpoint_mgr:
+                                        await checkpoint_mgr.mark_processed(
+                                            index, False, None,
+                                        )
+
+                        except Exception as e:
+                            if attempt < max_attempts - 1:
+                                logger.warning(
+                                    f"[Generation] Error (attempt {attempt + 1}/"
+                                    f"{max_attempts}): {e} — retrying"
+                                )
+                            else:
+                                logger.error(
+                                    f"[Generation] Error after {max_attempts} "
+                                    f"attempts: {e}"
+                                )
+                                generation_stats["errors"] += 1
+                                if checkpoint_mgr:
+                                    await checkpoint_mgr.mark_processed(
+                                        index, False, None,
+                                    )
+                finally:
+                    await agent.cleanup()
 
         try:
             while True:
@@ -650,54 +802,25 @@ class JobProcessor:
                 try:
                     item = await asyncio.wait_for(work_item_queue.get(), timeout=5.0)
                 except asyncio.TimeoutError:
-                    # Flush batch on timeout
-                    if batch:
-                        await self._process_work_item_batch(
-                            batch, schema, db, project, version,
-                            tracked_client, cost_tracker, checkpoint_mgr,
-                            workspace_dir, stop_checker, batch_start_index,
-                            generation_stats, uploaded_file_urls=uploaded_file_urls,
-                            on_cost=on_cost,
-                            langfuse_parent=langfuse_parent,
-                            on_browser_started=on_browser_started,
-                        )
-                        batch_start_index += len(batch)
-                        batch = []
                     continue
 
                 if item is None:
-                    # Poison pill — no more items coming
-                    if batch:
-                        await self._process_work_item_batch(
-                            batch, schema, db, project, version,
-                            tracked_client, cost_tracker, checkpoint_mgr,
-                            workspace_dir, stop_checker, batch_start_index,
-                            generation_stats, uploaded_file_urls=uploaded_file_urls,
-                            on_cost=on_cost,
-                            langfuse_parent=langfuse_parent,
-                            on_browser_started=on_browser_started,
-                        )
-                        batch_start_index += len(batch)
-                        batch = []
                     break
 
-                batch.append(item)
+                task = asyncio.create_task(process_one(item_index, item))
+                in_flight.append(task)
+                item_index += 1
 
-                if len(batch) >= GENERATION_BATCH_SIZE:
-                    await self._process_work_item_batch(
-                        batch, schema, db, project, version,
-                        tracked_client, cost_tracker, checkpoint_mgr,
-                        workspace_dir, stop_checker, batch_start_index,
-                        generation_stats, uploaded_file_urls=uploaded_file_urls,
-                        on_cost=on_cost,
-                        langfuse_parent=langfuse_parent,
-                        on_browser_started=on_browser_started,
-                    )
-                    batch_start_index += len(batch)
-                    batch = []
+                # Clean up completed tasks periodically
+                in_flight = [t for t in in_flight if not t.done()]
 
         except Exception as e:
             logger.error(f"[Generation] Consumer error: {e}")
+
+        # Wait for all in-flight items to finish
+        if in_flight:
+            logger.info(f"[Generation] Waiting for {len(in_flight)} in-flight items...")
+            await asyncio.gather(*in_flight, return_exceptions=True)
 
         logger.info(
             f"[Generation] Consumer done: "
@@ -705,65 +828,6 @@ class JobProcessor:
             f"{generation_stats['errors']} errors, "
             f"{generation_stats['skipped']} skipped"
         )
-
-    async def _process_work_item_batch(
-        self,
-        batch: List[Dict],
-        schema: List[Dict],
-        db: Session,
-        project: Project,
-        version: ProjectVersion,
-        tracked_client: TrackedOpenAIClient,
-        cost_tracker: CostTracker,
-        checkpoint_mgr: CheckpointManager,
-        workspace_dir: Path,
-        stop_checker,
-        start_index: int,
-        generation_stats: Dict,
-        uploaded_file_urls: Optional[Dict[str, str]] = None,
-        on_cost: Optional[Callable] = None,
-        langfuse_parent: Optional[Any] = None,
-        on_browser_started: Optional[Callable] = None,
-    ) -> None:
-        """Process a batch of work items through the generation pool."""
-
-        if not batch:
-            return
-
-        logger.info(f"[Generation] Processing batch of {len(batch)} work items")
-
-        concurrency = settings.generation_parallel_samples
-
-        pool = GenerationWorkerPool(
-            workspace_dir=workspace_dir,
-            openai_client=tracked_client,
-            db_session=db,
-            project_id=project.id,
-            version_id=version.id,
-            model=settings.generation_model,
-            brave_api_key=settings.brave_api_key,
-            sandbox=self._sandbox,
-            num_workers=concurrency,
-            stop_checker=stop_checker,
-            cost_tracker=cost_tracker,
-            checkpoint_callback=lambda idx, success, row_id: asyncio.create_task(
-                checkpoint_mgr.mark_processed(start_index + idx, success, row_id)
-            ),
-            blob_service_client=self.blob_service_client,
-            uploaded_file_urls=uploaded_file_urls,
-            mcp_tools=self._mcp_tools,
-            on_cost=on_cost,
-            langfuse_parent=langfuse_parent,
-            on_browser_started=on_browser_started,
-        )
-
-        success, errors = await pool.process_work_items(batch, schema)
-
-        # Update shared stats
-        stats = pool.get_stats()
-        generation_stats["rows_generated"] += success
-        generation_stats["errors"] += errors
-        generation_stats["skipped"] += stats["skipped"]
 
     async def _run_generation_from_checkpoint(
         self,

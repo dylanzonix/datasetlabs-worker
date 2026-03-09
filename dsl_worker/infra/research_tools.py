@@ -1423,13 +1423,14 @@ if os.path.exists(_seeds_path):
     )
 
     async def _get_or_create_bu_agent(self, task: str) -> Any:
-        """Get the persistent BU agent, creating it on first call.
+        """Create a fresh BU agent for an interact() call.
 
-        Subsequent calls reuse the same agent via add_new_task() — same
-        browser session, same agent memory, same chauffeur.
+        A new agent is created each time — interact() cleans up after each
+        call to avoid lingering CDPClient connections.
         """
         from browser_use import Agent
         from browser_use.browser.profile import BrowserProfile
+        from browser_use.llm.browser_use import ChatBrowserUse
 
         if self._bu_agent is not None:
             # Reuse existing agent with new task
@@ -1460,12 +1461,17 @@ if os.path.exists(_seeds_path):
         async def should_stop():
             return bool(self.stop_checker and self.stop_checker())
 
+        llm = ChatBrowserUse(model='bu-2-0')
+
         agent_kwargs = dict(
             task=task,
+            llm=llm,
             browser_profile=profile,
             extend_system_message=self._BU_SYSTEM_PROMPT,
             register_should_stop_callback=should_stop,
             max_actions_per_step=3,
+            use_judge=False,           # We decide success, not BU's judge
+            directly_open_url=True,    # BU navigates to URL, triggering cloud captcha solver
         )
         if bu_tools is not None:
             agent_kwargs["tools"] = bu_tools
@@ -1473,63 +1479,112 @@ if os.path.exists(_seeds_path):
         self._bu_agent = Agent(**agent_kwargs)
         return self._bu_agent
 
-    def _make_bu_supervisor(self, soft_limit: int = 15) -> Callable:
-        """Create an on_step_end callback for non-intrusive BU supervision.
+    def _make_bu_supervisor(
+        self, checkpoint_interval: int = 10, hard_ceiling: int = 50,
+    ) -> Callable:
+        """Create an on_step_end callback for BU supervision.
 
-        The callback silently observes BU's state after each step. If BU
-        appears stuck or has exceeded its step budget, it sets
-        agent.state.stopped = True — which cleanly exits the run loop
-        without injecting any messages into BU's conversation. BU never
-        knows it was stopped.
-
-        Args:
-            soft_limit: Number of steps before the supervisor starts
-                considering whether to stop BU. BU can exceed this if
-                it's making progress (new URLs, no errors).
+        Logs every step for visibility, plus safety checks.
+        Collects step data in supervisor.steps for Langfuse tracing.
         """
         _recent_urls: list = []
+        scope_id = self.scope.id if self.scope else "unknown"
 
         async def on_step_end(agent) -> None:
             step = agent.state.n_steps
+            step_time = time.time()
 
-            # 1. External stop check (job cancelled, etc.)
-            if self.stop_checker and self.stop_checker():
-                agent.state.stopped = True
-                logger.info(f"[BU supervisor] Stopped at step {step}: external stop requested")
-                return
-
-            # 2. Consecutive failures — BU is stuck
-            if agent.state.consecutive_failures >= 3:
-                agent.state.stopped = True
-                logger.info(f"[BU supervisor] Stopped at step {step}: {agent.state.consecutive_failures} consecutive failures")
-                return
-
-            # 3. Track URL history for loop detection
+            # --- Extract step info for logging ---
             current_url = None
+            last_action = None
             if agent.history and agent.history.history:
                 last = agent.history.history[-1]
                 if hasattr(last, 'state') and last.state:
                     current_url = last.state.url
+                if hasattr(last, 'model_output') and last.model_output:
+                    mo = last.model_output
+                    if hasattr(mo, 'action') and mo.action:
+                        actions = mo.action if isinstance(mo.action, list) else [mo.action]
+                        action_names = []
+                        for a in actions:
+                            if hasattr(a, 'model_dump'):
+                                d = a.model_dump(exclude_unset=True)
+                                action_names.extend(d.keys())
+                            elif isinstance(a, dict):
+                                action_names.extend(a.keys())
+                        last_action = ", ".join(action_names) if action_names else None
+
+            short_url = current_url[:80] if current_url else "?"
+            action_str = last_action or "?"
+            logger.info(
+                f"[BU {scope_id}] step {step}: {action_str} | {short_url}"
+            )
+
+            # Collect for Langfuse span
+            on_step_end.steps.append({
+                "step": step,
+                "action": action_str,
+                "url": short_url,
+                "t": round(step_time - on_step_end.t0, 1),
+            })
+
             _recent_urls.append(current_url)
 
-            # 4. Under soft limit — let BU work freely
-            if step < soft_limit:
+            # --- Per-step checks ---
+
+            if self.stop_checker and self.stop_checker():
+                agent.state.stopped = True
+                on_step_end.stop_reason = "external stop"
+                logger.info(f"[BU {scope_id}] Stopped at step {step}: external stop")
                 return
 
-            # 5. Over soft limit — check if still making progress
-            # URL loop: same URL for last 4 steps = spinning
-            if len(_recent_urls) >= 4:
-                last_4 = _recent_urls[-4:]
-                if all(u == last_4[0] for u in last_4) and last_4[0] is not None:
+            if agent.state.consecutive_failures >= 3:
+                agent.state.stopped = True
+                on_step_end.stop_reason = f"{agent.state.consecutive_failures} consecutive failures"
+                logger.info(
+                    f"[BU {scope_id}] Stopped at step {step}: "
+                    f"{agent.state.consecutive_failures} consecutive failures"
+                )
+                return
+
+            # --- Hard ceiling ---
+            if step >= hard_ceiling:
+                agent.state.stopped = True
+                on_step_end.stop_reason = f"hard ceiling ({hard_ceiling})"
+                logger.info(f"[BU {scope_id}] Stopped at step {step}: hard ceiling ({hard_ceiling})")
+                return
+
+            # --- Checkpoint evaluation (every N steps) ---
+            if step > 0 and step % checkpoint_interval == 0:
+                window = _recent_urls[-checkpoint_interval:]
+                unique_in_window = set(u for u in window if u)
+
+                if len(unique_in_window) <= 1:
                     agent.state.stopped = True
-                    logger.info(f"[BU supervisor] Stopped at step {step}: URL loop on {last_4[0]}")
+                    on_step_end.stop_reason = f"same URL for {checkpoint_interval} steps"
+                    logger.info(
+                        f"[BU {scope_id}] Stopped at step {step}: "
+                        f"same URL for {checkpoint_interval} steps"
+                    )
                     return
 
-            # 6. Hard ceiling — regardless of progress
-            if step >= soft_limit * 2:
-                agent.state.stopped = True
-                logger.info(f"[BU supervisor] Stopped at step {step}: hard ceiling ({soft_limit * 2})")
-                return
+                if len(unique_in_window) >= checkpoint_interval // 2:
+                    agent.state.stopped = True
+                    on_step_end.stop_reason = (
+                        f"spiraling ({len(unique_in_window)} unique URLs "
+                        f"in {checkpoint_interval} steps)"
+                    )
+                    logger.info(
+                        f"[BU {scope_id}] Stopped at step {step}: "
+                        f"spiraling ({len(unique_in_window)} unique URLs "
+                        f"in {checkpoint_interval} steps)"
+                    )
+                    return
+
+        # Attach data collectors to the callback
+        on_step_end.steps = []
+        on_step_end.t0 = time.time()
+        on_step_end.stop_reason = None
 
         return on_step_end
 
@@ -1604,6 +1659,21 @@ if os.path.exists(_seeds_path):
         After BU finishes, we extract raw page content via our Playwright
         connection and return line-numbered markdown (same format as open()).
         """
+        langfuse = _get_langfuse()
+        if langfuse:
+            with langfuse.start_as_current_observation(
+                as_type="span",
+                name="tool:interact",
+                input={"task": task[:200], "url_or_ref_id": url_or_ref_id},
+            ) as span:
+                result_text, cost = await self._do_interact(url_or_ref_id, task, span)
+                return result_text, cost
+        return await self._do_interact(url_or_ref_id, task, None)
+
+    async def _do_interact(
+        self, url_or_ref_id: str, task: str, span: Any,
+    ) -> Tuple[str, float]:
+        """interact() implementation — optionally traced via Langfuse span."""
         try:
             from browser_use import Agent
         except ImportError:
@@ -1617,6 +1687,8 @@ if os.path.exists(_seeds_path):
         elif not url.startswith(("http://", "https://")):
             url = "https://" + url
 
+        scope_id = self.scope.id if self.scope else "unknown"
+
         try:
             # Ensure shared cloud browser exists (reuses existing session)
             await self._get_browser()
@@ -1625,36 +1697,82 @@ if os.path.exists(_seeds_path):
                 return "No cloud browser session available", 0.0
 
             # CRITICAL: Disconnect Playwright before BU runs.
-            # Having both Playwright AND BU's CDPClient connected to the same
-            # Chrome browser causes CDP target management conflicts that crash
-            # the browser session ("Target.detachedFromTarget").
             await self._disconnect_playwright()
 
-            # Build task string for BU
+            # Truncate task to prevent agents from embedding research
+            # goals into BU's task.
+            clean_task = task[:120].split("\n")[0]
+
             bu_task = (
-                f"Navigate to {url} and: {task}\n\n"
-                "Stay on the target site. Do not search the web."
+                f"{clean_task}\n\n"
+                f"Navigate to: {url}"
             )
 
-            bu_summary = "action failed"
-            try:
-                # Create fresh BU agent each time (no persistent agent).
-                # Persistent agents leave CDPClient WebSocket connections alive
-                # even after close() with keep_alive=True, causing dual-CDP
-                # conflicts on subsequent open() calls.
-                agent = await self._get_or_create_bu_agent(bu_task)
+            logger.info(
+                f"[interact {scope_id}] START task={clean_task!r} url={url[:80]}"
+            )
+            t0 = time.time()
 
-                # Non-intrusive supervision: set max_steps high and let the
-                # on_step_end callback silently observe. If BU is stuck or over
-                # budget, the callback sets agent.state.stopped = True — no
-                # messages injected, BU never knows it was stopped.
-                supervisor = self._make_bu_supervisor(soft_limit=15)
-                result = await agent.run(max_steps=100, on_step_end=supervisor)
-                bu_summary = result.final_result() if result.final_result() else "action completed"
+            bu_summary = "action failed"
+            bu_steps = 0
+            supervisor = None
+            bu_history_steps = []
+            try:
+                agent = await self._get_or_create_bu_agent(bu_task)
+                t_agent = time.time()
+
+                supervisor = self._make_bu_supervisor()
+                try:
+                    result = await agent.run(max_steps=100, on_step_end=supervisor)
+                    bu_summary = result.final_result() if result.final_result() else "action completed"
+                    bu_steps = agent.state.n_steps
+                except Exception as run_err:
+                    logger.warning(f"[interact {scope_id}] BU run error (will still extract): {run_err}")
+                    bu_summary = "action completed (with BU internal error)"
+                    bu_steps = getattr(agent.state, 'n_steps', 0)
+
+                t_run = time.time()
+
+                # Extract BU's own per-step timing from agent.history
+                try:
+                    for h in agent.history.history:
+                        step_info = {}
+                        if h.metadata:
+                            step_info["step"] = h.metadata.step_number
+                            step_info["duration_s"] = round(h.metadata.duration_seconds, 1)
+                        if h.state:
+                            step_info["url"] = (h.state.url or "")[:100]
+                        if h.model_output:
+                            if h.model_output.action:
+                                actions = h.model_output.action if isinstance(h.model_output.action, list) else [h.model_output.action]
+                                names = []
+                                for a in actions:
+                                    if hasattr(a, 'model_dump'):
+                                        names.extend(a.model_dump(exclude_unset=True).keys())
+                                step_info["actions"] = names
+                            if h.model_output.thinking:
+                                step_info["thinking"] = h.model_output.thinking[:200]
+                        if h.result:
+                            for r in h.result:
+                                if r.error:
+                                    step_info["error"] = str(r.error)[:200]
+                                if r.is_done:
+                                    step_info["is_done"] = True
+                        bu_history_steps.append(step_info)
+                except Exception as hist_err:
+                    logger.warning(f"[interact {scope_id}] History extraction error: {hist_err}")
+
+                logger.info(
+                    f"[interact {scope_id}] BU done: {bu_steps} steps, "
+                    f"agent_create={t_agent - t0:.1f}s, "
+                    f"run={t_run - t_agent:.1f}s, "
+                    f"summary={bu_summary!r}"
+                )
+                for hs in bu_history_steps:
+                    logger.info(f"[interact {scope_id}]   step {hs.get('step','?')}: "
+                                f"{hs.get('duration_s','?')}s | {hs.get('actions',[])} | "
+                                f"{hs.get('thinking','')[:80]}")
             finally:
-                # Force-stop BU's CDPClient to ensure clean state before
-                # reconnecting Playwright. With keep_alive=True, agent.close()
-                # does NOT stop the CDPClient — we must do it explicitly.
                 if self._bu_agent:
                     await self._stop_bu_cdp_client(self._bu_agent)
                     try:
@@ -1663,13 +1781,35 @@ if os.path.exists(_seeds_path):
                         pass
                     self._bu_agent = None
 
-                # Reconnect Playwright (sole CDP connection now)
                 await self._reconnect_playwright()
 
-            # Extract raw page content via our Playwright connection.
-            # BU changed the browser state; Playwright sees the same browser.
+            # Extract raw page content via Playwright
             try:
                 content, ref_id = await self._extract_page_content(url)
+                t_extract = time.time()
+
+                logger.info(
+                    f"[interact {scope_id}] DONE total={t_extract - t0:.1f}s "
+                    f"(agent={t_agent - t0:.1f}s + run={t_run - t_agent:.1f}s + "
+                    f"reconnect+extract={t_extract - t_run:.1f}s) "
+                    f"steps={bu_steps} content={'yes' if content else 'no'}"
+                )
+
+                # Update Langfuse span with full details
+                if span:
+                    span.update(output={
+                        "summary": bu_summary[:200],
+                        "step_count": bu_steps,
+                        "total_seconds": round(t_extract - t0, 1),
+                        "agent_create_seconds": round(t_agent - t0, 1),
+                        "run_seconds": round(t_run - t_agent, 1),
+                        "reconnect_extract_seconds": round(t_extract - t_run, 1),
+                        "stop_reason": supervisor.stop_reason if supervisor else None,
+                        "content_extracted": bool(content),
+                        "supervisor_steps": supervisor.steps if supervisor else [],
+                        "bu_history": bu_history_steps,
+                    })
+
                 if content:
                     return (
                         f"Browser action: {bu_summary}\n\n"
@@ -1679,12 +1819,22 @@ if os.path.exists(_seeds_path):
                 return f"Browser action: {bu_summary} (no page content extracted)", 0.0
 
             except Exception as extract_err:
-                logger.warning(f"[interact] Content extraction failed: {extract_err}")
+                logger.warning(f"[interact {scope_id}] Extraction failed: {extract_err}")
+                if span:
+                    span.update(output={
+                        "summary": bu_summary[:200],
+                        "step_count": bu_steps,
+                        "stop_reason": supervisor.stop_reason if supervisor else None,
+                        "error": f"extraction failed: {extract_err}",
+                        "bu_history": bu_history_steps,
+                    })
                 return f"Browser action: {bu_summary} (extraction failed: {extract_err})", 0.0
 
         except Exception as e:
-            logger.error(f"[interact] Browser agent failed: {e}", exc_info=True)
+            logger.error(f"[interact {scope_id}] Failed: {e}", exc_info=True)
             self._bu_agent = None
+            if span:
+                span.update(output={"error": str(e)})
             return f"Browser agent error: {e}", 0.0
     
     # =========================================================================
@@ -1968,17 +2118,18 @@ Working directory is /workspace. Files at /workspace/uploads/ and /workspace/dow
             {
                 "type": "function",
                 "name": "interact",
-                "description": "Take an action on a page using a browser agent. Same browser session as open() — shared cookies and state. Use when open() fails (Cloudflare, anti-bot) or when you need to interact with the page (click buttons, fill forms, scroll to load content, bypass login). Returns page content as line-numbered markdown (same as open). Keep tasks specific: 'load the page and bypass any challenge', 'click the Next button', 'fill the search box with X'. Do NOT use for web research — use brave_search or web_search for that.",
+                "description": "Send a SHORT, ATOMIC action to a browser navigation agent. The agent is dumb — it only clicks, scrolls, and bypasses challenges. It shouldn't research, extract, or strategize. You see the page content yourself after it acts. ONLY use when you need to do an action on the website to navigate to content.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "url_or_ref_id": {
                             "type": "string",
-                            "description": "URL or ref_id to interact with"
+                            "description": "URL or ref_id of the page"
                         },
                         "task": {
                             "type": "string",
-                            "description": "What to accomplish (e.g., 'login', 'click Load More')"
+                            "description": "One short action. Examples: 'bypass Cloudflare', 'click Next Page', 'scroll down', 'click Accept Cookies'. Do NOT include your research goal — the agent shouldn't help with that.",
+                            "maxLength": 100
                         },
                     },
                     "required": ["url_or_ref_id", "task"]

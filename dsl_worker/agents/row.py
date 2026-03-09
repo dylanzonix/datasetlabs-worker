@@ -80,11 +80,14 @@ DO NOT write JSON, code blocks, or row content as text. Only tool calls are capt
 - rng(options, weights): Pick a random option for controlled randomization
 - read_file(path): Read a file from the workspace
 - brave_search(query): Search the web for information
-- open(ref_id_or_url, start_line): View a page or file
+- open(ref_id_or_url, start_line): View a page or file. Always try this first.
 - find(ref_id, pattern): Search within a loaded page
 - click(ref_id, link_id): Follow a link
 - code_exec(script, description): Execute Python
-- interact(url_or_ref_id, task): Browser agent for complex interactions
+- interact(url_or_ref_id, task): Browser navigation agent. ONLY after open() returns \
+anti-bot/Cloudflare challenge or you need a page interaction (click, scroll). \
+Navigation tasks only: 'bypass challenge', 'click Accept'. Do NOT ask it to list, \
+extract, or summarize — you see the page directly after.
 
 ## How to Research
 
@@ -206,11 +209,14 @@ cannot produce a good row — don't skip just because research is hard.
 - rng(options, weights): Pick a random option for controlled randomization
 - read_file(path): Read a file from the workspace
 - brave_search(query): Search the web for information
-- open(ref_id_or_url, start_line): View a page or file
+- open(ref_id_or_url, start_line): View a page or file. Always try this first.
 - find(ref_id, pattern): Search within a loaded page
 - click(ref_id, link_id): Follow a link
 - code_exec(script, description): Execute Python
-- interact(url_or_ref_id, task): Browser agent for complex interactions
+- interact(url_or_ref_id, task): Browser navigation agent. ONLY after open() returns \
+anti-bot/Cloudflare challenge or you need a page interaction (click, scroll). \
+Navigation tasks only: 'bypass challenge', 'click Accept'. Do NOT ask it to list, \
+extract, or summarize — you see the page directly after.
 """
 
 

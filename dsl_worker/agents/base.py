@@ -460,8 +460,12 @@ class AgentConversation:
         try:
             args = json.loads(tc.arguments)
         except json.JSONDecodeError:
-            logger.warning(f"Bad tool args for {tc.name}: {tc.arguments}")
-            args = {}
+            logger.warning(f"Bad tool args for {tc.name}: {tc.arguments[:500]}")
+            return (
+                f"Error: invalid JSON in tool arguments for {tc.name}. "
+                f"Your arguments could not be parsed. Please retry with valid JSON.",
+                0.0,
+            )
 
         return await self.tools.execute(tc.name, args)
 

@@ -154,6 +154,9 @@ class SeedProcessor:
         self._submitted_total = 0   # total submit_seed calls
         self._rejected_dedup = 0
 
+        # Per-yielder contribution tracking (elastic fair share)
+        self._yielder_contributions: Dict[str, int] = {}
+
         # Distribution tracking (informational, not enforced)
         self._distribution: Dict[str, Dict[str, int]] = {}
 
@@ -189,19 +192,44 @@ class SeedProcessor:
             "remaining": max(0, self._target_rows - self._accepted),
         }
 
-    def _build_status(self, accepted: bool, reason: str = "") -> Dict[str, Any]:
+    def _build_status(
+        self, accepted: bool, reason: str = "", over_fair_share: bool = False,
+    ) -> Dict[str, Any]:
         """Build a rich status dict for the yielder."""
-        return {
+        status = {
             "accepted": accepted,
             "reason": reason,
             "stats": self.stats,
         }
+        if over_fair_share:
+            status["over_fair_share"] = True
+        return status
+
+    def _is_over_fair_share(self, yielder_id: str) -> bool:
+        """Check if a yielder has contributed more than its elastic fair share.
+
+        Fair share = target / num_active_yielders.
+        A yielder is "over" when it exceeds 1.5x fair share.
+        This ensures no single source dominates while allowing
+        fast yielders some headroom.
+        """
+        if not yielder_id or not self._yielder_contributions:
+            return False
+
+        num_yielders = len(self._yielder_contributions)
+        if num_yielders <= 1:
+            return False  # solo yielder — no fairness constraint
+
+        fair_share = self._target_rows / num_yielders
+        my_contributions = self._yielder_contributions.get(yielder_id, 0)
+
+        return my_contributions > fair_share * 1.5
 
     async def submit_seed(self, seed: Seed, yielder_id: str = "") -> Dict[str, Any]:
         """
         Process a seed: dedup → queue for generation.
 
-        Returns a rich status dict: {accepted, reason, stats}.
+        Returns a rich status dict: {accepted, reason, stats, over_fair_share?}.
         Called by seed yielders (possibly concurrently).
         """
         if not self._template:
@@ -210,6 +238,11 @@ class SeedProcessor:
         # --- Dedup (under lock) ---
         async with self._lock:
             self._submitted_total += 1
+
+            # Register yielder
+            if yielder_id and yielder_id not in self._yielder_contributions:
+                self._yielder_contributions[yielder_id] = 0
+
             if not self._check_dedup(seed):
                 self._rejected_dedup += 1
                 logger.debug(f"[SeedProcessor] Seed rejected by dedup: {seed.values}")
@@ -220,6 +253,10 @@ class SeedProcessor:
 
         async with self._lock:
             self._accepted += 1
+            if yielder_id:
+                self._yielder_contributions[yielder_id] = (
+                    self._yielder_contributions.get(yielder_id, 0) + 1
+                )
             self._track_distribution(seed)
 
         # Checkpoint the work item
@@ -229,10 +266,14 @@ class SeedProcessor:
         # Queue for generation
         await self._work_queue.put(work_item)
 
+        # Check fair share after accepting
+        over_share = self._is_over_fair_share(yielder_id) if yielder_id else False
+
         logger.info(
             f"[SeedProcessor] Seed accepted ({self._accepted}/{self._target_rows})"
+            f"{' [over fair share]' if over_share else ''}"
         )
-        return self._build_status(True)
+        return self._build_status(True, over_fair_share=over_share)
 
     def _check_dedup(self, seed: Seed) -> bool:
         """Check if seed passes dedup. Returns True if unique."""

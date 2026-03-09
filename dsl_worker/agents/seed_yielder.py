@@ -63,37 +63,51 @@ submit seeds — specific variable values that will each become one row in the d
 
 ## How to Work
 
-1. Start from your assigned sources. Search, browse, or iterate through them.
-2. For each valid item you find, call yield_seed() immediately with the required variable values.
-   Do NOT accumulate items mentally — yield each one as soon as you have the values.
-3. yield_seed() returns a status with accepted/rejected counts. Use this to guide your work:
-   - If rejection rate is high, try different sources or approaches.
-   - If many seeds are being rejected by dedup, try different sources.
-4. Keep going until you hit your quota of {target_seeds} ACCEPTED seeds, or your sources \
-are exhausted.
-5. Call done() when finished or when sources are exhausted.
+1. Start from your assigned sources. Follow the strategy and instructions above.
+2. Systematically iterate through your sources, calling yield_seed() for each item you find.
+3. Include useful context in yield_seed metadata (URLs, line numbers, source references) \
+so the row generator can find the content efficiently.
+4. yield_seed() returns pipeline status. Watch for these signals:
+   - "pipeline full" → call done() immediately, the dataset has enough seeds.
+   - "fair share reached" → call done(), let other yielders contribute diversity.
+   - "rejected (dedup)" → try different items, don't re-yield similar seeds.
+5. Use find() and open(ref_id, start_line) to navigate through long pages.
+   Use click() to follow pagination links.
+6. Call done() when your source is exhausted or pipeline signals to stop.
+
+## Browsing
+
+- **open(url)** — Opens a page and returns line-numbered markdown with links table. Fast (~2s).
+- **find(ref_id, pattern)** — Search within an already-opened page.
+- **click(ref_id, link_id)** — Follow a link from the links table.
+- **interact(url_or_ref_id, task)** — ONLY use when open() returns an anti-bot/Cloudflare \
+challenge page instead of real content. Give it a small, specific navigation task like \
+"bypass the challenge" or "click Accept Cookies". Do NOT ask it to list, extract, or \
+summarize content — you see the page directly after it navigates.
 
 ## Important
 
-- Focus on QUANTITY. Your job is to find items matching the variable descriptions and yield them.
-- Basic quality filtering is fine (skip obviously broken or irrelevant items), but do not \
-research or deeply evaluate each seed — the row generator will decide whether to use or skip it.
-- If a seed gets rejected, move on. Try a different source or query.
+- Focus on QUANTITY and SPEED. Yield items as fast as you can.
+- Follow the strategy and instructions — they tell you what to iterate and how.
+- Do NOT use interact() to extract or summarize content. Just open() the page and read it.
+- If a seed gets rejected, move on. Try a different item.
 - Do not yield duplicates of seeds you've already submitted.
+- Include source_url, line_range, or other context in yield_seed metadata — \
+this helps the row generator find the content faster.
 
 ## Tools
 
-- yield_seed(values, metadata): Submit a seed with resolved variable values.
+- yield_seed(values, metadata): Submit a seed. Include metadata like \
+{{"source_url": "...", "source_ref": "p0", "line_range": "45-80"}} to help row generators.
 - brave_search(query): Search the web.
-- open(ref_id_or_url, start_line): View a page or search result.
+- open(ref_id_or_url, start_line): View a page. ALWAYS try this first.
 - find(ref_id, pattern): Search within a loaded page.
 - click(ref_id, link_id): Follow a link.
 - code_exec(script, description): Execute Python for programmatic iteration.
 - read_file(path): Read a workspace file.
-- interact(url_or_ref_id, task): Browser agent for JS-heavy/anti-bot pages.
+- interact(url_or_ref_id, task): Browser navigation agent. ONLY for anti-bot bypass or \
+page interactions (clicking buttons, scrolling to load). NOT for reading or extracting content.
 - done(reason): Signal you're finished yielding.
-
-Target: {target_seeds} accepted seeds.
 """
 
 
@@ -146,15 +160,11 @@ class SeedYielderAgent:
         self.on_tool_call = on_tool_call
         self.on_cost = on_cost
 
-        # Calculate this yielder's target
-        base = pipeline_config.target_rows // total_yielders
-        extra = 1 if yielder_index < (pipeline_config.target_rows % total_yielders) else 0
-        self.target_seeds = base + extra
-
         # State
         self._yielded_count = 0   # total submissions (including rejected)
         self._accepted_count = 0  # accepted seeds only
         self._is_done = False
+        self._pipeline_full = False
         self.variables = pipeline_config.variables
 
         # Build research tools
@@ -297,7 +307,6 @@ class SeedYielderAgent:
             strategy_description=strategy_description,
             seed_instructions=seed_instructions,
             research_context=self.pipeline_config.research_context or "(no research context provided)",
-            target_seeds=self.target_seeds,
         )
 
     def _register_tools(self, registry: ToolRegistry) -> None:
@@ -353,14 +362,6 @@ class SeedYielderAgent:
             if missing:
                 return f"Error: missing variables {missing}", 0.0
 
-            # Hard cap — prevent runaway cost
-            if self._yielded_count >= self.target_seeds * HARD_CAP_MULTIPLIER:
-                self._is_done = True
-                return (
-                    f"Hard cap reached ({self._yielded_count} submitted for "
-                    f"{self.target_seeds} target). Stopping. Call done()."
-                ), 0.0
-
             seed = Seed(values=values, metadata=metadata)
             status = await self.on_yield_seed(seed, str(self.yielder_index))
             self._yielded_count += 1
@@ -373,24 +374,34 @@ class SeedYielderAgent:
                 return (
                     f"Seed REJECTED ({status['reason']}). "
                     f"Pipeline: {accepted_count} accepted, {remaining} remaining. "
-                    f"Try a different seed."
+                    f"Try a different item."
                 ), 0.0
 
             self._accepted_count += 1
 
-            if self._accepted_count >= self.target_seeds:
+            # Pipeline full — no more seeds needed
+            if remaining <= 0:
+                self._pipeline_full = True
                 return (
-                    f"Seed accepted! Your quota reached ({self._accepted_count}/{self.target_seeds}). "
+                    f"Seed accepted. Pipeline full ({accepted_count} accepted). "
                     f"Call done()."
                 ), 0.0
 
-            my_remaining = self.target_seeds - self._accepted_count
+            # Fair share throttle — let other yielders contribute diversity
+            if status.get("over_fair_share"):
+                self._is_done = True
+                return (
+                    f"Seed accepted. You've contributed {self._accepted_count} seeds — "
+                    f"fair share reached. Call done() to let other sources contribute. "
+                    f"Pipeline: {accepted_count} accepted, {remaining} remaining."
+                ), 0.0
+
             advice = ""
             if stats.get("rejected_dedup", 0) > accepted_count and accepted_count > 0:
                 advice = " High dedup rejection — try different sources/approaches."
 
             return (
-                f"Seed accepted. You: {self._accepted_count}/{self.target_seeds}. "
+                f"Seed accepted ({self._accepted_count} from you). "
                 f"Pipeline: {accepted_count} accepted, {remaining} remaining.{advice}"
             ), 0.0
 
@@ -433,7 +444,7 @@ class SeedYielderAgent:
             self._is_done = True
             return (
                 f"Seed yielder done: {reason}. "
-                f"Yielded {self._yielded_count} (accepted {self._accepted_count}/{self.target_seeds})."
+                f"Yielded {self._yielded_count} (accepted {self._accepted_count})."
             ), 0.0
 
         registry.add(
@@ -457,16 +468,15 @@ class SeedYielderAgent:
     async def run(self) -> AgentResult:
         """Run the seed yielder."""
         result = await self._conversation.send(
-            "Begin yielding seeds.",
-            exit_condition=lambda: self._is_done or self._accepted_count >= self.target_seeds,
+            "Begin yielding seeds from your assigned sources.",
+            exit_condition=lambda: self._is_done or self._pipeline_full,
         )
 
-        if self._accepted_count < self.target_seeds:
-            logger.warning(
-                f"[seed_yielder:{self.yielder_index}] finished with only "
-                f"{self._accepted_count}/{self.target_seeds} accepted seeds "
-                f"({self._yielded_count} total submitted)"
-            )
+        logger.info(
+            f"[seed_yielder:{self.yielder_index}] finished: "
+            f"{self._accepted_count} accepted, "
+            f"{self._yielded_count} total submitted"
+        )
 
         return result
 

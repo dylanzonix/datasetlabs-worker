@@ -93,7 +93,9 @@ Include a research approach section if row generators need to look things up.
 4. **Produce seeds** — Launch subagents:
    - parse_seeds() for iterating known sources (URLs, files, search results)
    - synthesize_seeds() for discovering seeds via research
-   - Call multiple in parallel for different source partitions or topics.
+   - ONE source per parse_seeds() call. Launch multiple in parallel for different sources.
+     Example: 3 listing URLs → 3 parallel parse_seeds() calls, each with one source.
+   - For synthesize_seeds(), split by topic partition for diversity.
 
 5. **React** — Check get_status(). If short on seeds, launch more subagents with \
 different sources or topics. If enough, call done().
@@ -438,9 +440,16 @@ class OrchestratorAgent:
                 return "Error: instructions is required", 0.0
 
             try:
-                variables = [VariableConfig(**v) for v in variables_raw]
+                variables = [
+                    VariableConfig(
+                        name=v["name"],
+                        description=v.get("description", ""),
+                        seed_strategy="iterate",  # default; overridden by parse_seeds/synthesize_seeds
+                    )
+                    for v in variables_raw
+                ]
             except (TypeError, KeyError) as e:
-                return f"Error parsing variables: {e}", 0.0
+                return f"Error parsing variables: {e}. Each variable needs at least a 'name'.", 0.0
 
             self._template = template
             self._variables = variables
