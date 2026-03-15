@@ -68,9 +68,10 @@ automatically. E.g., ["url"] for job listings, ["name", "email"] for contacts.
 5. **Harvest (in rounds)** — Launch harvest() calls:
    - Each harvest() = one crawler = one slice of the problem.
    - A slice is a single URL, search query, file, or topic.
-   - 5 slices = 5 parallel harvest() calls.
+   - Launch up to 10 crawlers total (hard limit). Prefer more slices over fewer \
+     for better coverage — don't hesitate to launch 8–10 for broad searches.
    - Each harvest() returns candidate and row counts.
-   - After a round completes, assess: enough candidates? Any gaps? \
+   - After a round completes, assess: enough rows? Any gaps? \
      Launch another round targeting underrepresented areas if needed.
 
 6. **Done** — Call done() when enough seeds have been dispatched.
@@ -95,12 +96,16 @@ automatically. E.g., ["url"] for job listings, ["name", "email"] for contacts.
 
 - ONE harvest() = ONE slice. Each spawns its own crawler with its own browser.
 - harvest() blocks until done, then returns status. Launch multiple in parallel.
-- After each round: assess counts, then either launch more or done().
+- After each round: assess row counts, then either launch more or done().
 - Row generators see the full user conversation — your instructions are additive. \
   Keep them focused: what to look for, how to find it, what to skip.
 - Our browsing stack handles anti-bot, CAPTCHAs, and JS-heavy pages automatically.
-- Row generators will skip_row() for dead ends. Overshoot quota slightly.
-- harvest() is fast and cheap — don't hesitate to launch many slices.
+- Row generators will skip_row() for dead ends. Expect some rejection — that's normal.
+- harvest() is fast and cheap — don't hesitate to launch many slices (up to 10 total).
+- harvest() instructions tell the crawler HOW to navigate: which links to follow, \
+  when to stop, how to recognize the end of a source. Express stopping criteria as \
+  observable content signals (e.g. "stop when listings are older than 7 days") not \
+  UI assumptions (never assume specific filter buttons or controls exist).
 
 <conversation>
 {conversation_summary}
@@ -126,8 +131,8 @@ Target: {num_samples} rows.
 - set_identity_columns(columns): Declare which output columns identify an entity. \
   When a row generator sets one of these columns, it gets back similar existing rows \
   and can skip_row() if it's a duplicate. E.g., ["url"] or ["name", "email"].
-- harvest(source, instructions, quota): Crawl one slice, extract candidates. \
-  Returns candidate count, rows generated so far, and cost.
+- harvest(source, instructions): Crawl one slice, extract candidates. \
+  Returns rows generated so far, rows still needed, and cost.
 - done(reason): Signal completion — all seed sources dispatched.
 
 You do NOT have browsing, search, code execution, or file reading tools. \
@@ -443,6 +448,9 @@ class OrchestratorAgent:
             handler=set_identity_columns,
         )
 
+        MAX_CONCURRENT_CRAWLERS = 10
+        crawler_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CRAWLERS)
+
         # --- harvest ---
         async def harvest(args: Dict) -> tuple[str, float]:
             from dsl_worker.agents.crawler import CrawlerAgent
@@ -461,101 +469,103 @@ class OrchestratorAgent:
             idx = self._subagent_counter
             self._subagent_counter += 1
 
-            langfuse_span = getattr(self._conversation, "_current_langfuse_span", None)
+            async with crawler_semaphore:
+                langfuse_span = getattr(self._conversation, "_current_langfuse_span", None)
 
-            candidate_description = self._seed_processor._candidate_description
+                candidate_description = self._seed_processor._candidate_description
 
-            extractor = CandidateExtractor(
-                openai_client=self.openai_client,
-                model=worker_settings.extractor_model,
-                candidate_description=candidate_description,
-                on_submit=self._seed_processor.submit_seed,
-                on_cost=self.on_cost,
-            )
-            extract_semaphore = asyncio.Semaphore(20)
-            extraction_tasks: List[asyncio.Task] = []
-            pages_dumped = 0
-
-            async def on_dump_page(page: Dict):
-                nonlocal pages_dumped
-                pages_dumped += 1
-                task = asyncio.create_task(
-                    extractor.extract_page(page, extract_semaphore)
+                extractor = CandidateExtractor(
+                    openai_client=self.openai_client,
+                    model=worker_settings.extractor_model,
+                    candidate_description=candidate_description,
+                    on_submit=self._seed_processor.submit_seed,
+                    on_cost=self.on_cost,
                 )
-                extraction_tasks.append(task)
+                extract_semaphore = asyncio.Semaphore(20)
+                extraction_tasks: List[asyncio.Task] = []
+                pages_dumped = 0
 
-            crawler = CrawlerAgent(
-                sources=[source],
-                instructions=instructions,
-                candidate_description=candidate_description,
-                openai_client=self.openai_client,
-                model=self.yielder_model,
-                workspace_dir=self.workspace_dir,
-                on_dump_page=on_dump_page,
-                crawler_index=idx,
-                research_context=self._seed_processor._research_context,
-                brave_api_key=self.brave_api_key,
-                sandbox=self.sandbox,
-                stop_checker=self.stop_checker,
-                blob_service_client=self.blob_service_client,
-                project_id=self.project_id,
-                on_tool_call=self.on_tool_call,
-                on_cost=self.on_cost,
-                mcp_tools=self.mcp_tools,
-                langfuse_parent=langfuse_span,
-                on_browser_started=self.on_browser_started,
-                on_browser_stopped=self.on_browser_stopped,
-            )
+                async def on_dump_page(page: Dict):
+                    nonlocal pages_dumped
+                    pages_dumped += 1
+                    task = asyncio.create_task(
+                        extractor.extract_page(page, extract_semaphore)
+                    )
+                    extraction_tasks.append(task)
 
-            t0 = time.time()
-            try:
-                await crawler.run()
-            finally:
-                await crawler.cleanup()
+                crawler = CrawlerAgent(
+                    sources=[source],
+                    instructions=instructions,
+                    candidate_description=candidate_description,
+                    openai_client=self.openai_client,
+                    model=self.yielder_model,
+                    workspace_dir=self.workspace_dir,
+                    on_dump_page=on_dump_page,
+                    crawler_index=idx,
+                    research_context=self._seed_processor._research_context,
+                    brave_api_key=self.brave_api_key,
+                    sandbox=self.sandbox,
+                    stop_checker=self.stop_checker,
+                    blob_service_client=self.blob_service_client,
+                    project_id=self.project_id,
+                    on_tool_call=self.on_tool_call,
+                    on_cost=self.on_cost,
+                    mcp_tools=self.mcp_tools,
+                    langfuse_parent=langfuse_span,
+                    on_browser_started=self.on_browser_started,
+                    on_browser_stopped=self.on_browser_stopped,
+                )
 
-            crawl_time = time.time() - t0
-            crawl_cost = crawler.cost_usd
+                t0 = time.time()
+                try:
+                    await crawler.run()
+                finally:
+                    await crawler.cleanup()
 
-            if not extraction_tasks:
+                crawl_time = time.time() - t0
+                crawl_cost = crawler.cost_usd
+
+                if not extraction_tasks:
+                    stats = self._seed_processor.stats
+                    gen = self._generation_stats
+                    return (
+                        f"Harvester {idx}: no pages found in {crawl_time:.0f}s. "
+                        f"Cost: ${crawl_cost:.3f}. "
+                        f"Pipeline: {stats['accepted']} candidates accepted, "
+                        f"{gen.get('rows_generated', 0)} rows generated."
+                    ), crawl_cost
+
+                results = await asyncio.gather(*extraction_tasks, return_exceptions=True)
+
+                candidates_found = 0
+                extract_cost = 0.0
+                for r in results:
+                    if isinstance(r, BaseException):
+                        continue
+                    count, cost = r
+                    candidates_found += count
+                    extract_cost += cost
+
+                total_cost = crawl_cost + extract_cost
                 stats = self._seed_processor.stats
                 gen = self._generation_stats
+
                 return (
-                    f"Harvester {idx}: no pages found in {crawl_time:.0f}s. "
-                    f"Cost: ${crawl_cost:.3f}. "
-                    f"Pipeline: {stats['accepted']} candidates accepted, "
-                    f"{gen.get('rows_generated', 0)} rows generated."
-                ), crawl_cost
-
-            results = await asyncio.gather(*extraction_tasks, return_exceptions=True)
-
-            candidates_found = 0
-            extract_cost = 0.0
-            for r in results:
-                if isinstance(r, BaseException):
-                    continue
-                count, cost = r
-                candidates_found += count
-                extract_cost += cost
-
-            total_cost = crawl_cost + extract_cost
-            stats = self._seed_processor.stats
-            gen = self._generation_stats
-
-            return (
-                f"Harvester {idx} done: {pages_dumped} pages in {crawl_time:.0f}s, "
-                f"{candidates_found} candidates extracted. "
-                f"Pipeline total: {stats['accepted']} accepted, "
-                f"{stats['remaining']} remaining to target, "
-                f"{gen.get('rows_generated', 0)} rows generated, "
-                f"{gen.get('skipped', 0)} skipped. "
-                f"Cost: ${total_cost:.3f} (crawl=${crawl_cost:.3f}, extract=${extract_cost:.3f})."
-            ), total_cost
+                    f"Harvester {idx} done: {pages_dumped} pages in {crawl_time:.0f}s, "
+                    f"{candidates_found} candidates extracted. "
+                    f"Pipeline total: {stats['accepted']} accepted, "
+                    f"{stats['remaining']} rows still needed, "
+                    f"{gen.get('rows_generated', 0)} rows generated, "
+                    f"{gen.get('skipped', 0)} skipped. "
+                    f"Cost: ${total_cost:.3f} (crawl=${crawl_cost:.3f}, extract=${extract_cost:.3f})."
+                ), total_cost
 
         registry.add(
             name="harvest",
             description=(
                 "Crawl one source slice and extract candidates. Blocks until done, "
-                "then returns counts and cost. Call multiple in parallel for different slices."
+                "then returns row counts and cost. Call multiple in parallel for different slices. "
+                f"Maximum {MAX_CONCURRENT_CRAWLERS} concurrent harvest() calls."
             ),
             parameters={
                 "type": "object",
@@ -567,15 +577,13 @@ class OrchestratorAgent:
                             "For multiple sources, call harvest() multiple times in parallel."
                         ),
                     },
-                    "quota": {
-                        "type": "integer",
-                        "description": "Target candidates to extract (default 50).",
-                    },
                     "instructions": {
                         "type": "string",
                         "description": (
-                            "Instructions for the crawler: how to navigate, what pages to dump. "
-                            "E.g., 'Follow pagination links, dump each listing page.'"
+                            "Navigation instructions for the crawler: which links to follow, "
+                            "how to paginate, when to stop. Use observable content signals for "
+                            "stopping (e.g. 'stop when you see listings older than 7 days'). "
+                            "Do not assume specific UI controls exist."
                         ),
                     },
                 },

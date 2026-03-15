@@ -463,6 +463,7 @@ class JobProcessor:
             work_queue=work_item_queue,
             on_checkpoint=on_seed_checkpoint,
             target_rows=state.num_samples,
+            generation_stats=generation_stats,
         )
 
         # Start generation consumer (runs in background the entire time)
@@ -672,6 +673,7 @@ class JobProcessor:
         work_item_queue: asyncio.Queue,
         workspace_dir: Path,
         stop_checker,
+        stop_event: asyncio.Event,
         schema: List[Dict],
         generation_stats: Dict,
         chat_history: Optional[List[Dict]] = None,

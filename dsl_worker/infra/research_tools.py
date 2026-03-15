@@ -1759,7 +1759,7 @@ if os.path.exists(_seeds_path):
                             step_info["step"] = h.metadata.step_number
                             step_info["duration_s"] = round(h.metadata.duration_seconds, 1)
                         if h.state:
-                            step_info["url"] = (h.state.url or "")[:100]
+                            step_info["url"] = h.state.url or ""
                         if h.model_output:
                             if h.model_output.action:
                                 actions = h.model_output.action if isinstance(h.model_output.action, list) else [h.model_output.action]

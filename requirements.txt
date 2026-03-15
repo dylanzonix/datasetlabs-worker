@@ -45,7 +45,7 @@ httpx
 playwright
 sandbox-service
 
-langfuse
+langfuse>=4.0
 
 pdfplumber
 python-docx

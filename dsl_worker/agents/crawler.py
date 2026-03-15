@@ -67,9 +67,15 @@ browse assigned sources and save pages that contain candidate items for the data
 ## Tips
 
 - save_page() is cheap. When in doubt, save it.
+- Maximize candidates per page saved. A search results page with 50 job cards is \
+  worth more than 50 individual page saves. Prefer pages that contain many candidates \
+  over drilling into individual items — only go to individual pages when there's no \
+  higher-density alternative.
 - Follow "Next page", "Page 2", "Load more" links for pagination.
-- If a listing page links to detail pages, save both the listing AND detail pages.
 - If a search returns many results pages, paginate through all of them.
+- Stop when you've clearly exhausted the source or hit a dead end (repeated content, \
+  irrelevant results, or content that signals you're past useful territory). \
+  Trust observable signals on the page — don't assume UI controls exist.
 - Use brave_search to discover additional sources if your assigned ones are thin.
 
 ## Tools
