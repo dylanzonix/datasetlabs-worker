@@ -37,25 +37,24 @@ from dsl_api.models.project_connector import ProjectConnector
 
 from dsl_worker.config import settings
 
-# Langfuse is optional
+# OTel/Phoenix tracing is optional
 try:
-    from langfuse import get_client as _get_langfuse_client, propagate_attributes
+    from opentelemetry import trace as _otel_trace
+    from openinference.semconv.trace import SpanAttributes as _SpanAttributes
+    from openinference.instrumentation import using_session
 
-    def _get_langfuse():
-        try:
-            return _get_langfuse_client()
-        except Exception:
-            return None
+    def _get_tracer():
+        return _otel_trace.get_tracer(__name__)
 except ImportError:
-    def _get_langfuse():
+    from contextlib import contextmanager
+
+    @contextmanager
+    def using_session(session_id):
+        yield
+
+    def _get_tracer():
         return None
 
-    def propagate_attributes(**kwargs):
-        from contextlib import contextmanager
-        @contextmanager
-        def _noop():
-            yield
-        return _noop()
 from dsl_worker.project_state import ProjectState
 from dsl_worker.billing import CostTracker, TrackedOpenAIClient
 from dsl_worker.checkpoint import CheckpointManager, checkpoints_to_work_items
@@ -193,33 +192,28 @@ class JobProcessor:
             # Emit running event
             self._emit_event(db, project, version, "running", "Worker started")
 
-            # Run pipeline wrapped in Langfuse trace.
-            # propagate_attributes sets session_id/user_id/tags on every
-            # observation created within the block, including sub-agent spans
-            # in asyncio tasks that inherit the contextvars context.
-            with propagate_attributes(
-                session_id=str(project_id),
-                user_id=str(project.user_id),
-                tags=[project.name, f"v{version.version_number}"],
-                metadata={
-                    "project_id": str(project_id),
-                    "version_id": str(version_id),
-                    "num_samples": version.num_samples,
-                },
-            ):
-                langfuse = _get_langfuse()
-                if langfuse:
-                    with langfuse.start_as_current_observation(
-                        as_type="span",
-                        name=f"job:{project.name} v{version.version_number}",
-                    ) as job_span:
+            # Run pipeline wrapped in OTel trace.
+            session_id = str(project_id)
+            tracer = _get_tracer()
+            with using_session(session_id):
+                if tracer is not None:
+                    with tracer.start_as_current_span(
+                        f"job:{project.name} v{version.version_number}",
+                        attributes={
+                            _SpanAttributes.OPENINFERENCE_SPAN_KIND: "CHAIN",
+                            _SpanAttributes.SESSION_ID: session_id,
+                            "user.id": str(project.user_id),
+                            "project_id": str(project_id),
+                            "version_id": str(version_id),
+                            "num_samples": version.num_samples,
+                        },
+                    ):
                         result = await self._run_pipeline(
                             db, project, version, state, tracked_client, cost_tracker,
-                            langfuse_parent=job_span,
                         )
                 else:
                     result = await self._run_pipeline(
-                        db, project, version, state, tracked_client, cost_tracker
+                        db, project, version, state, tracked_client, cost_tracker,
                     )
             return result
 
@@ -242,10 +236,6 @@ class JobProcessor:
             return False
 
         finally:
-            # Flush Langfuse traces before cleanup
-            langfuse = _get_langfuse()
-            if langfuse:
-                langfuse.flush()
             await self._cleanup()
             db.close()
 
@@ -257,7 +247,6 @@ class JobProcessor:
         state: ProjectState,
         tracked_client: TrackedOpenAIClient,
         cost_tracker: CostTracker,
-        langfuse_parent: Optional[Any] = None,
     ) -> bool:
         """Run the V5 pipeline: orchestrator → seed yielders → row generators."""
 
@@ -391,10 +380,9 @@ class JobProcessor:
         # --- Progress tracking ---
         progress_counters: Dict[str, Any] = {"phase": "orchestrating"}
         last_progress_flush = time.time()
-        last_langfuse_flush = time.time()
 
         def on_tool_call(agent_label: str, tool_name: str):
-            nonlocal last_progress_flush, last_langfuse_flush
+            nonlocal last_progress_flush
 
             phase_map = {
                 "research": "researching",
@@ -423,11 +411,6 @@ class JobProcessor:
                 version.progress_detail = merged
                 db.commit()
                 last_progress_flush = now
-            if now - last_langfuse_flush >= 10.0:
-                lf = _get_langfuse()
-                if lf:
-                    lf.flush()
-                last_langfuse_flush = now
 
         # --- Browser session tracking ---
         browser_sessions: Dict[str, Dict[str, str]] = {}
@@ -484,7 +467,6 @@ class JobProcessor:
                 seed_processor=seed_processor,
                 uploaded_file_urls=uploaded_file_urls,
                 on_cost=on_cost,
-                langfuse_parent=langfuse_parent,
                 on_browser_started=on_browser_started,
                 on_browser_stopped=on_browser_stopped,
             )
@@ -519,7 +501,6 @@ class JobProcessor:
             uploaded_file_urls=uploaded_file_urls if uploaded_file_urls else None,
             mcp_tools=mcp_tools,
             feedback_context=feedback_context,
-            langfuse_parent=langfuse_parent,
             on_browser_started=on_browser_started,
             on_browser_stopped=on_browser_stopped,
         )
@@ -617,7 +598,6 @@ class JobProcessor:
                 uploaded_file_urls=uploaded_file_urls,
                 mcp_tools=self._mcp_tools,
                 on_cost=on_cost,
-                langfuse_parent=langfuse_parent,
                 on_browser_started=on_browser_started,
                 on_browser_stopped=on_browser_stopped,
             )
@@ -678,7 +658,6 @@ class JobProcessor:
         seed_processor: Optional[Any] = None,
         uploaded_file_urls: Optional[Dict[str, str]] = None,
         on_cost: Optional[Callable] = None,
-        langfuse_parent: Optional[Any] = None,
         on_browser_started: Optional[Callable] = None,
         on_browser_stopped: Optional[Callable] = None,
     ) -> None:
@@ -731,7 +710,6 @@ class JobProcessor:
                     uploaded_file_urls=uploaded_file_urls,
                     mcp_tools=self._mcp_tools,
                     on_cost=on_cost,
-                    langfuse_parent=item.get("langfuse_parent") or langfuse_parent,
                     on_browser_started=on_browser_started,
                     on_browser_stopped=on_browser_stopped,
                 )
@@ -901,7 +879,6 @@ class JobProcessor:
         # Generate SAS URLs for uploaded files (needed by row generators)
         uploaded_file_urls = self._generate_file_urls(db, project.id)
 
-        # Langfuse parent not available for checkpoint resume (no active span)
         pool = GenerationWorkerPool(
             workspace_dir=workspace_dir,
             openai_client=tracked_client,

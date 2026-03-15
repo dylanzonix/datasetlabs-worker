@@ -42,7 +42,6 @@ class GenerationWorkerPool:
         uploaded_file_urls: Optional[Dict[str, str]] = None,
         mcp_tools: Optional[List[Dict]] = None,
         on_cost: Optional[Callable] = None,
-        langfuse_parent: Optional[Any] = None,
         on_browser_started: Optional[Callable] = None,
         on_browser_stopped: Optional[Callable] = None,
     ):
@@ -65,7 +64,6 @@ class GenerationWorkerPool:
         self.uploaded_file_urls = uploaded_file_urls
         self.mcp_tools = mcp_tools or []
         self.on_cost = on_cost
-        self.langfuse_parent = langfuse_parent
         self.on_browser_started = on_browser_started
         self.on_browser_stopped = on_browser_stopped
 
@@ -136,7 +134,6 @@ class GenerationWorkerPool:
                 uploaded_file_urls=self.uploaded_file_urls,
                 mcp_tools=self.mcp_tools,
                 on_cost=self.on_cost,
-                langfuse_parent=self.langfuse_parent,
                 on_browser_started=self.on_browser_started,
                 on_browser_stopped=self.on_browser_stopped,
             )
@@ -154,9 +151,6 @@ class GenerationWorkerPool:
                     instructions = item.get("instructions", "")
                     candidate = item.get("candidate")
                     tags = item.get("tags") or {}
-
-                    item_parent = item.get("langfuse_parent")
-                    agent.langfuse_parent = item_parent if item_parent is not None else self.langfuse_parent
 
                     if not instructions:
                         logger.warning(f"[GenerationPool] Empty instructions at index {index}")

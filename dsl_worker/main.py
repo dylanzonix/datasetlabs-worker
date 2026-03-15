@@ -177,12 +177,18 @@ async def main():
     """Main entry point."""
     setup_logging()
 
-    # Configure Langfuse env vars (the SDK reads these automatically)
-    if settings.langfuse_secret_key:
-        os.environ.setdefault("LANGFUSE_SECRET_KEY", settings.langfuse_secret_key)
-        os.environ.setdefault("LANGFUSE_PUBLIC_KEY", settings.langfuse_public_key)
-        os.environ.setdefault("LANGFUSE_BASE_URL", settings.langfuse_base_url)
-        logger.info("Langfuse tracing enabled")
+    # Configure Phoenix observability
+    if settings.phoenix_collector_endpoint:
+        try:
+            from phoenix.otel import register
+            register(
+                project_name=settings.phoenix_project_name,
+                endpoint=settings.phoenix_collector_endpoint,
+                auto_instrument=True,
+            )
+            logger.info(f"Phoenix tracing enabled → {settings.phoenix_collector_endpoint}")
+        except Exception as e:
+            logger.warning(f"Phoenix setup failed (tracing disabled): {e}")
 
     worker = Worker()
     await worker.run()

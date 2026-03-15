@@ -5,7 +5,7 @@ Provides secure, isolated code execution with:
 - Persistent sessions per agent (lazy-created on first use)
 - Async HTTP-based execution via sandbox_service
 - OOM detection, timeouts, memory limits
-- Langfuse tracing for sandbox operations
+- OTel tracing for sandbox operations
 """
 
 import logging
@@ -17,17 +17,15 @@ from sandbox_service import SandboxClient, SandboxSessionClient
 
 logger = logging.getLogger(__name__)
 
-# Langfuse is optional — tracing is a no-op if not configured
+# OTel tracing is optional
 try:
-    from langfuse import get_client as _get_langfuse_client
+    from opentelemetry import trace as _otel_trace
+    from openinference.semconv.trace import SpanAttributes as _SpanAttributes
 
-    def _get_langfuse():
-        try:
-            return _get_langfuse_client()
-        except Exception:
-            return None
+    def _get_tracer():
+        return _otel_trace.get_tracer(__name__)
 except ImportError:
-    def _get_langfuse():
+    def _get_tracer():
         return None
 
 
@@ -124,24 +122,21 @@ class SandboxSession:
         return self._session.session_id
 
     async def execute(self, script: str, timeout: int = 120) -> SandboxResult:
-        """Execute Python code, return result (with Langfuse span)."""
-        langfuse = _get_langfuse()
-        if langfuse:
-            with langfuse.start_as_current_observation(
-                as_type="span",
-                name="sandbox:execute",
-                input={"script_length": len(script), "timeout": timeout},
+        """Execute Python code, return result (with OTel span)."""
+        tracer = _get_tracer()
+        if tracer:
+            with tracer.start_as_current_span(
+                "sandbox:execute",
+                attributes={_SpanAttributes.OPENINFERENCE_SPAN_KIND: "TOOL"},
             ) as span:
+                span.set_attribute("input.value", str({"script_length": len(script), "timeout": timeout})[:500])
                 result = await self._do_execute(script, timeout)
-                span.update(
-                    output={
-                        "success": result.success,
-                        "exit_code": result.exit_code,
-                        "oom_killed": result.oom_killed,
-                        "timed_out": result.timed_out,
-                    },
-                    level="ERROR" if not result.success else "DEFAULT",
-                )
+                span.set_attribute("output.value", str({
+                    "success": result.success,
+                    "exit_code": result.exit_code,
+                    "oom_killed": result.oom_killed,
+                    "timed_out": result.timed_out,
+                })[:500])
                 return result
         return await self._do_execute(script, timeout)
 
@@ -171,24 +166,21 @@ class SandboxSession:
             )
 
     async def exec_shell(self, command: str, timeout: int = 60) -> SandboxResult:
-        """Execute a shell command, return result (with Langfuse span)."""
-        langfuse = _get_langfuse()
-        if langfuse:
-            with langfuse.start_as_current_observation(
-                as_type="span",
-                name="sandbox:exec_shell",
-                input={"command_length": len(command), "timeout": timeout},
+        """Execute a shell command, return result (with OTel span)."""
+        tracer = _get_tracer()
+        if tracer:
+            with tracer.start_as_current_span(
+                "sandbox:exec_shell",
+                attributes={_SpanAttributes.OPENINFERENCE_SPAN_KIND: "TOOL"},
             ) as span:
+                span.set_attribute("input.value", str({"command_length": len(command), "timeout": timeout})[:500])
                 result = await self._do_exec_shell(command, timeout)
-                span.update(
-                    output={
-                        "success": result.success,
-                        "exit_code": result.exit_code,
-                        "oom_killed": result.oom_killed,
-                        "timed_out": result.timed_out,
-                    },
-                    level="ERROR" if not result.success else "DEFAULT",
-                )
+                span.set_attribute("output.value", str({
+                    "success": result.success,
+                    "exit_code": result.exit_code,
+                    "oom_killed": result.oom_killed,
+                    "timed_out": result.timed_out,
+                })[:500])
                 return result
         return await self._do_exec_shell(command, timeout)
 
@@ -225,15 +217,13 @@ class SandboxSession:
         For uploaded files: uses file_urls (sandbox service fetches from SAS URLs).
         For other dirs (downloads/, web/, extracted/): uploads from local disk.
         """
-        langfuse = _get_langfuse()
-        if langfuse:
-            with langfuse.start_as_current_observation(
-                as_type="span",
-                name="sandbox:upload_workspace",
-                input={
-                    "file_url_count": len(file_urls) if file_urls else 0,
-                },
-            ):
+        tracer = _get_tracer()
+        if tracer:
+            with tracer.start_as_current_span(
+                "sandbox:upload_workspace",
+                attributes={_SpanAttributes.OPENINFERENCE_SPAN_KIND: "TOOL"},
+            ) as span:
+                span.set_attribute("input.value", str({"file_url_count": len(file_urls) if file_urls else 0})[:500])
                 await self._do_upload_workspace(workspace_dir, file_urls)
         else:
             await self._do_upload_workspace(workspace_dir, file_urls)
@@ -264,14 +254,14 @@ class SandboxSession:
                     logger.warning(f"Failed to upload {subdir}/ to sandbox: {e}")
 
     async def read_file(self, path: str) -> str:
-        """Read a file from the sandbox workspace (with Langfuse span)."""
-        langfuse = _get_langfuse()
-        if langfuse:
-            with langfuse.start_as_current_observation(
-                as_type="span",
-                name="sandbox:read_file",
-                input={"path": path},
-            ):
+        """Read a file from the sandbox workspace (with OTel span)."""
+        tracer = _get_tracer()
+        if tracer:
+            with tracer.start_as_current_span(
+                "sandbox:read_file",
+                attributes={_SpanAttributes.OPENINFERENCE_SPAN_KIND: "TOOL"},
+            ) as span:
+                span.set_attribute("input.value", str({"path": path})[:500])
                 return await self._session.read_file(path)
         return await self._session.read_file(path)
 

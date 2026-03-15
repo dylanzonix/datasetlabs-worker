@@ -45,7 +45,10 @@ httpx
 playwright
 sandbox-service
 
-langfuse
+arize-phoenix-otel
+openinference-instrumentation-openai
+openinference-instrumentation
+openinference-semconv
 
 pdfplumber
 python-docx

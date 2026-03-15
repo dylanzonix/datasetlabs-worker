@@ -24,17 +24,15 @@ from dsl_worker.utils import count_tokens
 
 logger = logging.getLogger(__name__)
 
-# Langfuse is optional — tracing is a no-op if not configured
+# OTel tracing is optional — no-op if Phoenix not configured
 try:
-    from langfuse import get_client as _get_langfuse_client
+    from opentelemetry import trace as _otel_trace
+    from openinference.semconv.trace import SpanAttributes as _SpanAttributes
 
-    def _get_langfuse():
-        try:
-            return _get_langfuse_client()
-        except Exception:
-            return None
+    def _get_tracer():
+        return _otel_trace.get_tracer(__name__)
 except ImportError:
-    def _get_langfuse():
+    def _get_tracer():
         return None
 
 # Max characters to include from a tool result
@@ -42,7 +40,7 @@ TOOL_OUTPUT_LIMIT = 15_000
 
 
 def _serialize_response_output(output_items) -> list:
-    """Convert OpenAI response output items to plain dicts for Langfuse logging."""
+    """Convert OpenAI response output items to plain dicts for tracing."""
     result = []
     for item in output_items:
         if item.type == "reasoning":
@@ -130,7 +128,6 @@ class AgentConversation:
         on_tool_call: Optional[Callable[[str, str], None]] = None,
         on_cost: Optional[Callable[[float, str], Awaitable[None]]] = None,
         extra_tools: Optional[List[Dict[str, Any]]] = None,
-        langfuse_parent: Optional[Any] = None,
     ) -> None:
         self.openai_client = openai_client
         self.model = model
@@ -149,9 +146,6 @@ class AgentConversation:
         self.on_cost = on_cost
         # Extra tool definitions (e.g. MCP connectors) passed directly to API
         self.extra_tools = extra_tools or []
-        # Explicit Langfuse parent span — avoids context-var inference issues
-        # across asyncio.create_task() boundaries.
-        self.langfuse_parent = langfuse_parent
 
         # Conversation state — this IS the context sent to the API each turn.
         # Contains user messages, reasoning items, assistant messages,
@@ -160,9 +154,6 @@ class AgentConversation:
         self.total_cost: float = 0.0
         self.total_turns: int = 0
         self._warned_soft_limit: bool = False
-        # Active Langfuse span for this agent — set in _run_loop_traced,
-        # used to create child generation/tool spans inside _run_loop_inner.
-        self._current_langfuse_span: Any = None
 
     def _should_stop(self) -> bool:
         return self.stop_checker is not None and self.stop_checker()
@@ -290,91 +281,17 @@ class AgentConversation:
         exit_condition: Optional[Callable[[], bool]] = None,
     ) -> AgentResult:
         """Core agent loop. Calls API, handles tools, repeats."""
-        # Use explicit parent if provided, otherwise fall back to context-var
-        # inference via the global Langfuse client.
-        parent = self.langfuse_parent or _get_langfuse()
-        if parent:
-            return await self._run_loop_traced(parent, exit_condition)
-        return await self._run_loop_inner(exit_condition)
-
-    async def _run_loop_traced(
-        self,
-        langfuse_parent,
-        exit_condition: Optional[Callable[[], bool]] = None,
-    ) -> AgentResult:
-        """Wrapper that creates a Langfuse span around the agent loop.
-
-        Calls start_as_current_observation on the parent — this creates
-        an explicit child span AND sets it as the current observation in
-        contextvars, so the OpenAI auto-wrapper and tool spans nest
-        correctly underneath.
-        """
-        with langfuse_parent.start_as_current_observation(
-            as_type="span",
-            name=self.label,
-            metadata={"model": self.model, "max_turns": self.max_turns},
+        tracer = _get_tracer()
+        if tracer is None:
+            return await self._run_loop_inner(exit_condition)
+        with tracer.start_as_current_span(
+            self.label,
+            attributes={_SpanAttributes.OPENINFERENCE_SPAN_KIND: "AGENT"},
         ) as span:
-            self._current_langfuse_span = span
             result = await self._run_loop_inner(exit_condition)
-            try:
-                span.update(
-                    output=result.text[:2000] if result.text else None,
-                    metadata={
-                        "total_cost_usd": round(result.cost_usd, 6),
-                        "total_turns": result.turns_taken,
-                        "stopped": result.stopped,
-                    },
-                )
-            except Exception:
-                pass
-            self._current_langfuse_span = None
-            return result
-
-    async def _call_api_with_trace(self, turn: int, input_items: list, **kwargs):
-        """Make one LLM API call, logging a Langfuse generation span if active.
-
-        Returns same as _api_call_with_stop_check: (response, cost) or None.
-
-        Uses _get_langfuse() (not span.start_as_current_observation) so that
-        the SDK's context var — set when _run_loop_traced entered the agent span
-        — automatically parents new observations correctly.
-        Langfuse failures are completely non-fatal: agent continues untraced.
-        """
-        if self._current_langfuse_span is None:
-            return await self._api_call_with_stop_check(input=input_items, **kwargs)
-
-        lf = _get_langfuse()
-        if lf is None:
-            return await self._api_call_with_stop_check(input=input_items, **kwargs)
-
-        try:
-            obs_ctx = lf.start_as_current_observation(
-                as_type="generation",
-                name=f"{self.label}:llm",
-                model=self.model,
-                input=input_items,
-            )
-        except Exception:
-            return await self._api_call_with_stop_check(input=input_items, **kwargs)
-
-        with obs_ctx as gen_obs:
-            result = await self._api_call_with_stop_check(input=input_items, **kwargs)
-            if result is not None:
-                try:
-                    response, cost = result
-                    usage_details = None
-                    if hasattr(response, "usage") and response.usage:
-                        usage_details = {
-                            "input": getattr(response.usage, "input_tokens", 0),
-                            "output": getattr(response.usage, "output_tokens", 0),
-                        }
-                    gen_obs.update(
-                        output=_serialize_response_output(response.output),
-                        usage_details=usage_details,
-                        metadata={"cost_usd": round(cost.total_cost_usd, 6)},
-                    )
-                except Exception:
-                    pass
+            span.set_attribute("output.value", result.text[:2000] if result.text else "")
+            span.set_attribute("cost_usd", str(round(result.cost_usd, 6)))
+            span.set_attribute("turns", result.turns_taken)
             return result
 
     async def _run_loop_inner(
@@ -427,9 +344,8 @@ class AgentConversation:
             all_tools = (self.tools.get_definitions() or []) + self.extra_tools
 
             try:
-                api_result = await self._call_api_with_trace(
-                    turn=turn,
-                    input_items=input_items,
+                api_result = await self._api_call_with_stop_check(
+                    input=input_items,
                     model=self.model,
                     tools=all_tools or None,
                     max_output_tokens=self.max_output_tokens,
@@ -575,32 +491,19 @@ class AgentConversation:
                 0.0,
             )
 
-        if self._current_langfuse_span is None:
+        tracer = _get_tracer()
+        if tracer is None:
             return await self.tools.execute(tc.name, args)
 
-        lf = _get_langfuse()
-        if lf is None:
-            return await self.tools.execute(tc.name, args)
-
-        try:
-            obs_ctx = lf.start_as_current_observation(
-                as_type="span",
-                name=f"tool:{tc.name}",
-                input=args,
-            )
-        except Exception:
-            return await self.tools.execute(tc.name, args)
-
-        with obs_ctx as tool_obs:
+        with tracer.start_as_current_span(
+            f"tool:{tc.name}",
+            attributes={_SpanAttributes.OPENINFERENCE_SPAN_KIND: "TOOL"},
+        ) as span:
+            span.set_attribute("input.value", str(args)[:500])
             result_text, cost = await self.tools.execute(tc.name, args)
-            try:
-                preview = result_text if len(result_text) <= 1000 else result_text[:1000] + "…"
-                tool_obs.update(
-                    output=preview,
-                    metadata={"cost_usd": round(cost, 6), "output_len": len(result_text)},
-                )
-            except Exception:
-                pass
+            preview = result_text if len(result_text) <= 1000 else result_text[:1000] + "…"
+            span.set_attribute("output.value", preview)
+            span.set_attribute("cost_usd", str(round(cost, 6)))
             return result_text, cost
 
     async def _execute_tools_parallel(
