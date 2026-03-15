@@ -35,9 +35,9 @@ class SeedProcessor:
 
     Configured incrementally by the orchestrator:
       - set_instructions(instructions, candidate_description)
-      - set_identity_columns(columns)
 
-    No seed-level dedup — dedup happens at row level inside the row generator.
+    No seed-level dedup — dedup happens at row level inside the row generator
+    via token Jaccard similarity on all columns.
 
     Backpressure: stops accepting seeds when in-flight seeds exceed
     remaining rows needed * OVERSHOOT_FACTOR, preventing crawlers from
@@ -60,7 +60,6 @@ class SeedProcessor:
         self._instructions: Optional[str] = None
         self._candidate_description: str = ""
         self._research_context: str = ""          # orchestrator note for row generators
-        self._identity_columns: List[str] = []    # columns that trigger dedup check
 
         self._lock = asyncio.Lock()
         self._accepted = 0
@@ -73,15 +72,8 @@ class SeedProcessor:
         if candidate_description:
             self._candidate_description = candidate_description
 
-    def set_identity_columns(self, columns: List[str]) -> None:
-        self._identity_columns = list(columns)
-
     def set_research_context(self, context: str) -> None:
         self._research_context = context
-
-    @property
-    def identity_columns(self) -> List[str]:
-        return self._identity_columns
 
     @property
     def accepted_count(self) -> int:

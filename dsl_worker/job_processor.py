@@ -61,7 +61,7 @@ from dsl_worker.billing import CostTracker, TrackedOpenAIClient
 from dsl_worker.checkpoint import CheckpointManager, checkpoints_to_work_items
 
 from dsl_worker.agents import OrchestratorAgent
-from dsl_worker.agents.row import RowGeneratorAgent
+from dsl_worker.agents.row import DedupStore, RowGeneratorAgent
 from dsl_worker.infra.pipeline import SeedProcessor
 from dsl_worker.infra.generation_pool import GenerationWorkerPool
 from sandbox_service import SandboxClient
@@ -466,6 +466,9 @@ class JobProcessor:
             generation_stats=generation_stats,
         )
 
+        # Shared dedup store — used by all row generators across the pipeline
+        dedup_store = DedupStore()
+
         # Start generation consumer (runs in background the entire time)
         generation_task = asyncio.create_task(
             self._run_generation_consumer(
@@ -488,6 +491,7 @@ class JobProcessor:
                 langfuse_parent=langfuse_parent,
                 on_browser_started=on_browser_started,
                 on_browser_stopped=on_browser_stopped,
+                dedup_store=dedup_store,
             )
         )
 
@@ -603,7 +607,7 @@ class JobProcessor:
                 project_id=project.id,
                 version_id=version.id,
                 chat_history=chat_history,
-                identity_columns=seed_processor.identity_columns,
+                dedup_store=dedup_store,
                 model=settings.generation_model,
                 brave_api_key=settings.brave_api_key,
                 sandbox=self._sandbox,
@@ -683,6 +687,7 @@ class JobProcessor:
         langfuse_parent: Optional[Any] = None,
         on_browser_started: Optional[Callable] = None,
         on_browser_stopped: Optional[Callable] = None,
+        dedup_store: Optional[DedupStore] = None,
     ) -> None:
         """
         Background consumer: dequeue work items and process them with a
@@ -695,11 +700,7 @@ class JobProcessor:
         item_index = 0
         save_lock = asyncio.Lock()
 
-        # Shared submitted rows store for row-level dedup
-        submitted_rows: List[Dict] = []
-        submitted_rows_lock = asyncio.Lock()
-
-        identity_columns = seed_processor.identity_columns if seed_processor else []
+        dedup_store = dedup_store or DedupStore()
 
         # Shared row saver (DB writes must be serialized)
         row_saver = GenerationWorkerPool(
@@ -721,13 +722,11 @@ class JobProcessor:
                     model=settings.generation_model,
                     workspace_dir=workspace_dir,
                     chat_history=chat_history or [],
-                    identity_columns=identity_columns,
-                    submitted_rows=submitted_rows,
-                    submitted_rows_lock=submitted_rows_lock,
+                    dedup_store=dedup_store,
                     brave_api_key=settings.brave_api_key,
                     sandbox=self._sandbox,
                     stop_checker=stop_checker,
-                stop_event=stop_event,
+                    stop_event=stop_event,
                     blob_service_client=self.blob_service_client,
                     project_id=project.id,
                     uploaded_file_urls=uploaded_file_urls,
@@ -764,8 +763,6 @@ class JobProcessor:
                                     row_id = await row_saver._save_row(
                                         result.row, tags=tags,
                                     )
-                                async with submitted_rows_lock:
-                                    submitted_rows.append(result.row)
                                 generation_stats["rows_generated"] += 1
 
                                 if generation_stats["rows_generated"] % 10 == 0:

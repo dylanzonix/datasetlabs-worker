@@ -1,0 +1,18 @@
+{
+  "group_coverage": {},
+  "wave_summaries": [],
+  "systematic_issues": [],
+  "domain_map": {},
+  "key_sources": [],
+  "eval_spec": {
+    "source_criteria": "Use the actual Upwork job post page as the primary source. Information (title, posted time/date, budget, client location, and scope) must be directly supported by what is visible on the listing at time of collection.",
+    "row_rubric": "Each row must: (1) be an open/active Upwork job; (2) have posted_date within 2026-03-08..2026-03-15 inclusive and formatted YYYY-MM-DD; (3) include a valid Upwork job_url; (4) job_title matches the listing; (5) summary is 1–2 sentences and accurately captures the dataset deliverable and method; (6) budget formatted as “Fixed: …” or “Hourly: …” with currency if shown, blank if not shown; (7) client_location matches listing or blank if missing.",
+    "cross_row_criteria": "No duplicate job_url across rows. Maintain diversity of industries and dataset types within each group. Avoid near-duplicate questions/rows that describe essentially the same job pattern; prefer varied sources and scopes. Overall set should cover multiple ways of producing tabular datasets (scrape, research, clean, label, API/SQL).",
+    "critical_checks": "Fail the row if: job is not open/active; posted_date is outside 2026-03-08..2026-03-15; any field is fabricated or inferred without support (especially budget/location); summary exceeds 2 sentences; budget includes a value when listing shows none; job_url is not a job post URL or is inaccessible/incorrect.",
+    "require_research": true
+  },
+  "agent_summaries": {},
+  "total_generated": 0,
+  "total_target": 100,
+  "wave_number": 1
+}

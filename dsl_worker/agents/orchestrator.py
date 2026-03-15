@@ -2,13 +2,13 @@
 Orchestrator agent — coordinates dataset generation.
 
 V8: Simplified pipeline. No template variables, no seed-level dedup.
-The orchestrator does recon, sets row-generator instructions, declares
-identity columns for row-level dedup, then harvests in rounds.
+The orchestrator does recon, sets row-generator instructions, then harvests
+in rounds. Row-level dedup is handled automatically by set_column() in
+row generators (token Jaccard on all columns, LLM judges).
 
 Tools:
 - research(question, ...) — spawn research subagent
 - set_instructions(instructions, candidate_description) — set row generator instructions
-- set_identity_columns(columns) — declare which columns identify an entity (for dedup)
 - harvest(source, instructions, quota) — crawl + extract candidates (returns status)
 - done() — signal completion
 """
@@ -61,11 +61,7 @@ candidate items. Each candidate becomes one row. Use for both known sources \
 and a candidate_description. Instructions tell row generators how to process each \
 candidate. candidate_description tells the extractor what items to look for.
 
-4. **Set identity columns** — Call set_identity_columns() to declare which output \
-columns uniquely identify an entity. Row generators will check these for duplicates \
-automatically. E.g., ["url"] for job listings, ["name", "email"] for contacts.
-
-5. **Harvest (in rounds)** — Launch harvest() calls:
+4. **Harvest (in rounds)** — Launch harvest() calls:
    - Each harvest() = one crawler = one slice of the problem.
    - A slice is a single URL, search query, file, or topic.
    - Launch up to 10 crawlers total (hard limit). Prefer more slices over fewer \
@@ -74,7 +70,7 @@ automatically. E.g., ["url"] for job listings, ["name", "email"] for contacts.
    - After a round completes, assess: enough rows? Any gaps? \
      Launch another round targeting underrepresented areas if needed.
 
-6. **Done** — Call done() when enough seeds have been dispatched.
+5. **Done** — Call done() when enough seeds have been dispatched.
 
 ## Common Patterns
 
@@ -128,9 +124,6 @@ Target: {num_samples} rows.
   instructions: plain text — what to do with each candidate, what columns to fill, \
   how to research. No {{variable}} placeholders needed. \
   candidate_description: what a candidate looks like (tells the extractor what to find).
-- set_identity_columns(columns): Declare which output columns identify an entity. \
-  When a row generator sets one of these columns, it gets back similar existing rows \
-  and can skip_row() if it's a duplicate. E.g., ["url"] or ["name", "email"].
 - harvest(source, instructions): Crawl one slice, extract candidates. \
   Returns rows generated so far, rows still needed, and cost.
 - done(reason): Signal completion — all seed sources dispatched.
@@ -145,8 +138,8 @@ All investigation goes through research() subagents.
 class OrchestratorAgent:
     """
     V8 Orchestrator. Simplified: set_instructions replaces write_template,
-    set_identity_columns replaces set_dedup, no get_status (status comes
-    from harvest() responses).
+    dedup is automatic via token Jaccard in row generators, no get_status
+    (status comes from harvest() responses).
     """
 
     def __init__(
@@ -414,40 +407,6 @@ class OrchestratorAgent:
             handler=set_instructions,
         )
 
-        # --- set_identity_columns ---
-        async def set_identity_columns(args: Dict) -> tuple[str, float]:
-            columns = args.get("columns", [])
-            if not isinstance(columns, list):
-                return "Error: columns must be a list of column names", 0.0
-
-            self._seed_processor.set_identity_columns(columns)
-            return (
-                f"Identity columns set: {columns}. Row generators will check these "
-                f"for duplicates when filling them."
-            ), 0.0
-
-        registry.add(
-            name="set_identity_columns",
-            description=(
-                "Declare which output columns uniquely identify an entity. When a row "
-                "generator sets one of these columns, it receives similar existing rows "
-                "and can skip_row() if it's a duplicate. E.g., ['url'] for job listings, "
-                "['name', 'email'] for contacts, ['podcast_name'] for podcasts."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "columns": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Column names that identify an entity",
-                    },
-                },
-                "required": ["columns"],
-            },
-            handler=set_identity_columns,
-        )
-
         MAX_CONCURRENT_CRAWLERS = 10
         crawler_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CRAWLERS)
 
@@ -619,7 +578,7 @@ class OrchestratorAgent:
             recipe = {
                 "instructions": self._seed_processor._instructions,
                 "candidate_description": self._seed_processor._candidate_description,
-                "identity_columns": self._seed_processor._identity_columns,
+                "identity_columns": [],  # deprecated — dedup is automatic now
                 "research_context": self._seed_processor._research_context,
                 "target_rows": self.num_samples,
             }

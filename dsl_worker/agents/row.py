@@ -7,8 +7,9 @@ V8: Simplified. Row generator receives:
 - Orchestrator instructions (what to do with each candidate)
 - The candidate (string or dict from extractor)
 
-set_column() checks identity columns against the submitted rows store
-and returns similar existing rows so the LLM can detect duplicates early.
+set_column() checks ALL columns for similar values (token Jaccard) against
+both submitted rows and in-flight rows from concurrent generators.
+The LLM judges whether matches are true duplicates based on context.
 """
 
 from __future__ import annotations
@@ -17,9 +18,10 @@ import asyncio
 import json
 import logging
 import random
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import jsonschema
 
@@ -32,6 +34,109 @@ logger = logging.getLogger(__name__)
 
 MAX_GENERATION_TURNS = 30
 READ_FILE_LIMIT = 30_000
+SIMILARITY_THRESHOLD = 0.5
+MAX_SIMILAR_MATCHES = 5
+
+# ── Token Jaccard helpers ──────────────────────────────────────────
+
+_SPLIT_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _tokenize(value: Any) -> Set[str]:
+    """Split a value into a set of lowercase alpha-numeric tokens."""
+    text = str(value).lower()
+    return {t for t in _SPLIT_RE.split(text) if t}
+
+
+def _token_jaccard(a: Set[str], b: Set[str]) -> float:
+    """Jaccard similarity between two token sets. Returns 0.0-1.0."""
+    if not a or not b:
+        return 0.0
+    intersection = len(a & b)
+    union = len(a | b)
+    return intersection / union if union else 0.0
+
+
+# ── Dedup store — shared between concurrent row generators ─────────
+
+class DedupStore:
+    """Thread-safe store of column values for dedup checking.
+
+    Tracks both submitted (final) rows and in-flight (being-generated) rows.
+    Row generators register values as they set columns, and query for similar
+    values across all rows. Uses token Jaccard for similarity.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        # row_id → {col_name: value}
+        self._submitted: Dict[str, Dict[str, Any]] = {}
+        self._in_flight: Dict[str, Dict[str, Any]] = {}
+        # Pre-computed token sets: (row_id, col_name) → token set
+        self._token_cache: Dict[Tuple[str, str], Set[str]] = {}
+
+    async def register_in_flight(self, row_id: str, col_name: str, value: Any) -> None:
+        """Register a column value from an in-flight row generator."""
+        async with self._lock:
+            if row_id not in self._in_flight:
+                self._in_flight[row_id] = {}
+            self._in_flight[row_id][col_name] = value
+            self._token_cache[(row_id, col_name)] = _tokenize(value)
+
+    async def promote_to_submitted(self, row_id: str, row: Dict[str, Any]) -> None:
+        """Move an in-flight row to submitted (called on submit_row)."""
+        async with self._lock:
+            self._in_flight.pop(row_id, None)
+            self._submitted[row_id] = row
+            for col_name, value in row.items():
+                self._token_cache[(row_id, col_name)] = _tokenize(value)
+
+    async def remove_in_flight(self, row_id: str) -> None:
+        """Remove an in-flight row (called on skip/error)."""
+        async with self._lock:
+            cols = self._in_flight.pop(row_id, {})
+            for col_name in cols:
+                self._token_cache.pop((row_id, col_name), None)
+
+    async def find_similar(
+        self,
+        col_name: str,
+        value: Any,
+        exclude_row_id: str,
+    ) -> List[Tuple[float, str, Dict[str, Any]]]:
+        """Find rows with similar values in the given column.
+
+        Returns list of (similarity, row_id, full_row) sorted by similarity desc.
+        Checks both submitted and in-flight rows.
+        Excludes the requesting row's own ID.
+        """
+        query_tokens = _tokenize(value)
+        if not query_tokens:
+            return []
+
+        matches: List[Tuple[float, str, Dict[str, Any]]] = []
+
+        async with self._lock:
+            all_rows = list(self._submitted.items()) + list(self._in_flight.items())
+
+        for rid, row in all_rows:
+            if rid == exclude_row_id:
+                continue
+            existing_value = row.get(col_name)
+            if existing_value is None:
+                continue
+
+            cached_key = (rid, col_name)
+            existing_tokens = self._token_cache.get(cached_key)
+            if existing_tokens is None:
+                existing_tokens = _tokenize(existing_value)
+
+            sim = _token_jaccard(query_tokens, existing_tokens)
+            if sim >= SIMILARITY_THRESHOLD:
+                matches.append((sim, rid, row))
+
+        matches.sort(key=lambda x: -x[0])
+        return matches[:MAX_SIMILAR_MATCHES]
 
 
 @dataclass
@@ -64,17 +169,16 @@ You are generating a single dataset row.
 
 {instructions}
 
-## Your candidate
-
-{candidate}
-
 ## How to work
 
 1. Read the candidate and instructions.
 2. Fill in what you already know from the candidate using set_column().
-   - For identity columns (e.g. name, url, email), fill these FIRST. \
-If the response shows similar existing rows, check if this is a duplicate \
-and call skip_row(reason="duplicate: ...") if so.
+   - When you set a column, the system will tell you if similar values already \
+exist in other rows. Pay attention to these warnings — if the match is close \
+and the column is something that should be unique (like a name, URL, or email), \
+this is likely a duplicate. Call skip_row(reason="duplicate: ...") if so.
+   - Use your judgment: 50 rows with country="USA" is normal, but 2 rows with \
+the same email or very similar program name is suspicious.
 3. Research what you still need. Use primary sources. Verify claims that matter.
 4. Fill remaining columns with set_column().
 5. Call submit_row() when all columns are filled.
@@ -89,8 +193,8 @@ making something up.
 
 ## Tools
 
-- set_column(name, value): Set a column value. For identity columns, returns similar \
-existing rows — check them for duplicates.
+- set_column(name, value): Set a column value. Returns warnings if similar values \
+exist in other rows — check them for duplicates.
 - append_to_column(name, value): Append to a column (json arrays or strings).
 - clear_column(name): Clear a column to start over.
 - submit_row(): Submit the completed row.
@@ -110,14 +214,13 @@ class RowGeneratorAgent:
     Generates a single dataset row from a candidate.
 
     Usage:
+        dedup = DedupStore()
         agent = RowGeneratorAgent(
             openai_client=tracked_client,
             model="gpt-5.2",
             workspace_dir=Path("/workspace"),
             chat_history=[...],
-            identity_columns=["url", "name"],
-            submitted_rows=shared_list,
-            submitted_rows_lock=shared_lock,
+            dedup_store=dedup,
             ...
         )
         result = await agent.generate(
@@ -133,9 +236,7 @@ class RowGeneratorAgent:
         model: str,
         workspace_dir: Path,
         chat_history: Optional[List[Dict[str, str]]] = None,
-        identity_columns: Optional[List[str]] = None,
-        submitted_rows: Optional[List[Dict[str, Any]]] = None,
-        submitted_rows_lock: Optional[Any] = None,
+        dedup_store: Optional[DedupStore] = None,
         brave_api_key: Optional[str] = None,
         sandbox: Optional[Any] = None,
         stop_checker: Optional[Callable[[], bool]] = None,
@@ -153,14 +254,13 @@ class RowGeneratorAgent:
         self.model = model
         self.workspace_dir = Path(workspace_dir)
         self.chat_history = chat_history or []
-        self.identity_columns = set(identity_columns or [])
-        self.submitted_rows = submitted_rows if submitted_rows is not None else []
-        self.submitted_rows_lock = submitted_rows_lock
+        self.dedup_store = dedup_store or DedupStore()
         self.stop_checker = stop_checker
         self.stop_event = stop_event
         self.mcp_tools = mcp_tools or []
         self.on_cost = on_cost
         self.langfuse_parent = langfuse_parent
+        self._row_id = str(id(self))  # Unique ID for this generator's in-flight tracking
 
         # State — reset per generate() call
         self._current_row: Dict[str, Any] = {}
@@ -221,27 +321,6 @@ class RowGeneratorAgent:
                     return f"json_schema validation failed: {e.message}"
         return None
 
-    def _find_similar_rows(self, col_name: str, value: Any) -> List[Dict[str, Any]]:
-        """Find submitted rows with a similar value in the given column.
-
-        Case-insensitive exact match on string values.
-        Returns up to 5 matching rows.
-        """
-        if not self.submitted_rows:
-            return []
-
-        value_str = str(value).lower().strip()
-        matches = []
-        for row in self.submitted_rows:
-            existing = row.get(col_name)
-            if existing is None:
-                continue
-            if str(existing).lower().strip() == value_str:
-                matches.append(row)
-                if len(matches) >= 5:
-                    break
-        return matches
-
     def _register_tools(self, registry: ToolRegistry) -> None:
 
         async def set_column(args: Dict) -> tuple[str, float]:
@@ -256,24 +335,37 @@ class RowGeneratorAgent:
 
             self._current_row[name] = value
 
-            # Check identity columns for duplicates
-            if name in self.identity_columns:
-                similar = self._find_similar_rows(name, value)
-                if similar:
-                    rows_text = json.dumps(similar, indent=2, ensure_ascii=False)
-                    return (
-                        f"Set {name} = {value!r}\n\n"
-                        f"Similar existing rows found ({len(similar)}):\n{rows_text}\n\n"
-                        f"If any of these is the same entity, call skip_row(reason=\"duplicate: ...\")."
-                    ), 0.0
+            # Register in dedup store so concurrent generators can see it
+            await self.dedup_store.register_in_flight(self._row_id, name, value)
+
+            # Check ALL columns for similar values (token Jaccard)
+            similar = await self.dedup_store.find_similar(name, value, self._row_id)
+            if similar:
+                lines = []
+                for sim_score, _rid, row in similar:
+                    row_preview = {k: v for k, v in row.items() if v is not None}
+                    # Truncate long values in preview
+                    for k, v in row_preview.items():
+                        s = str(v)
+                        if len(s) > 120:
+                            row_preview[k] = s[:120] + "..."
+                    lines.append(
+                        f"  - similarity {sim_score:.0%}: {json.dumps(row_preview, ensure_ascii=False)}"
+                    )
+                return (
+                    f"Set {name} = {value!r}\n\n"
+                    f"⚠ {len(similar)} existing row(s) have similar '{name}' values:\n"
+                    + "\n".join(lines) + "\n\n"
+                    f"If any of these is the same entity, call skip_row(reason=\"duplicate: ...\")."
+                ), 0.0
 
             return f"Set {name}", 0.0
 
         registry.add(
             name="set_column",
             description=(
-                "Set a column value. For identity columns, returns similar existing rows "
-                "so you can detect duplicates early and skip_row() if needed."
+                "Set a column value. Returns warnings if similar values "
+                "exist in other rows — check them for duplicates."
             ),
             parameters={
                 "type": "object",
@@ -481,7 +573,6 @@ class RowGeneratorAgent:
             conversation=self._format_conversation(),
             schema_str=json.dumps(schema, indent=2),
             instructions=instructions or "(no specific instructions)",
-            candidate=self._format_candidate(candidate),
         )
 
         conversation = AgentConversation(
@@ -499,21 +590,32 @@ class RowGeneratorAgent:
             langfuse_parent=self.langfuse_parent,
         )
 
+        # Candidate goes in the user message (not system prompt) so the system
+        # prompt prefix is identical across all row generators → prompt caching.
+        candidate_text = self._format_candidate(candidate)
+        user_msg = (
+            f"## Candidate\n\n{candidate_text}\n\n"
+            f"Process this candidate and generate a dataset row."
+        )
+
         await conversation.send(
-            "Process the candidate above and generate a dataset row.",
+            user_msg,
             exit_condition=lambda: self._submitted or self._skipped,
         )
 
         cost = conversation.total_cost
 
         if self._skipped:
+            await self.dedup_store.remove_in_flight(self._row_id)
             return GeneratedRow(
                 success=False, skipped=True, skip_reason=self._skip_reason, cost_usd=cost
             )
 
         if self._submitted:
+            await self.dedup_store.promote_to_submitted(self._row_id, self._current_row)
             return GeneratedRow(success=True, row=self._current_row, cost_usd=cost)
 
+        await self.dedup_store.remove_in_flight(self._row_id)
         return GeneratedRow(
             success=False,
             error=f"Row generation did not complete ({conversation.total_turns} turns)",

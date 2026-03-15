@@ -47,7 +47,7 @@ class WorkerSettings(BaseSettings):
     brave_search_rps: float = 0.5  # requests per second
 
     research_model: str = "gpt-5.2"
-    generation_model: str = "gpt-5.2"
+    generation_model: str = "gpt-5-mini"
     summarize_model: str = "gpt-5-nano"
     extractor_model: str = "gpt-5-mini"       # model for candidate extraction (cheap batch)
 

@@ -1,4 +1,0 @@
-instructions: 
-sources_dir: ./config/test_sources/swift/
-topic_tree: ./config/test_topic_tree_swift.json
-samples: 100

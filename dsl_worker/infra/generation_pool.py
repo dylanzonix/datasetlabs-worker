@@ -2,7 +2,7 @@
 Row generation — worker pool for the generation phase.
 
 V8: Work items contain instructions + candidate (no template interpolation).
-Shared submitted_rows store enables row-level dedup via set_column().
+Shared DedupStore enables row-level dedup via token Jaccard in set_column().
 """
 
 import asyncio
@@ -12,7 +12,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from dsl_worker.agents.row import GeneratedRow, RowGeneratorAgent
+from dsl_worker.agents.row import DedupStore, GeneratedRow, RowGeneratorAgent
 from dsl_worker.config import settings
 
 logger = logging.getLogger(__name__)
@@ -29,7 +29,7 @@ class GenerationWorkerPool:
         project_id: Any,
         version_id: Any,
         chat_history: Optional[List[Dict[str, str]]] = None,
-        identity_columns: Optional[List[str]] = None,
+        dedup_store: Optional[DedupStore] = None,
         model: str = "",
         brave_api_key: Optional[str] = None,
         sandbox: Optional[Any] = None,
@@ -52,7 +52,7 @@ class GenerationWorkerPool:
         self.project_id = project_id
         self.version_id = version_id
         self.chat_history = chat_history or []
-        self.identity_columns = identity_columns or []
+        self.dedup_store = dedup_store or DedupStore()
         self.model = model or settings.generation_model
         self.brave_api_key = brave_api_key
         self.sandbox = sandbox
@@ -69,10 +69,6 @@ class GenerationWorkerPool:
         self.on_browser_started = on_browser_started
         self.on_browser_stopped = on_browser_stopped
 
-        # Shared store of submitted rows for row-level dedup
-        self._submitted_rows: List[Dict[str, Any]] = []
-        self._submitted_rows_lock = asyncio.Lock()
-
         self._total_cost = 0.0
         self._rows_generated = 0
         self._skipped = 0
@@ -80,10 +76,6 @@ class GenerationWorkerPool:
 
     def _should_stop(self) -> bool:
         return bool(self.stop_checker and self.stop_checker())
-
-    async def _add_submitted_row(self, row: Dict[str, Any]) -> None:
-        async with self._submitted_rows_lock:
-            self._submitted_rows.append(row)
 
     async def process_work_items(
         self,
@@ -124,9 +116,7 @@ class GenerationWorkerPool:
                 model=self.model,
                 workspace_dir=self.workspace_dir,
                 chat_history=self.chat_history,
-                identity_columns=self.identity_columns,
-                submitted_rows=self._submitted_rows,
-                submitted_rows_lock=self._submitted_rows_lock,
+                dedup_store=self.dedup_store,
                 brave_api_key=self.brave_api_key,
                 sandbox=self.sandbox,
                 stop_checker=self.stop_checker,
@@ -180,7 +170,6 @@ class GenerationWorkerPool:
 
                             if result.success and result.row:
                                 row_id = await self._save_row(result.row, tags=tags)
-                                await self._add_submitted_row(result.row)
 
                                 async with lock:
                                     success_count += 1

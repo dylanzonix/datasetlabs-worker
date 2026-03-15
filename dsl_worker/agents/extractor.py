@@ -21,6 +21,18 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from dsl_worker.billing.tracked_client import TrackedOpenAIClient
 from dsl_worker.infra.pipeline import Seed
 
+try:
+    from langfuse import get_client as _get_langfuse_client
+
+    def _get_langfuse():
+        try:
+            return _get_langfuse_client()
+        except Exception:
+            return None
+except ImportError:
+    def _get_langfuse():
+        return None
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_CHUNK_SIZE = 8000
@@ -100,11 +112,44 @@ class CandidateExtractor:
         )
 
         try:
+            input_items = [{"role": "user", "content": prompt}]
+
+            # Trace the LLM call via Langfuse if available
+            lf = _get_langfuse()
+            obs_ctx = None
+            if lf:
+                try:
+                    obs_ctx = lf.start_as_current_observation(
+                        as_type="generation",
+                        name="extractor:llm",
+                        model=self.model,
+                        input=input_items,
+                    )
+                except Exception:
+                    obs_ctx = None
+
             response, cost = await self.openai_client.responses_create(
                 model=self.model,
-                input=[{"role": "user", "content": prompt}],
+                input=input_items,
                 text={"format": {"type": "json_object"}},
             )
+
+            if obs_ctx is not None:
+                try:
+                    usage_details = None
+                    if hasattr(response, "usage") and response.usage:
+                        usage_details = {
+                            "input": getattr(response.usage, "input_tokens", 0),
+                            "output": getattr(response.usage, "output_tokens", 0),
+                        }
+                    obs_ctx.__enter__().update(
+                        output=self._response_text(response),
+                        usage_details=usage_details,
+                        metadata={"cost_usd": round(cost.total_cost_usd, 6), "page_url": page_url},
+                    )
+                    obs_ctx.__exit__(None, None, None)
+                except Exception:
+                    pass
 
             if self.on_cost and cost.total_cost_usd > 0:
                 await self.on_cost(cost.total_cost_usd, "extractor")
@@ -115,6 +160,17 @@ class CandidateExtractor:
         except Exception as e:
             logger.warning(f"[Extractor] Chunk extraction failed for {page_url}: {e}")
             return [], 0.0
+
+    @staticmethod
+    def _response_text(response: Any) -> str:
+        """Extract text content from an OpenAI Responses API response."""
+        parts = []
+        for item in response.output:
+            if item.type == "message":
+                for block in item.content:
+                    if hasattr(block, "text"):
+                        parts.append(block.text)
+        return "".join(parts)
 
     def _parse_candidates(self, response: Any, page_url: str) -> List[Any]:
         """Parse candidate list from LLM response."""
