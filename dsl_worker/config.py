@@ -69,10 +69,10 @@ class WorkerSettings(BaseSettings):
     # Cookie persistence blob path (global pre-auth cookies shared across all projects)
     browser_global_cookies_blob_path: str = "browser/global_cookies.json"
 
-    # Phoenix observability (optional — leave blank to disable)
-    # Set to your Phoenix collector endpoint, e.g. http://localhost:6006/v1/traces
-    phoenix_collector_endpoint: str = ""
-    phoenix_project_name: str = "datasetlabs"
+    # Langfuse observability (optional — leave blank to disable)
+    langfuse_secret_key: str = ""
+    langfuse_public_key: str = ""
+    langfuse_base_url: str = "https://cloud.langfuse.com"
 
 
 settings = WorkerSettings()

@@ -145,6 +145,7 @@ class RowGeneratorAgent:
         uploaded_file_urls: Optional[Dict[str, str]] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
         on_cost: Optional[Callable] = None,
+        langfuse_parent: Optional[Any] = None,
         on_browser_started: Optional[Callable] = None,
         on_browser_stopped: Optional[Callable] = None,
     ) -> None:
@@ -159,6 +160,7 @@ class RowGeneratorAgent:
         self.stop_event = stop_event
         self.mcp_tools = mcp_tools or []
         self.on_cost = on_cost
+        self.langfuse_parent = langfuse_parent
 
         # State — reset per generate() call
         self._current_row: Dict[str, Any] = {}
@@ -494,6 +496,7 @@ class RowGeneratorAgent:
             label="row_generator",
             on_cost=self.on_cost,
             extra_tools=self.mcp_tools,
+            langfuse_parent=self.langfuse_parent,
         )
 
         await conversation.send(

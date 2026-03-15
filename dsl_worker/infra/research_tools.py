@@ -36,15 +36,17 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import httpx
 from markdownify import markdownify as md
 
-# OTel tracing is optional
+# Langfuse is optional — tracing is a no-op if not configured
 try:
-    from opentelemetry import trace as _otel_trace
-    from openinference.semconv.trace import SpanAttributes as _SpanAttributes
+    from langfuse import get_client as _get_langfuse_client
 
-    def _get_tracer():
-        return _otel_trace.get_tracer(__name__)
+    def _get_langfuse():
+        try:
+            return _get_langfuse_client()
+        except Exception:
+            return None
 except ImportError:
-    def _get_tracer():
+    def _get_langfuse():
         return None
 
 from dsl_worker.infra.artifacts import (
@@ -364,15 +366,29 @@ class ResearchTools:
 
         async with self._sandbox_session_lock:
             if self._sandbox_session is None:
-                config = SessionConfig(network_enabled=True, memory_limit="4g")
-                session_client = await self.sandbox.create_session(config)
-                self._sandbox_session = SandboxSession(session_client, self.sandbox)
-                await self._sandbox_session.upload_workspace(
-                    self.workspace_dir,
-                    file_urls=self.uploaded_file_urls,
-                )
-                scope_id = self.scope.id if self.scope else "unknown"
-                logger.info(f"[ResearchTools] Sandbox session created for scope {scope_id}")
+                langfuse = _get_langfuse()
+                if langfuse:
+                    ctx = langfuse.start_as_current_observation(
+                        as_type="span",
+                        name="sandbox:create_session",
+                    )
+                    ctx.__enter__()
+                else:
+                    ctx = None
+
+                try:
+                    config = SessionConfig(network_enabled=True, memory_limit="4g")
+                    session_client = await self.sandbox.create_session(config)
+                    self._sandbox_session = SandboxSession(session_client, self.sandbox)
+                    await self._sandbox_session.upload_workspace(
+                        self.workspace_dir,
+                        file_urls=self.uploaded_file_urls,
+                    )
+                    scope_id = self.scope.id if self.scope else "unknown"
+                    logger.info(f"[ResearchTools] Sandbox session created for scope {scope_id}")
+                finally:
+                    if ctx is not None:
+                        ctx.__exit__(None, None, None)
 
         return self._sandbox_session
 
@@ -1091,15 +1107,21 @@ class ResearchTools:
         if not self.sandbox:
             return "Code execution not available", 0.0
 
-        tracer = _get_tracer()
-        if tracer:
-            with tracer.start_as_current_span(
-                "tool:code_exec",
-                attributes={_SpanAttributes.OPENINFERENCE_SPAN_KIND: "TOOL"},
+        langfuse = _get_langfuse()
+        if langfuse:
+            with langfuse.start_as_current_observation(
+                as_type="span",
+                name="tool:code_exec",
+                input={
+                    "script": script[:500],
+                    "description": description,
+                },
             ) as span:
-                span.set_attribute("input.value", str({"script": script[:500], "description": description})[:500])
                 result_text, cost = await self._do_code_exec(script)
-                span.set_attribute("output.value", result_text[:300])
+                span.update(output={
+                    "result_preview": result_text[:300],
+                    "seeds_extracted": self.seeds_submitted,
+                })
                 return result_text, cost
         return await self._do_code_exec(script)
 
@@ -1184,15 +1206,18 @@ if os.path.exists(_seeds_path):
         if not self.sandbox:
             return "Shell execution not available", 0.0
 
-        tracer = _get_tracer()
-        if tracer:
-            with tracer.start_as_current_span(
-                "tool:shell_exec",
-                attributes={_SpanAttributes.OPENINFERENCE_SPAN_KIND: "TOOL"},
+        langfuse = _get_langfuse()
+        if langfuse:
+            with langfuse.start_as_current_observation(
+                as_type="span",
+                name="tool:shell_exec",
+                input={
+                    "command": command[:500],
+                    "description": description,
+                },
             ) as span:
-                span.set_attribute("input.value", str({"command": command[:500], "description": description})[:500])
                 result_text, cost = await self._do_shell_exec(command)
-                span.set_attribute("output.value", result_text[:300])
+                span.update(output={"result_preview": result_text[:300]})
                 return result_text, cost
         return await self._do_shell_exec(command)
 
@@ -1478,7 +1503,7 @@ if os.path.exists(_seeds_path):
         """Create an on_step_end callback for BU supervision.
 
         Logs every step for visibility, plus safety checks.
-        Collects step data in supervisor.steps for tracing.
+        Collects step data in supervisor.steps for Langfuse tracing.
         """
         _recent_urls: list = []
         scope_id = self.scope.id if self.scope else "unknown"
@@ -1513,7 +1538,7 @@ if os.path.exists(_seeds_path):
                 f"[BU {scope_id}] step {step}: {action_str} | {short_url}"
             )
 
-            # Collect for tracing span
+            # Collect for Langfuse span
             on_step_end.steps.append({
                 "step": step,
                 "action": action_str,
@@ -1652,13 +1677,13 @@ if os.path.exists(_seeds_path):
         After BU finishes, we extract raw page content via our Playwright
         connection and return line-numbered markdown (same format as open()).
         """
-        tracer = _get_tracer()
-        if tracer:
-            with tracer.start_as_current_span(
-                "tool:interact",
-                attributes={_SpanAttributes.OPENINFERENCE_SPAN_KIND: "TOOL"},
+        langfuse = _get_langfuse()
+        if langfuse:
+            with langfuse.start_as_current_observation(
+                as_type="span",
+                name="tool:interact",
+                input={"task": task[:200], "url_or_ref_id": url_or_ref_id},
             ) as span:
-                span.set_attribute("input.value", str({"task": task[:200], "url_or_ref_id": url_or_ref_id})[:500])
                 result_text, cost = await self._do_interact(url_or_ref_id, task, span)
                 return result_text, cost
         return await self._do_interact(url_or_ref_id, task, None)
@@ -1666,7 +1691,7 @@ if os.path.exists(_seeds_path):
     async def _do_interact(
         self, url_or_ref_id: str, task: str, span: Any,
     ) -> Tuple[str, float]:
-        """interact() implementation — optionally traced via OTel span."""
+        """interact() implementation — optionally traced via Langfuse span."""
         try:
             from browser_use import Agent
         except ImportError:
@@ -1788,14 +1813,20 @@ if os.path.exists(_seeds_path):
                     f"steps={bu_steps} content={'yes' if content else 'no'}"
                 )
 
+                # Update Langfuse span with full details
                 if span:
-                    span.set_attribute("output.value", str({
+                    span.update(output={
                         "summary": bu_summary[:200],
                         "step_count": bu_steps,
                         "total_seconds": round(t_extract - t0, 1),
+                        "agent_create_seconds": round(t_agent - t0, 1),
+                        "run_seconds": round(t_run - t_agent, 1),
+                        "reconnect_extract_seconds": round(t_extract - t_run, 1),
                         "stop_reason": supervisor.stop_reason if supervisor else None,
                         "content_extracted": bool(content),
-                    })[:1000])
+                        "supervisor_steps": supervisor.steps if supervisor else [],
+                        "bu_history": bu_history_steps,
+                    })
 
                 if content:
                     return (
@@ -1808,18 +1839,20 @@ if os.path.exists(_seeds_path):
             except Exception as extract_err:
                 logger.warning(f"[interact {scope_id}] Extraction failed: {extract_err}")
                 if span:
-                    span.set_attribute("output.value", str({
+                    span.update(output={
                         "summary": bu_summary[:200],
                         "step_count": bu_steps,
+                        "stop_reason": supervisor.stop_reason if supervisor else None,
                         "error": f"extraction failed: {extract_err}",
-                    })[:1000])
+                        "bu_history": bu_history_steps,
+                    })
                 return f"Browser action: {bu_summary} (extraction failed: {extract_err})", 0.0
 
         except Exception as e:
             logger.error(f"[interact {scope_id}] Failed: {e}", exc_info=True)
             self._bu_agent = None
             if span:
-                span.set_attribute("output.value", str({"error": str(e)})[:500])
+                span.update(output={"error": str(e)})
             return f"Browser agent error: {e}", 0.0
     
     # =========================================================================

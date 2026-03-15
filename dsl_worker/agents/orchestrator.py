@@ -167,6 +167,7 @@ class OrchestratorAgent:
         uploaded_file_urls: Optional[Dict[str, str]] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
         feedback_context: Optional[Dict[str, Any]] = None,
+        langfuse_parent: Optional[Any] = None,
         on_browser_started: Optional[Callable] = None,
         on_browser_stopped: Optional[Callable] = None,
         yielder_model: str = "",
@@ -191,6 +192,7 @@ class OrchestratorAgent:
         self.mcp_tools = mcp_tools or []
         self.on_browser_started = on_browser_started
         self.on_browser_stopped = on_browser_stopped
+        self.langfuse_parent = langfuse_parent
         self.yielder_model = yielder_model or model
 
         self._is_done = False
@@ -234,6 +236,7 @@ class OrchestratorAgent:
             on_tool_call=on_tool_call,
             on_cost=on_cost,
             extra_tools=self.mcp_tools,
+            langfuse_parent=langfuse_parent,
         )
 
     def _format_conversation(self) -> str:
@@ -290,6 +293,8 @@ class OrchestratorAgent:
             if not question:
                 return "Error: question is required", 0.0
 
+            langfuse_span = getattr(self._conversation, "_current_langfuse_span", None)
+
             agent = ResearchAgent(
                 openai_client=self.openai_client,
                 model=self.model,
@@ -303,6 +308,8 @@ class OrchestratorAgent:
                 on_browser_started=self.on_browser_started,
                 on_browser_stopped=self.on_browser_stopped,
             )
+            if langfuse_span:
+                agent._conversation.langfuse_parent = langfuse_span
 
             full_question = question
             if scope:
@@ -454,6 +461,8 @@ class OrchestratorAgent:
             idx = self._subagent_counter
             self._subagent_counter += 1
 
+            langfuse_span = getattr(self._conversation, "_current_langfuse_span", None)
+
             candidate_description = self._seed_processor._candidate_description
 
             extractor = CandidateExtractor(
@@ -493,6 +502,7 @@ class OrchestratorAgent:
                 on_tool_call=self.on_tool_call,
                 on_cost=self.on_cost,
                 mcp_tools=self.mcp_tools,
+                langfuse_parent=langfuse_span,
                 on_browser_started=self.on_browser_started,
                 on_browser_stopped=self.on_browser_stopped,
             )

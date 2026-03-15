@@ -123,6 +123,7 @@ class CrawlerAgent:
         on_tool_call: Optional[Callable[[str, str], None]] = None,
         on_cost: Optional[Callable] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
+        langfuse_parent: Optional[Any] = None,
         on_browser_started: Optional[Callable] = None,
         on_browser_stopped: Optional[Callable] = None,
     ) -> None:
@@ -185,6 +186,7 @@ class CrawlerAgent:
             on_tool_call=on_tool_call,
             on_cost=on_cost,
             extra_tools=mcp_tools or [],
+            langfuse_parent=langfuse_parent,
         )
 
     def _register_tools(self, registry: ToolRegistry) -> None:
