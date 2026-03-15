@@ -43,6 +43,10 @@ models:
     cached_input: 0.00000018  # $0.18 / 1M tokens (Azure pricing)
     output: 0.000014     # $14.00 / 1M tokens
 
+  gpt-5-mini:
+    input: 0.00000025    # $0.25 / 1M tokens
+    output: 0.000002     # $2.00 / 1M tokens
+
   gpt-5-nano:
     input: 0.00000005    # $0.05 / 1M tokens
     output: 0.0000004    # $0.40 / 1M tokens

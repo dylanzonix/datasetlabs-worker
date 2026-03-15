@@ -1,16 +1,11 @@
 """
 Pipeline configuration and seed processing.
 
-V6: SeedProcessor is created before the orchestrator and configured incrementally.
-The orchestrator sets template, variables, and dedup via tools rather than
-designing a monolithic PipelineConfig upfront.
+V8: Simplified. SeedProcessor accepts raw candidates (no variable declarations,
+no template interpolation, no seed-level dedup). Candidates flow directly to the
+work queue. Row generators receive the raw candidate + instructions.
 
-PipelineConfig still exists as a data structure — used for:
-- Checkpoint serialization
-- Constructing per-yielder configs when the orchestrator spawns subagents
-- Backward compatibility with V4/V5 checkpoint resume
-
-Seeds flow through: yielder → dedup gate → work item queue → row generators.
+Dedup happens at row level via set_column() in the row generator.
 """
 
 from __future__ import annotations
@@ -18,165 +13,69 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
-from dataclasses import dataclass, field, asdict
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class VariableConfig:
-    """Configuration for a single pipeline variable."""
-    name: str                           # e.g., "job_url", "topic", "facts"
-    description: str                    # what this variable represents
-    seed_strategy: str                  # "search" | "iterate" | "synthetic"
-    seed_sources: List[str] = field(default_factory=list)   # URLs, file paths, search queries
-    seed_context: str = ""              # accumulated research context (for synthetic)
-    seed_instructions: str = ""         # specific instructions for seed yielders
-
-
-@dataclass
-class DedupConfig:
-    """Configuration for seed deduplication."""
-    strategy: str = "none"              # "exact" | "embedding_similarity" | "none"
-    field: str = ""                     # which variable to dedup on
-    threshold: float = 0.85             # for similarity-based
-
-
-@dataclass
-class PipelineConfig:
-    """
-    Full pipeline configuration produced by the orchestrator.
-
-    The template is the row generation instruction with {variable} placeholders.
-    Variables define what changes per row and how to yield seeds.
-    """
-    template: str                       # row generation instructions with {var} placeholders
-    variables: List[VariableConfig]     # what changes per row
-    dedup: DedupConfig = field(default_factory=DedupConfig)
-    distribution: Dict[str, Dict[str, float]] = field(default_factory=dict)
-    target_rows: int = 100
-    seed_yielder_count: int = 1         # how many parallel seed yielders
-    seed_yielder_instructions: str = "" # shared instructions for all seed yielders
-    research_context: str = ""          # orchestrator's research findings for inheritance
-    preset_seeds: List[Dict[str, Any]] = field(default_factory=list)  # orchestrator-provided seeds
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> PipelineConfig:
-        variables = [VariableConfig(**v) for v in data.get("variables", [])]
-        dedup = DedupConfig(**data.get("dedup", {}))
-        return cls(
-            template=data["template"],
-            variables=variables,
-            dedup=dedup,
-            distribution=data.get("distribution", {}),
-            target_rows=data.get("target_rows", 100),
-            seed_yielder_count=data.get("seed_yielder_count", 1),
-            seed_yielder_instructions=data.get("seed_yielder_instructions", ""),
-            research_context=data.get("research_context", ""),
-            preset_seeds=data.get("preset_seeds", []),
-        )
-
-    def fill_template(self, values: Dict[str, Any]) -> str:
-        """Fill the template with variable values.
-
-        Uses simple {var_name} substitution. Unresolved placeholders are
-        left as-is so the row generator sees them (should not happen if
-        seeds are complete).
-        """
-        result = self.template
-        for name, value in values.items():
-            placeholder = "{" + name + "}"
-            str_value = str(value) if not isinstance(value, str) else value
-            result = result.replace(placeholder, str_value)
-        return result
-
-
-@dataclass
 class Seed:
-    """A resolved set of variable values that will become one row."""
-    values: Dict[str, Any] = field(default_factory=dict)
+    """A candidate item that will become one row."""
+    values: Any = None              # raw candidate: string, dict, or any extracted value
     metadata: Dict[str, Any] = field(default_factory=dict)
-    filter_findings: Dict[str, Any] = field(default_factory=dict)
 
 
 class SeedProcessor:
     """
-    Manages the seed processing pipeline: dedup → filter → dispatch to work queue.
+    Accepts candidates from harvesters and dispatches them to the work queue.
 
-    Thread-safe for concurrent seed yielders submitting seeds.
+    Configured incrementally by the orchestrator:
+      - set_instructions(instructions, candidate_description)
+      - set_identity_columns(columns)
 
-    V6: Can be created with just a target_rows count, then configured incrementally
-    via set_template(), set_variables(), set_dedup(). This allows
-    the orchestrator to set things up gradually through tool calls.
-
-    Also accepts a full PipelineConfig for V5-compat (checkpoint resume, etc.).
+    No seed-level dedup — dedup happens at row level inside the row generator.
     """
 
     def __init__(
         self,
         work_queue: asyncio.Queue,
         on_checkpoint: Optional[Callable[[Dict], Awaitable[None]]] = None,
-        # V6: configure incrementally
         target_rows: int = 100,
-        # V5 compat: pass full config
-        config: Optional[PipelineConfig] = None,
     ) -> None:
         self._work_queue = work_queue
         self._on_checkpoint = on_checkpoint
+        self._target_rows = target_rows
 
-        # V6 mutable state — set via methods or from PipelineConfig
-        if config is not None:
-            self._template: Optional[str] = config.template
-            self._variables: List[VariableConfig] = list(config.variables)
-            self._dedup: DedupConfig = config.dedup
-            self._target_rows: int = config.target_rows
-            self._research_context: str = config.research_context or ""
-            self._distribution_targets: Dict[str, Dict[str, float]] = config.distribution
-        else:
-            self._template = None
-            self._variables = []
-            self._dedup = DedupConfig()
-            self._target_rows = target_rows
-            self._research_context = ""
-            self._distribution_targets = {}
+        # Set incrementally by orchestrator tools
+        self._instructions: Optional[str] = None
+        self._candidate_description: str = ""
+        self._research_context: str = ""          # orchestrator note for row generators
+        self._identity_columns: List[str] = []    # columns that trigger dedup check
 
-        # Dedup state
-        self._seen: Set[str] = set()
         self._lock = asyncio.Lock()
-
-        # Counters
         self._accepted = 0
-        self._submitted_total = 0   # total submit_seed calls
-        self._rejected_dedup = 0
+        self._submitted_total = 0
 
-        # Per-yielder contribution tracking (elastic fair share)
-        self._yielder_contributions: Dict[str, int] = {}
+        # Per-harvester contribution tracking (elastic fair share)
+        self._harvester_contributions: Dict[str, int] = {}
 
-        # Distribution tracking (informational, not enforced)
-        self._distribution: Dict[str, Dict[str, int]] = {}
+    # --- Incremental configuration ---
 
-    # --- V6 incremental configuration ---
+    def set_instructions(self, instructions: str, candidate_description: str = "") -> None:
+        self._instructions = instructions
+        if candidate_description:
+            self._candidate_description = candidate_description
 
-    def set_template(self, template: str) -> None:
-        """Set or update the row generation template."""
-        self._template = template
-
-    def set_variables(self, variables: List[VariableConfig]) -> None:
-        """Set or update the pipeline variables."""
-        self._variables = list(variables)
-
-    def set_dedup(self, dedup: DedupConfig) -> None:
-        """Set or update the dedup config."""
-        self._dedup = dedup
+    def set_identity_columns(self, columns: List[str]) -> None:
+        self._identity_columns = list(columns)
 
     def set_research_context(self, context: str) -> None:
-        """Set or update the research context passed to row generators."""
         self._research_context = context
+
+    @property
+    def identity_columns(self) -> List[str]:
+        return self._identity_columns
 
     @property
     def accepted_count(self) -> int:
@@ -186,150 +85,66 @@ class SeedProcessor:
     def stats(self) -> Dict[str, Any]:
         return {
             "accepted": self._accepted,
-            "rejected_dedup": self._rejected_dedup,
             "submitted_total": self._submitted_total,
             "target": self._target_rows,
             "remaining": max(0, self._target_rows - self._accepted),
         }
 
-    def _build_status(
-        self, accepted: bool, reason: str = "", over_fair_share: bool = False,
-    ) -> Dict[str, Any]:
-        """Build a rich status dict for the yielder."""
-        status = {
-            "accepted": accepted,
-            "reason": reason,
-            "stats": self.stats,
-        }
-        if over_fair_share:
-            status["over_fair_share"] = True
-        return status
-
-    def _is_over_fair_share(self, yielder_id: str) -> bool:
-        """Check if a yielder has contributed more than its elastic fair share.
-
-        Fair share = target / num_active_yielders.
-        A yielder is "over" when it exceeds 1.5x fair share.
-        This ensures no single source dominates while allowing
-        fast yielders some headroom.
-        """
-        if not yielder_id or not self._yielder_contributions:
+    def _is_over_fair_share(self, harvester_id: str) -> bool:
+        """Check if a harvester has contributed more than its elastic fair share."""
+        if not harvester_id or not self._harvester_contributions:
             return False
+        num_harvesters = len(self._harvester_contributions)
+        if num_harvesters <= 1:
+            return False
+        fair_share = self._target_rows / num_harvesters
+        return self._harvester_contributions.get(harvester_id, 0) > fair_share * 1.5
 
-        num_yielders = len(self._yielder_contributions)
-        if num_yielders <= 1:
-            return False  # solo yielder — no fairness constraint
-
-        fair_share = self._target_rows / num_yielders
-        my_contributions = self._yielder_contributions.get(yielder_id, 0)
-
-        return my_contributions > fair_share * 1.5
-
-    async def submit_seed(self, seed: Seed, yielder_id: str = "") -> Dict[str, Any]:
+    async def submit_seed(self, seed: Seed, harvester_id: str = "") -> Dict[str, Any]:
         """
-        Process a seed: dedup → queue for generation.
+        Accept a candidate and queue it for row generation.
 
-        Returns a rich status dict: {accepted, reason, stats, over_fair_share?}.
-        Called by seed yielders (possibly concurrently).
+        Returns status dict: {accepted, stats, over_fair_share?}.
         """
-        if not self._template:
-            return self._build_status(False, "no template set")
+        if not self._instructions:
+            return {"accepted": False, "reason": "no instructions set", "stats": self.stats}
 
-        # --- Dedup (under lock) ---
         async with self._lock:
             self._submitted_total += 1
+            if harvester_id and harvester_id not in self._harvester_contributions:
+                self._harvester_contributions[harvester_id] = 0
 
-            # Register yielder
-            if yielder_id and yielder_id not in self._yielder_contributions:
-                self._yielder_contributions[yielder_id] = 0
-
-            if not self._check_dedup(seed):
-                self._rejected_dedup += 1
-                logger.debug(f"[SeedProcessor] Seed rejected by dedup: {seed.values}")
-                return self._build_status(False, "duplicate")
-
-        # --- Accept ---
         work_item = self._build_work_item(seed)
 
         async with self._lock:
             self._accepted += 1
-            if yielder_id:
-                self._yielder_contributions[yielder_id] = (
-                    self._yielder_contributions.get(yielder_id, 0) + 1
+            if harvester_id:
+                self._harvester_contributions[harvester_id] = (
+                    self._harvester_contributions.get(harvester_id, 0) + 1
                 )
-            self._track_distribution(seed)
 
-        # Checkpoint the work item
         if self._on_checkpoint:
             await self._on_checkpoint(work_item)
 
-        # Queue for generation
         await self._work_queue.put(work_item)
 
-        # Check fair share after accepting
-        over_share = self._is_over_fair_share(yielder_id) if yielder_id else False
+        over_share = self._is_over_fair_share(harvester_id) if harvester_id else False
 
         logger.info(
-            f"[SeedProcessor] Seed accepted ({self._accepted}/{self._target_rows})"
+            f"[SeedProcessor] Candidate accepted ({self._accepted}/{self._target_rows})"
             f"{' [over fair share]' if over_share else ''}"
         )
-        return self._build_status(True, over_fair_share=over_share)
 
-    def _check_dedup(self, seed: Seed) -> bool:
-        """Check if seed passes dedup. Returns True if unique."""
-        dedup = self._dedup
-        if dedup.strategy == "none":
-            return True
-
-        if dedup.strategy == "exact":
-            # Dedup on a specific field, or all values
-            if dedup.field and dedup.field in seed.values:
-                key = str(seed.values[dedup.field])
-            else:
-                key = json.dumps(seed.values, sort_keys=True, ensure_ascii=False)
-
-            if key in self._seen:
-                return False
-            self._seen.add(key)
-            return True
-
-        # TODO: embedding_similarity — use embeddings to detect near-duplicates
-        if dedup.strategy == "embedding_similarity":
-            logger.warning("[SeedProcessor] embedding_similarity dedup not yet implemented, passing")
-            return True
-
-        return True
+        status = {"accepted": True, "stats": self.stats}
+        if over_share:
+            status["over_fair_share"] = True
+        return status
 
     def _build_work_item(self, seed: Seed) -> Dict[str, Any]:
-        """Fill template with seed values, build work item for row generator."""
-        filled_template = self._fill_template(seed.values)
-
+        """Build a work item for the row generator."""
         return {
-            "template": filled_template,
-            "seed_values": seed.values,
+            "instructions": self._instructions,
+            "candidate": seed.values,
             "research_context": self._research_context,
-            "metadata": seed.metadata,
             "tags": seed.metadata.get("tags", {}),
-            "status": "pending",
-            "row_id": None,
         }
-
-    def _fill_template(self, values: Dict[str, Any]) -> str:
-        """Fill the template with variable values."""
-        result = self._template or ""
-        for name, value in values.items():
-            placeholder = "{" + name + "}"
-            str_value = str(value) if not isinstance(value, str) else value
-            result = result.replace(placeholder, str_value)
-        return result
-
-    def _track_distribution(self, seed: Seed) -> None:
-        """Track actual distribution of variable values."""
-        for var_name, target_dist in self._distribution_targets.items():
-            if var_name in seed.values:
-                value = str(seed.values[var_name])
-                if var_name not in self._distribution:
-                    self._distribution[var_name] = {}
-                self._distribution[var_name][value] = (
-                    self._distribution[var_name].get(value, 0) + 1
-                )

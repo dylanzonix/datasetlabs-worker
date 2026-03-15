@@ -1,16 +1,19 @@
 """
-Row generator agent — generates a single dataset row from an assignment.
+Row generator agent — generates a single dataset row from a candidate.
 
-V5: Takes a filled template + seed values + filter findings + schema.
-V4 compat: Still accepts assignment + dataset_brief for backward compatibility.
+V8: Simplified. Row generator receives:
+- Raw user conversation (same as orchestrator sees)
+- Schema
+- Orchestrator instructions (what to do with each candidate)
+- The candidate (string or dict from extractor)
 
-Each row generator gets one work item and produces one row. In V5, the work
-item contains a filled template (variables already substituted) plus seed
-values and filter findings as reference context.
+set_column() checks identity columns against the submitted rows store
+and returns similar existing rows so the LLM can detect duplicates early.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import random
@@ -28,8 +31,6 @@ from dsl_worker.infra.research_tools import ResearchTools, ResearchScope
 logger = logging.getLogger(__name__)
 
 MAX_GENERATION_TURNS = 30
-
-# Max chars for read_file results
 READ_FILE_LIMIT = 30_000
 
 
@@ -47,200 +48,83 @@ class GeneratedRow:
 ROW_GENERATOR_SYSTEM_PROMPT = """\
 You are generating a single dataset row.
 
-## Dataset Brief
+## What the user wants
 
-{brief_section}
-
-## Your Assignment
-
-{assignment_section}
+<conversation>
+{conversation}
+</conversation>
 
 ## Schema
 
 <schema>
 {schema_str}
 </schema>
-
-## Output — TOOLS ONLY
-
-You MUST deliver your output via tool calls. Text responses are discarded by the system.
-
-For each column in the schema, call set_column(name, value). Then call submit_row().
-
-IMPORTANT: Call set_column for ALL columns in a SINGLE response. Do not call set_column one at a time across multiple turns — batch all set_column calls together, then call submit_row in the same response or the next one.
-
-DO NOT write JSON, code blocks, or row content as text. Only tool calls are captured.
-
-## Tools
-
-- set_column(name, value): Set a column value. Values are validated against the schema type.
-- append_to_column(name, value): Append to a column. For json columns, appends value as a list element. For string columns, concatenates with a newline.
-- clear_column(name): Clear a column value so you can start over.
-- submit_row(): Submit the completed row. Call after all columns are set.
-- rng(options, weights): Pick a random option for controlled randomization
-- read_file(path): Read a file from the workspace
-- brave_search(query): Search the web for information
-- open(ref_id_or_url, start_line): View a page or file. Always try this first.
-- find(ref_id, pattern): Search within a loaded page
-- click(ref_id, link_id): Follow a link
-- code_exec(script, description): Execute Python
-- interact(url_or_ref_id, task): Browser navigation agent. ONLY after open() returns \
-anti-bot/Cloudflare challenge or you need a page interaction (click, scroll). \
-Navigation tasks only: 'bypass challenge', 'click Accept'. Do NOT ask it to list, \
-extract, or summarize — you see the page directly after.
-
-## How to Research
-
-You are the execution layer. An orchestrator planned the dataset and a topic agent wrote
-your specific assignment. Your job is to produce one high-quality row — and that means
-getting the information right.
-
-### Step 1: Figure out what this row needs
-
-Read your assignment and the dataset brief. Ask yourself:
-
-- **Does this need factual research?** If the assignment involves a real entity, product,
-  library, event, person, or any verifiable claim — yes, look it up. Don't rely on what
-  you already know. Things change. Your knowledge has a cutoff.
-- **Is this synthetic content?** If you're designing a conversation, writing a creative
-  prompt, or generating a hypothetical scenario, you probably don't need web research.
-  But you might want to ground specific details in reality (e.g., real product names,
-  real API methods, real locations).
-- **Is this evaluation/judgment?** If you're scoring, classifying, or assessing something,
-  focus on analyzing what's in front of you. Your reasoning is the value — don't waste
-  time searching unless you're genuinely unsure about evaluation criteria.
-
-### Step 2: Check your assignment for source hints
-
-Your assignment may include context from the topic agent — use it:
-- **URLs** — open them directly instead of searching blind
-- **File paths** — read them with read_file
-- **Key facts or warnings** — these save you from common mistakes
-- **Source recommendations** — "use the official docs, not blog posts" means that
-
-### Step 3: Research with purpose
-
-When you do need to look things up:
-
-**Prefer primary sources.** Go to the actual website, repo, platform, or documentation
-rather than blog posts, tutorials, or summaries about them. Official docs over Stack
-Overflow. The actual PyPI page over a "top 10 libraries" listicle.
-
-**Verify claims that matter.** If a search result says "Library X supports feature Y,"
-open the actual docs to confirm. If you're reporting numbers (versions, dates, stats,
-damage values), find the primary source. If something seems surprising, double-check it.
-
-**Check freshness.** When dates matter, look at when sources were written. A 2023 blog
-post about a library's API may not reflect the 2025 version. Prefer recent sources and
-look for changelogs or release notes when versioning matters.
-
-**Use code to verify.** If you can check a claim programmatically — test a code snippet,
-check a package version, validate a calculation — use code_exec. Running code is the
-strongest form of verification.
-
-**Use the right tool for the job:**
-- brave_search: find something when you don't have a URL yet
-- open: read a specific URL or search result in detail
-- code_exec: verify claims programmatically, test code snippets, process data
-- read_file: access workspace files the assignment points you to
-
-### Step 4: Know when you have enough
-
-Stop researching when you can confidently fill every column with verified information.
-A few well-chosen sources beat a dozen skimmed ones. Don't over-research simple
-assignments, and don't under-research complex ones.
-
-If you can't find information after 2-3 targeted attempts, note that in your output
-rather than making something up.
-
-## Process
-
-1. Read the assignment and the dataset brief
-2. Decide what needs research vs. what you can produce directly
-3. Research with purpose — use source hints, verify claims, prefer primary sources
-4. Call set_column(name, value) for EACH column in the schema
-5. For json array columns, prefer append_to_column to build the list one element at a time
-6. Call submit_row() when done
-"""
-
-
-ROW_GENERATOR_V5_SYSTEM_PROMPT = """\
-You are generating a single dataset row.
 
 ## Instructions
 
-{template_with_filled_variables}
+{instructions}
 
-## Research Context
+## Your candidate
 
-{research_context_section}
+{candidate}
 
-## Schema
+## How to work
 
-<schema>
-{schema_str}
-</schema>
+1. Read the candidate and instructions.
+2. Fill in what you already know from the candidate using set_column().
+   - For identity columns (e.g. name, url, email), fill these FIRST. \
+If the response shows similar existing rows, check if this is a duplicate \
+and call skip_row(reason="duplicate: ...") if so.
+3. Research what you still need. Use primary sources. Verify claims that matter.
+4. Fill remaining columns with set_column().
+5. Call submit_row() when all columns are filled.
 
-## Output — TOOLS ONLY
+## Rules
 
-You MUST deliver your output via tool calls. Text responses are discarded by the system.
-
-For each column in the schema, call set_column(name, value). Then call submit_row().
-
-IMPORTANT: Call set_column for ALL columns in a SINGLE response. Do not call set_column one at a time across multiple turns — batch all set_column calls together, then call submit_row in the same response or the next one.
-
-DO NOT write JSON, code blocks, or row content as text. Only tool calls are captured.
-
-## Research
-
-Your seed values and research context may already contain much of what you need.
-Check what you have before searching. Only research if the instructions
-require verification or additional information beyond what was provided.
+- Output via tool calls ONLY. Text responses are ignored.
+- If the candidate is a dead end (broken URL, entity doesn't exist, doesn't qualify), \
+call skip_row(reason="...").
+- If you can't find information after 2-3 attempts, note it in the column rather than \
+making something up.
 
 ## Tools
 
-- set_column(name, value): Set a column value. Values are validated against the schema type.
-- append_to_column(name, value): Append to a column. For json columns, appends value as a list element. For string columns, concatenates with a newline.
-- clear_column(name): Clear a column value so you can start over.
-- submit_row(): Submit the completed row. Call after all columns are set.
-- skip_row(reason): Skip this row entirely. Use when the seed turns out to be a dead end \
-(broken URL, unavailable content, doesn't meet quality standards). Only skip if you genuinely \
-cannot produce a good row — don't skip just because research is hard.
-- rng(options, weights): Pick a random option for controlled randomization
-- read_file(path): Read a file from the workspace
-- brave_search(query): Search the web for information
-- open(ref_id_or_url, start_line): View a page or file. Always try this first.
-- find(ref_id, pattern): Search within a loaded page
-- click(ref_id, link_id): Follow a link
-- code_exec(script, description): Execute Python
-- interact(url_or_ref_id, task): Browser navigation agent. ONLY after open() returns \
-anti-bot/Cloudflare challenge or you need a page interaction (click, scroll). \
-Navigation tasks only: 'bypass challenge', 'click Accept'. Do NOT ask it to list, \
-extract, or summarize — you see the page directly after.
+- set_column(name, value): Set a column value. For identity columns, returns similar \
+existing rows — check them for duplicates.
+- append_to_column(name, value): Append to a column (json arrays or strings).
+- clear_column(name): Clear a column to start over.
+- submit_row(): Submit the completed row.
+- skip_row(reason): Skip this candidate entirely.
+- brave_search(query): Search the web.
+- open(url): View a page.
+- find(ref_id, pattern): Search within a loaded page.
+- click(ref_id, link_id): Follow a link.
+- code_exec(script, description): Execute Python.
+- interact(url_or_ref_id, task): Browser agent for anti-bot bypass only.
+- read_file(path): Read a workspace file.
 """
 
 
 class RowGeneratorAgent:
     """
-    Generates a single dataset row from a work item instruction.
+    Generates a single dataset row from a candidate.
 
     Usage:
         agent = RowGeneratorAgent(
             openai_client=tracked_client,
             model="gpt-5.2",
             workspace_dir=Path("/workspace"),
-            brave_api_key="...",
+            chat_history=[...],
+            identity_columns=["url", "name"],
+            submitted_rows=shared_list,
+            submitted_rows_lock=shared_lock,
+            ...
         )
-
         result = await agent.generate(
-            instruction="Write a tip about lean-peeking in DayZ. Consult sources tagged 'combat'.",
-            schema=[{"name": "tip", "type": "string"}, ...],
+            instructions="You will be given a podcast...",
+            candidate={"name": "XYZ Podcast", "url": "https://..."},
+            schema=[{"name": "podcast_name", "type": "string"}, ...],
         )
-
-        if result.success:
-            print(result.row)
-
-        await agent.cleanup()
     """
 
     def __init__(
@@ -248,9 +132,14 @@ class RowGeneratorAgent:
         openai_client: TrackedOpenAIClient,
         model: str,
         workspace_dir: Path,
+        chat_history: Optional[List[Dict[str, str]]] = None,
+        identity_columns: Optional[List[str]] = None,
+        submitted_rows: Optional[List[Dict[str, Any]]] = None,
+        submitted_rows_lock: Optional[Any] = None,
         brave_api_key: Optional[str] = None,
         sandbox: Optional[Any] = None,
         stop_checker: Optional[Callable[[], bool]] = None,
+        stop_event: Optional[asyncio.Event] = None,
         blob_service_client: Optional[Any] = None,
         project_id: Optional[Any] = None,
         uploaded_file_urls: Optional[Dict[str, str]] = None,
@@ -258,23 +147,28 @@ class RowGeneratorAgent:
         on_cost: Optional[Callable] = None,
         langfuse_parent: Optional[Any] = None,
         on_browser_started: Optional[Callable] = None,
+        on_browser_stopped: Optional[Callable] = None,
     ) -> None:
         self.openai_client = openai_client
         self.model = model
         self.workspace_dir = Path(workspace_dir)
+        self.chat_history = chat_history or []
+        self.identity_columns = set(identity_columns or [])
+        self.submitted_rows = submitted_rows if submitted_rows is not None else []
+        self.submitted_rows_lock = submitted_rows_lock
         self.stop_checker = stop_checker
+        self.stop_event = stop_event
         self.mcp_tools = mcp_tools or []
         self.on_cost = on_cost
         self.langfuse_parent = langfuse_parent
 
-        # Tool state — reset per generate() call
+        # State — reset per generate() call
         self._current_row: Dict[str, Any] = {}
         self._submitted: bool = False
         self._skipped: bool = False
         self._skip_reason: str = ""
         self._schema: List[Dict] = []
 
-        # Create ResearchTools for browsing tool implementations
         self._impl = ResearchTools(
             workspace_dir=workspace_dir,
             schema=[],
@@ -287,33 +181,21 @@ class RowGeneratorAgent:
             project_id=project_id,
             uploaded_file_urls=uploaded_file_urls,
             on_browser_started=on_browser_started,
+            on_browser_stopped=on_browser_stopped,
         )
-        # Set a dummy scope for ResearchTools compatibility
-        self._impl.set_scope(ResearchScope(
-            id="row_gen",
-            description="",
-            quota=0,
-        ))
+        self._impl.set_scope(ResearchScope(id="row_gen", description="", quota=0))
 
-        # Build tool registry
         self._registry = ToolRegistry()
         self._register_tools(self._registry)
 
-        # Store config for building conversations per generate() call
-        self._brave_api_key = brave_api_key
-        self._sandbox = sandbox
-
     def _get_col_def(self, name: str) -> Optional[Dict]:
-        """Look up a column definition by name."""
         for col in self._schema:
             if col.get("name") == name:
                 return col
         return None
 
     def _validate_value(self, col_def: Dict, value: Any) -> Optional[str]:
-        """Validate a value against a column type. Returns error string or None."""
         col_type = col_def.get("type", "string")
-
         if col_type == "string":
             if not isinstance(value, str):
                 return f"expects string, got {type(value).__name__}"
@@ -337,14 +219,30 @@ class RowGeneratorAgent:
                     jsonschema.validate(value, schema)
                 except jsonschema.ValidationError as e:
                     return f"json_schema validation failed: {e.message}"
-
         return None
 
-    def _register_tools(self, registry: ToolRegistry) -> None:
-        """Register row generation tools + research browsing tools."""
-        impl = self._impl
+    def _find_similar_rows(self, col_name: str, value: Any) -> List[Dict[str, Any]]:
+        """Find submitted rows with a similar value in the given column.
 
-        # --- Row generation tools ---
+        Case-insensitive exact match on string values.
+        Returns up to 5 matching rows.
+        """
+        if not self.submitted_rows:
+            return []
+
+        value_str = str(value).lower().strip()
+        matches = []
+        for row in self.submitted_rows:
+            existing = row.get(col_name)
+            if existing is None:
+                continue
+            if str(existing).lower().strip() == value_str:
+                matches.append(row)
+                if len(matches) >= 5:
+                    break
+        return matches
+
+    def _register_tools(self, registry: ToolRegistry) -> None:
 
         async def set_column(args: Dict) -> tuple[str, float]:
             name = args.get("name", "")
@@ -357,16 +255,31 @@ class RowGeneratorAgent:
                     return f"Error: column '{name}' {error}", 0.0
 
             self._current_row[name] = value
+
+            # Check identity columns for duplicates
+            if name in self.identity_columns:
+                similar = self._find_similar_rows(name, value)
+                if similar:
+                    rows_text = json.dumps(similar, indent=2, ensure_ascii=False)
+                    return (
+                        f"Set {name} = {value!r}\n\n"
+                        f"Similar existing rows found ({len(similar)}):\n{rows_text}\n\n"
+                        f"If any of these is the same entity, call skip_row(reason=\"duplicate: ...\")."
+                    ), 0.0
+
             return f"Set {name}", 0.0
 
         registry.add(
             name="set_column",
-            description="Set a column value for the row. Values are validated against the schema type.",
+            description=(
+                "Set a column value. For identity columns, returns similar existing rows "
+                "so you can detect duplicates early and skip_row() if needed."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Column name"},
-                    "value": {"description": "Column value (string, number, list, etc.)"},
+                    "value": {"description": "Column value"},
                 },
                 "required": ["name", "value"],
             },
@@ -376,40 +289,35 @@ class RowGeneratorAgent:
         async def append_to_column(args: Dict) -> tuple[str, float]:
             name = args.get("name", "")
             value = args.get("value")
-
             col_def = self._get_col_def(name)
             if not col_def:
                 return f"Error: unknown column '{name}'", 0.0
-
             col_type = col_def.get("type", "string")
-
             if col_type == "json":
                 if name not in self._current_row:
                     self._current_row[name] = []
                 if not isinstance(self._current_row[name], list):
-                    return f"Error: column '{name}' is not a list, cannot append", 0.0
+                    return f"Error: column '{name}' is not a list", 0.0
                 self._current_row[name].append(value)
-                return f"Appended to {name} (now {len(self._current_row[name])} items)", 0.0
+                return f"Appended to {name} ({len(self._current_row[name])} items)", 0.0
             elif col_type == "string":
                 if name not in self._current_row:
                     self._current_row[name] = ""
                 if not isinstance(value, str):
                     return "Error: append value must be string for string column", 0.0
-                if self._current_row[name]:
-                    self._current_row[name] += "\n" + value
-                else:
-                    self._current_row[name] = value
+                sep = "\n" if self._current_row[name] else ""
+                self._current_row[name] += sep + value
                 return f"Appended to {name}", 0.0
             else:
                 return f"Error: append not supported for type '{col_type}'", 0.0
 
         registry.add(
             name="append_to_column",
-            description="Append a value to a column. For json columns, appends as a list element. For string columns, concatenates with a newline.",
+            description="Append to a column. For json columns, appends as list element. For strings, concatenates with newline.",
             parameters={
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "Column name"},
+                    "name": {"type": "string"},
                     "value": {"description": "Value to append"},
                 },
                 "required": ["name", "value"],
@@ -424,12 +332,10 @@ class RowGeneratorAgent:
 
         registry.add(
             name="clear_column",
-            description="Clear a column value so you can start over.",
+            description="Clear a column value to start over.",
             parameters={
                 "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Column name to clear"},
-                },
+                "properties": {"name": {"type": "string"}},
                 "required": ["name"],
             },
             handler=clear_column,
@@ -448,7 +354,7 @@ class RowGeneratorAgent:
                 if col_name in self._current_row:
                     error = self._validate_value(col, self._current_row[col_name])
                     if error:
-                        return f"Error: column '{col_name}' {error}. Fix it before submitting.", 0.0
+                        return f"Error: column '{col_name}' {error}.", 0.0
 
             self._submitted = True
             return "Row submitted.", 0.0
@@ -469,17 +375,13 @@ class RowGeneratorAgent:
         registry.add(
             name="skip_row",
             description=(
-                "Skip this row entirely. Use when the seed turns out to be a dead end "
-                "(broken URL, unavailable content, doesn't meet quality standards). "
-                "Only skip if you genuinely cannot produce a good row."
+                "Skip this candidate. Use when it's a duplicate, dead end, "
+                "broken URL, or doesn't qualify."
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "reason": {
-                        "type": "string",
-                        "description": "Why this row is being skipped",
-                    },
+                    "reason": {"type": "string", "description": "Why this row is being skipped"},
                 },
                 "required": ["reason"],
             },
@@ -499,41 +401,29 @@ class RowGeneratorAgent:
 
         registry.add(
             name="rng",
-            description="Pick a random option. Use for controlled randomization (e.g., tone, perspective, style).",
+            description="Pick a random option for controlled randomization.",
             parameters={
                 "type": "object",
                 "properties": {
-                    "options": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Options to choose from",
-                    },
-                    "weights": {
-                        "type": "array",
-                        "items": {"type": "number"},
-                        "description": "Optional weights (must match length of options)",
-                    },
+                    "options": {"type": "array", "items": {"type": "string"}},
+                    "weights": {"type": "array", "items": {"type": "number"}},
                 },
                 "required": ["options"],
             },
             handler=rng,
         )
 
-        # --- read_file tool (reads workspace files including sources) ---
         async def read_file(args: Dict) -> tuple[str, float]:
             path_str = args.get("path", "")
             try:
                 path = Path(path_str)
                 if not path.is_absolute():
-                    # Try as relative to workspace first, then sources
                     candidate = self.workspace_dir / path
                     if not candidate.exists():
                         candidate = self.workspace_dir / "sources" / path
                     path = candidate
-
                 if not path.exists():
                     return f"File not found: {path_str}", 0.0
-
                 content = path.read_text(encoding="utf-8")
                 if len(content) > READ_FILE_LIMIT:
                     content = content[:READ_FILE_LIMIT] + f"\n\n[Truncated at {READ_FILE_LIMIT} chars]"
@@ -546,98 +436,53 @@ class RowGeneratorAgent:
             description="Read a file from the workspace.",
             parameters={
                 "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "File path (relative to workspace or sources directory)",
-                    },
-                },
+                "properties": {"path": {"type": "string"}},
                 "required": ["path"],
             },
             handler=read_file,
         )
 
-        # --- Research/browsing tools from ResearchTools ---
-        impl.register_on(registry)
+        self._impl.register_on(registry)
 
-    def _build_system_prompt(
-        self,
-        assignment: str,
-        schema: List[Dict],
-        dataset_brief: str = "",
-    ) -> str:
-        schema_str = json.dumps(schema, indent=2)
+    def _format_conversation(self) -> str:
+        if not self.chat_history:
+            return "(no conversation history)"
+        parts = []
+        for msg in self.chat_history:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            parts.append(f"**{role}**: {content}")
+        return "\n\n".join(parts)
 
-        brief_section = ""
-        if dataset_brief:
-            brief_section = f"<dataset_brief>\n{dataset_brief}\n</dataset_brief>"
-
-        assignment_section = f"<assignment>\n{assignment}\n</assignment>"
-
-        return ROW_GENERATOR_SYSTEM_PROMPT.format(
-            brief_section=brief_section,
-            assignment_section=assignment_section,
-            schema_str=schema_str,
-        )
-
-    def _build_v5_prompt(
-        self,
-        template: str,
-        seed: Optional[Dict],
-        schema: List[Dict],
-        research_context: Optional[str] = None,
-    ) -> str:
-        """Build V5 system prompt from filled template + seed."""
-        schema_str = json.dumps(schema, indent=2)
-
-        research_section = ""
-        if research_context:
-            research_section = f"<research_context>\n{research_context}\n</research_context>"
-        else:
-            research_section = "(no research context)"
-
-        return ROW_GENERATOR_V5_SYSTEM_PROMPT.format(
-            template_with_filled_variables=template,
-            research_context_section=research_section,
-            schema_str=schema_str,
-        )
+    def _format_candidate(self, candidate: Any) -> str:
+        if candidate is None:
+            return "(no candidate)"
+        if isinstance(candidate, dict):
+            return json.dumps(candidate, indent=2, ensure_ascii=False)
+        return str(candidate)
 
     async def generate(
         self,
-        # V5 interface
-        template: str = "",
-        seed: Optional[Dict] = None,
-        research_context: Optional[str] = None,
+        instructions: str,
+        candidate: Any,
         schema: Optional[List[Dict]] = None,
-        # V4 backward compat
-        assignment: str = "",
-        dataset_brief: str = "",
     ) -> GeneratedRow:
-        """
-        Generate a single row.
-
-        V5+: Pass template (filled), seed, research_context, schema.
-        V4: Pass assignment, schema, dataset_brief.
-
-        Creates a fresh AgentConversation per call so each row generation
-        starts with a clean message history.
-        """
+        """Generate a single row from a candidate."""
         if schema is None:
             schema = []
 
-        # Reset state
         self._current_row = {}
         self._submitted = False
         self._skipped = False
         self._skip_reason = ""
         self._schema = schema
 
-        if template:
-            system_prompt = self._build_v5_prompt(
-                template, seed, schema, research_context
-            )
-        else:
-            system_prompt = self._build_system_prompt(assignment, schema, dataset_brief)
+        system_prompt = ROW_GENERATOR_SYSTEM_PROMPT.format(
+            conversation=self._format_conversation(),
+            schema_str=json.dumps(schema, indent=2),
+            instructions=instructions or "(no specific instructions)",
+            candidate=self._format_candidate(candidate),
+        )
 
         conversation = AgentConversation(
             openai_client=self.openai_client,
@@ -645,6 +490,7 @@ class RowGeneratorAgent:
             system_prompt=system_prompt,
             tools=self._registry,
             stop_checker=self.stop_checker,
+            stop_event=self.stop_event,
             max_turns=MAX_GENERATION_TURNS,
             reasoning={"effort": "low", "summary": "auto"},
             label="row_generator",
@@ -653,8 +499,8 @@ class RowGeneratorAgent:
             langfuse_parent=self.langfuse_parent,
         )
 
-        result = await conversation.send(
-            "Generate a dataset row from the assignment above.",
+        await conversation.send(
+            "Process the candidate above and generate a dataset row.",
             exit_condition=lambda: self._submitted or self._skipped,
         )
 
@@ -662,18 +508,11 @@ class RowGeneratorAgent:
 
         if self._skipped:
             return GeneratedRow(
-                success=False,
-                skipped=True,
-                skip_reason=self._skip_reason,
-                cost_usd=cost,
+                success=False, skipped=True, skip_reason=self._skip_reason, cost_usd=cost
             )
 
         if self._submitted:
-            return GeneratedRow(
-                success=True,
-                row=self._current_row,
-                cost_usd=cost,
-            )
+            return GeneratedRow(success=True, row=self._current_row, cost_usd=cost)
 
         return GeneratedRow(
             success=False,
@@ -684,10 +523,9 @@ class RowGeneratorAgent:
 
     @property
     def cost_usd(self) -> float:
-        return 0.0  # Cost tracked per generate() call, not accumulated
+        return 0.0
 
     async def cleanup(self) -> None:
-        """Clean up browser and other resources."""
         try:
             await self._impl.cleanup()
         except Exception as e:

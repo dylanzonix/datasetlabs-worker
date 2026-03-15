@@ -34,7 +34,6 @@ __all__ = [
     "get_pricing_config",
     # Tracked client
     "TrackedOpenAIClient",
-    "TrackedChatCompletion",
     "TrackedEmbeddingResponse",
     # Cost tracking
     "CostTracker",

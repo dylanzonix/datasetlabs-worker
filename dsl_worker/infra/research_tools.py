@@ -207,6 +207,7 @@ class ResearchTools:
         project_id: Optional[str] = None,
         uploaded_file_urls: Optional[Dict[str, str]] = None,
         on_browser_started: Optional[Callable] = None,
+        on_browser_stopped: Optional[Callable] = None,
     ):
         self.workspace_dir = Path(workspace_dir)
         self.schema = schema
@@ -219,6 +220,7 @@ class ResearchTools:
         self.project_id = str(project_id) if project_id else None
         self.uploaded_file_urls = uploaded_file_urls
         self._on_browser_started = on_browser_started
+        self._on_browser_stopped = on_browser_stopped
 
         # Ensure downloads dir exists (uploads go direct to sandbox via SAS URLs)
         (self.workspace_dir / "downloads").mkdir(parents=True, exist_ok=True)
@@ -498,6 +500,7 @@ class ResearchTools:
             # Stop cloud browser session FIRST (before disconnecting Playwright)
             # so the API call goes through while we still have connectivity
             if self._cloud_client and self._cloud_session_id:
+                stopped_session_id = self._cloud_session_id
                 try:
                     await self._cloud_client.browsers.update_browser_session(
                         self._cloud_session_id, action="stop",
@@ -507,6 +510,13 @@ class ResearchTools:
                 except Exception as e:
                     logger.warning(f"[ResearchTools] Error stopping cloud session: {e}")
                 self._cloud_session_id = None
+                if self._on_browser_stopped and stopped_session_id:
+                    try:
+                        result = self._on_browser_stopped(stopped_session_id)
+                        if asyncio.iscoroutine(result):
+                            await result
+                    except Exception as e:
+                        logger.warning(f"[ResearchTools] on_browser_stopped callback failed: {e}")
 
             # Close Playwright connection (cloud session already stopped above)
             try:
@@ -534,6 +544,7 @@ class ResearchTools:
 
     async def _reset_browser_state(self):
         """Reset all browser state so _get_browser() creates a fresh session."""
+        stopped_session_id = self._cloud_session_id
         try:
             if self._playwright:
                 await self._playwright.stop()
@@ -544,6 +555,13 @@ class ResearchTools:
         self._cdp_url = None
         self._cloud_session_id = None
         self._bu_agent = None
+        if self._on_browser_stopped and stopped_session_id:
+            try:
+                result = self._on_browser_stopped(stopped_session_id)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                logger.warning(f"[ResearchTools] on_browser_stopped callback failed: {e}")
         logger.info("[ResearchTools] Browser state reset — next operation will create fresh session")
 
     # =========================================================================

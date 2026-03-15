@@ -1,13 +1,8 @@
 """
 Row generation — worker pool for the generation phase.
 
-The actual row generation agent is in dsl_worker.agents.row.
-This module provides the pool that manages parallel workers consuming
-work items from a queue.
-
-V5+: Work items are filled templates from the pipeline. Each has a template
-(filled with seed values), seed_values, research_context, and tags.
-V4 compat: Also handles V4 format (instruction, context, schema, tags).
+V8: Work items contain instructions + candidate (no template interpolation).
+Shared submitted_rows store enables row-level dedup via set_column().
 """
 
 import asyncio
@@ -33,11 +28,14 @@ class GenerationWorkerPool:
         db_session: Any,
         project_id: Any,
         version_id: Any,
+        chat_history: Optional[List[Dict[str, str]]] = None,
+        identity_columns: Optional[List[str]] = None,
         model: str = "",
         brave_api_key: Optional[str] = None,
         sandbox: Optional[Any] = None,
         num_workers: int = 10,
         stop_checker: Optional[Callable[[], bool]] = None,
+        stop_event: Optional[asyncio.Event] = None,
         cost_tracker: Optional[Any] = None,
         checkpoint_callback: Optional[Callable[[int, bool, Optional[str]], Any]] = None,
         blob_service_client: Optional[Any] = None,
@@ -46,17 +44,21 @@ class GenerationWorkerPool:
         on_cost: Optional[Callable] = None,
         langfuse_parent: Optional[Any] = None,
         on_browser_started: Optional[Callable] = None,
+        on_browser_stopped: Optional[Callable] = None,
     ):
         self.workspace_dir = Path(workspace_dir)
         self.openai_client = openai_client
         self.db = db_session
         self.project_id = project_id
         self.version_id = version_id
+        self.chat_history = chat_history or []
+        self.identity_columns = identity_columns or []
         self.model = model or settings.generation_model
         self.brave_api_key = brave_api_key
         self.sandbox = sandbox
         self.num_workers = num_workers
         self.stop_checker = stop_checker
+        self.stop_event = stop_event
         self.cost_tracker = cost_tracker
         self.checkpoint_callback = checkpoint_callback
         self.blob_service_client = blob_service_client
@@ -65,6 +67,11 @@ class GenerationWorkerPool:
         self.on_cost = on_cost
         self.langfuse_parent = langfuse_parent
         self.on_browser_started = on_browser_started
+        self.on_browser_stopped = on_browser_stopped
+
+        # Shared store of submitted rows for row-level dedup
+        self._submitted_rows: List[Dict[str, Any]] = []
+        self._submitted_rows_lock = asyncio.Lock()
 
         self._total_cost = 0.0
         self._rows_generated = 0
@@ -72,26 +79,23 @@ class GenerationWorkerPool:
         self._errors = 0
 
     def _should_stop(self) -> bool:
-        return self.stop_checker and self.stop_checker()
+        return bool(self.stop_checker and self.stop_checker())
+
+    async def _add_submitted_row(self, row: Dict[str, Any]) -> None:
+        async with self._submitted_rows_lock:
+            self._submitted_rows.append(row)
 
     async def process_work_items(
         self,
         work_items: List[Dict],
         default_schema: List[Dict],
     ) -> Tuple[int, int]:
-        """
-        Process work items in parallel. Returns (success_count, error_count).
+        """Process work items in parallel. Returns (success_count, error_count).
 
-        V5 work item format:
-            - template: str — filled template (variables substituted)
-            - seed_values: Dict — resolved variable values
-            - research_context: str — orchestrator research findings
-            - tags: Dict — metadata tags
-
-        V4 work item format (backward compat):
-            - instruction: str — the filled instruction template
-            - context: str — supplementary notes from topic agent
-            - schema: List[Dict] — overrides default_schema for this item
+        Work item format (V8):
+            - instructions: str — row generator instructions from orchestrator
+            - candidate: Any — raw candidate (string or dict) from extractor
+            - research_context: str — orchestrator note
             - tags: Dict — metadata tags
         """
         if not work_items:
@@ -103,7 +107,6 @@ class GenerationWorkerPool:
             f"with {self.num_workers} workers"
         )
 
-        # Build work queue: (index, work_item)
         queue: asyncio.Queue = asyncio.Queue()
         for i, item in enumerate(work_items):
             await queue.put((i, item))
@@ -120,9 +123,14 @@ class GenerationWorkerPool:
                 openai_client=self.openai_client,
                 model=self.model,
                 workspace_dir=self.workspace_dir,
+                chat_history=self.chat_history,
+                identity_columns=self.identity_columns,
+                submitted_rows=self._submitted_rows,
+                submitted_rows_lock=self._submitted_rows_lock,
                 brave_api_key=self.brave_api_key,
                 sandbox=self.sandbox,
                 stop_checker=self.stop_checker,
+                stop_event=self.stop_event,
                 blob_service_client=self.blob_service_client,
                 project_id=self.project_id,
                 uploaded_file_urls=self.uploaded_file_urls,
@@ -130,6 +138,7 @@ class GenerationWorkerPool:
                 on_cost=self.on_cost,
                 langfuse_parent=self.langfuse_parent,
                 on_browser_started=self.on_browser_started,
+                on_browser_stopped=self.on_browser_stopped,
             )
 
             try:
@@ -142,28 +151,15 @@ class GenerationWorkerPool:
                     except asyncio.QueueEmpty:
                         break
 
-                    # Detect V5 vs V4 format
-                    is_v5 = "template" in item
+                    instructions = item.get("instructions", "")
+                    candidate = item.get("candidate")
                     tags = item.get("tags") or {}
 
-                    # Use per-item langfuse parent so traces nest correctly
                     item_parent = item.get("langfuse_parent")
-                    if item_parent is not None:
-                        agent.langfuse_parent = item_parent
-                    else:
-                        agent.langfuse_parent = self.langfuse_parent
+                    agent.langfuse_parent = item_parent if item_parent is not None else self.langfuse_parent
 
-                    # Validate work item has content
-                    if is_v5 and not item.get("template"):
-                        logger.warning(f"[GenerationPool] Empty template at index {index}")
-                        async with lock:
-                            error_count += 1
-                            self._errors += 1
-                        if self.checkpoint_callback:
-                            await self.checkpoint_callback(index, False, None)
-                        continue
-                    elif not is_v5 and not item.get("instruction"):
-                        logger.warning(f"[GenerationPool] Empty instruction at index {index}")
+                    if not instructions:
+                        logger.warning(f"[GenerationPool] Empty instructions at index {index}")
                         async with lock:
                             error_count += 1
                             self._errors += 1
@@ -176,36 +172,28 @@ class GenerationWorkerPool:
 
                     for attempt in range(max_attempts):
                         try:
-                            if is_v5:
-                                result = await agent.generate(
-                                    template=item["template"],
-                                    seed=item.get("seed_values"),
-                                    research_context=item.get("research_context"),
-                                    schema=default_schema,
-                                )
-                            else:
-                                result = await agent.generate(
-                                    assignment=item.get("instruction", ""),
-                                    schema=item.get("schema") or default_schema,
-                                    dataset_brief=item.get("context", ""),
-                                )
+                            result = await agent.generate(
+                                instructions=instructions,
+                                candidate=candidate,
+                                schema=default_schema,
+                            )
 
                             if result.success and result.row:
                                 row_id = await self._save_row(result.row, tags=tags)
+                                await self._add_submitted_row(result.row)
 
                                 async with lock:
                                     success_count += 1
                                     self._rows_generated += 1
 
                                 if success_count % 10 == 0:
-                                    logger.info(
-                                        f"[GenerationPool] Generated {success_count} rows..."
-                                    )
+                                    logger.info(f"[GenerationPool] Generated {success_count} rows...")
 
                                 if self.checkpoint_callback:
                                     await self.checkpoint_callback(index, True, row_id)
                                 succeeded = True
                                 break
+
                             elif result.skipped:
                                 async with lock:
                                     skip_count += 1
@@ -218,6 +206,7 @@ class GenerationWorkerPool:
                                     await self.checkpoint_callback(index, True, None)
                                 succeeded = True
                                 break
+
                             else:
                                 if attempt < max_attempts - 1:
                                     logger.warning(
@@ -229,8 +218,7 @@ class GenerationWorkerPool:
                                         error_count += 1
                                         self._errors += 1
                                     logger.warning(
-                                        f"[GenerationPool] Failed after {max_attempts} "
-                                        f"attempts: {result.error}"
+                                        f"[GenerationPool] Failed after {max_attempts} attempts: {result.error}"
                                     )
                                     if self.checkpoint_callback:
                                         await self.checkpoint_callback(index, False, None)
@@ -238,14 +226,10 @@ class GenerationWorkerPool:
                         except Exception as e:
                             if attempt < max_attempts - 1:
                                 logger.warning(
-                                    f"[GenerationPool] Error (attempt {attempt + 1}/"
-                                    f"{max_attempts}): {e} — retrying"
+                                    f"[GenerationPool] Error (attempt {attempt + 1}/{max_attempts}): {e} — retrying"
                                 )
                             else:
-                                logger.error(
-                                    f"[GenerationPool] Error after {max_attempts} "
-                                    f"attempts: {e}"
-                                )
+                                logger.error(f"[GenerationPool] Error after {max_attempts} attempts: {e}")
                                 async with lock:
                                     error_count += 1
                                     self._errors += 1
@@ -261,14 +245,9 @@ class GenerationWorkerPool:
             f"[GenerationPool] Completed: {success_count} success, "
             f"{skip_count} skipped, {error_count} errors"
         )
-
         return success_count, error_count
 
-    async def _save_row(
-        self,
-        row: Dict,
-        tags: Optional[Dict] = None,
-    ) -> Optional[str]:
+    async def _save_row(self, row: Dict, tags: Optional[Dict] = None) -> Optional[str]:
         """Save generated row to database. Returns row ID."""
         from sqlalchemy import func as sql_func
         from dsl_api.models.project_version import ProjectVersion
@@ -309,7 +288,6 @@ class GenerationWorkerPool:
             )
 
             self.db.commit()
-
             return row_id
 
         except Exception as e:
@@ -318,7 +296,6 @@ class GenerationWorkerPool:
             raise
 
     def get_stats(self) -> Dict:
-        """Get current stats."""
         return {
             "rows_generated": self._rows_generated,
             "skipped": self._skipped,

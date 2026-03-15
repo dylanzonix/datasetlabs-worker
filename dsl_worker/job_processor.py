@@ -47,14 +47,15 @@ try:
         except Exception:
             return None
 except ImportError:
-    from contextlib import contextmanager
-
     def _get_langfuse():
         return None
 
-    @contextmanager
     def propagate_attributes(**kwargs):
-        yield
+        from contextlib import contextmanager
+        @contextmanager
+        def _noop():
+            yield
+        return _noop()
 from dsl_worker.project_state import ProjectState
 from dsl_worker.billing import CostTracker, TrackedOpenAIClient
 from dsl_worker.checkpoint import CheckpointManager, checkpoints_to_work_items
@@ -102,11 +103,18 @@ class JobProcessor:
         logger.warning("[Worker] Stop requested")
         self.should_stop = True
 
-    def _make_stop_checker(self, state: ProjectState):
-        """Create a stop checker that refreshes state before checking."""
+    def _make_stop_checker(self, state: ProjectState, stop_event: asyncio.Event):
+        """Create a stop checker that refreshes state before checking.
+
+        Also sets stop_event so all agents wake up instantly once stop is detected,
+        rather than each waiting for their own poll cycle.
+        """
         def checker():
             state.refresh()
-            return self.should_stop or state.paused
+            should_stop = self.should_stop or state.paused
+            if should_stop and not stop_event.is_set():
+                stop_event.set()
+            return should_stop
         return checker
 
     async def process_job(self, message_body: Dict[str, Any]) -> bool:
@@ -185,7 +193,10 @@ class JobProcessor:
             # Emit running event
             self._emit_event(db, project, version, "running", "Worker started")
 
-            # Run pipeline (wrapped in Langfuse trace if available)
+            # Run pipeline wrapped in Langfuse trace.
+            # propagate_attributes sets session_id/user_id/tags on every
+            # observation created within the block, including sub-agent spans
+            # in asyncio tasks that inherit the contextvars context.
             with propagate_attributes(
                 session_id=str(project_id),
                 user_id=str(project.user_id),
@@ -272,7 +283,8 @@ class JobProcessor:
         )
         checkpoint = await checkpoint_mgr.initialize()
 
-        stop_checker = self._make_stop_checker(state)
+        stop_event = asyncio.Event()
+        stop_checker = self._make_stop_checker(state, stop_event)
 
         # Per-turn cost callback — fires on every API call in every agent.
         async def on_cost(cost_usd: float, label: str):
@@ -379,17 +391,16 @@ class JobProcessor:
         # --- Progress tracking ---
         progress_counters: Dict[str, Any] = {"phase": "orchestrating"}
         last_progress_flush = time.time()
+        last_langfuse_flush = time.time()
 
         def on_tool_call(agent_label: str, tool_name: str):
-            nonlocal last_progress_flush
+            nonlocal last_progress_flush, last_langfuse_flush
 
             phase_map = {
                 "research": "researching",
-                "write_template": "designing_template",
-                "parse_seeds": "parsing_seeds",
-                "synthesize_seeds": "synthesizing_seeds",
+                "set_instructions": "designing_template",
+                "harvest": "harvesting",
                 "done": "finishing",
-                "yield_seed": "yielding_seeds",
             }
             if tool_name in phase_map:
                 progress_counters["phase"] = phase_map[tool_name]
@@ -399,9 +410,8 @@ class JobProcessor:
                 "open": "pages_viewed",
                 "code_exec": "code_runs",
                 "research": "research_subagents",
-                "yield_seed": "seeds_yielded",
-                "parse_seeds": "parsers_spawned",
-                "synthesize_seeds": "synthesizers_spawned",
+                "harvest": "harvesters_spawned",
+                "save_page": "pages_saved",
             }
             if tool_name in counter_map:
                 key = counter_map[tool_name]
@@ -413,6 +423,11 @@ class JobProcessor:
                 version.progress_detail = merged
                 db.commit()
                 last_progress_flush = now
+            if now - last_langfuse_flush >= 10.0:
+                lf = _get_langfuse()
+                if lf:
+                    lf.flush()
+                last_langfuse_flush = now
 
         # --- Browser session tracking ---
         browser_sessions: Dict[str, Dict[str, str]] = {}
@@ -424,6 +439,11 @@ class JobProcessor:
             }
             progress_counters["browser_sessions"] = list(browser_sessions.values())
             logger.info(f"[Pipeline] Cloud browser started: {live_url}")
+
+        def on_browser_stopped(session_id: str):
+            browser_sessions.pop(session_id, None)
+            progress_counters["browser_sessions"] = list(browser_sessions.values())
+            logger.info(f"[Pipeline] Cloud browser stopped: {session_id}")
 
         version.progress_detail = {"phase": "orchestrating"}
         db.commit()
@@ -457,12 +477,16 @@ class JobProcessor:
                 work_item_queue=work_item_queue,
                 workspace_dir=workspace_dir,
                 stop_checker=stop_checker,
+                stop_event=stop_event,
                 schema=state.columns,
                 generation_stats=generation_stats,
+                chat_history=chat_history,
+                seed_processor=seed_processor,
                 uploaded_file_urls=uploaded_file_urls,
                 on_cost=on_cost,
                 langfuse_parent=langfuse_parent,
                 on_browser_started=on_browser_started,
+                on_browser_stopped=on_browser_stopped,
             )
         )
 
@@ -487,6 +511,7 @@ class JobProcessor:
             brave_api_key=settings.brave_api_key,
             sandbox=self._sandbox,
             stop_checker=stop_checker,
+                stop_event=stop_event,
             blob_service_client=self.blob_service_client,
             project_id=project.id,
             on_tool_call=on_tool_call,
@@ -496,6 +521,7 @@ class JobProcessor:
             feedback_context=feedback_context,
             langfuse_parent=langfuse_parent,
             on_browser_started=on_browser_started,
+            on_browser_stopped=on_browser_stopped,
         )
 
         try:
@@ -554,17 +580,16 @@ class JobProcessor:
                 f"generating {shortfall} more"
             )
 
-            # Build backfill work items using the pipeline template
-            template = seed_processor._template or "Generate a row for this dataset."
+            # Build backfill work items
+            instructions = seed_processor._instructions or "Generate a row for this dataset."
             backfill_items: List[Dict] = []
             for i in range(shortfall):
                 backfill_items.append({
-                    "template": (
-                        f"{template}\n\n"
-                        f"(Backfill row — generate a unique row that hasn't been "
-                        f"covered yet. Use your judgment for variable values.)"
+                    "instructions": (
+                        f"{instructions}\n\n"
+                        f"(Backfill row — generate a unique row not already covered.)"
                     ),
-                    "seed_values": {},
+                    "candidate": None,
                     "research_context": seed_processor._research_context or "",
                     "tags": {"backfill": True},
                 })
@@ -576,11 +601,14 @@ class JobProcessor:
                 db_session=db,
                 project_id=project.id,
                 version_id=version.id,
+                chat_history=chat_history,
+                identity_columns=seed_processor.identity_columns,
                 model=settings.generation_model,
                 brave_api_key=settings.brave_api_key,
                 sandbox=self._sandbox,
                 num_workers=settings.generation_parallel_samples,
                 stop_checker=stop_checker,
+                stop_event=stop_event,
                 cost_tracker=cost_tracker,
                 checkpoint_callback=lambda idx, success, row_id: asyncio.create_task(
                     checkpoint_mgr.mark_processed(backfill_start + idx, success, row_id)
@@ -591,6 +619,7 @@ class JobProcessor:
                 on_cost=on_cost,
                 langfuse_parent=langfuse_parent,
                 on_browser_started=on_browser_started,
+                on_browser_stopped=on_browser_stopped,
             )
             success, errors = await pool.process_work_items(
                 backfill_items, state.columns,
@@ -645,10 +674,13 @@ class JobProcessor:
         stop_checker,
         schema: List[Dict],
         generation_stats: Dict,
+        chat_history: Optional[List[Dict]] = None,
+        seed_processor: Optional[Any] = None,
         uploaded_file_urls: Optional[Dict[str, str]] = None,
         on_cost: Optional[Callable] = None,
         langfuse_parent: Optional[Any] = None,
         on_browser_started: Optional[Callable] = None,
+        on_browser_stopped: Optional[Callable] = None,
     ) -> None:
         """
         Background consumer: dequeue work items and process them with a
@@ -660,6 +692,12 @@ class JobProcessor:
         in_flight: list[asyncio.Task] = []
         item_index = 0
         save_lock = asyncio.Lock()
+
+        # Shared submitted rows store for row-level dedup
+        submitted_rows: List[Dict] = []
+        submitted_rows_lock = asyncio.Lock()
+
+        identity_columns = seed_processor.identity_columns if seed_processor else []
 
         # Shared row saver (DB writes must be serialized)
         row_saver = GenerationWorkerPool(
@@ -680,9 +718,14 @@ class JobProcessor:
                     openai_client=tracked_client,
                     model=settings.generation_model,
                     workspace_dir=workspace_dir,
+                    chat_history=chat_history or [],
+                    identity_columns=identity_columns,
+                    submitted_rows=submitted_rows,
+                    submitted_rows_lock=submitted_rows_lock,
                     brave_api_key=settings.brave_api_key,
                     sandbox=self._sandbox,
                     stop_checker=stop_checker,
+                stop_event=stop_event,
                     blob_service_client=self.blob_service_client,
                     project_id=project.id,
                     uploaded_file_urls=uploaded_file_urls,
@@ -690,21 +733,16 @@ class JobProcessor:
                     on_cost=on_cost,
                     langfuse_parent=item.get("langfuse_parent") or langfuse_parent,
                     on_browser_started=on_browser_started,
+                    on_browser_stopped=on_browser_stopped,
                 )
 
                 try:
-                    is_v5 = "template" in item
                     tags = item.get("tags") or {}
+                    instructions = item.get("instructions", "")
+                    candidate = item.get("candidate")
 
-                    # Validate
-                    if is_v5 and not item.get("template"):
-                        logger.warning(f"[Generation] Empty template at index {index}")
-                        generation_stats["errors"] += 1
-                        if checkpoint_mgr:
-                            await checkpoint_mgr.mark_processed(index, False, None)
-                        return
-                    elif not is_v5 and not item.get("instruction"):
-                        logger.warning(f"[Generation] Empty instruction at index {index}")
+                    if not instructions:
+                        logger.warning(f"[Generation] Empty instructions at index {index}")
                         generation_stats["errors"] += 1
                         if checkpoint_mgr:
                             await checkpoint_mgr.mark_processed(index, False, None)
@@ -713,25 +751,19 @@ class JobProcessor:
                     max_attempts = 2
                     for attempt in range(max_attempts):
                         try:
-                            if is_v5:
-                                result = await agent.generate(
-                                    template=item["template"],
-                                    seed=item.get("seed_values"),
-                                    research_context=item.get("research_context"),
-                                    schema=schema,
-                                )
-                            else:
-                                result = await agent.generate(
-                                    assignment=item.get("instruction", ""),
-                                    schema=item.get("schema") or schema,
-                                    dataset_brief=item.get("context", ""),
-                                )
+                            result = await agent.generate(
+                                instructions=instructions,
+                                candidate=candidate,
+                                schema=schema,
+                            )
 
                             if result.success and result.row:
                                 async with save_lock:
                                     row_id = await row_saver._save_row(
                                         result.row, tags=tags,
                                     )
+                                async with submitted_rows_lock:
+                                    submitted_rows.append(result.row)
                                 generation_stats["rows_generated"] += 1
 
                                 if generation_stats["rows_generated"] % 10 == 0:
@@ -795,16 +827,18 @@ class JobProcessor:
                 if stop_checker():
                     break
 
-                can_continue, _ = cost_tracker.check_balance_and_charge()
-                if not can_continue:
-                    break
-
                 try:
                     item = await asyncio.wait_for(work_item_queue.get(), timeout=5.0)
                 except asyncio.TimeoutError:
                     continue
 
                 if item is None:
+                    break
+
+                # Check balance AFTER dequeuing — don't kill the consumer
+                # while it's idle waiting for seeds from the orchestrator.
+                can_continue, _ = cost_tracker.check_balance_and_charge()
+                if not can_continue:
                     break
 
                 task = asyncio.create_task(process_one(item_index, item))
@@ -879,6 +913,7 @@ class JobProcessor:
             sandbox=self._sandbox,
             num_workers=concurrency,
             stop_checker=stop_checker,
+                stop_event=stop_event,
             cost_tracker=cost_tracker,
             checkpoint_callback=lambda idx, success, row_id: asyncio.create_task(
                 checkpoint_mgr.mark_processed(pending_indices[idx], success, row_id)

@@ -23,12 +23,7 @@ from dsl_worker.config import settings
 from dsl_worker.job_processor import JobProcessor
 from dsl_worker.logging_setup import setup_logging
 
-# Use Langfuse-wrapped AsyncOpenAI if configured, otherwise plain OpenAI.
-# The wrapper auto-traces every responses.create() call with zero code changes.
-if settings.langfuse_secret_key:
-    from langfuse.openai import AsyncAzureOpenAI
-else:
-    from openai import AsyncAzureOpenAI
+from openai import AsyncAzureOpenAI
 
 logger = logging.getLogger(__name__)
 

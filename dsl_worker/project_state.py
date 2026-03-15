@@ -7,6 +7,7 @@ Only tracks:
 """
 
 import logging
+import time
 from typing import List, Optional
 from uuid import UUID
 
@@ -41,11 +42,24 @@ class ProjectState:
         self.generation_prompt = ""
         self.columns = []
 
-        # Initial refresh
-        self.refresh()
+        # Throttle DB queries — all concurrent agents share this object,
+        # so one refresh per second is enough regardless of how many are polling.
+        self._last_refresh: float = 0.0
+        self._REFRESH_TTL: float = 1.0
 
-    def refresh(self):
-        """Poll database for latest state."""
+        # Initial refresh
+        self.refresh(force=True)
+
+    def refresh(self, force: bool = False):
+        """Poll database for latest state.
+
+        Throttled to at most once per _REFRESH_TTL seconds so concurrent agents
+        sharing this object don't each hammer the DB independently.
+        """
+        now = time.monotonic()
+        if not force and (now - self._last_refresh) < self._REFRESH_TTL:
+            return
+        self._last_refresh = now
         project = self.db.query(Project).filter(Project.id == self.project_id).first()
         if not project:
             logger.error(f"Project {self.project_id} not found")

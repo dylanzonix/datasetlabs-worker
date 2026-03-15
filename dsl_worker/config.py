@@ -49,6 +49,7 @@ class WorkerSettings(BaseSettings):
     research_model: str = "gpt-5.2"
     generation_model: str = "gpt-5.2"
     summarize_model: str = "gpt-5-nano"
+    extractor_model: str = "gpt-5-mini"       # model for candidate extraction (cheap batch)
 
     # V6 pipeline settings
     research_subagent_model: str = "gpt-5.2"    # model for research subagents

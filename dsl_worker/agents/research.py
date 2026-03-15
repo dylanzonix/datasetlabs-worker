@@ -113,6 +113,7 @@ class ResearchAgent:
         uploaded_file_urls: Optional[Dict[str, str]] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
         on_browser_started: Optional[Callable] = None,
+        on_browser_stopped: Optional[Callable] = None,
     ) -> None:
         self.workspace_dir = Path(workspace_dir)
 
@@ -134,6 +135,7 @@ class ResearchAgent:
             project_id=project_id,
             uploaded_file_urls=uploaded_file_urls,
             on_browser_started=on_browser_started,
+            on_browser_stopped=on_browser_stopped,
         )
         # Set a dummy scope for ResearchTools compatibility
         self._impl.set_scope(ResearchScope(
