@@ -5,7 +5,6 @@ Handles:
 - Accumulating costs from API calls
 - Charging to user credit balance at intervals
 - Checking if user has sufficient balance
-- THREAD-SAFE for concurrent workers
 
 Credits are consumed based on raw OpenAI cost divided by a configurable
 compute_cost_per_credit rate (e.g. $0.10 means 1 credit = $0.10 of compute).
@@ -13,7 +12,7 @@ compute_cost_per_credit rate (e.g. $0.10 means 1 credit = $0.10 of compute).
 
 import logging
 import threading
-import uuid
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, List
@@ -28,6 +27,9 @@ from dsl_api.credits import consume_credits, get_total_credits
 from dsl_api.plans import CENTS_PER_CREDIT
 
 logger = logging.getLogger(__name__)
+
+# Cache balance checks for this many seconds to avoid hammering the DB
+BALANCE_CACHE_TTL = 10.0
 
 
 @dataclass
@@ -47,14 +49,14 @@ class ChargeRecord:
     """Record of a charge made."""
     timestamp: datetime
     amount_credits: float
-    amount_cents: int  # For backward compat with cumulative_spend
+    amount_cents: int
 
 
 class CostTracker:
     """
     Tracks costs for a single project run and handles charging.
 
-    THREAD-SAFE: Uses locks for all state mutations.
+    Thread-safe via threading.Lock (DB calls are synchronous).
 
     Args:
         db: Database session
@@ -71,14 +73,13 @@ class CostTracker:
         user_id: UUID,
         project_id: UUID,
         compute_cost_per_credit: float = 0.10,
-        charge_threshold_cents: int = 100,  # Keep param name for backward compat
+        charge_threshold_cents: int = 100,
         charge_interval_seconds: int = 60,
     ):
         self.db = db
         self.user_id = user_id
         self.project_id = project_id
         self.compute_cost_per_credit = compute_cost_per_credit
-        # Convert cents threshold to credits
         self.charge_threshold_credits = charge_threshold_cents / CENTS_PER_CREDIT
         self.charge_interval_seconds = charge_interval_seconds
 
@@ -93,6 +94,10 @@ class CostTracker:
         # Cache cumulative spend at init
         self._cumulative_spend_at_start = self._query_cumulative_project_spend()
 
+        # Balance cache
+        self._cached_balance: Optional[float] = None
+        self._balance_cache_time: float = 0.0
+
         # Thread-safe lock
         self._lock = threading.Lock()
 
@@ -106,7 +111,6 @@ class CostTracker:
         if total_cost_usd <= 0:
             return
 
-        # Record the total cost incurred before the crash
         with self._lock:
             self._costs.append(CostEntry(
                 timestamp=datetime.now(timezone.utc),
@@ -116,7 +120,6 @@ class CostTracker:
             ))
 
         # Figure out how much was already charged by querying the ledger
-        # for debits on this project since the tracker was created.
         already_charged_cents = self._query_charged_since_start()
         if already_charged_cents > 0:
             already_charged_credits = already_charged_cents / CENTS_PER_CREDIT
@@ -165,7 +168,7 @@ class CostTracker:
 
     @property
     def cumulative_spend_cents(self) -> int:
-        """Total spend on this project including current run (in cents for backward compat)."""
+        """Total spend on this project including current run (in cents)."""
         with self._lock:
             charged_credits = sum(c.amount_credits for c in self._charges)
             charged_cents = int(charged_credits * CENTS_PER_CREDIT)
@@ -204,9 +207,9 @@ class CostTracker:
         total_tokens = input_tokens + output_tokens
         if model:
             logger.info(
-                f"💰 Cost: {phase} | {model} | "
+                f"Cost: {phase} | {model} | "
                 f"in={input_tokens:,} out={output_tokens:,} ({total_tokens:,} total) | "
-                f"${cost_usd:.4f} raw → {cost_credits:.2f} credits | "
+                f"${cost_usd:.4f} raw -> {cost_credits:.2f} credits | "
                 f"running total: {total_cost_credits:.2f} credits ({total_input:,}+{total_output:,} tokens)"
             )
 
@@ -232,7 +235,6 @@ class CostTracker:
         with self._lock:
             return self._total_costs_credits_unlocked()
 
-    # Backward compat
     @property
     def total_costs_cents(self) -> int:
         return int(self.total_costs_credits * CENTS_PER_CREDIT)
@@ -251,7 +253,6 @@ class CostTracker:
         with self._lock:
             return self._uncharged_credits_unlocked()
 
-    # Backward compat
     @property
     def uncharged_cents(self) -> int:
         return int(self.uncharged_credits * CENTS_PER_CREDIT)
@@ -276,13 +277,13 @@ class CostTracker:
         return False
 
     def charge_if_needed(self) -> Optional[float]:
-        """Charge uncharged costs if needed. Returns credits charged or None."""
+        """Charge uncharged costs if threshold or interval is met. Returns credits charged or None."""
         if not self.should_charge():
             return None
         return self._do_charge()
 
     def charge_remaining(self) -> Optional[float]:
-        """Charge any remaining uncharged costs."""
+        """Charge any remaining uncharged costs (call at end of run)."""
         with self._lock:
             if self._uncharged_credits_unlocked() <= 0:
                 return None
@@ -295,23 +296,49 @@ class CostTracker:
             if credits_to_charge <= 0:
                 return 0
 
-            account = self.db.query(Account).filter(Account.user_id == self.user_id).first()
-            if not account:
-                logger.error(f"No account found for user {self.user_id}")
-                return 0
+        # DB operations outside lock to minimize hold time
+        account = self.db.query(Account).filter(Account.user_id == self.user_id).first()
+        if not account:
+            logger.error(f"No account found for user {self.user_id}")
+            return 0
 
-            success = consume_credits(
-                self.db, account, credits_to_charge, project_id=self.project_id
+        success = consume_credits(
+            self.db, account, credits_to_charge, project_id=self.project_id
+        )
+
+        if not success:
+            # Partial balance — consume what's available, record that amount
+            self.db.rollback()
+            logger.warning(
+                f"[CostTracker] Insufficient balance for {credits_to_charge:.2f} credits. "
+                f"Charging what's available."
             )
+            # Re-query available balance and charge that
+            available = get_total_credits(self.db, account)
+            if available > 0.01:
+                success = consume_credits(
+                    self.db, account, available, project_id=self.project_id
+                )
+                if success:
+                    self.db.commit()
+                    credits_to_charge = available
+                else:
+                    self.db.rollback()
+                    return 0
+            else:
+                return 0
+        else:
             self.db.commit()
 
-            record = ChargeRecord(
+        with self._lock:
+            self._charges.append(ChargeRecord(
                 timestamp=datetime.now(timezone.utc),
                 amount_credits=credits_to_charge,
                 amount_cents=int(credits_to_charge * CENTS_PER_CREDIT),
-            )
-            self._charges.append(record)
+            ))
             self._last_charge_time = datetime.now(timezone.utc)
+            # Invalidate balance cache after charging
+            self._cached_balance = None
 
         logger.info(
             f"Charged user {self.user_id}: {credits_to_charge:.2f} credits "
@@ -321,13 +348,19 @@ class CostTracker:
         return credits_to_charge
 
     def get_user_balance_credits(self) -> float:
-        """Get user's current total available credits."""
+        """Get user's current total available credits (cached)."""
+        now = time.monotonic()
+        if self._cached_balance is not None and (now - self._balance_cache_time) < BALANCE_CACHE_TTL:
+            return self._cached_balance
+
         account = self.db.query(Account).filter(Account.user_id == self.user_id).first()
         if not account:
             return 0
-        return get_total_credits(self.db, account)
+        balance = get_total_credits(self.db, account)
+        self._cached_balance = balance
+        self._balance_cache_time = now
+        return balance
 
-    # Backward compat
     def get_user_balance_cents(self) -> int:
         return int(self.get_user_balance_credits() * CENTS_PER_CREDIT)
 
@@ -345,11 +378,7 @@ class CostTracker:
         return True, None
 
     def get_sample_cost_report(self, samples_generated: int, total_target_rows: int) -> dict:
-        """
-        Get cost report after sample phase for transparency UI.
-
-        Returns credits used for samples and estimated total cost.
-        """
+        """Get cost report after sample phase for transparency UI."""
         with self._lock:
             total_credits = self._total_costs_credits_unlocked()
 
@@ -382,7 +411,6 @@ class CostTracker:
             "total_costs_credits": round(total_costs_credits, 2),
             "total_charged_credits": round(total_charged_credits, 2),
             "uncharged_credits": round(uncharged_credits, 2),
-            # Backward compat in cents
             "total_costs_cents": int(total_costs_credits * CENTS_PER_CREDIT),
             "total_charged_cents": int(total_charged_credits * CENTS_PER_CREDIT),
             "uncharged_cents": int(uncharged_credits * CENTS_PER_CREDIT),

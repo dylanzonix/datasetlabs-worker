@@ -756,6 +756,8 @@ class JobProcessor:
                                 instructions=instructions,
                                 candidate=candidate,
                                 schema=schema,
+                                source_url=item.get("source_url"),
+                                source_content=item.get("source_content"),
                             )
 
                             if result.success and result.row:

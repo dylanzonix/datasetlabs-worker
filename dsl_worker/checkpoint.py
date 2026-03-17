@@ -5,9 +5,8 @@ Handles saving and restoring pipeline state for pause/resume.
 
 Checkpoints are stored as JSON in Azure Blob Storage.
 
-V5: Work items include template + seed values + filter findings.
+V9: Work items stored as-is (pass-through). No format remapping.
 Phases: orchestrator | execution | completed.
-Backward-compatible with v2/v3/v4 checkpoints.
 """
 
 import asyncio
@@ -15,22 +14,10 @@ import json
 import logging
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Dict, List, Optional, Set, Any
+from typing import Dict, List, Optional, Any
 from uuid import UUID
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class WorkItemCheckpoint:
-    """Serializable work item data."""
-    instruction: str
-    schema: Optional[Dict] = None
-
-    # Generation status
-    status: str = "pending"  # 'pending', 'completed', 'failed'
-    row_id: Optional[str] = None
 
 
 @dataclass
@@ -44,8 +31,7 @@ class PipelineCheckpoint:
     - Debuggable (human-readable JSON)
     """
 
-    # Version for future compatibility
-    version: str = "2.0"
+    version: str = "3.0"
 
     # Identity
     project_id: str = ""
@@ -55,13 +41,12 @@ class PipelineCheckpoint:
     created_at: str = ""
     updated_at: str = ""
 
-    # Phase tracking
-    # V5: 'orchestrator' | 'execution' | 'completed'
-    # V4 compat: 'sample' and 'generation' are treated as 'execution'
+    # Phase tracking: 'orchestrator' | 'execution' | 'completed'
     current_phase: str = "orchestrator"
 
-    # Work items (output of orchestrator, input to generation)
-    work_items: List[Dict] = field(default_factory=list)  # WorkItemCheckpoint as dict
+    # Work items — stored as-is from the pipeline (opaque dicts).
+    # Each item gets "status" and "row_id" fields added for tracking.
+    work_items: List[Dict] = field(default_factory=list)
 
     # Generation progress — just indices, actual rows are in DB
     processed_indices: List[int] = field(default_factory=list)
@@ -82,39 +67,44 @@ class PipelineCheckpoint:
 
     @classmethod
     def from_json(cls, json_str: str) -> 'PipelineCheckpoint':
-        """Deserialize from JSON string. Handles v1 (seeds) and v2 (work_items)."""
+        """Deserialize from JSON string. Handles legacy formats."""
         data = json.loads(json_str)
 
-        # Handle legacy v1 checkpoints with "seeds" field
-        if "seeds" in data and "work_items" not in data:
-            data["work_items"] = _migrate_seeds_to_work_items(data.pop("seeds"))
+        # --- Legacy migration ---
 
-        # Handle legacy phase names
-        if data.get("current_phase") == "research":
+        # v1: "seeds" field → work_items
+        if "seeds" in data and "work_items" not in data:
+            data["work_items"] = [
+                {"instructions": s.get("content", ""), "status": s.get("status", "pending"), "row_id": s.get("row_id")}
+                for s in data.pop("seeds")
+            ]
+
+        # Legacy phase names
+        phase = data.get("current_phase", "")
+        if phase == "research":
             data["current_phase"] = "orchestrator"
-        # V4 phases map to V5
-        if data.get("current_phase") in ("sample", "generation"):
+        elif phase in ("sample", "generation"):
             data["current_phase"] = "execution"
 
-        # Handle legacy field names
+        # Legacy field names
         if "processed_seed_indices" in data and "processed_indices" not in data:
             data["processed_indices"] = data.pop("processed_seed_indices")
 
-        # Remove legacy fields not in v2
-        for legacy_key in [
-            "completed_scope_ids", "pending_scopes", "seeds",
-            "processed_seed_indices",
-        ]:
-            data.pop(legacy_key, None)
+        # Remove any fields not in our dataclass
+        known_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        for key in list(data.keys()):
+            if key not in known_fields:
+                data.pop(key)
 
-        # Ensure version is set
-        if "version" not in data or data["version"] == "1.0":
-            data["version"] = "2.0"
+        # Bump version
+        data["version"] = "3.0"
 
         return cls(**data)
 
     def add_work_item(self, item: Dict) -> None:
-        """Add a work item."""
+        """Add a work item (stored as-is with status tracking)."""
+        item.setdefault("status", "pending")
+        item.setdefault("row_id", None)
         self.work_items.append(item)
 
     def mark_processed(self, index: int, success: bool, row_id: Optional[str] = None) -> None:
@@ -150,7 +140,7 @@ class CheckpointManager:
     """
     Manages pipeline checkpoints in Azure Blob Storage.
 
-    Thread-safe for concurrent generation workers.
+    Auto-saves based on pending update count or time interval.
     """
 
     def __init__(
@@ -160,7 +150,7 @@ class CheckpointManager:
         project_id: UUID,
         version_id: UUID,
         auto_save_interval: int = 30,  # seconds
-        auto_save_count: int = 10,     # work items
+        auto_save_count: int = 10,     # pending updates
     ):
         self.blob_client = blob_service_client
         self.container_name = container_name
@@ -172,7 +162,6 @@ class CheckpointManager:
 
         # Paths
         self._checkpoint_path = f"checkpoints/{project_id}/{version_id}/state.json"
-        self._history_prefix = f"checkpoints/{project_id}/{version_id}/history/"
 
         # State
         self._checkpoint: Optional[PipelineCheckpoint] = None
@@ -204,7 +193,6 @@ class CheckpointManager:
 
     @property
     def checkpoint(self) -> PipelineCheckpoint:
-        """Get current checkpoint."""
         if self._checkpoint is None:
             raise RuntimeError("CheckpointManager not initialized")
         return self._checkpoint
@@ -216,18 +204,14 @@ class CheckpointManager:
                 container=self.container_name,
                 blob=self._checkpoint_path
             )
-
             json_data = blob.download_blob().readall().decode('utf-8')
-            checkpoint = PipelineCheckpoint.from_json(json_data)
-
-            return checkpoint
-
+            return PipelineCheckpoint.from_json(json_data)
         except Exception as e:
             logger.debug(f"[CheckpointManager] No checkpoint found: {e}")
             return None
 
     async def save(self, force: bool = False) -> None:
-        """Save checkpoint to blob storage."""
+        """Save checkpoint to blob storage (respects auto-save thresholds)."""
         async with self._lock:
             if self._checkpoint is None:
                 return
@@ -245,7 +229,6 @@ class CheckpointManager:
                 return
 
             self._checkpoint.updated_at = now.isoformat()
-
             json_data = self._checkpoint.to_json()
 
             try:
@@ -254,15 +237,6 @@ class CheckpointManager:
                     blob=self._checkpoint_path
                 )
                 blob.upload_blob(json_data, overwrite=True)
-
-                # Save to history (for debugging)
-                timestamp = now.strftime("%Y%m%d_%H%M%S")
-                history_path = f"{self._history_prefix}{timestamp}.json"
-                history_blob = self.blob_client.get_blob_client(
-                    container=self.container_name,
-                    blob=history_path
-                )
-                history_blob.upload_blob(json_data, overwrite=True)
 
                 self._pending_updates = 0
                 self._last_save_time = now
@@ -280,29 +254,9 @@ class CheckpointManager:
                 raise
 
     async def add_work_item(self, work_item: Dict) -> None:
-        """Add a work item to the checkpoint. Handles both V4 and V5 formats."""
+        """Add a work item to the checkpoint (stored as-is)."""
         async with self._lock:
-            # V5 format has "template" key, V4 has "instruction"
-            if "template" in work_item:
-                checkpoint_item = {
-                    "template": work_item.get("template", ""),
-                    "seed_values": work_item.get("seed_values", {}),
-                    "filter_findings": work_item.get("filter_findings", ""),
-                    "metadata": work_item.get("metadata", {}),
-                    "tags": work_item.get("tags", {}),
-                    "status": "pending",
-                    "row_id": None,
-                }
-            else:
-                checkpoint_item = {
-                    "instruction": work_item.get("instruction", ""),
-                    "context": work_item.get("context", ""),
-                    "schema": work_item.get("schema"),
-                    "tags": work_item.get("tags", {}),
-                    "status": "pending",
-                    "row_id": None,
-                }
-            self._checkpoint.add_work_item(checkpoint_item)
+            self._checkpoint.add_work_item(dict(work_item))
             self._pending_updates += 1
 
         await self.save()
@@ -335,9 +289,12 @@ class CheckpointManager:
         await self.save(force=True)
 
     async def add_cost(self, cost_usd: float) -> None:
-        """Add to total cost."""
+        """Add to total cost. Bumps pending updates so cost is included in next save."""
         async with self._lock:
             self._checkpoint.total_cost_usd += cost_usd
+            self._pending_updates += 1
+
+        await self.save()
 
     async def add_error(self, error: Dict) -> None:
         """Record an error."""
@@ -348,7 +305,8 @@ class CheckpointManager:
             })
 
     async def delete(self) -> None:
-        """Delete checkpoint (after successful completion)."""
+        """Delete checkpoint and any history blobs (after successful completion)."""
+        # Delete main checkpoint
         try:
             blob = self.blob_client.get_blob_client(
                 container=self.container_name,
@@ -358,6 +316,21 @@ class CheckpointManager:
             logger.info("[CheckpointManager] Checkpoint deleted")
         except Exception as e:
             logger.warning(f"[CheckpointManager] Could not delete checkpoint: {e}")
+
+        # Clean up any legacy history blobs
+        try:
+            container_client = self.blob_client.get_container_client(self.container_name)
+            history_prefix = f"checkpoints/{self.project_id}/{self.version_id}/history/"
+            blobs = list(container_client.list_blobs(name_starts_with=history_prefix))
+            for blob in blobs:
+                try:
+                    container_client.delete_blob(blob.name)
+                except Exception:
+                    pass
+            if blobs:
+                logger.info(f"[CheckpointManager] Cleaned up {len(blobs)} history blobs")
+        except Exception as e:
+            logger.debug(f"[CheckpointManager] History cleanup skipped: {e}")
 
     async def force_save(self) -> None:
         """Force immediate save."""
@@ -369,40 +342,30 @@ def checkpoints_to_work_items(checkpoint_items: List[Dict]) -> List[Dict]:
     Convert checkpoint work item dicts to the format expected by
     GenerationWorkerPool.process_work_items().
 
-    V5 checkpoint: {template, seed_values, filter_findings, metadata, tags, status, row_id}
-    V4 checkpoint: {instruction, context, schema, tags, status, row_id}
-    Pool format: {template, seed_values, filter_findings, tags} or {instruction, context, schema, tags}
+    Strips checkpoint-only fields (status, row_id) and returns
+    the work items as-is. Handles legacy formats for backward compat.
     """
     work_items = []
     for item in checkpoint_items:
-        if "template" in item:
-            # V5 format
-            work_items.append({
-                "template": item.get("template", ""),
-                "seed_values": item.get("seed_values", {}),
-                "filter_findings": item.get("filter_findings", ""),
-                "metadata": item.get("metadata", {}),
-                "tags": item.get("tags", {}),
-            })
-        else:
-            # V4 format
-            work_items.append({
-                "instruction": item.get("instruction", ""),
-                "context": item.get("context", ""),
-                "schema": item.get("schema"),
-                "tags": item.get("tags", {}),
-            })
-    return work_items
+        # Copy and strip checkpoint tracking fields
+        wi = {k: v for k, v in item.items() if k not in ("status", "row_id")}
 
+        # Legacy V4/V5 → V9 migration: convert old format to current
+        if "template" in wi and "instructions" not in wi:
+            # V5 format: template + seed_values → instructions + candidate
+            wi = {
+                "instructions": wi.get("template", ""),
+                "candidate": wi.get("seed_values", {}),
+                "research_context": wi.get("filter_findings", ""),
+                "tags": wi.get("tags", {}),
+            }
+        elif "instruction" in wi and "instructions" not in wi:
+            # V4 format: instruction + context → instructions + candidate
+            wi = {
+                "instructions": wi.get("instruction", ""),
+                "candidate": wi.get("context", ""),
+                "tags": wi.get("tags", {}),
+            }
 
-def _migrate_seeds_to_work_items(seeds: List[Dict]) -> List[Dict]:
-    """Convert v1 seed checkpoint dicts to v2 work item format."""
-    work_items = []
-    for seed in seeds:
-        work_items.append({
-            "instruction": seed.get("content", ""),
-            "schema": None,
-            "status": seed.get("status", "pending"),
-            "row_id": seed.get("row_id"),
-        })
+        work_items.append(wi)
     return work_items

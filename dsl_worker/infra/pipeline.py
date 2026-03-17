@@ -137,9 +137,12 @@ class SeedProcessor:
 
     def _build_work_item(self, seed: Seed) -> Dict[str, Any]:
         """Build a work item for the row generator."""
-        return {
+        item: Dict[str, Any] = {
             "instructions": self._instructions,
             "candidate": seed.values,
             "research_context": self._research_context,
             "tags": seed.metadata.get("tags", {}),
         }
+        if seed.metadata.get("source_url"):
+            item["source_url"] = seed.metadata["source_url"]
+        return item

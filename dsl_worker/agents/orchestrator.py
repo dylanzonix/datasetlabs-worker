@@ -29,6 +29,9 @@ from dsl_worker.infra.pipeline import SeedProcessor
 
 logger = logging.getLogger(__name__)
 
+CRAWLER_WALL_CLOCK_TIMEOUT = 300  # seconds
+CRAWLER_DEAD_TIMEOUT = 120  # auto-kill crawler if 0 pages after this many seconds
+
 
 ORCHESTRATOR_SYSTEM_PROMPT = """\
 You are the orchestrator for a dataset generation system. A user described a dataset \
@@ -475,10 +478,31 @@ class OrchestratorAgent:
                     on_browser_stopped=self.on_browser_stopped,
                 )
 
+                # Watchdog: kill crawler if 0 pages after CRAWLER_DEAD_TIMEOUT
+                async def _dead_crawler_watchdog():
+                    await asyncio.sleep(CRAWLER_DEAD_TIMEOUT)
+                    if pages_dumped == 0:
+                        logger.info(
+                            f"[orchestrator] Crawler {idx} auto-killed: "
+                            f"0 pages after {CRAWLER_DEAD_TIMEOUT}s"
+                        )
+                        crawler._gate.set()
+
+                watchdog_task = asyncio.create_task(_dead_crawler_watchdog())
+
                 t0 = time.time()
                 try:
-                    await crawler.run()
+                    await asyncio.wait_for(
+                        crawler.run(),
+                        timeout=CRAWLER_WALL_CLOCK_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"[orchestrator] Crawler {idx} wall-clock timeout "
+                        f"({CRAWLER_WALL_CLOCK_TIMEOUT}s)"
+                    )
                 finally:
+                    watchdog_task.cancel()
                     await crawler.cleanup()
 
                 crawl_time = time.time() - t0
@@ -600,9 +624,21 @@ class OrchestratorAgent:
                 "strategy, then set instructions and harvest candidates."
             )
 
+        def _should_exit() -> bool:
+            if self._is_done:
+                return True
+            rows_done = self._generation_stats.get("rows_generated", 0)
+            if rows_done >= self.num_samples:
+                logger.info(
+                    f"[orchestrator] Auto-done: {rows_done}/{self.num_samples} rows generated"
+                )
+                self._is_done = True
+                return True
+            return False
+
         return await self._conversation.send(
             message,
-            exit_condition=lambda: self._is_done,
+            exit_condition=_should_exit,
         )
 
     @property

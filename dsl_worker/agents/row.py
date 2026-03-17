@@ -179,7 +179,9 @@ and the column is something that should be unique (like a name, URL, or email), 
 this is likely a duplicate. Call skip_row(reason="duplicate: ...") if so.
    - Use your judgment: 50 rows with country="USA" is normal, but 2 rows with \
 the same email or very similar program name is suspicious.
-3. Research what you still need. Use primary sources. Verify claims that matter.
+3. Research what you still need. If a source URL is provided, open it first \
+before searching — the page likely has links to the candidate's own website. \
+Use primary sources. Verify claims that matter.
 4. Fill remaining columns with set_column().
 5. Call submit_row() when all columns are filled.
 
@@ -558,6 +560,8 @@ class RowGeneratorAgent:
         instructions: str,
         candidate: Any,
         schema: Optional[List[Dict]] = None,
+        source_url: Optional[str] = None,
+        source_content: Optional[str] = None,
     ) -> GeneratedRow:
         """Generate a single row from a candidate."""
         if schema is None:
@@ -593,8 +597,12 @@ class RowGeneratorAgent:
         # Candidate goes in the user message (not system prompt) so the system
         # prompt prefix is identical across all row generators → prompt caching.
         candidate_text = self._format_candidate(candidate)
+        source_section = ""
+        if source_url:
+            source_section = f"\n\n## Source URL\n\n{source_url}"
         user_msg = (
-            f"## Candidate\n\n{candidate_text}\n\n"
+            f"## Candidate\n\n{candidate_text}"
+            f"{source_section}\n\n"
             f"Process this candidate and generate a dataset row."
         )
 

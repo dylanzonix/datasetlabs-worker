@@ -337,13 +337,12 @@ class ResearchTools:
                 )
                 self._browser_context = browser.contexts[0]
 
-                # Inject cookies from Azure Blob (global + per-project)
-                if self.blob_service_client and self.project_id:
+                # Inject global cookies from Azure Blob
+                if self.blob_service_client:
                     from dsl_worker.infra.cookie_manager import load_cookies
                     storage_state = load_cookies(
                         self.blob_service_client,
                         settings.azure_storage_container_name,
-                        self.project_id,
                         settings.browser_global_cookies_blob_path,
                     )
                     if storage_state and storage_state.get("cookies"):
@@ -479,24 +478,6 @@ class ResearchTools:
 
         # Cleanup cloud browser session
         if self._browser_context or self._cloud_session_id:
-            # Save project cookies before stopping
-            if self._browser_context:
-                try:
-                    if self.blob_service_client and self.project_id:
-                        from dsl_worker.config import settings
-                        from dsl_worker.infra.cookie_manager import save_project_cookies_from_context
-                        try:
-                            await save_project_cookies_from_context(
-                                self._browser_context,
-                                self.blob_service_client,
-                                settings.azure_storage_container_name,
-                                self.project_id,
-                            )
-                        except Exception as e:
-                            logger.warning(f"[ResearchTools] Failed to save cookies: {e}")
-                except Exception as e:
-                    logger.warning(f"[ResearchTools] Error during cookie save: {e}")
-
             # Stop cloud browser session FIRST (before disconnecting Playwright)
             # so the API call goes through while we still have connectivity
             if self._cloud_client and self._cloud_session_id:
