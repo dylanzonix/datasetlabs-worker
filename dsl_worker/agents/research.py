@@ -19,8 +19,9 @@ from dsl_worker.infra.research_tools import ResearchTools, ResearchScope
 logger = logging.getLogger(__name__)
 
 RESEARCH_SYSTEM_PROMPT = """\
-You are a research agent in a multi-agent system. An orchestrator sends you
-specific questions; your job is to investigate and give a focused answer.
+# Research Agent
+
+An orchestrator sends specific questions; investigate and give a focused answer.
 
 The orchestrator controls depth — it will send follow-up questions if it needs
 more detail on any aspect. Your job is to give a solid answer to the specific

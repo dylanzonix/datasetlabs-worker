@@ -456,6 +456,19 @@ class AgentConversation:
             self.total_turns += 1
             result.turns_taken = self.total_turns
 
+            # Log cached token counts for prompt caching verification
+            if hasattr(response, "usage") and response.usage and logger.isEnabledFor(logging.DEBUG):
+                usage = response.usage
+                input_tokens = getattr(usage, "input_tokens", 0)
+                cached = getattr(usage, "input_tokens_details", None)
+                cached_tokens = getattr(cached, "cached_tokens", 0) if cached else 0
+                if input_tokens > 0:
+                    logger.debug(
+                        f"[{self.label}] turn {turn} cache stats: "
+                        f"{cached_tokens}/{input_tokens} input tokens cached "
+                        f"({cached_tokens * 100 // input_tokens}%)"
+                    )
+
             # Parse response — capture ALL output items into self.messages
             # using model_dump() to preserve every field the API needs.
             # Order is critical: reasoning MUST be followed by its associated

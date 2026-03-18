@@ -36,8 +36,9 @@ TRIM_MIN_LENGTH = 500  # Don't bother truncating short outputs
 
 
 CRAWLER_SYSTEM_PROMPT = """\
-You are a source navigator for a dataset generation pipeline. Your job is to \
-browse assigned sources and save pages that contain candidate items for the dataset.
+# Source Navigator — Dataset Generation Pipeline
+
+Browse the assigned sources below and save pages that contain candidate items for the dataset.
 
 <what_to_find>
 {candidate_description}

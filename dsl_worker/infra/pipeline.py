@@ -26,9 +26,6 @@ class Seed:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-OVERSHOOT_FACTOR = 3  # accept up to 3x the remaining rows needed as in-flight seeds
-
-
 class SeedProcessor:
     """
     Accepts candidates from harvesters and dispatches them to the work queue.
@@ -39,9 +36,9 @@ class SeedProcessor:
     No seed-level dedup — dedup happens at row level inside the row generator
     via token Jaccard similarity on all columns.
 
-    Backpressure: stops accepting seeds when in-flight seeds exceed
-    remaining rows needed * OVERSHOOT_FACTOR, preventing crawlers from
-    producing far more seeds than the target requires.
+    Backpressure is organic: when the bounded work queue is full, submit_seed()
+    blocks until row generators consume items, which throttles extractors and
+    crawlers upstream.
     """
 
     def __init__(
@@ -89,35 +86,30 @@ class SeedProcessor:
             "remaining": max(0, self._target_rows - rows_done),
         }
 
-    def _is_backpressured(self) -> bool:
-        """Return True if we have enough seeds in flight to hit the target."""
+    def _is_full(self) -> bool:
+        """Return True if target rows have been generated."""
         rows_done = self._generation_stats.get("rows_generated", 0)
-        rows_skipped = self._generation_stats.get("skipped", 0)
-        processed = rows_done + rows_skipped
-        in_flight = self._accepted - processed
-        rows_needed = max(0, self._target_rows - rows_done)
-        if rows_needed == 0:
-            return True
-        return in_flight > rows_needed * OVERSHOOT_FACTOR
+        return rows_done >= self._target_rows
 
     async def submit_seed(self, seed: Seed, harvester_id: str = "") -> Dict[str, Any]:
         """
         Accept a candidate and queue it for row generation.
 
         Returns status dict: {accepted, stats}.
-        Rejects with backpressure if in-flight seeds already cover the target.
+        Blocks if the work queue is full (organic backpressure) — extractors
+        and crawlers slow down naturally until row generators catch up.
         """
         if not self._instructions:
             return {"accepted": False, "reason": "no instructions set", "stats": self.stats}
 
         async with self._lock:
             self._submitted_total += 1
-            if self._is_backpressured():
+            if self._is_full():
                 logger.debug(
-                    f"[SeedProcessor] Backpressure: {self._accepted} accepted, "
+                    f"[SeedProcessor] Full: {self._accepted} accepted, "
                     f"{self._generation_stats.get('rows_generated', 0)} rows done"
                 )
-                return {"accepted": False, "reason": "backpressure", "stats": self.stats}
+                return {"accepted": False, "reason": "target_reached", "stats": self.stats}
             self._accepted += 1
 
         work_item = self._build_work_item(seed)
@@ -125,7 +117,17 @@ class SeedProcessor:
         if self._on_checkpoint:
             await self._on_checkpoint(work_item)
 
-        await self._work_queue.put(work_item)
+        # Backpressure loop: if the bounded queue is full, wait with a timeout
+        # so we can re-check _is_full() and bail if quota was reached while
+        # we were blocked (prevents deadlock if consumer stops).
+        while True:
+            if self._is_full():
+                return {"accepted": True, "stats": self.stats}
+            try:
+                await asyncio.wait_for(self._work_queue.put(work_item), timeout=2.0)
+                break
+            except asyncio.TimeoutError:
+                continue
 
         logger.info(
             f"[SeedProcessor] Candidate accepted ({self._accepted}, "

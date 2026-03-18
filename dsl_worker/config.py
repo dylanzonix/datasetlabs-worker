@@ -46,14 +46,14 @@ class WorkerSettings(BaseSettings):
     brave_api_key: str
     brave_search_rps: float = 0.5  # requests per second
 
-    research_model: str = "gpt-5.2"
-    generation_model: str = "gpt-5-mini"
+    research_model: str = "gpt-5.4"
+    generation_model: str = "gpt-5.4"
     summarize_model: str = "gpt-5-nano"
     extractor_model: str = "gpt-5-mini"       # model for candidate extraction (cheap batch)
 
     # V6 pipeline settings
-    research_subagent_model: str = "gpt-5.2"    # model for research subagents
-    seed_yielder_model: str = "gpt-5.2"          # model for seed yielders
+    research_subagent_model: str = "gpt-5-mini"    # model for research subagents
+    seed_yielder_model: str = "gpt-5-mini"          # model for seed yielders
     max_research_subagents: int = 10             # cap on parallel research
     max_seed_yielders: int = 10                  # cap on parallel seed yielders
     orchestrator_max_turns: int = 40             # hard cap on orchestrator turns

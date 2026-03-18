@@ -34,8 +34,9 @@ CRAWLER_DEAD_TIMEOUT = 120  # auto-kill crawler if 0 pages after this many secon
 
 
 ORCHESTRATOR_SYSTEM_PROMPT = """\
-You are the orchestrator for a dataset generation system. A user described a dataset \
-they want. Your job is to figure out how to produce it and coordinate execution.
+# Dataset Generation Orchestrator
+
+A user described a dataset they want. Figure out how to produce it and coordinate execution.
 
 You stay in the loop throughout — dispatch research, write row instructions, launch \
 harvesters in rounds, and adapt based on results.
@@ -285,6 +286,7 @@ class OrchestratorAgent:
         # --- research ---
         async def research(args: Dict) -> tuple[str, float]:
             from dsl_worker.agents.research import ResearchAgent
+            from dsl_worker.config import settings as worker_settings
 
             question = args.get("question", "")
             scope = args.get("scope", "")
@@ -298,7 +300,7 @@ class OrchestratorAgent:
 
             agent = ResearchAgent(
                 openai_client=self.openai_client,
-                model=self.model,
+                model=worker_settings.research_subagent_model,
                 workspace_dir=self.workspace_dir,
                 brave_api_key=self.brave_api_key,
                 sandbox=self.sandbox,
@@ -337,7 +339,10 @@ class OrchestratorAgent:
             except Exception as e:
                 logger.warning(f"Failed to save research finding: {e}")
 
-            return f"[Saved to research/finding_{n}.md]\n\n{result.text}", result.cost_usd
+            # Return 0.0 cost — already reported via on_cost above.
+            # Returning the cost here would cause base.py's tool loop to
+            # call on_cost a second time, double-charging the user.
+            return f"[Saved to research/finding_{n}.md]\n\n{result.text}", 0.0
 
         registry.add(
             name="research",
@@ -486,7 +491,7 @@ class OrchestratorAgent:
                             f"[orchestrator] Crawler {idx} auto-killed: "
                             f"0 pages after {CRAWLER_DEAD_TIMEOUT}s"
                         )
-                        crawler._gate.set()
+                        crawler._is_done = True
 
                 watchdog_task = asyncio.create_task(_dead_crawler_watchdog())
 
@@ -511,12 +516,13 @@ class OrchestratorAgent:
                 if not extraction_tasks:
                     stats = self._seed_processor.stats
                     gen = self._generation_stats
+                    # Return 0.0 cost — crawler already reported via on_cost.
                     return (
                         f"Harvester {idx}: no pages found in {crawl_time:.0f}s. "
                         f"Cost: ${crawl_cost:.3f}. "
                         f"Pipeline: {stats['accepted']} candidates accepted, "
                         f"{gen.get('rows_generated', 0)} rows generated."
-                    ), crawl_cost
+                    ), 0.0
 
                 results = await asyncio.gather(*extraction_tasks, return_exceptions=True)
 
@@ -533,6 +539,9 @@ class OrchestratorAgent:
                 stats = self._seed_processor.stats
                 gen = self._generation_stats
 
+                # Return 0.0 cost — crawler and extractor already reported
+                # via their own on_cost callbacks. Returning total_cost here
+                # would cause base.py's tool loop to double-charge.
                 return (
                     f"Harvester {idx} done: {pages_dumped} pages in {crawl_time:.0f}s, "
                     f"{candidates_found} candidates extracted. "
@@ -541,7 +550,7 @@ class OrchestratorAgent:
                     f"{gen.get('rows_generated', 0)} rows generated, "
                     f"{gen.get('skipped', 0)} skipped. "
                     f"Cost: ${total_cost:.3f} (crawl=${crawl_cost:.3f}, extract=${extract_cost:.3f})."
-                ), total_cost
+                ), 0.0
 
         registry.add(
             name="harvest",

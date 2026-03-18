@@ -352,7 +352,9 @@ class JobProcessor:
         logger.info(f"[Pipeline] Starting V6 pipeline with {len(chat_history)} chat messages")
 
         # === Shared state ===
-        work_item_queue: asyncio.Queue = asyncio.Queue()
+        work_item_queue: asyncio.Queue = asyncio.Queue(
+            maxsize=settings.generation_parallel_samples
+        )
         generation_stats = {
             "rows_generated": 0,
             "errors": 0,
@@ -492,6 +494,7 @@ class JobProcessor:
                 on_browser_started=on_browser_started,
                 on_browser_stopped=on_browser_stopped,
                 dedup_store=dedup_store,
+                target_rows=state.num_samples,
             )
         )
 
@@ -545,8 +548,15 @@ class JobProcessor:
             f"[Pipeline] Orchestrator complete. Seeds: {seed_processor.stats}"
         )
 
-        # Signal generation consumer to drain
-        await work_item_queue.put(None)  # poison pill
+        # Signal generation consumer to drain (bounded queue may be full
+        # if consumer already exited, so use put_nowait with guard)
+        if generation_task.done():
+            logger.info("[Pipeline] Generation consumer already done, skipping poison pill")
+        else:
+            try:
+                work_item_queue.put_nowait(None)
+            except asyncio.QueueFull:
+                logger.info("[Pipeline] Queue full, consumer likely done — skipping poison pill")
         try:
             await asyncio.wait_for(generation_task, timeout=300)
         except asyncio.TimeoutError:
@@ -688,6 +698,7 @@ class JobProcessor:
         on_browser_started: Optional[Callable] = None,
         on_browser_stopped: Optional[Callable] = None,
         dedup_store: Optional[DedupStore] = None,
+        target_rows: int = 0,
     ) -> None:
         """
         Background consumer: dequeue work items and process them with a
@@ -702,6 +713,14 @@ class JobProcessor:
 
         dedup_store = dedup_store or DedupStore()
 
+        # Wrapped stop checker: row generators (and their research subagents
+        # which inherit self.stop_checker) exit at the next turn boundary
+        # when quota is hit — no task.cancel() needed.
+        def gen_stop_checker():
+            if stop_checker():
+                return True
+            return target_rows > 0 and generation_stats["rows_generated"] >= target_rows
+
         # Shared row saver (DB writes must be serialized)
         row_saver = GenerationWorkerPool(
             workspace_dir=workspace_dir,
@@ -714,7 +733,7 @@ class JobProcessor:
         async def process_one(index: int, item: Dict):
             """Process a single work item under the semaphore."""
             async with semaphore:
-                if stop_checker():
+                if gen_stop_checker():
                     return
 
                 agent = RowGeneratorAgent(
@@ -725,7 +744,7 @@ class JobProcessor:
                     dedup_store=dedup_store,
                     brave_api_key=settings.brave_api_key,
                     sandbox=self._sandbox,
-                    stop_checker=stop_checker,
+                    stop_checker=gen_stop_checker,
                     stop_event=stop_event,
                     blob_service_client=self.blob_service_client,
                     project_id=project.id,
@@ -762,10 +781,18 @@ class JobProcessor:
 
                             if result.success and result.row:
                                 async with save_lock:
+                                    # Atomic quota check + save: guarantees we
+                                    # never persist more rows than target_rows.
+                                    if target_rows > 0 and generation_stats["rows_generated"] >= target_rows:
+                                        logger.info(
+                                            f"[Generation] Discarding row at index {index}: "
+                                            f"quota reached ({target_rows})"
+                                        )
+                                        break
                                     row_id = await row_saver._save_row(
                                         result.row, tags=tags,
                                     )
-                                generation_stats["rows_generated"] += 1
+                                    generation_stats["rows_generated"] += 1
 
                                 if generation_stats["rows_generated"] % 10 == 0:
                                     logger.info(
@@ -826,6 +853,14 @@ class JobProcessor:
         try:
             while True:
                 if stop_checker():
+                    break
+
+                # Quota check: stop dequeuing once target is reached
+                if target_rows > 0 and generation_stats["rows_generated"] >= target_rows:
+                    logger.info(
+                        f"[Generation] Target reached ({generation_stats['rows_generated']}"
+                        f"/{target_rows}), stopping consumer"
+                    )
                     break
 
                 try:
@@ -961,7 +996,10 @@ class JobProcessor:
     ) -> None:
         """Drain the generation consumer by sending a poison pill and waiting."""
         if generation_task and not generation_task.done():
-            await work_item_queue.put(None)  # poison pill
+            try:
+                work_item_queue.put_nowait(None)  # poison pill
+            except asyncio.QueueFull:
+                logger.info("[Pipeline] Queue full during drain, consumer likely done")
             try:
                 await asyncio.wait_for(generation_task, timeout=120)
             except asyncio.TimeoutError:

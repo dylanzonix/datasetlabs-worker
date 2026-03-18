@@ -179,8 +179,8 @@ and the column is something that should be unique (like a name, URL, or email), 
 this is likely a duplicate. Call skip_row(reason="duplicate: ...") if so.
    - Use your judgment: 50 rows with country="USA" is normal, but 2 rows with \
 the same email or very similar program name is suspicious.
-3. Research what you still need. If a source URL is provided, open it first \
-before searching — the page likely has links to the candidate's own website. \
+3. Research what you still need. Use research(question) to look up information — \
+include the source URL in your question if one is provided. \
 Use primary sources. Verify claims that matter.
 4. Fill remaining columns with set_column().
 5. Call submit_row() when all columns are filled.
@@ -201,12 +201,9 @@ exist in other rows — check them for duplicates.
 - clear_column(name): Clear a column to start over.
 - submit_row(): Submit the completed row.
 - skip_row(reason): Skip this candidate entirely.
-- brave_search(query): Search the web.
-- open(url): View a page.
-- find(ref_id, pattern): Search within a loaded page.
-- click(ref_id, link_id): Follow a link.
+- research(question): Ask a research sub-agent to look something up on the web. \
+Returns a concise answer. Use this instead of browsing directly.
 - code_exec(script, description): Execute Python.
-- interact(url_or_ref_id, task): Browser agent for anti-bot bypass only.
 - read_file(path): Read a workspace file.
 """
 
@@ -536,7 +533,70 @@ class RowGeneratorAgent:
             handler=read_file,
         )
 
-        self._impl.register_on(registry)
+        self._impl.register_on(
+            registry,
+            exclude=["brave_search", "open", "find", "click", "interact", "shell_exec"],
+            include_builtins=False,
+        )
+
+        # research() — delegates to a ResearchAgent on a cheap model
+        async def research(args: Dict) -> tuple[str, float]:
+            from dsl_worker.agents.research import ResearchAgent
+            from dsl_worker.config import settings as worker_settings
+
+            question = args.get("question", "")
+            if not question:
+                return "Error: question is required", 0.0
+
+            agent = ResearchAgent(
+                openai_client=self.openai_client,
+                model=worker_settings.research_subagent_model,
+                workspace_dir=self.workspace_dir,
+                brave_api_key=self._impl.brave_api_key,
+                sandbox=self._impl.sandbox,
+                stop_checker=self.stop_checker,
+                max_turns=8,
+                blob_service_client=self._impl.blob_service_client,
+                project_id=self._impl.project_id,
+                on_browser_started=self._impl._on_browser_started,
+                on_browser_stopped=self._impl._on_browser_stopped,
+            )
+            if self.langfuse_parent:
+                agent._conversation.langfuse_parent = self.langfuse_parent
+
+            try:
+                result = await agent.ask_full(question)
+            finally:
+                await agent.cleanup()
+
+            if self.on_cost and result.cost_usd > 0:
+                await self.on_cost(result.cost_usd, "row_research_subagent")
+
+            answer = result.text or ""
+            if len(answer) > 3000:
+                answer = answer[:3000] + "\n\n[Truncated to 3K chars]"
+
+            # Return 0.0 cost — already reported via on_cost above.
+            return answer, 0.0
+
+        registry.add(
+            name="research",
+            description=(
+                "Ask a research sub-agent to look something up on the web. "
+                "Returns a concise answer. Use for any web research needs."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "Specific question to research",
+                    },
+                },
+                "required": ["question"],
+            },
+            handler=research,
+        )
 
     def _format_conversation(self) -> str:
         if not self.chat_history:

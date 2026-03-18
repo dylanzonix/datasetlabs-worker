@@ -1840,7 +1840,7 @@ if os.path.exists(_seeds_path):
     # Tool Registration for Agent Framework
     # =========================================================================
 
-    def register_on(self, registry: 'ToolRegistry', exclude: Optional[List[str]] = None) -> None:
+    def register_on(self, registry: 'ToolRegistry', exclude: Optional[List[str]] = None, include_builtins: bool = True) -> None:
         """
         Register browsing/research tools onto an agent ToolRegistry.
 
@@ -1906,10 +1906,11 @@ if os.path.exists(_seeds_path):
 
         # Add OpenAI native web search tool — the model can use this to read
         # web pages directly without going through Browser Use Cloud.
-        registry.add_builtin({
-            "type": "web_search_preview",
-            "search_context_size": "medium",
-        })
+        if include_builtins:
+            registry.add_builtin({
+                "type": "web_search_preview",
+                "search_context_size": "medium",
+            })
 
     # =========================================================================
     # Tool Definitions for LLM
