@@ -60,6 +60,9 @@ class PipelineCheckpoint:
     # Error tracking
     errors: List[Dict] = field(default_factory=list)
 
+    # V10: Source stats for CandidatePool Thompson Sampling state
+    source_stats: Optional[Dict[str, Any]] = None
+
     def to_json(self) -> str:
         """Serialize to JSON string."""
         data = asdict(self)

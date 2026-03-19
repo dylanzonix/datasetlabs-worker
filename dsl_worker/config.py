@@ -36,7 +36,7 @@ class WorkerSettings(BaseSettings):
     checkpoint_interval_seconds: int = 60
 
     # Generation settings
-    generation_parallel_samples: int = 30  # Number of samples to generate in parallel
+    generation_parallel_samples: int = 10  # Number of samples to generate in parallel
 
     # Billing settings
     compute_cost_per_credit: float = 0.10  # How much raw OpenAI spend 1 credit covers
@@ -48,12 +48,10 @@ class WorkerSettings(BaseSettings):
 
     research_model: str = "gpt-5.4"
     generation_model: str = "gpt-5.4"
-    summarize_model: str = "gpt-5-nano"
-    extractor_model: str = "gpt-5-mini"       # model for candidate extraction (cheap batch)
 
-    # V6 pipeline settings
-    research_subagent_model: str = "gpt-5-mini"    # model for research subagents
-    seed_yielder_model: str = "gpt-5-mini"          # model for seed yielders
+    # V10 pipeline settings
+    research_subagent_model: str = "gpt-5.4"           # model for research subagents
+    seed_yielder_model: str = "gpt-5.4"               # model for harvesters
     max_research_subagents: int = 10             # cap on parallel research
     max_seed_yielders: int = 10                  # cap on parallel seed yielders
     orchestrator_max_turns: int = 40             # hard cap on orchestrator turns
@@ -66,8 +64,11 @@ class WorkerSettings(BaseSettings):
     browser_use_api_key: str = ""                  # API key from cloud.browser-use.com/settings
     browser_use_proxy_country: str = "us"          # Residential proxy country code (us, gb, de, etc.)
 
-    # Cookie persistence blob path (global pre-auth cookies shared across all projects)
-    browser_global_cookies_blob_path: str = "browser/global_cookies.json"
+    # Credential pool service URL (serves authenticated cookies per session)
+    credential_pool_url: str = ""
+
+    # Local browser viewer (auto-opens a page showing live browser sessions for the current job)
+    browser_viewer_enabled: bool = False
 
     # Langfuse observability (optional — leave blank to disable)
     langfuse_secret_key: str = ""

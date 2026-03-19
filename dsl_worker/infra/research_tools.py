@@ -337,16 +337,12 @@ class ResearchTools:
                 )
                 self._browser_context = browser.contexts[0]
 
-                # Inject global cookies from Azure Blob
-                if self.blob_service_client:
-                    from dsl_worker.infra.cookie_manager import load_cookies
-                    storage_state = load_cookies(
-                        self.blob_service_client,
-                        settings.azure_storage_container_name,
-                        settings.browser_global_cookies_blob_path,
-                    )
-                    if storage_state and storage_state.get("cookies"):
-                        await self._browser_context.add_cookies(storage_state["cookies"])
+                # Inject authenticated cookies from credential pool
+                if settings.credential_pool_url:
+                    from dsl_worker.infra.credential_pool import load_pool_cookies
+                    pool_cookies = await load_pool_cookies(settings.credential_pool_url)
+                    if pool_cookies:
+                        await self._browser_context.add_cookies(pool_cookies)
 
         return self._browser_context
     
@@ -454,6 +450,28 @@ class ResearchTools:
         except Exception as e:
             logger.debug(f"[ResearchTools] Error stopping BU CDPClient: {e}")
 
+    @staticmethod
+    async def _kill_event_bus(agent) -> None:
+        """Ensure BU agent's EventBus is fully dead after cleanup."""
+        try:
+            session = getattr(agent, 'browser_session', None)
+            if not session:
+                return
+            bus = getattr(session, 'event_bus', None)
+            if not bus:
+                return
+            if getattr(bus, '_is_running', False):
+                await bus.stop(clear=True, timeout=2)
+            task = getattr(bus, '_runloop_task', None)
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        except Exception:
+            pass
+
     async def cleanup(self):
         """Cleanup browser, BU agent, and sandbox sessions."""
         # Cleanup BU agent — stop its CDPClient first, then close
@@ -461,6 +479,7 @@ class ResearchTools:
             try:
                 await self._stop_bu_cdp_client(self._bu_agent)
                 await self._bu_agent.close()
+                await self._kill_event_bus(self._bu_agent)
                 logger.info("[ResearchTools] BU agent closed")
             except Exception as e:
                 logger.warning(f"[ResearchTools] Error closing BU agent: {e}")
@@ -1160,7 +1179,7 @@ if os.path.exists(_seeds_path):
 
         # Add seeds to our collection
         for seed_data in new_seeds:
-            self._add_seed_from_code(seed_data)
+            await self._add_seed_from_code(seed_data)
 
         # Build response
         output_parts = []
@@ -1215,11 +1234,17 @@ if os.path.exists(_seeds_path):
 
         return '\n'.join(output_parts) if output_parts else "Command executed (no output)", 0.0
 
-    def _add_seed_from_code(self, seed_data: Dict):
+    async def _add_seed_from_code(self, seed_data: Dict):
         """Add a seed that was submitted via code execution."""
+        # V10: if harvester set on_seed_from_code callback, bridge to CandidatePool
+        if hasattr(self, 'on_seed_from_code') and self.on_seed_from_code:
+            await self.on_seed_from_code(seed_data)
+            self.seeds_submitted += 1
+            return
+
         if not self.scope:
             return
-        
+
         seed = Seed(
             content=seed_data.get("content", ""),
             scope_id=self.scope.id,
@@ -1778,6 +1803,8 @@ if os.path.exists(_seeds_path):
                         await self._bu_agent.close()
                     except Exception:
                         pass
+                    # Kill any EventBus that restarted during cleanup
+                    await self._kill_event_bus(self._bu_agent)
                     self._bu_agent = None
 
                 await self._reconnect_playwright()

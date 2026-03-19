@@ -1,16 +1,16 @@
 """
 Orchestrator agent — coordinates dataset generation.
 
-V8: Simplified pipeline. No template variables, no seed-level dedup.
-The orchestrator does recon, sets row-generator instructions, then harvests
-in rounds. Row-level dedup is handled automatically by set_column() in
-row generators (token Jaccard on all columns, LLM judges).
+V10: Event-driven, multi-armed bandit. The orchestrator is a reactive strategist:
+- harvest() is non-blocking — spawns harvesters in background
+- No set_instructions — row generators use conversation context directly
+- No done() — system auto-exits when target reached or all sources exhausted
+- Events (source_exhausted, milestone, stall, etc.) auto-inject as messages
+  via the on_idle callback in AgentConversation
 
 Tools:
 - research(question, ...) — spawn research subagent
-- set_instructions(instructions, candidate_description) — set row generator instructions
-- harvest(source, instructions, quota) — crawl + extract candidates (returns status)
-- done() — signal completion
+- harvest(source, description) — spawn a harvester (non-blocking)
 """
 
 from __future__ import annotations
@@ -25,87 +25,93 @@ from typing import Any, Callable, Dict, List, Optional
 from dsl_worker.agents.base import AgentConversation, AgentResult
 from dsl_worker.agents.tools import ToolRegistry
 from dsl_worker.billing.tracked_client import TrackedOpenAIClient
-from dsl_worker.infra.pipeline import SeedProcessor
+from dsl_worker.infra.candidate_pool import CandidatePool, StrategyMonitor
 
 logger = logging.getLogger(__name__)
 
-CRAWLER_WALL_CLOCK_TIMEOUT = 300  # seconds
-CRAWLER_DEAD_TIMEOUT = 120  # auto-kill crawler if 0 pages after this many seconds
+HARVESTER_WALL_CLOCK_TIMEOUT = 600  # seconds — max time for a single harvester
 
 
 ORCHESTRATOR_SYSTEM_PROMPT = """\
 # Dataset Generation Orchestrator
 
-A user described a dataset they want. Figure out how to produce it and coordinate execution.
+A user described a dataset they want. You coordinate its production.
 
-You stay in the loop throughout — dispatch research, write row instructions, launch \
-harvesters in rounds, and adapt based on results.
+## Your Role
+
+You are a strategist. You dispatch harvesters to find candidates from sources, \
+and the system automatically processes them into dataset rows. You do NOT manage \
+quotas, throttling, or operational details — the system handles that via \
+cost-optimized source sampling (Thompson Sampling).
 
 ## Your Subagents
 
 **research(question, ...)** — Recon agents that investigate specific questions. \
-They can browse the web, search, run code, and read files. They return findings. \
-Use these to understand the landscape before writing instructions.
+They can browse the web, search, run code, and read files. Use these to \
+understand the landscape before harvesting.
 
-**harvest(source, instructions, quota)** — Crawl a source and extract candidates. \
-A smart crawler navigates pages and dumps them; a cheap extractor pulls out \
-candidate items. Each candidate becomes one row. Use for both known sources \
-(URLs, files) and discovery (search queries, topic exploration).
+**harvest(source, description)** — Start a harvester for one source slice. \
+Non-blocking — returns immediately. The harvester navigates the source \
+and submits ALL items it finds as candidates. Do NOT put filtering criteria \
+in the description — filtering (date range, qualification, etc.) happens \
+automatically downstream in row generators. The source URL is the filter. \
+The description just says what kind of items to look for (e.g. "job listings").
 
 ## Workflow
 
-1. **Reason** — Which pattern? What unknowns need resolving?
+1. **Research** (if needed) — Dispatch research() agents for specific questions.
+   - "What search categories exist on this site?"
+   - "What columns are in this CSV?"
+   - Call multiple in parallel. Once findings come back, MOVE ON.
 
-2. **Research** (if needed) — Dispatch research() agents for specific questions.
-   - Ask focused questions: "What fields are on an Upwork job listing page?"
-   - Call multiple in parallel for different questions.
-   - Once findings come back, MOVE ON. Don't over-research.
+2. **Harvest** — Call harvest() for each source slice. Each harvest is one \
+   source: a URL, search query, file path, or topic. Call many in parallel.
 
-3. **Set instructions** — Call set_instructions() with row generation instructions \
-and a candidate_description. Instructions tell row generators how to process each \
-candidate. candidate_description tells the extractor what items to look for.
+3. **React to Events** — After dispatching, you'll receive status updates:
+   - **source_exhausted**: A harvester finished. Consider new sources/search terms.
+   - **fertility_shift**: A source's success rate changed significantly.
+   - **milestone**: Progress checkpoint (25%/50%/75%/100%).
+   - **stall**: No successful rows recently. Diagnose and adjust strategy.
+   - **pool_empty**: All candidates consumed but more rows needed.
+   - **target_reached**: Done! System exits automatically.
 
-4. **Harvest (in rounds)** — Launch harvest() calls:
-   - Each harvest() = one crawler = one slice of the problem.
-   - A slice is a single URL, search query, file, or topic.
-   - Launch up to 10 crawlers total (hard limit). Prefer more slices over fewer \
-     for better coverage — don't hesitate to launch 8–10 for broad searches.
-   - Each harvest() returns candidate and row counts.
-   - After a round completes, assess: enough rows? Any gaps? \
-     Launch another round targeting underrepresented areas if needed.
+   When you have nothing to do, just say so and wait for the next event.
 
-5. **Done** — Call done() when enough seeds have been dispatched.
+## Strategy
+
+- Cast a WIDE net. Deduplication is cheap and reliable — overlap is fine.
+- Broad search terms > narrow ones. "data entry jobs" beats \
+  "Google sheets list building b2b leads analyst".
+- Launch many harvesters in parallel for different source slices.
+- The system automatically favors sources with better success rates. \
+  You just need to FIND good sources.
+- You'll see metrics: fertility rate (% candidates → rows) and cost/row per source.
+- If a source is underperforming, try different search terms or a new source entirely.
+- For file uploads: harvest the file directly. The harvester will parse it via code.
 
 ## Common Patterns
 
 **Extraction** — rows from real sources (job listings, products, directories)
-  Quick recon to understand the site structure, then harvest() on listing URLs.
+  Quick recon to understand the site, then harvest() on listing URLs.
 
 **Enrichment** — rows already exist (CSV upload), need additional columns
-  Read the file via research(), then harvest() to iterate its rows.
+  harvest() the file. Each row in the file becomes a candidate.
 
-**Discovery** — find entities matching criteria (podcasts, companies, churches)
-  Research to find sources and subcategories, then parallel harvest() calls \
-  across platforms and topics. Check results and add more slices if thin.
+**Discovery** — find entities matching criteria (rappers, companies, churches)
+  Research to find sources, then many parallel harvest() calls across \
+  platforms, search terms, and topics.
 
 **Qualification** — given a list, filter then enrich
-  harvest() the list file; row generators visit each entity and skip_row() \
-  if it doesn't qualify.
+  harvest() the list. Row generators skip candidates that don't qualify.
 
 ## Principles
 
-- ONE harvest() = ONE slice. Each spawns its own crawler with its own browser.
-- harvest() blocks until done, then returns status. Launch multiple in parallel.
-- After each round: assess row counts, then either launch more or done().
-- Row generators see the full user conversation — your instructions are additive. \
-  Keep them focused: what to look for, how to find it, what to skip.
-- Our browsing stack handles anti-bot, CAPTCHAs, and JS-heavy pages automatically.
-- Row generators will skip_row() for dead ends. Expect some rejection — that's normal.
-- harvest() is fast and cheap — don't hesitate to launch many slices (up to 10 total).
-- harvest() instructions tell the crawler HOW to navigate: which links to follow, \
-  when to stop, how to recognize the end of a source. Express stopping criteria as \
-  observable content signals (e.g. "stop when listings are older than 7 days") not \
-  UI assumptions (never assume specific filter buttons or controls exist).
+- ONE harvest() = ONE source slice. Each spawns its own navigator.
+- harvest() is non-blocking — returns immediately. Don't wait for results.
+- Row generators see the full user conversation — they understand the task.
+- The browsing stack handles anti-bot, CAPTCHAs, and JS-heavy pages automatically.
+- Row generators will skip_row() for dead ends — some rejection is normal.
+- Don't over-research. 1-2 research calls to understand the landscape, then harvest.
 
 <conversation>
 {conversation_summary}
@@ -124,16 +130,9 @@ Target: {num_samples} rows.
 ## Tools
 
 - research(question, scope, budget, output_format): Spawn a research subagent.
-- set_instructions(instructions, candidate_description): Set row generator instructions. \
-  instructions: plain text — what to do with each candidate, what columns to fill, \
-  how to research. No {{variable}} placeholders needed. \
-  candidate_description: what a candidate looks like (tells the extractor what to find).
-- harvest(source, instructions): Crawl one slice, extract candidates. \
-  Returns rows generated so far, rows still needed, and cost.
-- done(reason): Signal completion — all seed sources dispatched.
-
-You do NOT have browsing, search, code execution, or file reading tools. \
-All investigation goes through research() subagents.
+- harvest(source, description): Start a harvester for one source. Non-blocking. \
+  source: URL, file path, search query, or topic. \
+  description: what kind of candidates to find and how to navigate.
 
 {feedback_section}
 """
@@ -141,9 +140,12 @@ All investigation goes through research() subagents.
 
 class OrchestratorAgent:
     """
-    V8 Orchestrator. Simplified: set_instructions replaces write_template,
-    dedup is automatic via token Jaccard in row generators, no get_status
-    (status comes from harvest() responses).
+    V10 Orchestrator. Event-driven, multi-armed bandit source allocation.
+
+    - harvest() is non-blocking (spawns background task)
+    - Events auto-inject via on_idle callback
+    - No set_instructions, no done, no quotas
+    - Auto-exits when target reached or all sources exhausted
     """
 
     def __init__(
@@ -154,7 +156,8 @@ class OrchestratorAgent:
         openai_client: TrackedOpenAIClient,
         model: str,
         workspace_dir: Path,
-        seed_processor: SeedProcessor,
+        candidate_pool: CandidatePool,
+        strategy_monitor: StrategyMonitor,
         generation_stats: Dict[str, Any],
         uploaded_files: Optional[List[Dict[str, Any]]] = None,
         brave_api_key: Optional[str] = None,
@@ -172,7 +175,7 @@ class OrchestratorAgent:
         langfuse_parent: Optional[Any] = None,
         on_browser_started: Optional[Callable] = None,
         on_browser_stopped: Optional[Callable] = None,
-        yielder_model: str = "",
+        harvester_model: str = "",
     ) -> None:
         self.feedback_context = feedback_context
         self.chat_history = chat_history
@@ -191,17 +194,21 @@ class OrchestratorAgent:
         self.on_tool_call = on_tool_call
         self.on_cost = on_cost
         self.uploaded_file_urls = uploaded_file_urls
+        self.uploaded_files = uploaded_files
         self.mcp_tools = mcp_tools or []
         self.on_browser_started = on_browser_started
         self.on_browser_stopped = on_browser_stopped
         self.langfuse_parent = langfuse_parent
-        self.yielder_model = yielder_model or model
+        self.harvester_model = harvester_model or model
 
-        self._is_done = False
-        self._research_counter = 0
-        self._subagent_counter = 0
-        self._seed_processor = seed_processor
+        self._pool = candidate_pool
+        self._monitor = strategy_monitor
         self._generation_stats = generation_stats
+
+        self._research_counter = 0
+        self._harvester_counter = 0
+        self._active_harvesters = 0
+        self._harvester_tasks: List[asyncio.Task] = []
 
         registry = ToolRegistry()
         self._register_tools(registry)
@@ -234,11 +241,11 @@ class OrchestratorAgent:
             soft_turn_limit=soft_limit,
             reasoning={"effort": "high", "summary": "detailed"},
             label="orchestrator",
-            continue_on_text=True,
             on_tool_call=on_tool_call,
             on_cost=on_cost,
             extra_tools=self.mcp_tools,
             langfuse_parent=langfuse_parent,
+            on_idle=self._on_idle,
         )
 
     def _format_conversation(self) -> str:
@@ -254,7 +261,7 @@ class OrchestratorAgent:
     def _format_resources(self, uploaded_files: Optional[List[Dict[str, Any]]]) -> str:
         if not uploaded_files:
             return "No uploaded files."
-        lines = ["Uploaded files:"]
+        lines = ["Uploaded files (accessible in harvester via code_exec):"]
         for f in uploaded_files:
             name = f.get("filename", "unknown")
             size = f.get("size_bytes", 0)
@@ -265,7 +272,7 @@ class OrchestratorAgent:
                 size_str = f"{size / 1_000:.0f} KB"
             else:
                 size_str = f"{size} bytes"
-            lines.append(f"  - {name} ({ctype}, {size_str})")
+            lines.append(f"  - /workspace/uploads/{name} ({ctype}, {size_str})")
         return "\n".join(lines)
 
     def _format_feedback(self) -> str:
@@ -280,6 +287,58 @@ class OrchestratorAgent:
             f"The previous results were discarded. Design a new pipeline "
             f"based on this feedback."
         )
+
+    # ── on_idle: event injection ─────────────────────────────────────
+
+    async def _on_idle(self) -> Optional[str]:
+        """
+        Called when the orchestrator outputs text with no tool calls.
+        Blocks until a strategic event arrives, then returns it as a string.
+        Returns None to signal the conversation loop to exit.
+        """
+        # Check stop/pause immediately
+        if self.stop_checker and self.stop_checker():
+            return None
+
+        # Check if target already reached
+        rows_done = self._generation_stats.get("rows_generated", 0)
+        if rows_done >= self.num_samples:
+            logger.info(f"[orchestrator] Target reached: {rows_done}/{self.num_samples}")
+            return None
+
+        # Check if nothing to wait for
+        if self._active_harvesters == 0 and self._pool.total_pending == 0:
+            if self._pool._is_fully_drained():
+                logger.info("[orchestrator] All sources exhausted, pool drained")
+                return None
+
+        # Poll for events in short intervals so pause/stop is detected quickly
+        elapsed = 0.0
+        max_wait = 120.0
+        poll_interval = 2.0
+
+        while elapsed < max_wait:
+            if self.stop_checker and self.stop_checker():
+                return None
+
+            event = await self._monitor.wait_for_event(timeout=poll_interval)
+            if event is not None:
+                return event.message
+
+            elapsed += poll_interval
+
+            # Re-check exit conditions each poll
+            rows_done = self._generation_stats.get("rows_generated", 0)
+            if rows_done >= self.num_samples:
+                return None
+            if self._active_harvesters == 0 and self._pool._is_fully_drained():
+                return None
+
+        # Full timeout — inject status update
+        status = self._pool.format_status()
+        return f"Status update (no events in 2 minutes):\n{status}"
+
+    # ── Tool registration ────────────────────────────────────────────
 
     def _register_tools(self, registry: ToolRegistry) -> None:
 
@@ -310,6 +369,7 @@ class OrchestratorAgent:
                 project_id=self.project_id,
                 on_browser_started=self.on_browser_started,
                 on_browser_stopped=self.on_browser_stopped,
+                uploaded_file_urls=self.uploaded_file_urls,
             )
             if langfuse_span:
                 agent._conversation.langfuse_parent = langfuse_span
@@ -339,9 +399,6 @@ class OrchestratorAgent:
             except Exception as e:
                 logger.warning(f"Failed to save research finding: {e}")
 
-            # Return 0.0 cost — already reported via on_cost above.
-            # Returning the cost here would cause base.py's tool loop to
-            # call on_cost a second time, double-charging the user.
             return f"[Saved to research/finding_{n}.md]\n\n{result.text}", 0.0
 
         registry.add(
@@ -369,195 +426,40 @@ class OrchestratorAgent:
             handler=research,
         )
 
-        # --- set_instructions ---
-        async def set_instructions(args: Dict) -> tuple[str, float]:
-            instructions = args.get("instructions", "")
-            candidate_description = args.get("candidate_description", "")
-
-            if not instructions:
-                return "Error: instructions is required", 0.0
-
-            self._seed_processor.set_instructions(instructions, candidate_description)
-
-            return (
-                f"Instructions set. Candidate description: \"{candidate_description}\". "
-                f"You can now harvest()."
-            ), 0.0
-
-        registry.add(
-            name="set_instructions",
-            description=(
-                "Set row generator instructions. Plain text — what to do with each candidate, "
-                "what columns to fill, how to research. Also sets candidate_description which "
-                "tells the extractor what items to look for on crawled pages."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "instructions": {
-                        "type": "string",
-                        "description": (
-                            "Instructions for row generators. Plain text, no {variable} placeholders. "
-                            "E.g.: 'You will be given a podcast. Find the host name, description, "
-                            "and contact email. Visit the podcast website if available.'"
-                        ),
-                    },
-                    "candidate_description": {
-                        "type": "string",
-                        "description": (
-                            "What a candidate looks like — tells the extractor what to find on pages. "
-                            "E.g.: 'podcast entries with name and URL', 'church listings with name and address'"
-                        ),
-                    },
-                },
-                "required": ["instructions"],
-            },
-            handler=set_instructions,
-        )
-
-        MAX_CONCURRENT_CRAWLERS = 10
-        crawler_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CRAWLERS)
-
-        # --- harvest ---
+        # --- harvest (non-blocking) ---
         async def harvest(args: Dict) -> tuple[str, float]:
-            from dsl_worker.agents.crawler import CrawlerAgent
-            from dsl_worker.agents.extractor import CandidateExtractor
-            from dsl_worker.config import settings as worker_settings
-
             source = args.get("source", "")
-            instructions = args.get("instructions", "")
+            description = args.get("description", "")
 
             if not source:
                 return "Error: source is required", 0.0
 
-            if not self._seed_processor._instructions:
-                return "Error: call set_instructions first", 0.0
+            idx = self._harvester_counter
+            self._harvester_counter += 1
+            source_id = f"harvest:{idx}"
 
-            idx = self._subagent_counter
-            self._subagent_counter += 1
+            # Register source arm in the pool
+            label = source[:80]
+            self._pool.register_source(source_id, label=label)
 
-            async with crawler_semaphore:
-                langfuse_span = getattr(self._conversation, "_current_langfuse_span", None)
+            # Spawn harvester in background
+            self._active_harvesters += 1
+            task = asyncio.create_task(
+                self._run_harvester(source, description, source_id, idx)
+            )
+            self._harvester_tasks.append(task)
 
-                candidate_description = self._seed_processor._candidate_description
-
-                extractor = CandidateExtractor(
-                    openai_client=self.openai_client,
-                    model=worker_settings.extractor_model,
-                    candidate_description=candidate_description,
-                    on_submit=self._seed_processor.submit_seed,
-                    on_cost=self.on_cost,
-                )
-                extract_semaphore = asyncio.Semaphore(20)
-                extraction_tasks: List[asyncio.Task] = []
-                pages_dumped = 0
-
-                async def on_dump_page(page: Dict):
-                    nonlocal pages_dumped
-                    pages_dumped += 1
-                    task = asyncio.create_task(
-                        extractor.extract_page(page, extract_semaphore)
-                    )
-                    extraction_tasks.append(task)
-
-                crawler = CrawlerAgent(
-                    sources=[source],
-                    instructions=instructions,
-                    candidate_description=candidate_description,
-                    openai_client=self.openai_client,
-                    model=self.yielder_model,
-                    workspace_dir=self.workspace_dir,
-                    on_dump_page=on_dump_page,
-                    crawler_index=idx,
-                    research_context=self._seed_processor._research_context,
-                    brave_api_key=self.brave_api_key,
-                    sandbox=self.sandbox,
-                    stop_checker=self.stop_checker,
-                    blob_service_client=self.blob_service_client,
-                    project_id=self.project_id,
-                    on_tool_call=self.on_tool_call,
-                    on_cost=self.on_cost,
-                    mcp_tools=self.mcp_tools,
-                    langfuse_parent=langfuse_span,
-                    on_browser_started=self.on_browser_started,
-                    on_browser_stopped=self.on_browser_stopped,
-                )
-
-                # Watchdog: kill crawler if 0 pages after CRAWLER_DEAD_TIMEOUT
-                async def _dead_crawler_watchdog():
-                    await asyncio.sleep(CRAWLER_DEAD_TIMEOUT)
-                    if pages_dumped == 0:
-                        logger.info(
-                            f"[orchestrator] Crawler {idx} auto-killed: "
-                            f"0 pages after {CRAWLER_DEAD_TIMEOUT}s"
-                        )
-                        crawler._is_done = True
-
-                watchdog_task = asyncio.create_task(_dead_crawler_watchdog())
-
-                t0 = time.time()
-                try:
-                    await asyncio.wait_for(
-                        crawler.run(),
-                        timeout=CRAWLER_WALL_CLOCK_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        f"[orchestrator] Crawler {idx} wall-clock timeout "
-                        f"({CRAWLER_WALL_CLOCK_TIMEOUT}s)"
-                    )
-                finally:
-                    watchdog_task.cancel()
-                    await crawler.cleanup()
-
-                crawl_time = time.time() - t0
-                crawl_cost = crawler.cost_usd
-
-                if not extraction_tasks:
-                    stats = self._seed_processor.stats
-                    gen = self._generation_stats
-                    # Return 0.0 cost — crawler already reported via on_cost.
-                    return (
-                        f"Harvester {idx}: no pages found in {crawl_time:.0f}s. "
-                        f"Cost: ${crawl_cost:.3f}. "
-                        f"Pipeline: {stats['accepted']} candidates accepted, "
-                        f"{gen.get('rows_generated', 0)} rows generated."
-                    ), 0.0
-
-                results = await asyncio.gather(*extraction_tasks, return_exceptions=True)
-
-                candidates_found = 0
-                extract_cost = 0.0
-                for r in results:
-                    if isinstance(r, BaseException):
-                        continue
-                    count, cost = r
-                    candidates_found += count
-                    extract_cost += cost
-
-                total_cost = crawl_cost + extract_cost
-                stats = self._seed_processor.stats
-                gen = self._generation_stats
-
-                # Return 0.0 cost — crawler and extractor already reported
-                # via their own on_cost callbacks. Returning total_cost here
-                # would cause base.py's tool loop to double-charge.
-                return (
-                    f"Harvester {idx} done: {pages_dumped} pages in {crawl_time:.0f}s, "
-                    f"{candidates_found} candidates extracted. "
-                    f"Pipeline total: {stats['accepted']} accepted, "
-                    f"{stats['remaining']} rows still needed, "
-                    f"{gen.get('rows_generated', 0)} rows generated, "
-                    f"{gen.get('skipped', 0)} skipped. "
-                    f"Cost: ${total_cost:.3f} (crawl=${crawl_cost:.3f}, extract=${extract_cost:.3f})."
-                ), 0.0
+            return (
+                f"Harvester {idx} started for: {source}\n"
+                f"Description: {description or '(auto)'}\n"
+                f"Candidates will flow into the pool as they're found."
+            ), 0.0
 
         registry.add(
             name="harvest",
             description=(
-                "Crawl one source slice and extract candidates. Blocks until done, "
-                "then returns row counts and cost. Call multiple in parallel for different slices. "
-                f"Maximum {MAX_CONCURRENT_CRAWLERS} concurrent harvest() calls."
+                "Start a harvester for one source slice. Non-blocking — returns "
+                "immediately. Call multiple in parallel for different sources."
             ),
             parameters={
                 "type": "object",
@@ -565,17 +467,15 @@ class OrchestratorAgent:
                     "source": {
                         "type": "string",
                         "description": (
-                            "One source to crawl: a URL, file path, search query, or topic. "
-                            "For multiple sources, call harvest() multiple times in parallel."
+                            "One source to harvest: URL, file path, search query, or topic."
                         ),
                     },
-                    "instructions": {
+                    "description": {
                         "type": "string",
                         "description": (
-                            "Navigation instructions for the crawler: which links to follow, "
-                            "how to paginate, when to stop. Use observable content signals for "
-                            "stopping (e.g. 'stop when you see listings older than 7 days'). "
-                            "Do not assume specific UI controls exist."
+                            "What kind of items are on this source (e.g. 'job listings', "
+                            "'company profiles'). Do NOT include filtering criteria — "
+                            "filtering happens downstream automatically."
                         ),
                     },
                 },
@@ -584,42 +484,76 @@ class OrchestratorAgent:
             handler=harvest,
         )
 
-        # --- done ---
-        async def done(args: Dict) -> tuple[str, float]:
-            reason = args.get("reason", "complete")
-            self._is_done = True
-            self._save_recipe()
-            return f"Orchestrator done: {reason}", 0.0
+    # ── Harvester lifecycle ──────────────────────────────────────────
 
-        registry.add(
-            name="done",
-            description=(
-                "Signal orchestration is complete — all seed sources dispatched. "
-                "Row generation continues in background."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "reason": {"type": "string", "description": "Why orchestration is done"},
-                },
-            },
-            handler=done,
+    async def _run_harvester(
+        self,
+        source: str,
+        description: str,
+        source_id: str,
+        idx: int,
+    ) -> None:
+        """
+        Run a harvester in the background. When done, fires source_exhausted event.
+        """
+        from dsl_worker.agents.harvester import HarvesterAgent
+
+        langfuse_span = getattr(self._conversation, "_current_langfuse_span", None)
+
+        harvester = HarvesterAgent(
+            source=source,
+            description=description,
+            source_id=source_id,
+            openai_client=self.openai_client,
+            model=self.harvester_model,
+            workspace_dir=self.workspace_dir,
+            pool=self._pool,
+            harvester_index=idx,
+            brave_api_key=self.brave_api_key,
+            sandbox=self.sandbox,
+            stop_checker=self.stop_checker,
+            blob_service_client=self.blob_service_client,
+            project_id=self.project_id,
+            on_tool_call=self.on_tool_call,
+            on_cost=self.on_cost,
+            uploaded_file_urls=self.uploaded_file_urls,
+            uploaded_files=self.uploaded_files,
+            mcp_tools=self.mcp_tools,
+            langfuse_parent=langfuse_span,
+            on_browser_started=self.on_browser_started,
+            on_browser_stopped=self.on_browser_stopped,
         )
 
-    def _save_recipe(self) -> None:
+        t0 = time.time()
         try:
-            recipe = {
-                "instructions": self._seed_processor._instructions,
-                "candidate_description": self._seed_processor._candidate_description,
-                "identity_columns": [],  # deprecated — dedup is automatic now
-                "research_context": self._seed_processor._research_context,
-                "target_rows": self.num_samples,
-            }
-            (self.workspace_dir / "pipeline_recipe.json").write_text(
-                json.dumps(recipe, indent=2), encoding="utf-8"
+            await asyncio.wait_for(
+                harvester.run(),
+                timeout=HARVESTER_WALL_CLOCK_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[orchestrator] Harvester {idx} wall-clock timeout "
+                f"({HARVESTER_WALL_CLOCK_TIMEOUT}s)"
             )
         except Exception as e:
-            logger.warning(f"Failed to save recipe: {e}")
+            logger.error(f"[orchestrator] Harvester {idx} error: {e}", exc_info=True)
+        finally:
+            await harvester.cleanup()
+
+        cost = harvester.cost_usd
+        self._pool.add_production_cost(source_id, cost)
+
+        elapsed = time.time() - t0
+        logger.info(
+            f"[orchestrator] Harvester {idx} done: "
+            f"{harvester.candidates_submitted} candidates, "
+            f"{elapsed:.0f}s, ${cost:.3f}"
+        )
+
+        self._active_harvesters -= 1
+        await self._monitor.on_source_done(source_id)
+
+    # ── Run ──────────────────────────────────────────────────────────
 
     async def run(self) -> AgentResult:
         if self.feedback_context:
@@ -630,18 +564,15 @@ class OrchestratorAgent:
         else:
             message = (
                 "Begin. Read the conversation history and resources, reason about "
-                "strategy, then set instructions and harvest candidates."
+                "strategy, then dispatch harvesters for candidate sources."
             )
 
         def _should_exit() -> bool:
-            if self._is_done:
-                return True
             rows_done = self._generation_stats.get("rows_generated", 0)
             if rows_done >= self.num_samples:
                 logger.info(
                     f"[orchestrator] Auto-done: {rows_done}/{self.num_samples} rows generated"
                 )
-                self._is_done = True
                 return True
             return False
 
@@ -655,4 +586,11 @@ class OrchestratorAgent:
         return self._conversation.total_cost
 
     async def cleanup(self) -> None:
-        pass
+        # Cancel any remaining harvester tasks
+        for task in self._harvester_tasks:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass

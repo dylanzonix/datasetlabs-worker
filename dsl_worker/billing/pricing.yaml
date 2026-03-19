@@ -39,7 +39,7 @@ models:
 
   # GPT 5
   gpt-5.4:
-    input: 0.0000025      # $2.50 / 1M tokens
+    input: 0.0000025      # $2.50 / 1M tokens (short context <272K)
     cached_input: 0.00000025  # $0.25 / 1M tokens
     output: 0.000015      # $15.00 / 1M tokens
 
@@ -48,9 +48,19 @@ models:
     cached_input: 0.00000018  # $0.18 / 1M tokens (Azure pricing)
     output: 0.000014     # $14.00 / 1M tokens
 
+  gpt-5.4-mini:
+    input: 0.00000075    # $0.75 / 1M tokens
+    cached_input: 0.000000075  # $0.075 / 1M tokens
+    output: 0.0000045    # $4.50 / 1M tokens
+
   gpt-5-mini:
     input: 0.00000025    # $0.25 / 1M tokens
     output: 0.000002     # $2.00 / 1M tokens
+
+  gpt-5.4-nano:
+    input: 0.0000002     # $0.20 / 1M tokens
+    cached_input: 0.00000002  # $0.02 / 1M tokens
+    output: 0.00000125   # $1.25 / 1M tokens
 
   gpt-5-nano:
     input: 0.00000005    # $0.05 / 1M tokens

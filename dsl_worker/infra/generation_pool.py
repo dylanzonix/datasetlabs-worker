@@ -163,9 +163,10 @@ class GenerationWorkerPool:
                     for attempt in range(max_attempts):
                         try:
                             result = await agent.generate(
-                                instructions=instructions,
                                 candidate=candidate,
                                 schema=default_schema,
+                                source_context=item.get("source_context", ""),
+                                instructions=instructions,  # backward compat
                             )
 
                             if result.success and result.row:

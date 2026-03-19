@@ -131,6 +131,7 @@ class AgentConversation:
         on_cost: Optional[Callable[[float, str], Awaitable[None]]] = None,
         extra_tools: Optional[List[Dict[str, Any]]] = None,
         langfuse_parent: Optional[Any] = None,
+        on_idle: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
     ) -> None:
         self.openai_client = openai_client
         self.model = model
@@ -152,6 +153,10 @@ class AgentConversation:
         # Explicit Langfuse parent span — avoids context-var inference issues
         # across asyncio.create_task() boundaries.
         self.langfuse_parent = langfuse_parent
+        # on_idle: called when agent outputs text with no tool calls.
+        # If set, blocks until it returns a string (injected as user message)
+        # or None (signals the loop to exit). Takes priority over continue_on_text.
+        self.on_idle = on_idle
 
         # Conversation state — this IS the context sent to the API each turn.
         # Contains user messages, reasoning items, assistant messages,
@@ -517,7 +522,18 @@ class AgentConversation:
                 logger.info(f"[{self.label}] turn {turn} — text response ({len(output_text)} chars): {preview}")
                 result.text = output_text
 
-                if self.continue_on_text:
+                if self.on_idle is not None:
+                    # Event-driven mode: block until an event arrives or exit.
+                    # Takes priority over continue_on_text.
+                    event_msg = await self.on_idle()
+                    if event_msg is None:
+                        break  # on_idle signals exit
+                    self.messages.append({
+                        "role": "user",
+                        "content": event_msg,
+                    })
+                    continue
+                elif self.continue_on_text:
                     # Don't break — inject a continuation prompt so the agent
                     # keeps working (e.g. orchestrator thinking before acting).
                     self.messages.append({

@@ -114,8 +114,11 @@ class RateLimiter:
     DEFAULT_LIMITS = {
         "gpt-4o": RateLimitConfig("gpt-4o", rpm_limit=1_500, tpm_limit=150_000),
         "gpt-4o-mini": RateLimitConfig("gpt-4o-mini", rpm_limit=1_500, tpm_limit=200_000),
+        "gpt-5.4": RateLimitConfig("gpt-5.4", rpm_limit=1_500, tpm_limit=150_000),
         "gpt-5.2": RateLimitConfig("gpt-5.2", rpm_limit=1_500, tpm_limit=150_000),
+        "gpt-5.4-mini": RateLimitConfig("gpt-5.4-mini", rpm_limit=1_500, tpm_limit=200_000),
         "gpt-5-mini": RateLimitConfig("gpt-5-mini", rpm_limit=1_500, tpm_limit=200_000),
+        "gpt-5.4-nano": RateLimitConfig("gpt-5.4-nano", rpm_limit=1_500, tpm_limit=1_000_000),
         "gpt-5-nano": RateLimitConfig("gpt-5-nano", rpm_limit=1_500, tpm_limit=1_000_000),
         "o1": RateLimitConfig("o1", rpm_limit=1_500, tpm_limit=150_000),
         "o1-mini": RateLimitConfig("o1-mini", rpm_limit=1_500, tpm_limit=150_000),

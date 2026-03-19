@@ -1,9 +1,9 @@
 """
 Pipeline configuration and seed processing.
 
-V8: Simplified. SeedProcessor accepts raw candidates (no variable declarations,
-no template interpolation, no seed-level dedup). Candidates flow directly to the
-work queue. Row generators receive the raw candidate + instructions.
+V10: CandidatePool (Thompson Sampling) replaces the FIFO work queue.
+SeedProcessor is kept for backward compatibility (checkpoint resume).
+SeedProcessorAdapter bridges old interface to new CandidatePool.
 
 Dedup happens at row level via set_column() in the row generator.
 """
@@ -17,6 +17,44 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+# ── V10 adapter ──────────────────────────────────────────────────────
+
+
+class SeedProcessorAdapter:
+    """
+    Bridges the old SeedProcessor.submit_seed() interface to CandidatePool.
+
+    Used by CandidateExtractor and code_exec seed callbacks which expect
+    the old submit_seed(seed, harvester_id) signature.
+    """
+
+    def __init__(
+        self,
+        pool: "CandidatePool",  # forward ref — imported at runtime
+        source_id: str,
+        source_context: str = "",
+    ) -> None:
+        from dsl_worker.infra.candidate_pool import Candidate
+
+        self._pool = pool
+        self._source_id = source_id
+        self._source_context = source_context
+        self._Candidate = Candidate
+        self.seeds_submitted = 0
+
+    async def submit_seed(self, seed: "Seed", harvester_id: str = "") -> Dict[str, Any]:
+        """Old-style submit that routes to CandidatePool."""
+        candidate = self._Candidate(
+            values=seed.values,
+            source_id=self._source_id,
+            source_context=self._source_context,
+            metadata=seed.metadata,
+        )
+        await self._pool.submit(candidate)
+        self.seeds_submitted += 1
+        return {"accepted": True, "stats": {}}
 
 
 @dataclass
