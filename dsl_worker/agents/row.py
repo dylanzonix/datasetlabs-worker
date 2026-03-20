@@ -32,7 +32,7 @@ import jsonschema
 from dsl_worker.agents.base import AgentConversation
 from dsl_worker.agents.tools import ToolRegistry
 from dsl_worker.billing.tracked_client import TrackedOpenAIClient
-from dsl_worker.infra.research_tools import ResearchTools, ResearchScope
+from dsl_worker.infra.bu_client import BUClient
 
 logger = logging.getLogger(__name__)
 
@@ -184,9 +184,12 @@ and the column is something that should be unique (like a name, URL, or email), 
 this is likely a duplicate. Call skip_row(reason="duplicate: ...") if so.
    - Use your judgment: 50 rows with country="USA" is normal, but 2 rows with \
 the same email or very similar program name is suspicious.
-3. Research what you still need. Use research(question) to look up information — \
-include the source URL in your question if one is provided. \
-Use primary sources. Verify claims that matter.
+3. Research what you still need:
+   - Use browse(url, task) to visit a page and extract specific information. \
+Describe what you need in the task (e.g. "Find the company CEO name and founding year").
+   - You can also use browse without a URL to search the web: \
+browse(task="Search for Acme Corp leadership contacts").
+   - Use primary sources. Verify claims that matter.
 4. Fill remaining columns with set_column().
 5. Call submit_row() when all columns are filled.
 
@@ -206,8 +209,8 @@ exist in other rows — check them for duplicates.
 - clear_column(name): Clear a column to start over.
 - submit_row(): Submit the completed row.
 - skip_row(reason): Skip this candidate entirely.
-- research(question): Ask a research sub-agent to look something up on the web. \
-Returns a concise answer. Use this instead of browsing directly.
+- browse(url, task): Browse the web — visit a URL or search. Describe what \
+you need. Returns extracted text.
 - code_exec(script, description): Execute Python.
 - read_file(path): Read a workspace file.
 """
@@ -241,7 +244,7 @@ class RowGeneratorAgent:
         workspace_dir: Path,
         chat_history: Optional[List[Dict[str, str]]] = None,
         dedup_store: Optional[DedupStore] = None,
-        brave_api_key: Optional[str] = None,
+        bu_client: Optional[BUClient] = None,
         sandbox: Optional[Any] = None,
         stop_checker: Optional[Callable[[], bool]] = None,
         stop_event: Optional[asyncio.Event] = None,
@@ -251,6 +254,8 @@ class RowGeneratorAgent:
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
         on_cost: Optional[Callable] = None,
         langfuse_parent: Optional[Any] = None,
+        # Legacy kwargs (ignored)
+        brave_api_key: Optional[str] = None,
         on_browser_started: Optional[Callable] = None,
         on_browser_stopped: Optional[Callable] = None,
     ) -> None:
@@ -259,12 +264,13 @@ class RowGeneratorAgent:
         self.workspace_dir = Path(workspace_dir)
         self.chat_history = chat_history or []
         self.dedup_store = dedup_store or DedupStore()
+        self.bu_client = bu_client
         self.stop_checker = stop_checker
         self.stop_event = stop_event
         self.mcp_tools = mcp_tools or []
         self.on_cost = on_cost
         self.langfuse_parent = langfuse_parent
-        self._row_id = str(id(self))  # Unique ID for this generator's in-flight tracking
+        self._row_id = str(id(self))
 
         # State — reset per generate() call
         self._current_row: Dict[str, Any] = {}
@@ -273,21 +279,23 @@ class RowGeneratorAgent:
         self._skip_reason: str = ""
         self._schema: List[Dict] = []
 
-        self._impl = ResearchTools(
-            workspace_dir=workspace_dir,
-            schema=[],
-            brave_api_key=brave_api_key,
-            openai_client=openai_client,
-            model=model,
-            sandbox=sandbox,
-            stop_checker=stop_checker,
-            blob_service_client=blob_service_client,
-            project_id=project_id,
-            uploaded_file_urls=uploaded_file_urls,
-            on_browser_started=on_browser_started,
-            on_browser_stopped=on_browser_stopped,
-        )
-        self._impl.set_scope(ResearchScope(id="row_gen", description="", quota=0))
+        # Sandbox for code_exec only (minimal ResearchTools)
+        self._sandbox_impl: Optional[Any] = None
+        if sandbox:
+            from dsl_worker.infra.research_tools import ResearchTools, ResearchScope
+            self._sandbox_impl = ResearchTools(
+                workspace_dir=workspace_dir,
+                schema=[],
+                brave_api_key=None,
+                openai_client=openai_client,
+                model=model,
+                sandbox=sandbox,
+                stop_checker=stop_checker,
+                blob_service_client=blob_service_client,
+                project_id=project_id,
+                uploaded_file_urls=uploaded_file_urls,
+            )
+            self._sandbox_impl.set_scope(ResearchScope(id="row_gen", description="", quota=0))
 
         self._registry = ToolRegistry()
         self._register_tools(self._registry)
@@ -564,70 +572,73 @@ class RowGeneratorAgent:
             handler=read_file,
         )
 
-        self._impl.register_on(
-            registry,
-            exclude=["brave_search", "open", "find", "click", "interact", "shell_exec"],
-            include_builtins=False,
-        )
-
-        # research() — delegates to a ResearchAgent on a cheap model
-        async def research(args: Dict) -> tuple[str, float]:
-            from dsl_worker.agents.research import ResearchAgent
-            from dsl_worker.config import settings as worker_settings
-
-            question = args.get("question", "")
-            if not question:
-                return "Error: question is required", 0.0
-
-            agent = ResearchAgent(
-                openai_client=self.openai_client,
-                model=worker_settings.research_subagent_model,
-                workspace_dir=self.workspace_dir,
-                brave_api_key=self._impl.brave_api_key,
-                sandbox=self._impl.sandbox,
-                stop_checker=self.stop_checker,
-                max_turns=8,
-                blob_service_client=self._impl.blob_service_client,
-                project_id=self._impl.project_id,
-                on_browser_started=self._impl._on_browser_started,
-                on_browser_stopped=self._impl._on_browser_stopped,
+        # code_exec from sandbox (if available)
+        if self._sandbox_impl:
+            self._sandbox_impl.register_on(
+                registry,
+                exclude=[
+                    "brave_search", "open", "find", "click",
+                    "interact", "shell_exec",
+                ],
+                include_builtins=False,
             )
-            if self.langfuse_parent:
-                agent._conversation.langfuse_parent = self.langfuse_parent
 
-            try:
-                result = await agent.ask_full(question)
-            finally:
-                await agent.cleanup()
-
-            if self.on_cost and result.cost_usd > 0:
-                await self.on_cost(result.cost_usd, "row_research_subagent")
-
-            answer = result.text or ""
-            if len(answer) > 3000:
-                answer = answer[:3000] + "\n\n[Truncated to 3K chars]"
-
-            # Return 0.0 cost — already reported via on_cost above.
-            return answer, 0.0
+        # --- browse: BU V3 SDK ---
+        async def browse(args: Dict) -> tuple[str, float]:
+            url = args.get("url", "")
+            task = args.get("task", "")
+            if not url and not task:
+                return "Error: url or task is required", 0.0
+            if url and not task:
+                task = "Extract relevant information from this page."
+            if not url:
+                # Task-only: web search
+                return await self._browse("", task)
+            return await self._browse(url, task)
 
         registry.add(
-            name="research",
+            name="browse",
             description=(
-                "Ask a research sub-agent to look something up on the web. "
-                "Returns a concise answer. Use for any web research needs."
+                "Browse the web — navigate to a URL, search, or extract information. "
+                "Provide a URL to visit a specific page, or just a task to search the web. "
+                "Returns extracted text."
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "question": {
+                    "url": {
                         "type": "string",
-                        "description": "Specific question to research",
+                        "description": "URL to visit (optional if task is a search query)",
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": (
+                            "What to do. E.g.: 'Find the CEO name and founding year' "
+                            "or 'Search for Acme Corp leadership team'."
+                        ),
                     },
                 },
-                "required": ["question"],
             },
-            handler=research,
+            handler=browse,
         )
+
+    # ── BU V3 SDK web access ────────────────────────────────────────
+
+    async def _browse(self, url: str, task: str) -> Tuple[str, float]:
+        """Navigate to a URL and extract information via BU V3 SDK."""
+        if not self.bu_client:
+            return "Error: BU client not configured", 0.0
+
+        bu_task = f"Navigate to: {url}\n\n{task}" if url else task
+
+        try:
+            text, bu_cost = await self.bu_client.research(bu_task)
+            if len(text) > 4000:
+                text = text[:4000] + "\n\n[Truncated to 4K chars]"
+            return text, bu_cost
+        except Exception as e:
+            logger.warning(f"[row_gen] browse error: {e}")
+            return f"Browse error: {e}", 0.0
 
     def _format_conversation(self) -> str:
         if not self.chat_history:
@@ -734,7 +745,8 @@ class RowGeneratorAgent:
         return 0.0
 
     async def cleanup(self) -> None:
-        try:
-            await self._impl.cleanup()
-        except Exception as e:
-            logger.warning(f"RowGeneratorAgent cleanup error: {e}")
+        if self._sandbox_impl:
+            try:
+                await self._sandbox_impl.cleanup()
+            except Exception as e:
+                logger.warning(f"RowGeneratorAgent cleanup error: {e}")

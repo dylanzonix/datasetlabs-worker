@@ -127,8 +127,6 @@ class GenerationWorkerPool:
                 mcp_tools=self.mcp_tools,
                 on_cost=self.on_cost,
                 langfuse_parent=self.langfuse_parent,
-                on_browser_started=self.on_browser_started,
-                on_browser_stopped=self.on_browser_stopped,
             )
 
             try:

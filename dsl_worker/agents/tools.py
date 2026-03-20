@@ -46,9 +46,11 @@ class ToolRegistry:
         result, cost = await registry.execute("brave_search", {"query": "test"})
     """
 
-    def __init__(self) -> None:
+    def __init__(self, tool_budget: int = 0) -> None:
         self._definitions: Dict[str, Dict[str, Any]] = {}
         self._handlers: Dict[str, ToolHandler] = {}
+        self._tool_budget = tool_budget  # 0 = unlimited
+        self._tool_calls_used = 0
 
     def add(
         self,
@@ -109,10 +111,18 @@ class ToolRegistry:
             return f"Unknown tool: {name}", 0.0
 
         try:
-            return await handler(args)
+            result_text, cost = await handler(args)
         except Exception as e:
             logger.error(f"Tool {name} failed: {e}", exc_info=True)
-            return f"Tool error: {e}", 0.0
+            result_text, cost = f"Tool error: {e}", 0.0
+
+        # Tool budget countdown (skip for respond/done — those are completion signals)
+        if self._tool_budget > 0 and name not in ("respond", "done"):
+            self._tool_calls_used += 1
+            remaining = max(0, self._tool_budget - self._tool_calls_used)
+            result_text += f"\n\n[{remaining} tool calls remaining]"
+
+        return result_text, cost
 
     def merge(self, other: ToolRegistry) -> None:
         """Merge another registry's tools into this one."""

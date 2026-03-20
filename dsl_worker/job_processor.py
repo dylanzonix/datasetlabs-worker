@@ -479,6 +479,15 @@ class JobProcessor:
         # Shared dedup store — used by all row generators across the pipeline
         dedup_store = DedupStore()
 
+        # BU V3 SDK client — shared across all agents for web access.
+        # stop_event races BU calls so a pause cancels them instantly.
+        from dsl_worker.infra.bu_client import BUClient
+        bu_client = BUClient(
+            api_key=settings.browser_use_api_key,
+            model=getattr(settings, 'bu_model', 'bu-mini'),
+            stop_event=stop_event,
+        )
+
         # Start generation consumer (pulls from CandidatePool via Thompson Sampling)
         generation_task = asyncio.create_task(
             self._run_generation_consumer(
@@ -499,10 +508,9 @@ class JobProcessor:
                 uploaded_file_urls=uploaded_file_urls,
                 on_cost=on_cost,
                 langfuse_parent=langfuse_parent,
-                on_browser_started=on_browser_started,
-                on_browser_stopped=on_browser_stopped,
                 dedup_store=dedup_store,
                 target_rows=state.num_samples,
+                bu_client=bu_client,
             )
         )
 
@@ -524,7 +532,7 @@ class JobProcessor:
             generation_stats=generation_stats,
             harvester_model=settings.seed_yielder_model,
             uploaded_files=uploaded_files if uploaded_files else None,
-            brave_api_key=settings.brave_api_key,
+            bu_client=bu_client,
             sandbox=self._sandbox,
             stop_checker=stop_checker,
             stop_event=stop_event,
@@ -697,10 +705,9 @@ class JobProcessor:
         uploaded_file_urls: Optional[Dict[str, str]] = None,
         on_cost: Optional[Callable] = None,
         langfuse_parent: Optional[Any] = None,
-        on_browser_started: Optional[Callable] = None,
-        on_browser_stopped: Optional[Callable] = None,
         dedup_store: Optional[DedupStore] = None,
         target_rows: int = 0,
+        bu_client: Optional[Any] = None,
         # Legacy compat
         work_item_queue: Optional[asyncio.Queue] = None,
         seed_processor: Optional[Any] = None,
@@ -747,7 +754,7 @@ class JobProcessor:
                     workspace_dir=workspace_dir,
                     chat_history=chat_history or [],
                     dedup_store=dedup_store,
-                    brave_api_key=settings.brave_api_key,
+                    bu_client=bu_client,
                     sandbox=self._sandbox,
                     stop_checker=gen_stop_checker,
                     stop_event=stop_event,
@@ -757,8 +764,6 @@ class JobProcessor:
                     mcp_tools=self._mcp_tools,
                     on_cost=on_cost,
                     langfuse_parent=candidate_item.get("langfuse_parent") or langfuse_parent,
-                    on_browser_started=on_browser_started,
-                    on_browser_stopped=on_browser_stopped,
                 )
 
                 try:
@@ -888,7 +893,9 @@ class JobProcessor:
 
                 # Pull next candidate via Thompson Sampling
                 if candidate_pool:
-                    candidate_item = await candidate_pool.pull(timeout=5.0)
+                    candidate_item = await candidate_pool.pull(
+                        timeout=5.0, stop_event=stop_event,
+                    )
                     if candidate_item is None:
                         # pull() returns None when truly drained (all sources
                         # exhausted + queues empty) OR on timeout. Only exit

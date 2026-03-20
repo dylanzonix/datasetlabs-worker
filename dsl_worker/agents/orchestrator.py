@@ -46,26 +46,45 @@ cost-optimized source sampling (Thompson Sampling).
 
 ## Your Subagents
 
-**research(question, ...)** — Recon agents that investigate specific questions. \
-They can browse the web, search, run code, and read files. Use these to \
-understand the landscape before harvesting.
+**explore_agent(task)** — Recon agent for files, data, and connected resources. \
+Uses code execution to inspect uploaded files, parse schemas, analyze data. \
+No web access. Use this to understand what you already have.
 
-**harvest(source, description)** — Start a harvester for one source slice. \
+**web_search_agent(task)** — Web research agent. Browses websites, searches \
+the web. Use this to understand the landscape of potential sources online.
+
+**harvester_agent(source, description)** — Start a harvester for one source slice. \
 Non-blocking — returns immediately. The harvester navigates the source \
 and submits ALL items it finds as candidates. Do NOT put filtering criteria \
-in the description — filtering (date range, qualification, etc.) happens \
-automatically downstream in row generators. The source URL is the filter. \
-The description just says what kind of items to look for (e.g. "job listings").
+in the description — filtering happens downstream in row generators.
+
+## Candidate Scope
+
+Pay attention to the user's intended candidate scope — where candidates \
+live varies by project.
+
+Examples:
+- **Enrichment**: User uploads a spreadsheet of hospitals and wants director \
+contacts added. The spreadsheet rows ARE the candidates — one harvester on the \
+file, done. Don't spawn web harvesters to find more hospitals.
+- **Single-source extraction**: User wants product listings from Amazon. \
+Candidates are on Amazon — harvest search pages on that site. Don't also \
+harvest eBay or Walmart unless asked.
+- **Open discovery**: User wants a list of craft breweries in the midwest. \
+No source given — cast a wide net across directories, search engines, \
+industry databases. This is where many parallel harvesters shine.
 
 ## Workflow
 
-1. **Research** (if needed) — Dispatch research() agents for specific questions.
-   - "What search categories exist on this site?"
-   - "What columns are in this CSV?"
-   - Call multiple in parallel. Once findings come back, MOVE ON.
+1. **Recon** (if needed) — Use explore_agent for files/data, web_search_agent \
+for web. Not every project needs both. A file enrichment job may only need \
+explore_agent to inspect the schema. A web extraction job may not need recon \
+at all if the source is obvious.
+   - Recon gives you a plan. Harvesting gives you data.
+   - Don't wait for perfect information — launch harvesters early and learn \
+from their results. The Thompson Sampling system tells you which sources work.
 
-2. **Harvest** — Call harvest() for each source slice. Each harvest is one \
-   source: a URL, search query, file path, or topic. Call many in parallel.
+2. **Harvest** — Call harvester_agent() for each source slice.
 
 3. **React to Events** — After dispatching, you'll receive status updates:
    - **source_exhausted**: A harvester finished. Consider new sources/search terms.
@@ -79,39 +98,20 @@ The description just says what kind of items to look for (e.g. "job listings").
 
 ## Strategy
 
-- Cast a WIDE net. Deduplication is cheap and reliable — overlap is fine.
-- Broad search terms > narrow ones. "data entry jobs" beats \
-  "Google sheets list building b2b leads analyst".
-- Launch many harvesters in parallel for different source slices.
+- Deduplication is cheap and reliable — overlap between sources is fine.
+- Broad search terms > narrow ones.
 - The system automatically favors sources with better success rates. \
   You just need to FIND good sources.
 - You'll see metrics: fertility rate (% candidates → rows) and cost/row per source.
 - If a source is underperforming, try different search terms or a new source entirely.
-- For file uploads: harvest the file directly. The harvester will parse it via code.
-
-## Common Patterns
-
-**Extraction** — rows from real sources (job listings, products, directories)
-  Quick recon to understand the site, then harvest() on listing URLs.
-
-**Enrichment** — rows already exist (CSV upload), need additional columns
-  harvest() the file. Each row in the file becomes a candidate.
-
-**Discovery** — find entities matching criteria (rappers, companies, churches)
-  Research to find sources, then many parallel harvest() calls across \
-  platforms, search terms, and topics.
-
-**Qualification** — given a list, filter then enrich
-  harvest() the list. Row generators skip candidates that don't qualify.
 
 ## Principles
 
-- ONE harvest() = ONE source slice. Each spawns its own navigator.
-- harvest() is non-blocking — returns immediately. Don't wait for results.
+- ONE harvester_agent() = ONE source slice. Each spawns its own navigator.
+- harvester_agent() is non-blocking — returns immediately. Don't wait for results.
 - Row generators see the full user conversation — they understand the task.
 - The browsing stack handles anti-bot, CAPTCHAs, and JS-heavy pages automatically.
 - Row generators will skip_row() for dead ends — some rejection is normal.
-- Don't over-research. 1-2 research calls to understand the landscape, then harvest.
 
 <conversation>
 {conversation_summary}
@@ -129,10 +129,11 @@ Target: {num_samples} rows.
 
 ## Tools
 
-- research(question, scope, budget, output_format): Spawn a research subagent.
-- harvest(source, description): Start a harvester for one source. Non-blocking. \
+- explore_agent(task, budget): Inspect files, data, integrations. No web access.
+- web_search_agent(task, budget): Research the web. Browse sites, search engines.
+- harvester_agent(source, description): Start a harvester. Non-blocking. \
   source: URL, file path, search query, or topic. \
-  description: what kind of candidates to find and how to navigate.
+  description: what kind of candidates to find.
 
 {feedback_section}
 """
@@ -160,6 +161,7 @@ class OrchestratorAgent:
         strategy_monitor: StrategyMonitor,
         generation_stats: Dict[str, Any],
         uploaded_files: Optional[List[Dict[str, Any]]] = None,
+        bu_client: Optional[Any] = None,
         brave_api_key: Optional[str] = None,
         sandbox: Optional[Any] = None,
         stop_checker: Optional[Callable[[], bool]] = None,
@@ -184,6 +186,7 @@ class OrchestratorAgent:
         self.workspace_dir = Path(workspace_dir)
         self.openai_client = openai_client
         self.model = model
+        self.bu_client = bu_client
         self.brave_api_key = brave_api_key
         self.sandbox = sandbox
         self.stop_checker = stop_checker
@@ -342,18 +345,16 @@ class OrchestratorAgent:
 
     def _register_tools(self, registry: ToolRegistry) -> None:
 
-        # --- research ---
-        async def research(args: Dict) -> tuple[str, float]:
+        # --- web_search_agent ---
+        async def web_search_agent(args: Dict) -> tuple[str, float]:
             from dsl_worker.agents.research import ResearchAgent
             from dsl_worker.config import settings as worker_settings
 
-            question = args.get("question", "")
-            scope = args.get("scope", "")
-            budget = args.get("budget", 10)
-            output_format = args.get("output_format", "")
+            task = args.get("task", "")
+            budget = args.get("budget", 8)
 
-            if not question:
-                return "Error: question is required", 0.0
+            if not task:
+                return "Error: task is required", 0.0
 
             langfuse_span = getattr(self._conversation, "_current_langfuse_span", None)
 
@@ -361,32 +362,25 @@ class OrchestratorAgent:
                 openai_client=self.openai_client,
                 model=worker_settings.research_subagent_model,
                 workspace_dir=self.workspace_dir,
-                brave_api_key=self.brave_api_key,
+                bu_client=self.bu_client,
                 sandbox=self.sandbox,
                 stop_checker=self.stop_checker,
                 max_turns=budget,
+                tool_budget=budget,
                 blob_service_client=self.blob_service_client,
                 project_id=self.project_id,
-                on_browser_started=self.on_browser_started,
-                on_browser_stopped=self.on_browser_stopped,
                 uploaded_file_urls=self.uploaded_file_urls,
             )
             if langfuse_span:
                 agent._conversation.langfuse_parent = langfuse_span
 
-            full_question = question
-            if scope:
-                full_question += f"\n\nScope: {scope}"
-            if output_format:
-                full_question += f"\n\nExpected output format: {output_format}"
-
             try:
-                result = await agent.ask_full(full_question)
+                result = await agent.ask_full(task)
             finally:
                 await agent.cleanup()
 
             if self.on_cost and result.cost_usd > 0:
-                await self.on_cost(result.cost_usd, "research_subagent")
+                await self.on_cost(result.cost_usd, "web_search_agent")
 
             n = self._research_counter
             self._research_counter += 1
@@ -394,7 +388,7 @@ class OrchestratorAgent:
             research_dir.mkdir(exist_ok=True)
             try:
                 (research_dir / f"finding_{n}.md").write_text(
-                    f"# Research: {question}\n\n{result.text}", encoding="utf-8"
+                    f"# Web Search: {task}\n\n{result.text}", encoding="utf-8"
                 )
             except Exception as e:
                 logger.warning(f"Failed to save research finding: {e}")
@@ -402,32 +396,96 @@ class OrchestratorAgent:
             return f"[Saved to research/finding_{n}.md]\n\n{result.text}", 0.0
 
         registry.add(
-            name="research",
+            name="web_search_agent",
             description=(
-                "Spawn a research subagent to explore a question. Returns findings. "
-                "Call multiple in one response for parallel research."
+                "Web research agent. Browses websites and searches the web. "
+                "Returns findings. Call multiple in one response for parallel research."
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "question": {"type": "string", "description": "Specific research question"},
-                    "scope": {"type": "string", "description": "Focus area for research"},
+                    "task": {"type": "string", "description": "What to research on the web"},
                     "budget": {
                         "type": "integer",
-                        "description": "Max tool calls (default 10). 5 for quick, 15-20 for deep.",
-                    },
-                    "output_format": {
-                        "type": "string",
-                        "description": "Expected format for the answer",
+                        "description": "Max tool calls (default 8). 4 for quick, 12 for deep.",
                     },
                 },
-                "required": ["question"],
+                "required": ["task"],
             },
-            handler=research,
+            handler=web_search_agent,
         )
 
-        # --- harvest (non-blocking) ---
-        async def harvest(args: Dict) -> tuple[str, float]:
+        # --- explore_agent ---
+        async def explore_agent(args: Dict) -> tuple[str, float]:
+            from dsl_worker.agents.code_exec import CodeExecAgent
+            from dsl_worker.config import settings as worker_settings
+
+            task = args.get("task", "")
+            budget = args.get("budget", 6)
+
+            if not task:
+                return "Error: task is required", 0.0
+
+            langfuse_span = getattr(self._conversation, "_current_langfuse_span", None)
+
+            agent = CodeExecAgent(
+                openai_client=self.openai_client,
+                model=worker_settings.research_subagent_model,
+                workspace_dir=self.workspace_dir,
+                sandbox=self.sandbox,
+                stop_checker=self.stop_checker,
+                max_turns=budget,
+                tool_budget=budget,
+                blob_service_client=self.blob_service_client,
+                project_id=self.project_id,
+                uploaded_file_urls=self.uploaded_file_urls,
+            )
+            if langfuse_span:
+                agent._conversation.langfuse_parent = langfuse_span
+
+            try:
+                result = await agent.ask_full(task)
+            finally:
+                await agent.cleanup()
+
+            if self.on_cost and result.cost_usd > 0:
+                await self.on_cost(result.cost_usd, "explore_agent")
+
+            n = self._research_counter
+            self._research_counter += 1
+            research_dir = self.workspace_dir / "research"
+            research_dir.mkdir(exist_ok=True)
+            try:
+                (research_dir / f"finding_{n}.md").write_text(
+                    f"# Explore: {task}\n\n{result.text}", encoding="utf-8"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to save finding: {e}")
+
+            return f"[Saved to research/finding_{n}.md]\n\n{result.text}", 0.0
+
+        registry.add(
+            name="explore_agent",
+            description=(
+                "Inspect files, data, and connected resources via code execution. "
+                "No web access. Use this to understand uploaded files, schemas, etc."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "What to inspect or analyze"},
+                    "budget": {
+                        "type": "integer",
+                        "description": "Max tool calls (default 6). 3 for quick, 10 for deep.",
+                    },
+                },
+                "required": ["task"],
+            },
+            handler=explore_agent,
+        )
+
+        # --- harvester_agent (non-blocking) ---
+        async def harvester_agent(args: Dict) -> tuple[str, float]:
             source = args.get("source", "")
             description = args.get("description", "")
 
@@ -456,7 +514,7 @@ class OrchestratorAgent:
             ), 0.0
 
         registry.add(
-            name="harvest",
+            name="harvester_agent",
             description=(
                 "Start a harvester for one source slice. Non-blocking — returns "
                 "immediately. Call multiple in parallel for different sources."
@@ -481,7 +539,7 @@ class OrchestratorAgent:
                 },
                 "required": ["source"],
             },
-            handler=harvest,
+            handler=harvester_agent,
         )
 
     # ── Harvester lifecycle ──────────────────────────────────────────
@@ -509,7 +567,7 @@ class OrchestratorAgent:
             workspace_dir=self.workspace_dir,
             pool=self._pool,
             harvester_index=idx,
-            brave_api_key=self.brave_api_key,
+            bu_client=self.bu_client,
             sandbox=self.sandbox,
             stop_checker=self.stop_checker,
             blob_service_client=self.blob_service_client,
@@ -520,8 +578,6 @@ class OrchestratorAgent:
             uploaded_files=self.uploaded_files,
             mcp_tools=self.mcp_tools,
             langfuse_parent=langfuse_span,
-            on_browser_started=self.on_browser_started,
-            on_browser_stopped=self.on_browser_stopped,
         )
 
         t0 = time.time()

@@ -68,6 +68,7 @@ class CodeExecAgent:
         sandbox: Optional[Any] = None,
         stop_checker: Optional[Callable[[], bool]] = None,
         max_turns: int = 10,
+        tool_budget: int = 0,
         blob_service_client: Optional[Any] = None,
         project_id: Optional[Any] = None,
         uploaded_file_urls: Optional[Dict[str, str]] = None,
@@ -97,7 +98,7 @@ class CodeExecAgent:
             quota=0,
         ))
 
-        registry = ToolRegistry()
+        registry = ToolRegistry(tool_budget=tool_budget)
         self._register_tools(registry)
 
         soft_limit = max(max_turns, 5)

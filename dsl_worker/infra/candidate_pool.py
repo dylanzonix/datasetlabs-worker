@@ -170,16 +170,26 @@ class CandidatePool:
                 f"{self._total_pulled} pulled, {len(self._sources)} sources"
             )
 
-    async def pull(self, timeout: float = 30.0) -> Optional[Candidate]:
+    async def pull(
+        self,
+        timeout: float = 30.0,
+        stop_event: Optional[asyncio.Event] = None,
+    ) -> Optional[Candidate]:
         """
         Pull next candidate using Thompson Sampling.
 
         Blocks if no candidates are available. Returns None when all sources
         are exhausted and all queues are drained (signals consumer to exit).
+
+        If stop_event is provided, returns None immediately when it fires.
         """
         deadline = time.monotonic() + timeout
 
         while True:
+            # Fast-path: check stop_event outside the lock
+            if stop_event and stop_event.is_set():
+                return None
+
             async with self._condition:
                 # Check terminal condition: all exhausted + all drained
                 if self._is_fully_drained():
@@ -197,14 +207,15 @@ class CandidatePool:
                 }
 
                 if not available:
-                    # Wait for new candidates or timeout
+                    # Wait for new candidates or timeout.
+                    # Short poll interval (1s) so pause is detected quickly.
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         return None
                     try:
                         await asyncio.wait_for(
                             self._condition.wait(),
-                            timeout=min(remaining, 5.0),
+                            timeout=min(remaining, 1.0),
                         )
                     except asyncio.TimeoutError:
                         pass
@@ -333,10 +344,12 @@ class CandidatePool:
         rows_done = self._generation_stats.get("rows_generated", 0)
         skipped = self._generation_stats.get("skipped", 0)
         errors = self._generation_stats.get("errors", 0)
+        in_progress = self._total_pulled - (rows_done + skipped + errors)
 
         lines = [
             f"Progress: {rows_done}/{self._target_rows} rows "
-            f"({skipped} skipped, {errors} errors)"
+            f"({skipped} skipped, {errors} errors, "
+            f"{max(0, in_progress)} currently being processed)"
         ]
 
         if not self._sources:
@@ -461,7 +474,10 @@ class StrategyMonitor:
                 f"  Produced {stats.candidates_produced} candidates, "
                 f"{stats.rows_produced} rows, "
                 f"{stats.fertility_rate:.0%} fertility\n\n"
-                f"{status}"
+                f"{status}\n\n"
+                f"Note: This is informational. Candidates may still be processing. "
+                f"Check the 'currently being processed' count above before deciding "
+                f"whether to add more sources — it may not be necessary."
             ),
             data=stats.to_dict(),
         ))
@@ -581,6 +597,15 @@ class StrategyMonitor:
         if self._pool.total_pending > 0:
             return
 
+        # Don't fire pool_empty if candidates are still being processed
+        # (pulled but not yet completed by row generators)
+        skipped = self._generation_stats.get("skipped", 0)
+        errors = self._generation_stats.get("errors", 0)
+        total_completed = rows_done + skipped + errors
+        in_progress = self._pool._total_pulled - total_completed
+        if in_progress > 0:
+            return
+
         now = time.time()
         if now - self._last_pool_empty_time < self._pool_empty_debounce:
             return
@@ -590,7 +615,7 @@ class StrategyMonitor:
         await self._fire_event(StrategyEvent(
             type="pool_empty",
             message=(
-                f"Pool empty: all candidates consumed but "
+                f"Pool empty: all candidates consumed and processed, but "
                 f"{self._target_rows - rows_done} more rows needed.\n\n"
                 f"{self._pool.format_status()}"
             ),
