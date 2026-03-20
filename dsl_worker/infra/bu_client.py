@@ -72,12 +72,23 @@ class BUClient:
         self._default_proxy = proxy_country
         self._stop_event = stop_event
 
-    async def _run_cancellable(self, coro):
-        """Run a coroutine, cancelling it if stop_event fires."""
-        if not self._stop_event:
-            return await coro
+    async def _run_cancellable(self, awaitable):
+        """Run an awaitable, cancelling it if stop_event fires.
 
-        task = asyncio.create_task(coro)
+        Handles both coroutines and awaitable objects (like AsyncSessionRun).
+        """
+        if not self._stop_event:
+            return await awaitable
+
+        # Check before starting — skip the call entirely if already stopped
+        if self._stop_event.is_set():
+            raise asyncio.CancelledError("Stop already requested")
+
+        # Wrap in a coroutine so create_task works with any awaitable
+        async def _wrapper():
+            return await awaitable
+
+        task = asyncio.create_task(_wrapper())
         stop_fut = asyncio.ensure_future(self._stop_event.wait())
 
         done, pending = await asyncio.wait(
@@ -87,8 +98,12 @@ class BUClient:
         for p in pending:
             p.cancel()
 
-        if task in done:
-            return task.result()
+        # Stop takes priority — if both finished, prefer stopping
+        if stop_fut in done:
+            task.cancel()
+            raise asyncio.CancelledError("Stop requested during BU call")
+
+        return task.result()
 
         # Stop was requested — cancel the BU call
         raise asyncio.CancelledError("Stop requested during BU call")
