@@ -741,10 +741,10 @@ class JobProcessor:
         )
 
         async def process_one(index: int, candidate_item: Dict):
-            """Process a single candidate under the semaphore."""
+            """Process a single candidate. Releases semaphore when done."""
             source_id = candidate_item.get("source_id", "unknown")
 
-            async with semaphore:
+            try:
                 if gen_stop_checker():
                     return
 
@@ -770,7 +770,6 @@ class JobProcessor:
                     tags = candidate_item.get("tags") or {}
                     candidate = candidate_item.get("candidate")
                     source_context = candidate_item.get("source_context", "")
-                    # Backward compat: use instructions as source_context
                     instructions = candidate_item.get("instructions", "")
 
                     max_attempts = 2
@@ -806,7 +805,6 @@ class JobProcessor:
                                 if checkpoint_mgr:
                                     await checkpoint_mgr.mark_processed(index, True, row_id)
 
-                                # Record SUCCESS outcome
                                 if strategy_monitor:
                                     await strategy_monitor.on_outcome(
                                         source_id, OutcomeType.SUCCESS, result.cost_usd
@@ -822,7 +820,6 @@ class JobProcessor:
                                 if checkpoint_mgr:
                                     await checkpoint_mgr.mark_processed(index, True, None)
 
-                                # Record outcome: duplicate or filtered
                                 if strategy_monitor:
                                     reason = (result.skip_reason or "").lower()
                                     outcome = (
@@ -878,6 +875,8 @@ class JobProcessor:
                                     )
                 finally:
                     await agent.cleanup()
+            finally:
+                semaphore.release()
 
         try:
             while True:
@@ -891,6 +890,17 @@ class JobProcessor:
                     )
                     break
 
+                # Backpressure: wait for a free worker slot BEFORE pulling.
+                # This ensures Thompson Sampling only selects candidates when
+                # a worker is ready to process them, so outcomes flow back
+                # before the next selection and the bandit can actually learn.
+                await semaphore.acquire()
+
+                # Re-check stop/target after potentially blocking on semaphore
+                if stop_checker() or (target_rows > 0 and generation_stats["rows_generated"] >= target_rows):
+                    semaphore.release()
+                    break
+
                 # Pull next candidate via Thompson Sampling
                 if candidate_pool:
                     candidate_item = await candidate_pool.pull(
@@ -901,10 +911,12 @@ class JobProcessor:
                         # exhausted + queues empty) OR on timeout. Only exit
                         # if the pool is actually fully drained.
                         if candidate_pool._is_fully_drained():
+                            semaphore.release()
                             logger.info("[Generation] Pool drained, stopping consumer")
                             break
                         # Otherwise just a timeout — harvesters may still be
-                        # producing candidates. Keep polling.
+                        # producing candidates. Release and keep polling.
+                        semaphore.release()
                         continue
                     # Convert Candidate to work item dict
                     item = {
@@ -918,14 +930,18 @@ class JobProcessor:
                     try:
                         item = await asyncio.wait_for(work_item_queue.get(), timeout=5.0)
                     except asyncio.TimeoutError:
+                        semaphore.release()
                         continue
                     if item is None:
+                        semaphore.release()
                         break
 
                 can_continue, _ = cost_tracker.check_balance_and_charge()
                 if not can_continue:
+                    semaphore.release()
                     break
 
+                # Semaphore is already acquired — process_one releases it when done
                 task = asyncio.create_task(process_one(item_index, item))
                 in_flight.append(task)
                 item_index += 1
