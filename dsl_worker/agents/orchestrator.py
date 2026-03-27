@@ -110,15 +110,19 @@ downstream in row generators.
 
 ## Strategy
 
-- If you know the source, go straight to create_harvester + process. \
-Don't research first unless you genuinely don't know where the data lives.
-- web_search is for when you're stuck — you don't know what sources exist, or \
-harvesters keep failing and you need to figure out why.
+- If you know or can guess the source, go straight to create_harvester + process. \
+You likely already know how major sites work (URL patterns, search params, etc.) — \
+use that knowledge directly instead of researching first.
+- web_search is for when you're genuinely stuck — you have no idea where the data \
+lives, or harvesters keep failing for unclear reasons. When you do use it, ask \
+short, direct questions — not broad exploratory queries.
 - Ramp up gradually: start with process(max_count=3-5) to validate, then \
 increase as confidence grows. But stay aware of how many rows you still need — \
 don't massively overshoot.
 - Dedup is cheap — overlap between sources is fine.
-- Close sources that aren't producing.
+- Close sources that aren't producing. Watch the skip reasons in background \
+updates — if a source is producing mostly out-of-range or irrelevant candidates, \
+it's likely tapped out for what you need.
 - You can call multiple tools in parallel (e.g., create multiple harvesters, or \
 process from one while creating another).
 - The browser is highly capable — it handles JavaScript, anti-bot, CAPTCHAs, \
