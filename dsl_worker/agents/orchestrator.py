@@ -56,52 +56,57 @@ class HarvesterState:
 ORCHESTRATOR_SYSTEM_PROMPT = """\
 # Dataset Generation Orchestrator
 
-A user described a dataset they want. You coordinate its production.
+You are the strategist in a dataset generation pipeline. You coordinate \
+harvesters (which collect candidates from sources) and row generators \
+(which turn candidates into verified dataset rows). You make all the decisions \
+— what sources to tap, how fast to scale, when to pivot.
 
-## Your Role
+## How the Pipeline Works
 
-You are a strategist. You create harvesters to find candidates from sources, \
-then process those candidates into dataset rows. You control the pace — start \
-small, evaluate results, then scale up what works.
+1. You create harvesters pointed at sources (URLs, files, search queries).
+2. You call process() which harvests a batch of candidates and kicks off \
+row generators to turn them into dataset rows.
+3. Row generators run in the background. You'll see results as background \
+updates on your next tool call — you don't have to wait.
+4. You keep going — creating more harvesters, processing more batches — \
+until the target is reached.
 
 ## Your Tools
 
 **explore_agent(task)** — Inspect uploaded files, data, schemas via code execution. \
-No web access. Use to understand what you already have.
+No web access.
 
 **web_search(task)** — Send a task to a browser agent that can search the web, \
-navigate pages, and extract information. Write the task as a clear instruction, \
-not keywords. Use to scout potential sources before harvesting. \
-Note: the browser may come pre-authenticated to some sites (via cookies) — \
-you have no control over this, so don't assume logged-in or logged-out state.
+navigate pages, and extract information. Write as a clear instruction, not keywords. \
+The browser may come pre-authenticated to some sites via cookies.
 
-**create_harvester(source, description)** — Set up a harvester for a source. \
-Returns a harvester_id. No harvesting happens yet — that starts when you process().
+**create_harvester(source, candidate_description)** — Set up a harvester for a source. \
+The candidate_description is critical — it tells the harvester exactly what a \
+good candidate looks like, what data to extract, and what to skip at a glance. \
+Write it as a clear, complete brief. Returns a harvester_id.
 
-**process(harvester_id, max_count)** — Get rows from a harvester. Harvests a batch \
-of candidates if needed, then processes up to max_count into dataset rows. \
-Returns: rows produced, skipped, duplicates, costs, and a harvest report.
+**process(harvester_id, max_count)** — Harvest a batch of candidates and start \
+processing them into rows. Returns the harvest report immediately. Row generation \
+results appear as background updates on subsequent tool calls.
 
-**close_harvest(harvester_id)** — Close a harvester and free its browser session. \
-Use when a source is exhausted or not worth continuing.
+**close_harvest(harvester_id)** — Close a harvester and free its browser session.
 
-## Candidate Scope
+## Writing Good Candidate Descriptions
 
-Pay attention to where candidates live:
-- **Enrichment**: User uploads a spreadsheet — rows ARE the candidates. One \
-harvester on the file, then process.
-- **Single-source**: User wants listings from one site. Harvest that site.
-- **Open discovery**: No source given — try multiple sources, compare results.
+The candidate_description on create_harvester is the most important thing you write. \
+It's the spec that harvesters use to decide what to grab and what to skip. Include:
+- What a good candidate IS (the entity, the context)
+- What data to extract per candidate (all visible fields you'd want)
+- Any dealbreakers that are obvious from the surface (date range, status, type)
 
-## Workflow
+Example: "An open Upwork job posting from the last 7 days where the client wants \
+a tabular dataset delivered (CSV, spreadsheet, structured list). Include: job title, \
+URL, full description, budget/hourly rate, posted date, client location, and skills. \
+Skip any posting that is clearly not about data/dataset work based on the title."
 
-1. **Recon** (if needed) — explore_agent for files, web_search for web.
-2. **Create harvesters** — you can create multiple in parallel if you have several \
-search queries or sources to try (e.g., 2-3 different queries in one turn). \
-For single-source jobs (one file, one site), one is fine.
-3. **Process** — call process() to harvest + generate rows. Start small (3-5) to validate.
-4. **Scale based on results** — if a source works, increase max_count. If not, close it and try another.
-5. **Repeat** until target is reached.
+The harvester will grab anything that looks like a match and skip only what is \
+obviously wrong. When in doubt, it produces the candidate — validation happens \
+downstream in row generators.
 
 ## Strategy
 
@@ -110,7 +115,8 @@ Don't research first unless you genuinely don't know where the data lives.
 - web_search is for when you're stuck — you don't know what sources exist, or \
 harvesters keep failing and you need to figure out why.
 - Ramp up gradually: start with process(max_count=3-5) to validate, then \
-increase as confidence grows. But stay aware of how many rows you still need — don't massively overshoot.
+increase as confidence grows. But stay aware of how many rows you still need — \
+don't massively overshoot.
 - Dedup is cheap — overlap between sources is fine.
 - Close sources that aren't producing.
 - You can call multiple tools in parallel (e.g., create multiple harvesters, or \
@@ -168,7 +174,6 @@ class OrchestratorAgent:
         uploaded_file_urls: Optional[Dict[str, str]] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
         feedback_context: Optional[Dict[str, Any]] = None,
-        langfuse_parent: Optional[Any] = None,
         harvester_model: str = "",
         generation_model: str = "",
     ) -> None:
@@ -191,7 +196,6 @@ class OrchestratorAgent:
         self.uploaded_file_urls = uploaded_file_urls
         self.uploaded_files = uploaded_files
         self.mcp_tools = mcp_tools or []
-        self.langfuse_parent = langfuse_parent
         self.harvester_model = harvester_model or model
         self.generation_model = generation_model or "gpt-5-mini"
 
@@ -203,6 +207,8 @@ class OrchestratorAgent:
         self._research_counter = 0
         self._harvester_counter = 0
         self._harvesters: Dict[str, HarvesterState] = {}
+        self._background_tasks: List[asyncio.Task] = []
+        self._pending_events: List[str] = []
 
         from dsl_worker.config import settings
         self._generation_semaphore = asyncio.Semaphore(
@@ -245,7 +251,7 @@ class OrchestratorAgent:
             on_tool_call=on_tool_call,
             on_cost=on_cost,
             extra_tools=self.mcp_tools,
-            langfuse_parent=langfuse_parent,
+            drain_events=self.drain_pending_events,
         )
 
     # ── Formatting helpers ────────────────────────────────────────────
@@ -383,8 +389,6 @@ class OrchestratorAgent:
             if not task:
                 return "Error: task is required", 0.0
 
-            langfuse_span = getattr(self._conversation, "_current_langfuse_span", None)
-
             agent = CodeExecAgent(
                 openai_client=self.openai_client,
                 model=worker_settings.research_subagent_model,
@@ -397,8 +401,6 @@ class OrchestratorAgent:
                 project_id=self.project_id,
                 uploaded_file_urls=self.uploaded_file_urls,
             )
-            if langfuse_span:
-                agent._conversation.langfuse_parent = langfuse_span
 
             try:
                 result = await agent.ask_full(task)
@@ -444,10 +446,12 @@ class OrchestratorAgent:
         # --- create_harvester ---
         async def create_harvester(args: Dict) -> tuple[str, float]:
             source = args.get("source", "")
-            description = args.get("description", "")
+            candidate_description = args.get("candidate_description", "")
 
             if not source:
                 return "Error: source is required", 0.0
+            if not candidate_description:
+                return "Error: candidate_description is required — the harvester needs to know what to look for.", 0.0
 
             from dsl_worker.agents.harvester import HarvesterAgent
 
@@ -455,11 +459,9 @@ class OrchestratorAgent:
             self._harvester_counter += 1
             harvester_id = f"harvest:{idx}"
 
-            langfuse_span = getattr(self._conversation, "_current_langfuse_span", None)
-
             harvester = HarvesterAgent(
                 source=source,
-                description=description,
+                description=candidate_description,
                 source_id=harvester_id,
                 openai_client=self.openai_client,
                 model=self.harvester_model,
@@ -476,13 +478,12 @@ class OrchestratorAgent:
                 uploaded_file_urls=self.uploaded_file_urls,
                 uploaded_files=self.uploaded_files,
                 mcp_tools=self.mcp_tools,
-                langfuse_parent=langfuse_span,
             )
 
             state = HarvesterState(
                 id=harvester_id,
                 source=source,
-                description=description,
+                description=candidate_description,
                 agent=harvester,
             )
             self._harvesters[harvester_id] = state
@@ -496,7 +497,9 @@ class OrchestratorAgent:
             name="create_harvester",
             description=(
                 "Set up a harvester for a source. Returns a harvester_id. "
-                "No harvesting happens yet — call process() to start."
+                "No harvesting happens yet — call process() to start. "
+                "The candidate_description is the brief for the harvester — "
+                "what a good candidate looks like, what to extract, what to skip."
             ),
             parameters={
                 "type": "object",
@@ -505,15 +508,15 @@ class OrchestratorAgent:
                         "type": "string",
                         "description": "Source to harvest: URL, file path, search query, or topic.",
                     },
-                    "description": {
+                    "candidate_description": {
                         "type": "string",
                         "description": (
-                            "What kind of items are on this source (e.g. 'job listings', "
-                            "'company profiles'). Do NOT include filtering criteria."
+                            "What candidates to look for. Describe the entity, what data to extract, "
+                            "and any obvious surface-level dealbreakers. See system prompt for examples."
                         ),
                     },
                 },
-                "required": ["source"],
+                "required": ["source", "candidate_description"],
             },
             handler=create_harvester,
         )
@@ -529,6 +532,7 @@ class OrchestratorAgent:
                 return f"Error: unknown harvester '{harvester_id}'. Available: {available}", 0.0
 
             batch_report = None
+            harvest_cost = 0.0
 
             # Auto-fetch if buffer empty and not exhausted
             if not state.candidates and not state.exhausted:
@@ -543,6 +547,7 @@ class OrchestratorAgent:
                 state.candidates.extend(candidates)
                 state.total_harvested += len(candidates)
                 state.harvest_cost += cost_delta
+                harvest_cost = cost_delta
                 state.batches += 1
                 state.exhausted = state.agent.exhausted
                 state.last_report = report
@@ -554,85 +559,36 @@ class OrchestratorAgent:
                     f"Exhausted: {state.exhausted}",
                     self._format_harvester_status(),
                 ]
-                return "\n".join(lines), 0.0
+                return "\n".join(lines), harvest_cost
 
             # Dequeue up to max_count
             to_process = state.candidates[:max_count]
             state.candidates = state.candidates[max_count:]
 
-            # Process in parallel
-            results = await asyncio.gather(*[
-                self._generate_row(candidate, state)
-                for candidate in to_process
-            ], return_exceptions=True)
-
-            # Aggregate
-            rows = 0
-            skipped = 0
-            dupes = 0
-            errors = 0
-            process_cost = 0.0
-
-            for r in results:
-                if isinstance(r, Exception):
-                    errors += 1
-                    logger.error(f"Row generation error: {r}")
-                    continue
-                gen_row, cost, saved = r
-                process_cost += cost
-                if gen_row.success:
-                    if saved:
-                        rows += 1
-                    else:
-                        rows += 1  # viable but target reached
-                elif gen_row.skipped:
-                    if "duplicate" in (gen_row.skip_reason or "").lower():
-                        dupes += 1
-                    else:
-                        skipped += 1
-                else:
-                    errors += 1
-
-            # Update state
-            state.total_processed += len(to_process)
-            state.rows_produced += rows
-            state.duplicates += dupes
-            state.skipped += skipped
-            state.errors += errors
-            state.process_cost += process_cost
-
-            self._generation_stats["rows_generated"] = (
-                self._generation_stats.get("rows_generated", 0) + rows
+            # Spawn row generators in the background — don't block
+            task = asyncio.create_task(
+                self._process_batch_background(harvester_id, state, to_process)
             )
-            self._generation_stats["skipped"] = (
-                self._generation_stats.get("skipped", 0) + skipped + dupes
-            )
-            self._generation_stats["errors"] = (
-                self._generation_stats.get("errors", 0) + errors
-            )
+            self._background_tasks.append(task)
 
             lines = [
-                f"Processed {len(to_process)} candidates from {harvester_id}:",
-                f"  Rows produced: {rows}",
-                f"  Skipped: {skipped}",
-                f"  Duplicates: {dupes}",
-                f"  Errors: {errors}",
-                f"  Process cost: ${process_cost:.4f}",
+                f"Harvested from {harvester_id}: {len(to_process)} candidates queued for processing.",
                 f"  Buffer remaining: {len(state.candidates)}",
                 f"  Exhausted: {state.exhausted}",
             ]
             if batch_report:
                 lines.append(f"\nBatch report: {batch_report}")
+            lines.append(f"\nRow generation running in background. Results will appear on your next tool call.")
             lines.append(self._format_harvester_status())
 
-            return "\n".join(lines), process_cost
+            return "\n".join(lines), harvest_cost
 
         registry.add(
             name="process",
             description=(
-                "Process candidates from a harvester into dataset rows. "
-                "If the buffer is empty, automatically fetches one new batch first. "
-                "Candidates beyond max_count stay buffered for later."
+                "Harvest a batch of candidates and start processing them into rows. "
+                "Returns immediately with the harvest report. Row generation runs "
+                "in the background — results appear as updates on subsequent tool calls."
             ),
             parameters={
                 "type": "object",
@@ -700,6 +656,98 @@ class OrchestratorAgent:
             handler=close_harvest,
         )
 
+    # ── Background processing ──────────────────────────────────────────
+
+    async def _process_batch_background(
+        self,
+        harvester_id: str,
+        state: HarvesterState,
+        candidates: List[Candidate],
+    ) -> None:
+        """Process a batch of candidates in the background. Pushes events when done."""
+        try:
+            results = await asyncio.gather(*[
+                self._generate_row(candidate, state)
+                for candidate in candidates
+            ], return_exceptions=True)
+
+            # Aggregate
+            rows = 0
+            skipped = 0
+            dupes = 0
+            errors = 0
+            process_cost = 0.0
+
+            for r in results:
+                if isinstance(r, Exception):
+                    errors += 1
+                    logger.error(f"Row generation error: {r}")
+                    continue
+                gen_row, cost, saved = r
+                process_cost += cost
+                if gen_row.success:
+                    rows += 1
+                elif gen_row.skipped:
+                    if "duplicate" in (gen_row.skip_reason or "").lower():
+                        dupes += 1
+                    else:
+                        skipped += 1
+                else:
+                    errors += 1
+
+            # Update state
+            state.total_processed += len(candidates)
+            state.rows_produced += rows
+            state.duplicates += dupes
+            state.skipped += skipped
+            state.errors += errors
+            state.process_cost += process_cost
+
+            self._generation_stats["rows_generated"] = (
+                self._generation_stats.get("rows_generated", 0) + rows
+            )
+            self._generation_stats["skipped"] = (
+                self._generation_stats.get("skipped", 0) + skipped + dupes
+            )
+            self._generation_stats["errors"] = (
+                self._generation_stats.get("errors", 0) + errors
+            )
+
+            # Push batch_done event
+            total_rows = self._generation_stats.get("rows_generated", 0)
+            event = (
+                f"[batch_done] {harvester_id}: {len(candidates)} processed → "
+                f"{rows} rows, {skipped} skipped, {dupes} dupes, {errors} errors. "
+                f"Cost: ${process_cost:.4f}. "
+                f"Progress: {total_rows}/{self.num_samples} rows."
+            )
+            self._pending_events.append(event)
+
+            # Check if source exhausted (no buffer left + harvester done)
+            if state.exhausted and not state.candidates:
+                self._pending_events.append(
+                    f"[source_exhausted] {harvester_id}: source fully drained. "
+                    f"Total: {state.rows_produced} rows from {state.total_harvested} candidates."
+                )
+
+            logger.info(f"[orchestrator] {event}")
+
+        except Exception as e:
+            logger.error(f"[orchestrator] Background processing error for {harvester_id}: {e}")
+            self._pending_events.append(
+                f"[error] {harvester_id}: background processing failed: {e}"
+            )
+
+    def drain_pending_events(self) -> str:
+        """Collect and clear all pending background events. Called by base.py after tool execution."""
+        if not self._pending_events:
+            return ""
+        events = "\n".join(self._pending_events)
+        self._pending_events.clear()
+        # Clean up completed background tasks
+        self._background_tasks = [t for t in self._background_tasks if not t.done()]
+        return f"\n\n---\nBackground updates:\n{events}"
+
     # ── Row generation ────────────────────────────────────────────────
 
     async def _generate_row(
@@ -711,8 +759,6 @@ class OrchestratorAgent:
         from dsl_worker.agents.row import RowGeneratorAgent, GeneratedRow
 
         async with self._generation_semaphore:
-            langfuse_span = getattr(self._conversation, "_current_langfuse_span", None)
-
             agent = RowGeneratorAgent(
                 openai_client=self.openai_client,
                 model=self.generation_model,
@@ -728,7 +774,6 @@ class OrchestratorAgent:
                 uploaded_file_urls=self.uploaded_file_urls,
                 mcp_tools=self.mcp_tools,
                 on_cost=self.on_cost,
-                langfuse_parent=langfuse_span,
             )
             try:
                 result = await agent.generate(
@@ -788,7 +833,15 @@ class OrchestratorAgent:
         return self._conversation.total_cost
 
     async def cleanup(self) -> None:
-        """Close all active harvesters."""
+        """Wait for background tasks and close all harvesters."""
+        # Wait for any in-flight row generation
+        if self._background_tasks:
+            pending = [t for t in self._background_tasks if not t.done()]
+            if pending:
+                logger.info(f"[orchestrator] Waiting for {len(pending)} background tasks...")
+                await asyncio.gather(*pending, return_exceptions=True)
+            self._background_tasks.clear()
+
         for hid, state in list(self._harvesters.items()):
             try:
                 await state.agent.close()

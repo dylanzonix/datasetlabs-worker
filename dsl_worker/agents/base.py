@@ -132,6 +132,7 @@ class AgentConversation:
         extra_tools: Optional[List[Dict[str, Any]]] = None,
         langfuse_parent: Optional[Any] = None,
         on_idle: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
+        drain_events: Optional[Callable[[], str]] = None,
     ) -> None:
         self.openai_client = openai_client
         self.model = model
@@ -157,6 +158,9 @@ class AgentConversation:
         # If set, blocks until it returns a string (injected as user message)
         # or None (signals the loop to exit). Takes priority over continue_on_text.
         self.on_idle = on_idle
+        # drain_events: called after tool execution to collect background updates.
+        # Returns a string to append to the tool output, or "" if nothing pending.
+        self.drain_events = drain_events
 
         # Conversation state — this IS the context sent to the API each turn.
         # Contains user messages, reasoning items, assistant messages,
@@ -295,29 +299,27 @@ class AgentConversation:
         exit_condition: Optional[Callable[[], bool]] = None,
     ) -> AgentResult:
         """Core agent loop. Calls API, handles tools, repeats."""
-        # Use explicit parent if provided, otherwise fall back to context-var
-        # inference via the global Langfuse client.
-        parent = self.langfuse_parent or _get_langfuse()
-        if parent:
-            return await self._run_loop_traced(parent, exit_condition)
+        # v4: Langfuse uses OTel contextvars — start_as_current_observation
+        # automatically nests under the active span. No explicit parent needed.
+        lf = _get_langfuse()
+        if lf:
+            return await self._run_loop_traced(lf, exit_condition)
         return await self._run_loop_inner(exit_condition)
 
     async def _run_loop_traced(
         self,
-        langfuse_parent,
+        lf,
         exit_condition: Optional[Callable[[], bool]] = None,
     ) -> AgentResult:
         """Wrapper that creates a Langfuse span around the agent loop.
 
-        Calls start_as_current_observation on the parent — this creates
-        an explicit child span AND sets it as the current observation in
-        contextvars, so the OpenAI auto-wrapper and tool spans nest
-        correctly underneath.
+        Uses v4 OTel context — start_as_current_observation automatically
+        nests under the active span via contextvars.
         """
-        with langfuse_parent.start_as_current_observation(
+        with lf.start_as_current_observation(
             as_type="span",
             name=self.label,
-            metadata={"model": self.model, "max_turns": self.max_turns},
+            metadata={"model": str(self.model), "max_turns": str(self.max_turns)},
         ) as span:
             self._current_langfuse_span = span
             result = await self._run_loop_inner(exit_condition)
@@ -325,9 +327,9 @@ class AgentConversation:
                 span.update(
                     output=result.text[:2000] if result.text else None,
                     metadata={
-                        "total_cost_usd": round(result.cost_usd, 6),
-                        "total_turns": result.turns_taken,
-                        "stopped": result.stopped,
+                        "total_cost_usd": str(round(result.cost_usd, 6)),
+                        "total_turns": str(result.turns_taken),
+                        "stopped": str(result.stopped),
                     },
                 )
             except Exception:
@@ -376,7 +378,7 @@ class AgentConversation:
                     gen_obs.update(
                         output=_serialize_response_output(response.output),
                         usage_details=usage_details,
-                        metadata={"cost_usd": round(cost.total_cost_usd, 6)},
+                        metadata={"cost_usd": str(round(cost.total_cost_usd, 6))},
                     )
                 except Exception:
                     pass
@@ -559,6 +561,12 @@ class AgentConversation:
                 if self.on_cost and tool_cost > 0:
                     await self.on_cost(tool_cost, self.label)
 
+                # Append any pending background events
+                if self.drain_events:
+                    events = self.drain_events()
+                    if events:
+                        result_text += events
+
                 self.messages.append({
                     "type": "function_call_output",
                     "call_id": tc.call_id,
@@ -626,7 +634,7 @@ class AgentConversation:
                 preview = result_text if len(result_text) <= 1000 else result_text[:1000] + "…"
                 tool_obs.update(
                     output=preview,
-                    metadata={"cost_usd": round(cost, 6), "output_len": len(result_text)},
+                    metadata={"cost_usd": str(round(cost, 6)), "output_len": str(len(result_text))},
                 )
             except Exception:
                 pass
@@ -663,6 +671,12 @@ class AgentConversation:
                 if self.on_cost and tool_cost > 0:
                     await self.on_cost(tool_cost, self.label)
                 output_text = output_text[:TOOL_OUTPUT_LIMIT]
+
+            # Append background events to the last tool output
+            if i == len(results) - 1 and self.drain_events:
+                events = self.drain_events()
+                if events:
+                    output_text += events
 
             self.messages.append({
                 "type": "function_call_output",

@@ -204,7 +204,7 @@ class JobProcessor:
                 metadata={
                     "project_id": str(project_id),
                     "version_id": str(version_id),
-                    "num_samples": version.num_samples,
+                    "num_samples": str(version.num_samples),
                 },
             ):
                 langfuse = _get_langfuse()
@@ -212,10 +212,9 @@ class JobProcessor:
                     with langfuse.start_as_current_observation(
                         as_type="span",
                         name=f"job:{project.name} v{version.version_number}",
-                    ) as job_span:
+                    ):
                         result = await self._run_pipeline(
                             db, project, version, state, tracked_client, cost_tracker,
-                            langfuse_parent=job_span,
                         )
                 else:
                     result = await self._run_pipeline(
@@ -257,7 +256,6 @@ class JobProcessor:
         state: ProjectState,
         tracked_client: TrackedOpenAIClient,
         cost_tracker: CostTracker,
-        langfuse_parent: Optional[Any] = None,
     ) -> bool:
         """Run the V5 pipeline: orchestrator → seed yielders → row generators."""
 
@@ -513,7 +511,6 @@ class JobProcessor:
             uploaded_file_urls=uploaded_file_urls if uploaded_file_urls else None,
             mcp_tools=mcp_tools,
             feedback_context=feedback_context,
-            langfuse_parent=langfuse_parent,
         )
 
         try:
