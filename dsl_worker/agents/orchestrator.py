@@ -688,7 +688,7 @@ class OrchestratorAgent:
                 if gen_row.success:
                     rows += 1
                 elif gen_row.skipped:
-                    if "duplicate" in (gen_row.skip_reason or "").lower():
+                    if gen_row.is_duplicate:
                         dupes += 1
                     else:
                         skipped += 1

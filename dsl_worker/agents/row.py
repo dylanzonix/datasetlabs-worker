@@ -157,6 +157,7 @@ class GeneratedRow:
     cost_usd: float = 0.0
     skipped: bool = False
     skip_reason: str = ""
+    is_duplicate: bool = False
 
 
 ROW_GENERATOR_SYSTEM_PROMPT = """\
@@ -188,7 +189,7 @@ If the candidate already has all the data you need, just fill columns and submit
 no browsing required.
    - When you set a column, the system will warn you if similar values exist. \
 If the match is close on something that should be unique (name, URL, email), \
-this is likely a duplicate. Call skip_row(reason="duplicate: ...").
+this is likely a duplicate. Call mark_duplicate(reason="...").
    - Use judgment: many rows with country="USA" is normal, but 2 rows with \
 the same email is suspicious.
 3. Only browse if columns are missing from the candidate:
@@ -269,6 +270,7 @@ class RowGeneratorAgent:
         self._current_row: Dict[str, Any] = {}
         self._submitted: bool = False
         self._skipped: bool = False
+        self._is_duplicate: bool = False
         self._skip_reason: str = ""
         self._schema: List[Dict] = []
 
@@ -361,7 +363,7 @@ class RowGeneratorAgent:
                     f"Set {name} = {value!r}\n\n"
                     f"⚠ {len(similar)} existing row(s) in the dataset have similar '{name}' values:\n"
                     + "\n".join(lines) + "\n\n"
-                    f"If any of these is the same entity, call skip_row(reason=\"duplicate: ...\")."
+                    f"If any of these is the same entity, call mark_duplicate(reason=\"...\")."
                 ), 0.0
 
             return f"Set {name}", 0.0
@@ -498,17 +500,40 @@ class RowGeneratorAgent:
         registry.add(
             name="skip_row",
             description=(
-                "Skip this candidate. Use when it's a duplicate, dead end, "
-                "broken URL, or doesn't qualify."
+                "Skip this candidate because it doesn't qualify — wrong category, "
+                "outside date range, dead end, requires private data, etc."
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "reason": {"type": "string", "description": "Why this row is being skipped"},
+                    "reason": {"type": "string", "description": "Why this candidate doesn't qualify"},
                 },
                 "required": ["reason"],
             },
             handler=skip_row,
+        )
+
+        async def mark_duplicate(args: Dict) -> tuple[str, float]:
+            reason = args.get("reason", "")
+            self._skipped = True
+            self._is_duplicate = True
+            self._skip_reason = reason
+            return f"Row marked as duplicate: {reason}", 0.0
+
+        registry.add(
+            name="mark_duplicate",
+            description=(
+                "Mark this candidate as a duplicate of an existing row. "
+                "Use when the dedup warnings show a clear match."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string", "description": "What it's a duplicate of"},
+                },
+                "required": ["reason"],
+            },
+            handler=mark_duplicate,
         )
 
         async def rng(args: Dict) -> tuple[str, float]:
@@ -671,6 +696,7 @@ class RowGeneratorAgent:
         self._current_row = {}
         self._submitted = False
         self._skipped = False
+        self._is_duplicate = False
         self._skip_reason = ""
         self._schema = schema
 
@@ -720,7 +746,8 @@ class RowGeneratorAgent:
         if self._skipped:
             await self.dedup_store.remove_in_flight(self._row_id)
             return GeneratedRow(
-                success=False, skipped=True, skip_reason=self._skip_reason, cost_usd=cost
+                success=False, skipped=True, skip_reason=self._skip_reason,
+                is_duplicate=self._is_duplicate, cost_usd=cost,
             )
 
         if self._submitted:
