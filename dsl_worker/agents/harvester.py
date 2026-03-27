@@ -1,11 +1,12 @@
 """
-Harvester agent — produces candidates from sources.
+Harvester agent — produces candidates from sources in batches.
 
-V10.2: Uses BU V3 SDK for web extraction. Each browse() call is a single
-API call to BU Cloud — no local browser management.
-
-- Web: BU V3 SDK extract() → structured items → pool
-- Files: code_exec with submit_seed in sandbox
+V11: Batch-oriented iterator controlled by the orchestrator.
+- Each run_batch() call runs the agent loop until it produces a text response
+  (natural batch boundary) or calls done() (source exhausted).
+- BU sessions are reused between batches via keep_alive + session_id.
+- Candidates are buffered internally, not pushed to a shared pool.
+- The orchestrator decides when to harvest more, process, or close.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from dsl_worker.agents.base import AgentConversation, AgentResult
 from dsl_worker.agents.tools import ToolRegistry
 from dsl_worker.billing.tracked_client import TrackedOpenAIClient
 from dsl_worker.infra.bu_client import BUClient
-from dsl_worker.infra.candidate_pool import Candidate, CandidatePool
+from dsl_worker.infra.candidate_pool import Candidate
 
 logger = logging.getLogger(__name__)
 
@@ -47,19 +48,27 @@ You are harvesting candidates from the assigned source for a dataset.
 
 1. Navigate to the source. Use browse(url, task) to extract candidates.
 2. browse() sends a browser agent to the page — it extracts ALL items \
-and returns them. Each item is automatically submitted as a candidate.
-3. If you spot candidates yourself (e.g. from thinking about the source), \
-you can call submit_candidate() directly.
-4. Continue: try different pages, search terms, or sub-sections of the source.
-5. Call done() when the source is exhausted.
+and returns them. Each item is buffered as a candidate.
+3. If you spot candidates yourself, call submit_candidate() directly.
+4. After extracting what's available, respond with a short report:
+   - How many candidates you found
+   - What lies ahead (more pages? running out? source nearly tapped?)
+5. Call done() only when the source is fully exhausted.
 
 ## Important
 
 - Do NOT filter candidates. Submit everything. Filtering happens downstream.
+- Extract ALL visible data for each candidate (title, URL, date, price, location, \
+description — whatever is shown on the page). The more complete each candidate, \
+the less downstream research is needed.
+- Do NOT click into individual items to get more data — just grab what's on the list page.
 - Keep browse tasks simple and focused: "Extract all listings on this page."
 - Do NOT include quality/date/topic filters in browse tasks.
 - For file sources, use code_exec to parse and submit candidates programmatically.
 - Cast a wide net — deduplication and filtering are cheap downstream.
+- After extracting a batch, STOP and report. Don't keep browsing endlessly.
+
+Today's date: {current_date}
 
 {files_section}
 
@@ -69,16 +78,17 @@ you can call submit_candidate() directly.
 - submit_candidate(content): Submit a candidate you found directly.
 - code_exec(script, description): Execute Python in sandbox. Use submit_seed() \
 to yield candidates from code.
-- done(reason): Signal you're finished.
+- done(reason): Signal the source is fully exhausted.
 """
 
 
 class HarvesterAgent:
     """
-    Harvester — navigates sources and produces candidates.
+    Harvester — navigates sources and produces candidates in batches.
 
     Uses BU V3 SDK for web extraction (bu-mini, server-side).
     Code_exec for file sources (sandbox).
+    BU sessions are reused between batches for efficiency.
     """
 
     def __init__(
@@ -89,12 +99,12 @@ class HarvesterAgent:
         openai_client: TrackedOpenAIClient,
         model: str,
         workspace_dir: Path,
-        pool: CandidatePool,
         bu_client: BUClient,
         harvester_index: int = 0,
         research_context: str = "",
         sandbox: Optional[Any] = None,
         stop_checker: Optional[Callable[[], bool]] = None,
+        stop_event: Optional[asyncio.Event] = None,
         blob_service_client: Optional[Any] = None,
         project_id: Optional[Any] = None,
         on_tool_call: Optional[Callable[[str, str], None]] = None,
@@ -108,16 +118,18 @@ class HarvesterAgent:
         self.description = description
         self.source_id = source_id
         self.workspace_dir = Path(workspace_dir)
-        self.pool = pool
         self.bu_client = bu_client
         self.harvester_index = harvester_index
         self.stop_checker = stop_checker
         self.on_tool_call = on_tool_call
         self.on_cost = on_cost
 
-        # State
-        self._candidates_submitted = 0
-        self._is_done = False
+        # Batch state
+        self._buffer: List[Candidate] = []
+        self._bu_session_id: Optional[str] = None
+        self._exhausted: bool = False
+        self._candidates_total: int = 0
+        self._prev_cost: float = 0.0
 
         # Sandbox for code_exec (file sources)
         self._sandbox_impl: Optional[Any] = None
@@ -145,12 +157,14 @@ class HarvesterAgent:
         registry = ToolRegistry()
         self._register_tools(registry)
 
+        from datetime import date
         files_section = self._format_files_section(uploaded_files)
         system_prompt = HARVESTER_SYSTEM_PROMPT.format(
             source=source,
             description=description or "(navigate and find candidate items)",
             research_context=research_context or "(none)",
             files_section=files_section,
+            current_date=date.today().isoformat(),
         )
 
         self._conversation = AgentConversation(
@@ -159,6 +173,7 @@ class HarvesterAgent:
             system_prompt=system_prompt,
             tools=registry,
             stop_checker=stop_checker,
+            stop_event=stop_event,
             max_turns=30,
             reasoning={"effort": "medium", "summary": "detailed"},
             label=f"harvester:{harvester_index}",
@@ -185,20 +200,22 @@ class HarvesterAgent:
             lines.append(f"  - /workspace/uploads/{name} ({ctype}, {size_str})")
         return "\n".join(lines)
 
-    async def _submit_to_pool(self, content: Any, origin: str = "browse") -> None:
-        """Submit a candidate to the pool."""
+    # ── Buffer management ─────────────────────────────────────────────
+
+    def _add_to_buffer(self, content: Any, origin: str = "browse") -> None:
+        """Add a candidate to the internal buffer."""
         candidate = Candidate(
             values=content,
             source_id=self.source_id,
             source_context=self.description,
             metadata={"origin": origin},
         )
-        await self.pool.submit(candidate)
-        self._candidates_submitted += 1
+        self._buffer.append(candidate)
+        self._candidates_total += 1
 
     async def _handle_code_seed(self, seed_data: Dict) -> None:
-        """Bridge code_exec submit_seed() calls to the CandidatePool."""
-        await self._submit_to_pool(
+        """Bridge code_exec submit_seed() calls to internal buffer."""
+        self._add_to_buffer(
             content=seed_data.get("content", ""),
             origin="code_exec",
         )
@@ -206,29 +223,33 @@ class HarvesterAgent:
     # ── BU V3 SDK extraction ─────────────────────────────────────────
 
     async def _run_bu_extract(self, url: str, task: str) -> Tuple[str, float]:
-        """
-        Extract candidates from a page via BU V3 SDK.
-
-        Single API call — BU handles browser, navigation, extraction server-side.
-        Returns structured items which are submitted to the pool.
-        """
+        """Extract candidates from a page via BU V3 SDK with session reuse."""
         scope_id = f"harvester:{self.harvester_index}"
 
         bu_task = (
             f"Navigate to: {url}\n\n{task}\n\n"
-            "Extract ALL items from the page. For each item, include all visible "
-            "fields (title, URL, description, price, date, etc.) in the data."
+            "Extract ALL items from the page using JavaScript/evaluate where possible. "
+            "Include all visible fields (title, URL, description, price, date, etc.). "
+            "Be fast — extract and return, don't over-explore."
         ) if url else task
 
         logger.info(f"[{scope_id}] BU extract START: {url[:80] if url else 'no url'}")
         t0 = time.time()
 
         try:
-            items, bu_cost = await self.bu_client.extract(bu_task)
+            items, bu_cost, session_id = await self.bu_client.extract(
+                bu_task,
+                session_id=self._bu_session_id,
+                keep_alive=True,
+            )
             elapsed = time.time() - t0
 
+            # Store session for reuse
+            if session_id:
+                self._bu_session_id = session_id
+
             for item in items:
-                await self._submit_to_pool(json.dumps(item), origin="bu_extract")
+                self._add_to_buffer(json.dumps(item), origin="bu_extract")
 
             logger.info(
                 f"[{scope_id}] BU extract DONE: {len(items)} items, "
@@ -237,12 +258,16 @@ class HarvesterAgent:
 
             return (
                 f"Extracted {len(items)} candidates from the page.\n"
-                f"Total candidates submitted: {self._candidates_submitted}"
+                f"Total candidates this session: {self._candidates_total}"
             ), bu_cost
 
         except Exception as e:
             elapsed = time.time() - t0
             logger.error(f"[{scope_id}] BU extract error ({elapsed:.1f}s): {e}")
+            # Session may be dead — reset for next attempt
+            if self._bu_session_id:
+                logger.info(f"[{scope_id}] Resetting BU session after error")
+                self._bu_session_id = None
             return f"Extraction error: {e}", 0.0
 
     # ── Tool registration ─────────────────────────────────────────────
@@ -263,7 +288,7 @@ class HarvesterAgent:
             name="browse",
             description=(
                 "Navigate a page and extract candidates. A browser agent will "
-                "find all items and submit them automatically. "
+                "find all items and buffer them as candidates. "
                 "Returns a summary with candidate count."
             ),
             parameters={
@@ -300,10 +325,10 @@ class HarvesterAgent:
             content = args.get("content", "")
             if not content:
                 return "Error: content is required", 0.0
-            await self._submit_to_pool(content, origin="coordinator")
+            self._add_to_buffer(content, origin="coordinator")
             return (
-                f"Candidate #{self._candidates_submitted} submitted. "
-                f"Total: {self._candidates_submitted}"
+                f"Candidate #{self._candidates_total} buffered. "
+                f"Total: {self._candidates_total}"
             ), 0.0
 
         registry.add(
@@ -325,15 +350,15 @@ class HarvesterAgent:
         # --- done ---
         async def done(args: Dict) -> tuple[str, float]:
             reason = args.get("reason", "complete")
-            self._is_done = True
+            self._exhausted = True
             return (
                 f"Harvester done: {reason}. "
-                f"{self._candidates_submitted} candidates submitted."
+                f"{self._candidates_total} candidates produced."
             ), 0.0
 
         registry.add(
             name="done",
-            description="Signal you're finished harvesting.",
+            description="Signal the source is fully exhausted. Only call when there is genuinely nothing left.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -343,29 +368,69 @@ class HarvesterAgent:
             handler=done,
         )
 
-    async def run(self) -> AgentResult:
-        """Run the harvester."""
+    # ── Batch interface ───────────────────────────────────────────────
+
+    async def run_batch(
+        self, message: str = "Begin harvesting candidates from your assigned source.",
+    ) -> Tuple[List[Candidate], str]:
+        """
+        Run one batch of harvesting.
+
+        The agent loop runs until the harvester outputs text without tool calls
+        (natural batch boundary) or calls done() (source exhausted).
+
+        Returns (new_candidates, report_text).
+        Calling run_batch again continues the SAME conversation.
+        """
+        batch_start = len(self._buffer)
+
         result = await self._conversation.send(
-            "Begin harvesting candidates from your assigned source.",
-            exit_condition=lambda: self._is_done,
+            message,
+            exit_condition=lambda: self._exhausted,
         )
 
+        new_candidates = self._buffer[batch_start:]
+        report = result.text or "(no report)"
+
         logger.info(
-            f"[harvester:{self.harvester_index}] finished: "
-            f"{self._candidates_submitted} candidates submitted"
+            f"[harvester:{self.harvester_index}] batch done: "
+            f"{len(new_candidates)} new candidates, "
+            f"exhausted={self._exhausted}"
         )
-        return result
+
+        return new_candidates, report
+
+    @property
+    def exhausted(self) -> bool:
+        return self._exhausted
+
+    @property
+    def batch_cost_delta(self) -> float:
+        """Cost since last check."""
+        delta = self._conversation.total_cost - self._prev_cost
+        self._prev_cost = self._conversation.total_cost
+        return delta
 
     @property
     def cost_usd(self) -> float:
         return self._conversation.total_cost
 
     @property
-    def candidates_submitted(self) -> int:
-        return self._candidates_submitted
+    def candidates_total(self) -> int:
+        return self._candidates_total
 
-    async def cleanup(self) -> None:
-        """Clean up sandbox resources."""
+    @property
+    def buffer_size(self) -> int:
+        return len(self._buffer)
+
+    async def close(self) -> None:
+        """Stop BU session and clean up sandbox resources."""
+        if self._bu_session_id and self.bu_client:
+            try:
+                await self.bu_client.stop_session(self._bu_session_id)
+            except Exception as e:
+                logger.warning(f"Harvester {self.harvester_index} session stop error: {e}")
+            self._bu_session_id = None
         if self._sandbox_impl:
             try:
                 await self._sandbox_impl.cleanup()

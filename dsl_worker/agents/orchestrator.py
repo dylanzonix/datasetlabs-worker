@@ -1,16 +1,13 @@
 """
 Orchestrator agent — coordinates dataset generation.
 
-V10: Event-driven, multi-armed bandit. The orchestrator is a reactive strategist:
-- harvest() is non-blocking — spawns harvesters in background
-- No set_instructions — row generators use conversation context directly
-- No done() — system auto-exits when target reached or all sources exhausted
-- Events (source_exhausted, milestone, stall, etc.) auto-inject as messages
-  via the on_idle callback in AgentConversation
+V11: Orchestrator-driven batch pipeline. The orchestrator is the sole
+decision-maker — no background consumers, no Thompson Sampling, no events.
 
-Tools:
-- research(question, ...) — spawn research subagent
-- harvest(source, description) — spawn a harvester (non-blocking)
+- start_harvest() creates a harvester and runs its first batch
+- process() processes candidates into rows (auto-batches if buffer empty)
+- close_harvest() stops a harvester and frees its browser session
+- The orchestrator sees real cost breakdowns and makes all scaling decisions
 """
 
 from __future__ import annotations
@@ -19,18 +16,42 @@ import asyncio
 import json
 import logging
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from dsl_worker.agents.base import AgentConversation, AgentResult
 from dsl_worker.agents.tools import ToolRegistry
 from dsl_worker.billing.tracked_client import TrackedOpenAIClient
-from dsl_worker.infra.candidate_pool import CandidatePool, StrategyMonitor
+from dsl_worker.infra.candidate_pool import Candidate
 
 logger = logging.getLogger(__name__)
 
-HARVESTER_WALL_CLOCK_TIMEOUT = 600  # seconds — max time for a single harvester
 
+# ── HarvesterState ────────────────────────────────────────────────────
+
+@dataclass
+class HarvesterState:
+    """Tracks a harvester and its candidates."""
+    id: str                           # "harvest:0"
+    source: str
+    description: str
+    agent: Any                        # HarvesterAgent (forward ref)
+    candidates: List[Candidate] = field(default_factory=list)
+    total_harvested: int = 0
+    total_processed: int = 0
+    rows_produced: int = 0
+    duplicates: int = 0
+    skipped: int = 0
+    errors: int = 0
+    harvest_cost: float = 0.0
+    process_cost: float = 0.0
+    batches: int = 0
+    exhausted: bool = False
+    last_report: str = ""
+
+
+# ── System Prompt ─────────────────────────────────────────────────────
 
 ORCHESTRATOR_SYSTEM_PROMPT = """\
 # Dataset Generation Orchestrator
@@ -39,79 +60,65 @@ A user described a dataset they want. You coordinate its production.
 
 ## Your Role
 
-You are a strategist. You dispatch harvesters to find candidates from sources, \
-and the system automatically processes them into dataset rows. You do NOT manage \
-quotas, throttling, or operational details — the system handles that via \
-cost-optimized source sampling (Thompson Sampling).
+You are a strategist. You create harvesters to find candidates from sources, \
+then process those candidates into dataset rows. You control the pace — start \
+small, evaluate results, then scale up what works.
 
-## Your Subagents
+## Your Tools
 
-**explore_agent(task)** — Recon agent for files, data, and connected resources. \
-Uses code execution to inspect uploaded files, parse schemas, analyze data. \
-No web access. Use this to understand what you already have.
+**explore_agent(task)** — Inspect uploaded files, data, schemas via code execution. \
+No web access. Use to understand what you already have.
 
-**web_search_agent(task)** — Web research agent. Browses websites, searches \
-the web. Use this to understand the landscape of potential sources online.
+**web_search(task)** — Send a task to a browser agent that can search the web, \
+navigate pages, and extract information. Write the task as a clear instruction, \
+not keywords. Use to scout potential sources before harvesting. \
+Note: the browser may come pre-authenticated to some sites (via cookies) — \
+you have no control over this, so don't assume logged-in or logged-out state.
 
-**harvester_agent(source, description)** — Start a harvester for one source slice. \
-Non-blocking — returns immediately. The harvester navigates the source \
-and submits ALL items it finds as candidates. Do NOT put filtering criteria \
-in the description — filtering happens downstream in row generators.
+**create_harvester(source, description)** — Set up a harvester for a source. \
+Returns a harvester_id. No harvesting happens yet — that starts when you process().
+
+**process(harvester_id, max_count)** — Get rows from a harvester. Harvests a batch \
+of candidates if needed, then processes up to max_count into dataset rows. \
+Returns: rows produced, skipped, duplicates, costs, and a harvest report.
+
+**close_harvest(harvester_id)** — Close a harvester and free its browser session. \
+Use when a source is exhausted or not worth continuing.
 
 ## Candidate Scope
 
-Pay attention to the user's intended candidate scope — where candidates \
-live varies by project.
-
-Examples:
-- **Enrichment**: User uploads a spreadsheet of hospitals and wants director \
-contacts added. The spreadsheet rows ARE the candidates — one harvester on the \
-file, done. Don't spawn web harvesters to find more hospitals.
-- **Single-source extraction**: User wants product listings from Amazon. \
-Candidates are on Amazon — harvest search pages on that site. Don't also \
-harvest eBay or Walmart unless asked.
-- **Open discovery**: User wants a list of craft breweries in the midwest. \
-No source given — cast a wide net across directories, search engines, \
-industry databases. This is where many parallel harvesters shine.
+Pay attention to where candidates live:
+- **Enrichment**: User uploads a spreadsheet — rows ARE the candidates. One \
+harvester on the file, then process.
+- **Single-source**: User wants listings from one site. Harvest that site.
+- **Open discovery**: No source given — try multiple sources, compare results.
 
 ## Workflow
 
-1. **Recon** (if needed) — Use explore_agent for files/data, web_search_agent \
-for web. Not every project needs both. A file enrichment job may only need \
-explore_agent to inspect the schema. A web extraction job may not need recon \
-at all if the source is obvious.
-   - Recon gives you a plan. Harvesting gives you data.
-   - Don't wait for perfect information — launch harvesters early and learn \
-from their results. The Thompson Sampling system tells you which sources work.
-
-2. **Harvest** — Call harvester_agent() for each source slice.
-
-3. **React to Events** — After dispatching, you'll receive status updates:
-   - **source_exhausted**: A harvester finished. Consider new sources/search terms.
-   - **fertility_shift**: A source's success rate changed significantly.
-   - **milestone**: Progress checkpoint (25%/50%/75%/100%).
-   - **stall**: No successful rows recently. Diagnose and adjust strategy.
-   - **pool_empty**: All candidates consumed but more rows needed.
-   - **target_reached**: Done! System exits automatically.
-
-   When you have nothing to do, just say so and wait for the next event.
+1. **Recon** (if needed) — explore_agent for files, web_search for web.
+2. **Create harvesters** — you can create multiple in parallel if you have several \
+search queries or sources to try (e.g., 2-3 different queries in one turn). \
+For single-source jobs (one file, one site), one is fine.
+3. **Process** — call process() to harvest + generate rows. Start small (3-5) to validate.
+4. **Scale based on results** — if a source works, increase max_count. If not, close it and try another.
+5. **Repeat** until target is reached.
 
 ## Strategy
 
-- Deduplication is cheap and reliable — overlap between sources is fine.
-- Broad search terms > narrow ones.
-- The system automatically favors sources with better success rates. \
-  You just need to FIND good sources.
-- You'll see metrics: fertility rate (% candidates → rows) and cost/row per source.
-- If a source is underperforming, try different search terms or a new source entirely.
+- If you know the source, go straight to create_harvester + process. \
+Don't research first unless you genuinely don't know where the data lives.
+- web_search is for when you're stuck — you don't know what sources exist, or \
+harvesters keep failing and you need to figure out why.
+- Ramp up gradually: start with process(max_count=3-5) to validate, then \
+increase as confidence grows. But stay aware of how many rows you still need — don't massively overshoot.
+- Dedup is cheap — overlap between sources is fine.
+- Close sources that aren't producing.
+- You can call multiple tools in parallel (e.g., create multiple harvesters, or \
+process from one while creating another).
+- The browser is highly capable — it handles JavaScript, anti-bot, CAPTCHAs, \
+and dynamic pages. JS is almost never the issue if something isn't loading.
 
-## Principles
-
-- ONE harvester_agent() = ONE source slice. Each spawns its own navigator.
-- harvester_agent() is non-blocking — returns immediately. Don't wait for results.
-- Row generators see the full user conversation — they understand the task.
-- The browsing stack handles anti-bot, CAPTCHAs, and JS-heavy pages automatically.
-- Row generators will skip_row() for dead ends — some rejection is normal.
+Today's date: {current_date}
 
 <conversation>
 {conversation_summary}
@@ -127,26 +134,14 @@ from their results. The Thompson Sampling system tells you which sources work.
 
 Target: {num_samples} rows.
 
-## Tools
-
-- explore_agent(task, budget): Inspect files, data, integrations. No web access.
-- web_search_agent(task, budget): Research the web. Browse sites, search engines.
-- harvester_agent(source, description): Start a harvester. Non-blocking. \
-  source: URL, file path, search query, or topic. \
-  description: what kind of candidates to find.
-
 {feedback_section}
 """
 
 
 class OrchestratorAgent:
     """
-    V10 Orchestrator. Event-driven, multi-armed bandit source allocation.
-
-    - harvest() is non-blocking (spawns background task)
-    - Events auto-inject via on_idle callback
-    - No set_instructions, no done, no quotas
-    - Auto-exits when target reached or all sources exhausted
+    V11 Orchestrator. Drives the full pipeline directly — no background
+    consumers, no Thompson Sampling, no event system.
     """
 
     def __init__(
@@ -157,12 +152,11 @@ class OrchestratorAgent:
         openai_client: TrackedOpenAIClient,
         model: str,
         workspace_dir: Path,
-        candidate_pool: CandidatePool,
-        strategy_monitor: StrategyMonitor,
         generation_stats: Dict[str, Any],
+        dedup_store: Any,  # DedupStore from row.py
+        save_row: Callable[..., Awaitable[Optional[str]]],
         uploaded_files: Optional[List[Dict[str, Any]]] = None,
         bu_client: Optional[Any] = None,
-        brave_api_key: Optional[str] = None,
         sandbox: Optional[Any] = None,
         stop_checker: Optional[Callable[[], bool]] = None,
         stop_event: Optional[asyncio.Event] = None,
@@ -175,9 +169,8 @@ class OrchestratorAgent:
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
         feedback_context: Optional[Dict[str, Any]] = None,
         langfuse_parent: Optional[Any] = None,
-        on_browser_started: Optional[Callable] = None,
-        on_browser_stopped: Optional[Callable] = None,
         harvester_model: str = "",
+        generation_model: str = "",
     ) -> None:
         self.feedback_context = feedback_context
         self.chat_history = chat_history
@@ -187,7 +180,6 @@ class OrchestratorAgent:
         self.openai_client = openai_client
         self.model = model
         self.bu_client = bu_client
-        self.brave_api_key = brave_api_key
         self.sandbox = sandbox
         self.stop_checker = stop_checker
         self.stop_event = stop_event
@@ -199,19 +191,23 @@ class OrchestratorAgent:
         self.uploaded_file_urls = uploaded_file_urls
         self.uploaded_files = uploaded_files
         self.mcp_tools = mcp_tools or []
-        self.on_browser_started = on_browser_started
-        self.on_browser_stopped = on_browser_stopped
         self.langfuse_parent = langfuse_parent
         self.harvester_model = harvester_model or model
+        self.generation_model = generation_model or "gpt-5-mini"
 
-        self._pool = candidate_pool
-        self._monitor = strategy_monitor
         self._generation_stats = generation_stats
+        self._save_row = save_row
+        self._dedup_store = dedup_store
+        self._save_lock = asyncio.Lock()
 
         self._research_counter = 0
         self._harvester_counter = 0
-        self._active_harvesters = 0
-        self._harvester_tasks: List[asyncio.Task] = []
+        self._harvesters: Dict[str, HarvesterState] = {}
+
+        from dsl_worker.config import settings
+        self._generation_semaphore = asyncio.Semaphore(
+            settings.generation_parallel_samples
+        )
 
         registry = ToolRegistry()
         self._register_tools(registry)
@@ -221,15 +217,16 @@ class OrchestratorAgent:
         resources_section = self._format_resources(uploaded_files)
         feedback_section = self._format_feedback()
 
+        from datetime import date
         system_prompt = ORCHESTRATOR_SYSTEM_PROMPT.format(
             num_samples=num_samples,
             columns_description=columns_desc,
             conversation_summary=convo_summary,
             resources_section=resources_section,
             feedback_section=feedback_section,
+            current_date=date.today().isoformat(),
         )
 
-        from dsl_worker.config import settings
         max_turns = getattr(settings, 'orchestrator_max_turns', 40)
         soft_limit = getattr(settings, 'orchestrator_soft_limit', 25)
 
@@ -244,12 +241,14 @@ class OrchestratorAgent:
             soft_turn_limit=soft_limit,
             reasoning={"effort": "high", "summary": "detailed"},
             label="orchestrator",
+            continue_on_text=True,
             on_tool_call=on_tool_call,
             on_cost=on_cost,
             extra_tools=self.mcp_tools,
             langfuse_parent=langfuse_parent,
-            on_idle=self._on_idle,
         )
+
+    # ── Formatting helpers ────────────────────────────────────────────
 
     def _format_conversation(self) -> str:
         if not self.chat_history:
@@ -291,131 +290,89 @@ class OrchestratorAgent:
             f"based on this feedback."
         )
 
-    # ── on_idle: event injection ─────────────────────────────────────
-
-    async def _on_idle(self) -> Optional[str]:
-        """
-        Called when the orchestrator outputs text with no tool calls.
-        Blocks until a strategic event arrives, then returns it as a string.
-        Returns None to signal the conversation loop to exit.
-        """
-        # Check stop/pause immediately
-        if self.stop_checker and self.stop_checker():
-            return None
-
-        # Check if target already reached
+    def _format_harvester_status(self) -> str:
+        """Format status of all harvesters for tool output."""
         rows_done = self._generation_stats.get("rows_generated", 0)
-        if rows_done >= self.num_samples:
-            logger.info(f"[orchestrator] Target reached: {rows_done}/{self.num_samples}")
-            return None
+        lines = [f"\nOverall: {rows_done}/{self.num_samples} rows generated."]
 
-        # Check if nothing to wait for
-        if self._active_harvesters == 0 and self._pool.total_pending == 0:
-            if self._pool._is_fully_drained():
-                logger.info("[orchestrator] All sources exhausted, pool drained")
-                return None
+        if not self._harvesters:
+            return "\n".join(lines)
 
-        # Poll for events in short intervals so pause/stop is detected quickly
-        elapsed = 0.0
-        max_wait = 120.0
-        poll_interval = 2.0
+        lines.append("\nHarvesters:")
+        for hid, state in self._harvesters.items():
+            fertility = (
+                f"{state.rows_produced / state.total_processed:.0%}"
+                if state.total_processed > 0 else "N/A"
+            )
+            total_cost = state.harvest_cost + state.process_cost
+            cpr = (
+                f"${total_cost / state.rows_produced:.3f}"
+                if state.rows_produced > 0 else "N/A"
+            )
+            status = "exhausted" if state.exhausted else f"{len(state.candidates)} buffered"
+            lines.append(
+                f"  {hid} ({state.source[:60]}): "
+                f"{fertility} fertility, {cpr}/row, "
+                f"{state.rows_produced} rows from {state.total_processed} processed, "
+                f"harvest ${state.harvest_cost:.3f}, {status}"
+            )
 
-        while elapsed < max_wait:
-            if self.stop_checker and self.stop_checker():
-                return None
+        return "\n".join(lines)
 
-            event = await self._monitor.wait_for_event(timeout=poll_interval)
-            if event is not None:
-                return event.message
-
-            elapsed += poll_interval
-
-            # Re-check exit conditions each poll
-            rows_done = self._generation_stats.get("rows_generated", 0)
-            if rows_done >= self.num_samples:
-                return None
-            if self._active_harvesters == 0 and self._pool._is_fully_drained():
-                return None
-
-        # Full timeout — inject status update
-        status = self._pool.format_status()
-        return f"Status update (no events in 2 minutes):\n{status}"
-
-    # ── Tool registration ────────────────────────────────────────────
+    # ── Tool registration ─────────────────────────────────────────────
 
     def _register_tools(self, registry: ToolRegistry) -> None:
 
-        # --- web_search_agent ---
-        async def web_search_agent(args: Dict) -> tuple[str, float]:
-            from dsl_worker.agents.research import ResearchAgent
-            from dsl_worker.config import settings as worker_settings
-
+        # --- web_search (direct BU call, no LLM wrapper) ---
+        async def web_search(args: Dict) -> tuple[str, float]:
             task = args.get("task", "")
-            budget = args.get("budget", 8)
-
             if not task:
                 return "Error: task is required", 0.0
 
-            langfuse_span = getattr(self._conversation, "_current_langfuse_span", None)
+            if not self.bu_client:
+                return "Error: web search not available (no BU client)", 0.0
 
-            agent = ResearchAgent(
-                openai_client=self.openai_client,
-                model=worker_settings.research_subagent_model,
-                workspace_dir=self.workspace_dir,
-                bu_client=self.bu_client,
-                sandbox=self.sandbox,
-                stop_checker=self.stop_checker,
-                max_turns=budget,
-                tool_budget=budget,
-                blob_service_client=self.blob_service_client,
-                project_id=self.project_id,
-                uploaded_file_urls=self.uploaded_file_urls,
+            fast_task = (
+                f"{task}\n\n"
+                "Be fast and direct. Take the shortest path to the answer. "
+                "Do not explore or enumerate page elements — just do what's needed and return."
             )
-            if langfuse_span:
-                agent._conversation.langfuse_parent = langfuse_span
+            text, cost, _sid = await self.bu_client.research(fast_task)
 
-            try:
-                result = await agent.ask_full(task)
-            finally:
-                await agent.cleanup()
+            if self.on_cost and cost > 0:
+                await self.on_cost(cost, "web_search")
 
-            if self.on_cost and result.cost_usd > 0:
-                await self.on_cost(result.cost_usd, "web_search_agent")
+            if len(text) > 6000:
+                text = text[:6000] + "\n\n[Truncated]"
 
-            n = self._research_counter
-            self._research_counter += 1
-            research_dir = self.workspace_dir / "research"
-            research_dir.mkdir(exist_ok=True)
-            try:
-                (research_dir / f"finding_{n}.md").write_text(
-                    f"# Web Search: {task}\n\n{result.text}", encoding="utf-8"
-                )
-            except Exception as e:
-                logger.warning(f"Failed to save research finding: {e}")
-
-            return f"[Saved to research/finding_{n}.md]\n\n{result.text}", 0.0
+            return text or "(no results)", cost
 
         registry.add(
-            name="web_search_agent",
+            name="web_search",
             description=(
-                "Web research agent. Browses websites and searches the web. "
-                "Returns findings. Call multiple in one response for parallel research."
+                "Send a task to a browser agent that can search the web, navigate "
+                "pages, and extract information. Write the task as a full natural "
+                "language instruction — NOT a search query or keywords."
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "task": {"type": "string", "description": "What to research on the web"},
-                    "budget": {
-                        "type": "integer",
-                        "description": "Max tool calls (default 8). 4 for quick, 12 for deep.",
+                    "task": {
+                        "type": "string",
+                        "description": (
+                            "A clear instruction for the browser agent. "
+                            "Example: 'Go to upwork.com/nx/search/jobs and figure out "
+                            "the URL parameters for filtering by recency and date posted. "
+                            "Return the full URL with the correct filters applied.'"
+                        ),
                     },
                 },
                 "required": ["task"],
             },
-            handler=web_search_agent,
+            handler=web_search,
         )
 
-        # --- explore_agent ---
+        # --- explore_agent (unchanged) ---
         async def explore_agent(args: Dict) -> tuple[str, float]:
             from dsl_worker.agents.code_exec import CodeExecAgent
             from dsl_worker.config import settings as worker_settings
@@ -484,132 +441,321 @@ class OrchestratorAgent:
             handler=explore_agent,
         )
 
-        # --- harvester_agent (non-blocking) ---
-        async def harvester_agent(args: Dict) -> tuple[str, float]:
+        # --- create_harvester ---
+        async def create_harvester(args: Dict) -> tuple[str, float]:
             source = args.get("source", "")
             description = args.get("description", "")
 
             if not source:
                 return "Error: source is required", 0.0
 
+            from dsl_worker.agents.harvester import HarvesterAgent
+
             idx = self._harvester_counter
             self._harvester_counter += 1
-            source_id = f"harvest:{idx}"
+            harvester_id = f"harvest:{idx}"
 
-            # Register source arm in the pool
-            label = source[:80]
-            self._pool.register_source(source_id, label=label)
+            langfuse_span = getattr(self._conversation, "_current_langfuse_span", None)
 
-            # Spawn harvester in background
-            self._active_harvesters += 1
-            task = asyncio.create_task(
-                self._run_harvester(source, description, source_id, idx)
+            harvester = HarvesterAgent(
+                source=source,
+                description=description,
+                source_id=harvester_id,
+                openai_client=self.openai_client,
+                model=self.harvester_model,
+                workspace_dir=self.workspace_dir,
+                bu_client=self.bu_client,
+                harvester_index=idx,
+                sandbox=self.sandbox,
+                stop_checker=self.stop_checker,
+                stop_event=self.stop_event,
+                blob_service_client=self.blob_service_client,
+                project_id=self.project_id,
+                on_tool_call=self.on_tool_call,
+                on_cost=self.on_cost,
+                uploaded_file_urls=self.uploaded_file_urls,
+                uploaded_files=self.uploaded_files,
+                mcp_tools=self.mcp_tools,
+                langfuse_parent=langfuse_span,
             )
-            self._harvester_tasks.append(task)
+
+            state = HarvesterState(
+                id=harvester_id,
+                source=source,
+                description=description,
+                agent=harvester,
+            )
+            self._harvesters[harvester_id] = state
 
             return (
-                f"Harvester {idx} started for: {source}\n"
-                f"Description: {description or '(auto)'}\n"
-                f"Candidates will flow into the pool as they're found."
+                f"Harvester {harvester_id} created for: {source}\n"
+                f"Call process(harvester_id='{harvester_id}', max_count=N) to start."
             ), 0.0
 
         registry.add(
-            name="harvester_agent",
+            name="create_harvester",
             description=(
-                "Start a harvester for one source slice. Non-blocking — returns "
-                "immediately. Call multiple in parallel for different sources."
+                "Set up a harvester for a source. Returns a harvester_id. "
+                "No harvesting happens yet — call process() to start."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "source": {
                         "type": "string",
-                        "description": (
-                            "One source to harvest: URL, file path, search query, or topic."
-                        ),
+                        "description": "Source to harvest: URL, file path, search query, or topic.",
                     },
                     "description": {
                         "type": "string",
                         "description": (
                             "What kind of items are on this source (e.g. 'job listings', "
-                            "'company profiles'). Do NOT include filtering criteria — "
-                            "filtering happens downstream automatically."
+                            "'company profiles'). Do NOT include filtering criteria."
                         ),
                     },
                 },
                 "required": ["source"],
             },
-            handler=harvester_agent,
+            handler=create_harvester,
         )
 
-    # ── Harvester lifecycle ──────────────────────────────────────────
+        # --- process ---
+        async def process(args: Dict) -> tuple[str, float]:
+            harvester_id = args.get("harvester_id", "")
+            max_count = args.get("max_count", 10)
 
-    async def _run_harvester(
+            state = self._harvesters.get(harvester_id)
+            if not state:
+                available = list(self._harvesters.keys())
+                return f"Error: unknown harvester '{harvester_id}'. Available: {available}", 0.0
+
+            batch_report = None
+
+            # Auto-fetch if buffer empty and not exhausted
+            if not state.candidates and not state.exhausted:
+                is_first = state.batches == 0
+                message = (
+                    "Begin harvesting candidates from your assigned source."
+                    if is_first else
+                    "Get the next batch of candidates."
+                )
+                candidates, report = await state.agent.run_batch(message)
+                cost_delta = state.agent.batch_cost_delta
+                state.candidates.extend(candidates)
+                state.total_harvested += len(candidates)
+                state.harvest_cost += cost_delta
+                state.batches += 1
+                state.exhausted = state.agent.exhausted
+                state.last_report = report
+                batch_report = report
+
+            if not state.candidates:
+                lines = [
+                    f"Harvester {harvester_id} has no candidates.",
+                    f"Exhausted: {state.exhausted}",
+                    self._format_harvester_status(),
+                ]
+                return "\n".join(lines), 0.0
+
+            # Dequeue up to max_count
+            to_process = state.candidates[:max_count]
+            state.candidates = state.candidates[max_count:]
+
+            # Process in parallel
+            results = await asyncio.gather(*[
+                self._generate_row(candidate, state)
+                for candidate in to_process
+            ], return_exceptions=True)
+
+            # Aggregate
+            rows = 0
+            skipped = 0
+            dupes = 0
+            errors = 0
+            process_cost = 0.0
+
+            for r in results:
+                if isinstance(r, Exception):
+                    errors += 1
+                    logger.error(f"Row generation error: {r}")
+                    continue
+                gen_row, cost, saved = r
+                process_cost += cost
+                if gen_row.success:
+                    if saved:
+                        rows += 1
+                    else:
+                        rows += 1  # viable but target reached
+                elif gen_row.skipped:
+                    if "duplicate" in (gen_row.skip_reason or "").lower():
+                        dupes += 1
+                    else:
+                        skipped += 1
+                else:
+                    errors += 1
+
+            # Update state
+            state.total_processed += len(to_process)
+            state.rows_produced += rows
+            state.duplicates += dupes
+            state.skipped += skipped
+            state.errors += errors
+            state.process_cost += process_cost
+
+            self._generation_stats["rows_generated"] = (
+                self._generation_stats.get("rows_generated", 0) + rows
+            )
+            self._generation_stats["skipped"] = (
+                self._generation_stats.get("skipped", 0) + skipped + dupes
+            )
+            self._generation_stats["errors"] = (
+                self._generation_stats.get("errors", 0) + errors
+            )
+
+            lines = [
+                f"Processed {len(to_process)} candidates from {harvester_id}:",
+                f"  Rows produced: {rows}",
+                f"  Skipped: {skipped}",
+                f"  Duplicates: {dupes}",
+                f"  Errors: {errors}",
+                f"  Process cost: ${process_cost:.4f}",
+                f"  Buffer remaining: {len(state.candidates)}",
+                f"  Exhausted: {state.exhausted}",
+            ]
+            if batch_report:
+                lines.append(f"\nBatch report: {batch_report}")
+            lines.append(self._format_harvester_status())
+
+            return "\n".join(lines), process_cost
+
+        registry.add(
+            name="process",
+            description=(
+                "Process candidates from a harvester into dataset rows. "
+                "If the buffer is empty, automatically fetches one new batch first. "
+                "Candidates beyond max_count stay buffered for later."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "harvester_id": {
+                        "type": "string",
+                        "description": "Which harvester to process from (e.g. 'harvest:0')",
+                    },
+                    "max_count": {
+                        "type": "integer",
+                        "description": "Maximum candidates to process (default 10)",
+                    },
+                },
+                "required": ["harvester_id"],
+            },
+            handler=process,
+        )
+
+        # --- close_harvest ---
+        async def close_harvest(args: Dict) -> tuple[str, float]:
+            harvester_id = args.get("harvester_id", "")
+
+            state = self._harvesters.get(harvester_id)
+            if not state:
+                return f"Error: unknown harvester '{harvester_id}'", 0.0
+
+            await state.agent.close()
+
+            total_cost = state.harvest_cost + state.process_cost
+            cpr = (
+                f"${total_cost / state.rows_produced:.3f}"
+                if state.rows_produced > 0 else "N/A"
+            )
+            summary = (
+                f"Harvester {harvester_id} closed.\n"
+                f"  Source: {state.source}\n"
+                f"  {state.total_harvested} harvested, {state.total_processed} processed\n"
+                f"  {state.rows_produced} rows, {state.duplicates} dupes, "
+                f"{state.skipped} skipped, {state.errors} errors\n"
+                f"  Harvest cost: ${state.harvest_cost:.4f}, "
+                f"Process cost: ${state.process_cost:.4f}\n"
+                f"  All-in cost/row: {cpr}"
+            )
+
+            del self._harvesters[harvester_id]
+
+            return f"{summary}\n{self._format_harvester_status()}", 0.0
+
+        registry.add(
+            name="close_harvest",
+            description=(
+                "Close a harvester and free its browser session. Use when a source "
+                "is exhausted or not worth continuing."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "harvester_id": {
+                        "type": "string",
+                        "description": "Which harvester to close (e.g. 'harvest:0')",
+                    },
+                },
+                "required": ["harvester_id"],
+            },
+            handler=close_harvest,
+        )
+
+    # ── Row generation ────────────────────────────────────────────────
+
+    async def _generate_row(
         self,
-        source: str,
-        description: str,
-        source_id: str,
-        idx: int,
-    ) -> None:
-        """
-        Run a harvester in the background. When done, fires source_exhausted event.
-        """
-        from dsl_worker.agents.harvester import HarvesterAgent
+        candidate: Candidate,
+        state: HarvesterState,
+    ) -> tuple:
+        """Generate one row from a candidate. Semaphore-limited for concurrency."""
+        from dsl_worker.agents.row import RowGeneratorAgent, GeneratedRow
 
-        langfuse_span = getattr(self._conversation, "_current_langfuse_span", None)
+        async with self._generation_semaphore:
+            langfuse_span = getattr(self._conversation, "_current_langfuse_span", None)
 
-        harvester = HarvesterAgent(
-            source=source,
-            description=description,
-            source_id=source_id,
-            openai_client=self.openai_client,
-            model=self.harvester_model,
-            workspace_dir=self.workspace_dir,
-            pool=self._pool,
-            harvester_index=idx,
-            bu_client=self.bu_client,
-            sandbox=self.sandbox,
-            stop_checker=self.stop_checker,
-            blob_service_client=self.blob_service_client,
-            project_id=self.project_id,
-            on_tool_call=self.on_tool_call,
-            on_cost=self.on_cost,
-            uploaded_file_urls=self.uploaded_file_urls,
-            uploaded_files=self.uploaded_files,
-            mcp_tools=self.mcp_tools,
-            langfuse_parent=langfuse_span,
-        )
-
-        t0 = time.time()
-        try:
-            await asyncio.wait_for(
-                harvester.run(),
-                timeout=HARVESTER_WALL_CLOCK_TIMEOUT,
+            agent = RowGeneratorAgent(
+                openai_client=self.openai_client,
+                model=self.generation_model,
+                workspace_dir=self.workspace_dir,
+                chat_history=self.chat_history,
+                dedup_store=self._dedup_store,
+                bu_client=self.bu_client,
+                sandbox=self.sandbox,
+                stop_checker=self.stop_checker,
+                stop_event=self.stop_event,
+                blob_service_client=self.blob_service_client,
+                project_id=self.project_id,
+                uploaded_file_urls=self.uploaded_file_urls,
+                mcp_tools=self.mcp_tools,
+                on_cost=self.on_cost,
+                langfuse_parent=langfuse_span,
             )
-        except asyncio.TimeoutError:
-            logger.warning(
-                f"[orchestrator] Harvester {idx} wall-clock timeout "
-                f"({HARVESTER_WALL_CLOCK_TIMEOUT}s)"
-            )
-        except Exception as e:
-            logger.error(f"[orchestrator] Harvester {idx} error: {e}", exc_info=True)
-        finally:
-            await harvester.cleanup()
+            try:
+                result = await agent.generate(
+                    candidate=candidate.values,
+                    schema=self.columns,
+                    source_context=candidate.source_context or state.description,
+                )
 
-        cost = harvester.cost_usd
-        self._pool.add_production_cost(source_id, cost)
+                saved = False
+                if result.success and result.row:
+                    async with self._save_lock:
+                        row_id = await self._save_row(result.row)
+                        saved = row_id is not None
 
-        elapsed = time.time() - t0
-        logger.info(
-            f"[orchestrator] Harvester {idx} done: "
-            f"{harvester.candidates_submitted} candidates, "
-            f"{elapsed:.0f}s, ${cost:.3f}"
-        )
+                return result, result.cost_usd, saved
 
-        self._active_harvesters -= 1
-        await self._monitor.on_source_done(source_id)
+            except Exception as e:
+                logger.error(f"Row generation error: {e}", exc_info=True)
+                return GeneratedRow(success=False, error=str(e)), 0.0, False
 
-    # ── Run ──────────────────────────────────────────────────────────
+            finally:
+                try:
+                    await agent.cleanup()
+                except Exception:
+                    pass
+
+    # ── Run ───────────────────────────────────────────────────────────
 
     async def run(self) -> AgentResult:
         if self.feedback_context:
@@ -620,14 +766,14 @@ class OrchestratorAgent:
         else:
             message = (
                 "Begin. Read the conversation history and resources, reason about "
-                "strategy, then dispatch harvesters for candidate sources."
+                "strategy, then start harvesting candidate sources."
             )
 
         def _should_exit() -> bool:
             rows_done = self._generation_stats.get("rows_generated", 0)
             if rows_done >= self.num_samples:
                 logger.info(
-                    f"[orchestrator] Auto-done: {rows_done}/{self.num_samples} rows generated"
+                    f"[orchestrator] Target reached: {rows_done}/{self.num_samples}"
                 )
                 return True
             return False
@@ -642,11 +788,10 @@ class OrchestratorAgent:
         return self._conversation.total_cost
 
     async def cleanup(self) -> None:
-        # Cancel any remaining harvester tasks
-        for task in self._harvester_tasks:
-            if not task.done():
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
+        """Close all active harvesters."""
+        for hid, state in list(self._harvesters.items()):
+            try:
+                await state.agent.close()
+            except Exception as e:
+                logger.warning(f"Harvester {hid} cleanup error: {e}")
+        self._harvesters.clear()

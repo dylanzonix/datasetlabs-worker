@@ -174,22 +174,25 @@ You are generating a single dataset row.
 {schema_str}
 </schema>
 
+Today's date: {current_date}
+
 ## How to work
 
 1. Read the candidate and the user conversation above to understand what's needed.
-2. Fill in what you already know from the candidate using set_column().
+2. Fill in what you already know from the candidate using set_column(). \
+If the candidate already has all the data you need, just fill columns and submit — \
+no browsing required.
    - When you set a column, the system will tell you if similar values already \
 exist in other rows. Pay attention to these warnings — if the match is close \
 and the column is something that should be unique (like a name, URL, or email), \
 this is likely a duplicate. Call skip_row(reason="duplicate: ...") if so.
    - Use your judgment: 50 rows with country="USA" is normal, but 2 rows with \
 the same email or very similar program name is suspicious.
-3. Research what you still need:
+3. Only browse if columns are missing from the candidate:
    - Use browse(url, task) to visit a page and extract specific information. \
 Describe what you need in the task (e.g. "Find the company CEO name and founding year").
    - You can also use browse without a URL to search the web: \
 browse(task="Search for Acme Corp leadership contacts").
-   - Use primary sources. Verify claims that matter.
 4. Fill remaining columns with set_column().
 5. Call submit_row() when all columns are filled.
 
@@ -632,7 +635,7 @@ class RowGeneratorAgent:
         bu_task = f"Navigate to: {url}\n\n{task}" if url else task
 
         try:
-            text, bu_cost = await self.bu_client.research(bu_task)
+            text, bu_cost, _sid = await self.bu_client.research(bu_task)
             if len(text) > 4000:
                 text = text[:4000] + "\n\n[Truncated to 4K chars]"
             return text, bu_cost
@@ -681,9 +684,11 @@ class RowGeneratorAgent:
         self._skip_reason = ""
         self._schema = schema
 
+        from datetime import date
         system_prompt = ROW_GENERATOR_SYSTEM_PROMPT.format(
             conversation=self._format_conversation(),
             schema_str=json.dumps(schema, indent=2),
+            current_date=date.today().isoformat(),
         )
 
         conversation = AgentConversation(

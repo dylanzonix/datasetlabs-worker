@@ -4,9 +4,10 @@ Browser Use V3 SDK client — single interface for all web interactions.
 Uses browser_use_sdk.v3.AsyncBrowserUse which handles everything server-side:
 browser sessions, CAPTCHA solving, proxies, model selection.
 
-Two modes:
-- extract(task) → (structured items, cost_usd) for harvesters
-- research(task) → (plain text, cost_usd) for row generators, web_search_agent
+Three modes:
+- extract(task) → (items, cost, session_id) for harvesters
+- research(task) → (text, cost, session_id) for row generators, web_search_agent
+- Session management: keep_alive sessions for multi-batch harvesting
 
 Cost tracking: BU reports llm_cost_usd, proxy_cost_usd, browser_cost_usd per
 session. We extract total_cost_usd and return it alongside results so it flows
@@ -72,13 +73,14 @@ class BUClient:
         self._default_proxy = proxy_country
         self._stop_event = stop_event
 
-    async def _run_cancellable(self, awaitable):
-        """Run an awaitable, cancelling it if stop_event fires.
+    async def _run_cancellable(self, session_run):
+        """Run an AsyncSessionRun, cancelling it if stop_event fires.
 
-        Handles both coroutines and awaitable objects (like AsyncSessionRun).
+        If stop fires, also stops the BU cloud session so it doesn't
+        keep running (and costing money) after we've cancelled locally.
         """
         if not self._stop_event:
-            return await awaitable
+            return await session_run
 
         # Check before starting — skip the call entirely if already stopped
         if self._stop_event.is_set():
@@ -86,7 +88,7 @@ class BUClient:
 
         # Wrap in a coroutine so create_task works with any awaitable
         async def _wrapper():
-            return await awaitable
+            return await session_run
 
         task = asyncio.create_task(_wrapper())
         stop_fut = asyncio.ensure_future(self._stop_event.wait())
@@ -101,12 +103,17 @@ class BUClient:
         # Stop takes priority — if both finished, prefer stopping
         if stop_fut in done:
             task.cancel()
+            # Stop the BU cloud session so it doesn't keep running
+            sid = getattr(session_run, 'session_id', None)
+            if sid:
+                try:
+                    await self._client.sessions.stop(sid)
+                    logger.info(f"[BUClient] stopped cloud session {sid[:12]}... on pause")
+                except Exception:
+                    pass
             raise asyncio.CancelledError("Stop requested during BU call")
 
         return task.result()
-
-        # Stop was requested — cancel the BU call
-        raise asyncio.CancelledError("Stop requested during BU call")
 
     @staticmethod
     def _parse_cost(result) -> float:
@@ -138,72 +145,108 @@ class BUClient:
         except Exception:
             pass
 
+    @staticmethod
+    def _get_session_id(result) -> Optional[str]:
+        """Extract session ID from a BU result for session reuse."""
+        try:
+            sid = getattr(result, "id", None)
+            if sid:
+                return str(sid)
+            session = getattr(result, "session", None)
+            if session:
+                return str(getattr(session, "id", ""))
+            return None
+        except Exception:
+            return None
+
     async def extract(
         self,
         task: str,
         proxy_country: Optional[str] = None,
         profile_id: Optional[str] = None,
-    ) -> Tuple[List[Dict[str, Any]], float]:
+        session_id: Optional[str] = None,
+        keep_alive: bool = False,
+        timeout: float = 900,
+    ) -> Tuple[List[Dict[str, Any]], float, Optional[str]]:
         """
         Extract structured items from a page. For harvesters.
 
-        Returns (items, cost_usd) — each item is a dict of extracted fields.
+        Returns (items, cost_usd, session_id).
+        Pass session_id from a previous call to reuse the same browser session.
+        Set keep_alive=True to keep the session open for subsequent calls.
         """
         try:
-            result = await self._run_cancellable(
-                self._client.run(
-                    task,
-                    model=self._model,
-                    output_schema=ExtractionResult,
-                    proxy_country_code=proxy_country or self._default_proxy,
-                    profile_id=profile_id,
-                )
+            session_run = self._client.run(
+                task,
+                model=self._model,
+                output_schema=ExtractionResult,
+                proxy_country_code=proxy_country or self._default_proxy,
+                profile_id=profile_id,
+                session_id=session_id,
+                keep_alive=keep_alive,
             )
+            session_run._timeout = timeout
+            result = await self._run_cancellable(session_run)
             cost = self._parse_cost(result)
             self._log_cost_breakdown(result, "extract")
+            sid = self._get_session_id(result)
             if result.output and hasattr(result.output, "items"):
                 items = [item.data for item in result.output.items]
-                return items, cost
-            return [], cost
+                return items, cost, sid
+            return [], cost, sid
         except asyncio.CancelledError:
             logger.info("[BUClient] extract cancelled (stop requested)")
-            return [], 0.0
+            return [], 0.0, session_id
         except Exception as e:
             logger.error(f"[BUClient] extract error: {e}")
-            return [], 0.0
+            return [], 0.0, session_id
 
     async def research(
         self,
         task: str,
         proxy_country: Optional[str] = None,
         profile_id: Optional[str] = None,
-    ) -> Tuple[str, float]:
+        session_id: Optional[str] = None,
+        keep_alive: bool = False,
+        timeout: float = 900,
+    ) -> Tuple[str, float, Optional[str]]:
         """
         Research a question on the web. For row generators and web_search_agent.
 
-        Returns (text, cost_usd).
+        Returns (text, cost_usd, session_id).
         """
         try:
-            result = await self._run_cancellable(
-                self._client.run(
-                    task,
-                    model=self._model,
-                    proxy_country_code=proxy_country or self._default_proxy,
-                    profile_id=profile_id,
-                )
+            session_run = self._client.run(
+                task,
+                model=self._model,
+                proxy_country_code=proxy_country or self._default_proxy,
+                profile_id=profile_id,
+                session_id=session_id,
+                keep_alive=keep_alive,
             )
+            session_run._timeout = timeout
+            result = await self._run_cancellable(session_run)
             cost = self._parse_cost(result)
             self._log_cost_breakdown(result, "research")
+            sid = self._get_session_id(result)
             text = result.output or ""
             if not isinstance(text, str):
                 text = str(text)
-            return text, cost
+            return text, cost, sid
         except asyncio.CancelledError:
             logger.info("[BUClient] research cancelled (stop requested)")
-            return "", 0.0
+            return "", 0.0, session_id
         except Exception as e:
             logger.error(f"[BUClient] research error: {e}")
-            return f"Research error: {e}", 0.0
+            return f"Research error: {e}", 0.0, session_id
+
+    async def stop_session(self, session_id: str) -> None:
+        """Stop a keep_alive session to free browser resources."""
+        try:
+            await self._client.sessions.stop(session_id)
+            logger.info(f"[BUClient] stopped session {session_id[:12]}...")
+        except Exception as e:
+            logger.warning(f"[BUClient] failed to stop session {session_id[:12]}...: {e}")
 
     async def close(self) -> None:
         """Clean up the client."""

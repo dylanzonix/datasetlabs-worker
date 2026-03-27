@@ -134,7 +134,7 @@ class ResearchAgent:
         bu_task = f"Navigate to: {url}\n\n{task}" if url else task
 
         try:
-            text, bu_cost = await self.bu_client.research(bu_task)
+            text, bu_cost, _sid = await self.bu_client.research(bu_task)
             if len(text) > 4000:
                 text = text[:4000] + "\n\n[Truncated to 4K chars]"
             return text, bu_cost

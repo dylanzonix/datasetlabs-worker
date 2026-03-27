@@ -61,9 +61,7 @@ from dsl_worker.billing import CostTracker, TrackedOpenAIClient
 from dsl_worker.checkpoint import CheckpointManager, checkpoints_to_work_items
 
 from dsl_worker.agents import OrchestratorAgent
-from dsl_worker.agents.row import DedupStore, RowGeneratorAgent
-from dsl_worker.infra.pipeline import SeedProcessor
-from dsl_worker.infra.candidate_pool import CandidatePool, StrategyMonitor, OutcomeType
+from dsl_worker.agents.row import DedupStore
 from dsl_worker.infra.generation_pool import GenerationWorkerPool
 from dsl_worker.infra.browser_viewer import BrowserViewer
 from sandbox_service import SandboxClient
@@ -397,21 +395,21 @@ class JobProcessor:
             nonlocal last_progress_flush, last_langfuse_flush
 
             phase_map = {
-                "research": "researching",
-                "set_instructions": "designing_template",
-                "harvest": "harvesting",
-                "done": "finishing",
+                "web_search": "researching",
+                "explore_agent": "researching",
+                "create_harvester": "harvesting",
+                "process": "generating",
+                "close_harvest": "generating",
             }
             if tool_name in phase_map:
                 progress_counters["phase"] = phase_map[tool_name]
 
             counter_map = {
-                "brave_search": "searches",
-                "open": "pages_viewed",
+                "browse": "pages_viewed",
                 "code_exec": "code_runs",
-                "research": "research_subagents",
-                "harvest": "harvesters_spawned",
-                "save_page": "pages_saved",
+                "web_search": "web_searches",
+                "create_harvester": "harvesters_created",
+                "process": "batches_processed",
             }
             if tool_name in counter_map:
                 key = counter_map[tool_name]
@@ -460,27 +458,11 @@ class JobProcessor:
         db.commit()
 
         # ====================================================================
-        # V10: CandidatePool + StrategyMonitor (replaces SeedProcessor + FIFO)
+        # V11: Orchestrator-driven batch pipeline
         # ====================================================================
 
-        # CandidatePool: multi-armed bandit with Thompson Sampling
-        candidate_pool = CandidatePool(
-            target_rows=state.num_samples,
-            generation_stats=generation_stats,
-        )
-
-        # StrategyMonitor: watches pool stats, fires events to orchestrator
-        strategy_monitor = StrategyMonitor(
-            pool=candidate_pool,
-            target_rows=state.num_samples,
-            generation_stats=generation_stats,
-        )
-
-        # Shared dedup store — used by all row generators across the pipeline
         dedup_store = DedupStore()
 
-        # BU V3 SDK client — shared across all agents for web access.
-        # stop_event races BU calls so a pause cancels them instantly.
         from dsl_worker.infra.bu_client import BUClient
         bu_client = BUClient(
             api_key=settings.browser_use_api_key,
@@ -488,37 +470,24 @@ class JobProcessor:
             stop_event=stop_event,
         )
 
-        # Start generation consumer (pulls from CandidatePool via Thompson Sampling)
-        generation_task = asyncio.create_task(
-            self._run_generation_consumer(
-                db=db,
-                project=project,
-                version=version,
-                tracked_client=tracked_client,
-                cost_tracker=cost_tracker,
-                checkpoint_mgr=checkpoint_mgr,
-                workspace_dir=workspace_dir,
-                stop_checker=stop_checker,
-                stop_event=stop_event,
-                schema=state.columns,
-                generation_stats=generation_stats,
-                chat_history=chat_history,
-                candidate_pool=candidate_pool,
-                strategy_monitor=strategy_monitor,
-                uploaded_file_urls=uploaded_file_urls,
-                on_cost=on_cost,
-                langfuse_parent=langfuse_parent,
-                dedup_store=dedup_store,
-                target_rows=state.num_samples,
-                bu_client=bu_client,
-            )
+        # Row saver — reuses GenerationWorkerPool's _save_row for DB writes
+        row_saver = GenerationWorkerPool(
+            workspace_dir=workspace_dir,
+            openai_client=tracked_client,
+            db_session=db,
+            project_id=project.id,
+            version_id=version.id,
         )
 
-        # ====================================================================
-        # V10: Run orchestrator (event-driven, non-blocking harvest)
-        # ====================================================================
+        async def save_row(row: Dict, tags: Dict = None) -> Optional[str]:
+            """Save a row to DB. Returns row_id or None if target reached."""
+            db.refresh(version)
+            if (version.generated_count or 0) >= state.num_samples:
+                logger.info("[Pipeline] Discarding row: target already reached")
+                return None
+            return await row_saver._save_row(row, tags=tags or {})
 
-        logger.info("[Pipeline] Running V10 orchestrator")
+        logger.info("[Pipeline] Running V11 orchestrator")
 
         orchestrator = OrchestratorAgent(
             chat_history=chat_history,
@@ -527,10 +496,11 @@ class JobProcessor:
             openai_client=tracked_client,
             model=settings.research_model,
             workspace_dir=workspace_dir,
-            candidate_pool=candidate_pool,
-            strategy_monitor=strategy_monitor,
             generation_stats=generation_stats,
+            dedup_store=dedup_store,
+            save_row=save_row,
             harvester_model=settings.seed_yielder_model,
+            generation_model=settings.generation_model,
             uploaded_files=uploaded_files if uploaded_files else None,
             bu_client=bu_client,
             sandbox=self._sandbox,
@@ -544,8 +514,6 @@ class JobProcessor:
             mcp_tools=mcp_tools,
             feedback_context=feedback_context,
             langfuse_parent=langfuse_parent,
-            on_browser_started=on_browser_started,
-            on_browser_stopped=on_browser_stopped,
         )
 
         try:
@@ -556,27 +524,13 @@ class JobProcessor:
             )
         finally:
             await orchestrator.cleanup()
-
-        # Save recipe for checkpoint
-        await checkpoint_mgr.set_phase("execution")
-
-        logger.info(
-            f"[Pipeline] Orchestrator complete. Pool status:\n"
-            f"{candidate_pool.format_status()}"
-        )
-
-        # Wait for generation consumer to finish
-        # (it exits when pool is drained or target reached)
-        try:
-            await asyncio.wait_for(generation_task, timeout=600)
-        except asyncio.TimeoutError:
-            logger.warning("[Pipeline] Generation consumer drain timed out")
-        except Exception as e:
-            logger.warning(f"[Pipeline] Generation consumer error: {e}")
+            await bu_client.close()
 
         # ====================================================================
-        # COMPLETE — Check results, backfill if needed
+        # COMPLETE — Check results
         # ====================================================================
+
+        await checkpoint_mgr.set_phase("completed")
 
         state.refresh()
         if state.paused:
@@ -590,94 +544,13 @@ class JobProcessor:
             self._handle_force_stop(db, project, version, cost_tracker, stop_reason)
             return False
 
-        # --- Backfill loop ---
-        MAX_BACKFILL_ROUNDS = 3
-        for backfill_round in range(MAX_BACKFILL_ROUNDS):
-            db.refresh(version)
-            generated = version.generated_count or 0
-            shortfall = state.num_samples - generated
-            if shortfall <= 0:
-                break
-
-            logger.info(
-                f"[Pipeline] Backfill round {backfill_round + 1}: "
-                f"{generated}/{state.num_samples} rows — "
-                f"generating {shortfall} more"
-            )
-
-            # Build backfill work items
-            instructions = seed_processor._instructions or "Generate a row for this dataset."
-            backfill_items: List[Dict] = []
-            for i in range(shortfall):
-                backfill_items.append({
-                    "instructions": (
-                        f"{instructions}\n\n"
-                        f"(Backfill row — generate a unique row not already covered.)"
-                    ),
-                    "candidate": None,
-                    "research_context": seed_processor._research_context or "",
-                    "tags": {"backfill": True},
-                })
-
-            backfill_start = work_item_counter[0]
-            pool = GenerationWorkerPool(
-                workspace_dir=workspace_dir,
-                openai_client=tracked_client,
-                db_session=db,
-                project_id=project.id,
-                version_id=version.id,
-                chat_history=chat_history,
-                dedup_store=dedup_store,
-                model=settings.generation_model,
-                brave_api_key=settings.brave_api_key,
-                sandbox=self._sandbox,
-                num_workers=settings.generation_parallel_samples,
-                stop_checker=stop_checker,
-                stop_event=stop_event,
-                cost_tracker=cost_tracker,
-                checkpoint_callback=lambda idx, success, row_id: asyncio.create_task(
-                    checkpoint_mgr.mark_processed(backfill_start + idx, success, row_id)
-                ),
-                blob_service_client=self.blob_service_client,
-                uploaded_file_urls=uploaded_file_urls,
-                mcp_tools=self._mcp_tools,
-                on_cost=on_cost,
-                langfuse_parent=langfuse_parent,
-                on_browser_started=on_browser_started,
-                on_browser_stopped=on_browser_stopped,
-            )
-            success, errors = await pool.process_work_items(
-                backfill_items, state.columns,
-            )
-            stats = pool.get_stats()
-            generation_stats["rows_generated"] += success
-            generation_stats["errors"] += errors
-            generation_stats["skipped"] += stats["skipped"]
-            work_item_counter[0] += len(backfill_items)
-
-            state.refresh()
-            if state.paused:
-                await checkpoint_mgr.force_save()
-                self._handle_pause(db, project, version, cost_tracker)
-                return True
-
-            can_continue, stop_reason = cost_tracker.check_balance_and_charge()
-            if not can_continue:
-                await checkpoint_mgr.force_save()
-                self._handle_force_stop(
-                    db, project, version, cost_tracker, stop_reason
-                )
-                return False
-
         db.refresh(version)
         generated = version.generated_count or 0
         if generated > 0:
             if generated < state.num_samples:
                 logger.warning(
-                    f"[Pipeline] Completed with {generated}/{state.num_samples} "
-                    f"rows after {MAX_BACKFILL_ROUNDS} backfill rounds"
+                    f"[Pipeline] Completed with {generated}/{state.num_samples} rows"
                 )
-            await checkpoint_mgr.set_phase("completed")
             await checkpoint_mgr.force_save()
             self._handle_completion(db, project, version, cost_tracker)
             return True
@@ -686,281 +559,7 @@ class JobProcessor:
         self._handle_force_stop(db, project, version, cost_tracker, "No rows generated")
         return False
 
-    async def _run_generation_consumer(
-        self,
-        db: Session,
-        project: Project,
-        version: ProjectVersion,
-        tracked_client: TrackedOpenAIClient,
-        cost_tracker: CostTracker,
-        checkpoint_mgr: CheckpointManager,
-        workspace_dir: Path,
-        stop_checker,
-        stop_event: asyncio.Event,
-        schema: List[Dict],
-        generation_stats: Dict,
-        chat_history: Optional[List[Dict]] = None,
-        candidate_pool: Optional[CandidatePool] = None,
-        strategy_monitor: Optional[StrategyMonitor] = None,
-        uploaded_file_urls: Optional[Dict[str, str]] = None,
-        on_cost: Optional[Callable] = None,
-        langfuse_parent: Optional[Any] = None,
-        dedup_store: Optional[DedupStore] = None,
-        target_rows: int = 0,
-        bu_client: Optional[Any] = None,
-        # Legacy compat
-        work_item_queue: Optional[asyncio.Queue] = None,
-        seed_processor: Optional[Any] = None,
-    ) -> None:
-        """
-        Background consumer: pull candidates from CandidatePool (Thompson Sampling)
-        and process them with concurrent row generators.
-
-        Records outcomes back to StrategyMonitor for bandit updates and event generation.
-        """
-        concurrency = settings.generation_parallel_samples
-        semaphore = asyncio.Semaphore(concurrency)
-        in_flight: list[asyncio.Task] = []
-        item_index = 0
-        save_lock = asyncio.Lock()
-
-        dedup_store = dedup_store or DedupStore()
-
-        def gen_stop_checker():
-            if stop_checker():
-                return True
-            return target_rows > 0 and generation_stats["rows_generated"] >= target_rows
-
-        # Shared row saver (DB writes must be serialized)
-        row_saver = GenerationWorkerPool(
-            workspace_dir=workspace_dir,
-            openai_client=tracked_client,
-            db_session=db,
-            project_id=project.id,
-            version_id=version.id,
-        )
-
-        async def process_one(index: int, candidate_item: Dict):
-            """Process a single candidate. Releases semaphore when done."""
-            source_id = candidate_item.get("source_id", "unknown")
-
-            try:
-                if gen_stop_checker():
-                    return
-
-                agent = RowGeneratorAgent(
-                    openai_client=tracked_client,
-                    model=settings.generation_model,
-                    workspace_dir=workspace_dir,
-                    chat_history=chat_history or [],
-                    dedup_store=dedup_store,
-                    bu_client=bu_client,
-                    sandbox=self._sandbox,
-                    stop_checker=gen_stop_checker,
-                    stop_event=stop_event,
-                    blob_service_client=self.blob_service_client,
-                    project_id=project.id,
-                    uploaded_file_urls=uploaded_file_urls,
-                    mcp_tools=self._mcp_tools,
-                    on_cost=on_cost,
-                    langfuse_parent=candidate_item.get("langfuse_parent") or langfuse_parent,
-                )
-
-                try:
-                    tags = candidate_item.get("tags") or {}
-                    candidate = candidate_item.get("candidate")
-                    source_context = candidate_item.get("source_context", "")
-                    instructions = candidate_item.get("instructions", "")
-
-                    max_attempts = 2
-                    for attempt in range(max_attempts):
-                        try:
-                            result = await agent.generate(
-                                candidate=candidate,
-                                schema=schema,
-                                source_context=source_context,
-                                instructions=instructions,
-                                source_url=candidate_item.get("source_url"),
-                            )
-
-                            if result.success and result.row:
-                                async with save_lock:
-                                    if target_rows > 0 and generation_stats["rows_generated"] >= target_rows:
-                                        logger.info(
-                                            f"[Generation] Discarding row at index {index}: "
-                                            f"quota reached ({target_rows})"
-                                        )
-                                        break
-                                    row_id = await row_saver._save_row(
-                                        result.row, tags=tags,
-                                    )
-                                    generation_stats["rows_generated"] += 1
-
-                                if generation_stats["rows_generated"] % 10 == 0:
-                                    logger.info(
-                                        f"[Generation] Generated "
-                                        f"{generation_stats['rows_generated']} rows..."
-                                    )
-
-                                if checkpoint_mgr:
-                                    await checkpoint_mgr.mark_processed(index, True, row_id)
-
-                                if strategy_monitor:
-                                    await strategy_monitor.on_outcome(
-                                        source_id, OutcomeType.SUCCESS, result.cost_usd
-                                    )
-                                break
-
-                            elif result.skipped:
-                                generation_stats["skipped"] += 1
-                                logger.info(
-                                    f"[Generation] Row skipped at index {index}: "
-                                    f"{result.skip_reason}"
-                                )
-                                if checkpoint_mgr:
-                                    await checkpoint_mgr.mark_processed(index, True, None)
-
-                                if strategy_monitor:
-                                    reason = (result.skip_reason or "").lower()
-                                    outcome = (
-                                        OutcomeType.DUPLICATE
-                                        if "duplicate" in reason
-                                        else OutcomeType.FILTERED
-                                    )
-                                    await strategy_monitor.on_outcome(
-                                        source_id, outcome, result.cost_usd
-                                    )
-                                break
-
-                            else:
-                                if attempt < max_attempts - 1:
-                                    logger.warning(
-                                        f"[Generation] Failed (attempt {attempt + 1}/"
-                                        f"{max_attempts}): {result.error} — retrying"
-                                    )
-                                else:
-                                    generation_stats["errors"] += 1
-                                    logger.warning(
-                                        f"[Generation] Failed after {max_attempts} "
-                                        f"attempts: {result.error}"
-                                    )
-                                    if checkpoint_mgr:
-                                        await checkpoint_mgr.mark_processed(
-                                            index, False, None,
-                                        )
-                                    if strategy_monitor:
-                                        await strategy_monitor.on_outcome(
-                                            source_id, OutcomeType.ERROR, result.cost_usd
-                                        )
-
-                        except Exception as e:
-                            if attempt < max_attempts - 1:
-                                logger.warning(
-                                    f"[Generation] Error (attempt {attempt + 1}/"
-                                    f"{max_attempts}): {e} — retrying"
-                                )
-                            else:
-                                logger.error(
-                                    f"[Generation] Error after {max_attempts} "
-                                    f"attempts: {e}"
-                                )
-                                generation_stats["errors"] += 1
-                                if checkpoint_mgr:
-                                    await checkpoint_mgr.mark_processed(
-                                        index, False, None,
-                                    )
-                                if strategy_monitor:
-                                    await strategy_monitor.on_outcome(
-                                        source_id, OutcomeType.ERROR, 0.0
-                                    )
-                finally:
-                    await agent.cleanup()
-            finally:
-                semaphore.release()
-
-        try:
-            while True:
-                if stop_checker():
-                    break
-
-                if target_rows > 0 and generation_stats["rows_generated"] >= target_rows:
-                    logger.info(
-                        f"[Generation] Target reached ({generation_stats['rows_generated']}"
-                        f"/{target_rows}), stopping consumer"
-                    )
-                    break
-
-                # Backpressure: wait for a free worker slot BEFORE pulling.
-                # This ensures Thompson Sampling only selects candidates when
-                # a worker is ready to process them, so outcomes flow back
-                # before the next selection and the bandit can actually learn.
-                await semaphore.acquire()
-
-                # Re-check stop/target after potentially blocking on semaphore
-                if stop_checker() or (target_rows > 0 and generation_stats["rows_generated"] >= target_rows):
-                    semaphore.release()
-                    break
-
-                # Pull next candidate via Thompson Sampling
-                if candidate_pool:
-                    candidate_item = await candidate_pool.pull(
-                        timeout=5.0, stop_event=stop_event,
-                    )
-                    if candidate_item is None:
-                        # pull() returns None when truly drained (all sources
-                        # exhausted + queues empty) OR on timeout. Only exit
-                        # if the pool is actually fully drained.
-                        if candidate_pool._is_fully_drained():
-                            semaphore.release()
-                            logger.info("[Generation] Pool drained, stopping consumer")
-                            break
-                        # Otherwise just a timeout — harvesters may still be
-                        # producing candidates. Release and keep polling.
-                        semaphore.release()
-                        continue
-                    # Convert Candidate to work item dict
-                    item = {
-                        "candidate": candidate_item.values,
-                        "source_id": candidate_item.source_id,
-                        "source_context": candidate_item.source_context,
-                        "tags": candidate_item.metadata.get("tags", {}),
-                    }
-                else:
-                    # Legacy: pull from work_item_queue
-                    try:
-                        item = await asyncio.wait_for(work_item_queue.get(), timeout=5.0)
-                    except asyncio.TimeoutError:
-                        semaphore.release()
-                        continue
-                    if item is None:
-                        semaphore.release()
-                        break
-
-                can_continue, _ = cost_tracker.check_balance_and_charge()
-                if not can_continue:
-                    semaphore.release()
-                    break
-
-                # Semaphore is already acquired — process_one releases it when done
-                task = asyncio.create_task(process_one(item_index, item))
-                in_flight.append(task)
-                item_index += 1
-
-                in_flight = [t for t in in_flight if not t.done()]
-
-        except Exception as e:
-            logger.error(f"[Generation] Consumer error: {e}")
-
-        if in_flight:
-            logger.info(f"[Generation] Waiting for {len(in_flight)} in-flight items...")
-            await asyncio.gather(*in_flight, return_exceptions=True)
-
-        logger.info(
-            f"[Generation] Consumer done: "
-            f"{generation_stats['rows_generated']} success, "
-            f"{generation_stats['errors']} errors, "
-            f"{generation_stats['skipped']} skipped"
-        )
+    # _run_generation_consumer removed in V11 — orchestrator drives processing directly
 
     async def _run_generation_from_checkpoint(
         self,
@@ -1051,24 +650,6 @@ class JobProcessor:
         await checkpoint_mgr.force_save()
         self._handle_force_stop(db, project, version, cost_tracker, "No rows generated")
         return False
-
-    async def _drain_generation_consumer(
-        self,
-        work_item_queue: asyncio.Queue,
-        generation_task: Optional[asyncio.Task],
-    ) -> None:
-        """Drain the generation consumer by sending a poison pill and waiting."""
-        if generation_task and not generation_task.done():
-            try:
-                work_item_queue.put_nowait(None)  # poison pill
-            except asyncio.QueueFull:
-                logger.info("[Pipeline] Queue full during drain, consumer likely done")
-            try:
-                await asyncio.wait_for(generation_task, timeout=120)
-            except asyncio.TimeoutError:
-                logger.warning("[Pipeline] Generation consumer drain timed out")
-            except Exception as e:
-                logger.warning(f"[Pipeline] Generation consumer drain error: {e}")
 
     def _create_feedback_version(
         self,
