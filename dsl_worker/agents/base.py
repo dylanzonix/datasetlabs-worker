@@ -66,6 +66,10 @@ def _serialize_response_output(output_items) -> list:
                         text = text[:2000] + "…"
                     content.append({"type": "text", "text": text})
             result.append({"type": "message", "content": content})
+        elif item.type == "web_search_call":
+            action = getattr(item, "action", None)
+            query = getattr(action, "query", "") if action else ""
+            result.append({"type": "web_search_call", "query": query})
     return result
 
 
@@ -430,8 +434,11 @@ class AgentConversation:
             if self.reasoning is not None:
                 create_kwargs["reasoning"] = self.reasoning
 
-            # Merge function tools with extra tools (MCP connectors, etc.)
+            # Merge function tools with extra tools (MCP connectors, built-in web_search, etc.)
             all_tools = (self.tools.get_definitions() or []) + self.extra_tools
+            if turn == 0 and logger.isEnabledFor(logging.DEBUG):
+                tool_summary = [t.get("type", "?") + (":" + t.get("name", "") if t.get("name") else "") for t in all_tools]
+                logger.debug(f"[{self.label}] tools: {tool_summary}")
 
             try:
                 api_result = await self._call_api_with_trace(
@@ -489,7 +496,13 @@ class AgentConversation:
                 # construct() + field_get_default() can turn the required
                 # `summary` field into None when the API returns null,
                 # and model_dump(exclude_none=True) then strips it entirely.
-                if item.type == "reasoning":
+                if item.type == "web_search_call":
+                    # Server-side tool — already executed, results in the
+                    # model's text. Don't replay (API may not accept it).
+                    query = getattr(getattr(item, "action", None), "query", None) or "?"
+                    logger.info(f"[{self.label}] web_search: {query[:120]}")
+                    continue
+                elif item.type == "reasoning":
                     summary = []
                     if item.summary:
                         summary = [
@@ -672,7 +685,7 @@ class AgentConversation:
                     await self.on_cost(tool_cost, self.label)
                 output_text = output_text[:TOOL_OUTPUT_LIMIT]
 
-            # Append background events to the last tool output
+            # Append drain_events to the last tool output
             if i == len(results) - 1 and self.drain_events:
                 events = self.drain_events()
                 if events:

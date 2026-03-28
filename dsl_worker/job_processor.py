@@ -393,21 +393,26 @@ class JobProcessor:
             nonlocal last_progress_flush, last_langfuse_flush
 
             phase_map = {
-                "web_search": "researching",
+                "browse": "researching",
                 "explore_agent": "researching",
                 "create_harvester": "harvesting",
+                "apollo_search": "harvesting",
+                "apollo_search_companies": "harvesting",
                 "process": "generating",
-                "close_harvest": "generating",
+                "close_source": "generating",
             }
             if tool_name in phase_map:
                 progress_counters["phase"] = phase_map[tool_name]
 
             counter_map = {
-                "browse": "pages_viewed",
+                "browse": "pages_browsed",
                 "code_exec": "code_runs",
-                "web_search": "web_searches",
                 "create_harvester": "harvesters_created",
                 "process": "batches_processed",
+                "apollo_search": "apollo_searches",
+                "apollo_search_companies": "apollo_searches",
+                "apollo_enrich": "apollo_enrichments",
+                "apollo_enrich_company": "apollo_enrichments",
             }
             if tool_name in counter_map:
                 key = counter_map[tool_name]
@@ -468,6 +473,13 @@ class JobProcessor:
             stop_event=stop_event,
         )
 
+        # Apollo.io client (optional — for B2B contact/company data)
+        apollo_client = None
+        if settings.apollo_api_key:
+            from dsl_worker.infra.apollo_client import ApolloClient
+            apollo_client = ApolloClient(api_key=settings.apollo_api_key)
+            logger.info("[Pipeline] Apollo.io client initialized")
+
         # Row saver — reuses GenerationWorkerPool's _save_row for DB writes
         row_saver = GenerationWorkerPool(
             workspace_dir=workspace_dir,
@@ -501,6 +513,7 @@ class JobProcessor:
             generation_model=settings.generation_model,
             uploaded_files=uploaded_files if uploaded_files else None,
             bu_client=bu_client,
+            apollo_client=apollo_client,
             sandbox=self._sandbox,
             stop_checker=stop_checker,
             stop_event=stop_event,
@@ -522,6 +535,8 @@ class JobProcessor:
         finally:
             await orchestrator.cleanup()
             await bu_client.close()
+            if apollo_client:
+                await apollo_client.close()
 
         # ====================================================================
         # COMPLETE — Check results

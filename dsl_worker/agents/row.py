@@ -33,6 +33,7 @@ from dsl_worker.agents.base import AgentConversation
 from dsl_worker.agents.tools import ToolRegistry
 from dsl_worker.billing.tracked_client import TrackedOpenAIClient
 from dsl_worker.infra.bu_client import BUClient
+from dsl_worker.infra.apollo_client import ApolloClient
 
 logger = logging.getLogger(__name__)
 
@@ -181,24 +182,38 @@ details, and produce a complete dataset row. You are the quality gate.
 
 Today's date: {current_date}
 
-## How to work
+## How to work — FOLLOW THIS ORDER
 
-1. Read the candidate and user conversation to understand what's needed.
-2. Fill in what you already know from the candidate using set_column(). \
-If the candidate already has all the data you need, just fill columns and submit — \
-no browsing required.
-   - When you set a column, the system will warn you if similar values exist. \
-If the match is close on something that should be unique (name, URL, email), \
-this is likely a duplicate. Call mark_duplicate(reason="...").
-   - Use judgment: many rows with country="USA" is normal, but 2 rows with \
-the same email is suspicious.
-3. Only browse if columns are missing from the candidate:
-   - Use browse(url, task) to visit a page and extract specific information.
-   - You can also search: browse(task="Search for Acme Corp founding year").
-4. Fill remaining columns with set_column().
-5. Call submit_row() when all columns are filled.
-6. If the candidate doesn't qualify based on the user's criteria, \
-call skip_row(reason="...") with a clear explanation.
+**Step 1: Enrich first.** If the candidate has an apollo_id or company domain, \
+call apollo_enrich / apollo_enrich_company FIRST. These are instant (<1s) and \
+return name, email, phone, company details, LinkedIn. Wait for results before \
+doing anything else.
+
+**Step 2: Fill what you have.** Use set_column() for everything you already \
+know from the candidate data + enrichment results.
+   - When you set a column, the system warns if similar values exist. \
+If the match is close on something unique (name, URL, email), call \
+mark_duplicate(reason="...").
+
+**Step 3: Research only what's missing.** If columns are still empty after \
+enrichment, THEN do web research:
+   - **Use web search** (built-in) for almost everything — looking up company \
+info, finding contact names, checking team pages, verifying a company, finding \
+phone numbers, LinkedIn profiles. Even "find who works at X company" is a web \
+search, not a browse. Web search has access to pre-indexed, rendered content from \
+most websites.
+   - **Use browse(task) ONLY** when web search already failed for the specific \
+info you need AND you believe a live browser could succeed — e.g., the data is \
+behind a login, requires filling a form, is on an infinite-scroll feed, or the \
+site actively blocks search indexing. This is rare.
+
+**Step 4: Submit or skip.**
+   - Call submit_row() when all columns are filled.
+   - Call skip_row(reason="...") if the candidate doesn't qualify.
+
+**IMPORTANT: Work sequentially.** Enrich → fill → research gaps → fill → submit. \
+Do NOT call apollo_enrich and browse at the same time. Enrichment is instant; \
+wait for it and see what you still need before launching expensive web research.
 
 ## Rules
 
@@ -245,6 +260,7 @@ class RowGeneratorAgent:
         blob_service_client: Optional[Any] = None,
         project_id: Optional[Any] = None,
         uploaded_file_urls: Optional[Dict[str, str]] = None,
+        apollo_client: Optional[ApolloClient] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
         on_cost: Optional[Callable] = None,
         langfuse_parent: Optional[Any] = None,
@@ -259,6 +275,7 @@ class RowGeneratorAgent:
         self.chat_history = chat_history or []
         self.dedup_store = dedup_store or DedupStore()
         self.bu_client = bu_client
+        self.apollo_client = apollo_client
         self.stop_checker = stop_checker
         self.stop_event = stop_event
         self.mcp_tools = mcp_tools or []
@@ -601,43 +618,197 @@ class RowGeneratorAgent:
                 include_builtins=False,
             )
 
+        # --- Apollo enrichment (if available) ---
+        if self.apollo_client:
+            self._register_apollo_tools(registry)
+
         # --- browse: BU V3 SDK ---
         async def browse(args: Dict) -> tuple[str, float]:
-            url = args.get("url", "")
             task = args.get("task", "")
-            if not url and not task:
-                return "Error: url or task is required", 0.0
-            if url and not task:
-                task = "Extract relevant information from this page."
-            if not url:
-                # Task-only: web search
-                return await self._browse("", task)
-            return await self._browse(url, task)
+            if not task:
+                return "Error: task is required", 0.0
+            return await self._browse("", task)
 
         registry.add(
             name="browse",
             description=(
-                "Browse the web — navigate to a URL, search, or extract information. "
-                "Provide a URL to visit a specific page, or just a task to search the web. "
-                "Returns extracted text."
+                "Launch a full cloud browser for tasks that need live interaction, "
+                "anti-bot bypass, JS rendering, captcha solving, or accessing content "
+                "that wouldn't be indexed. Slow and expensive — prefer web search for "
+                "simple lookups."
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "url": {
-                        "type": "string",
-                        "description": "URL to visit (optional if task is a search query)",
-                    },
                     "task": {
                         "type": "string",
                         "description": (
-                            "What to do. E.g.: 'Find the CEO name and founding year' "
-                            "or 'Search for Acme Corp leadership team'."
+                            "What to do. E.g.: 'Go to coastmgt.com/about and find "
+                            "the leadership team names and contact info.'"
                         ),
                     },
                 },
+                "required": ["task"],
             },
             handler=browse,
+        )
+
+    # ── Apollo enrichment ──────────────────────────────────────────
+
+    def _register_apollo_tools(self, registry: ToolRegistry) -> None:
+        """Register Apollo.io enrichment tools on the row generator."""
+        from dsl_worker.config import settings as _settings
+        _apollo_credit_cost = _settings.apollo_cost_per_credit
+
+        async def apollo_enrich(args: Dict) -> tuple[str, float]:
+            apollo_id = args.get("apollo_id", "")
+            first_name = args.get("first_name", "")
+            last_name = args.get("last_name", "")
+            name = args.get("name", "")
+            email = args.get("email", "")
+            organization_name = args.get("organization_name", "")
+            domain = args.get("domain", "")
+            linkedin_url = args.get("linkedin_url", "")
+            if not any([apollo_id, name, first_name, linkedin_url, email]):
+                return "Error: provide at least apollo_id, name, email, or linkedin_url", 0.0
+
+            try:
+                person = await self.apollo_client.enrich_person(
+                    apollo_id=apollo_id or None,
+                    first_name=first_name or None,
+                    last_name=last_name or None,
+                    name=name or None,
+                    email=email or None,
+                    organization_name=organization_name or None,
+                    domain=domain or None,
+                    linkedin_url=linkedin_url or None,
+                )
+            except Exception as e:
+                return f"Apollo enrichment error: {e}", 0.0
+
+            if not person:
+                return "No match found in Apollo.", 0.0
+
+            # Format the enriched data
+            org = person.get("organization") or {}
+
+            # Personal/mobile phones (requires webhook — may be empty)
+            phones = person.get("phone_numbers") or []
+            phone_parts = [
+                f"{p.get('sanitized_number', '?')} ({p.get('type', '?')})"
+                for p in phones
+            ]
+            # Company/org phone (always available synchronously)
+            org_phone = org.get("primary_phone")
+            if isinstance(org_phone, dict) and org_phone.get("sanitized_number"):
+                phone_parts.append(f"{org_phone['sanitized_number']} (company)")
+            elif isinstance(org_phone, str) and org_phone:
+                phone_parts.append(f"{org_phone} (company)")
+            phone_str = ", ".join(phone_parts) if phone_parts else "N/A"
+
+            emp_history = person.get("employment_history") or []
+            history_str = ""
+            if emp_history:
+                recent = [h for h in emp_history[:3]]
+                history_lines = []
+                for h in recent:
+                    current = " (current)" if h.get("current") else ""
+                    history_lines.append(
+                        f"  - {h.get('title', '?')} at {h.get('organization_name', '?')}{current}"
+                    )
+                history_str = "\nEmployment history:\n" + "\n".join(history_lines)
+
+            return (
+                f"Name: {person.get('name', 'N/A')}\n"
+                f"Title: {person.get('title', 'N/A')}\n"
+                f"Headline: {person.get('headline', 'N/A')}\n"
+                f"Email: {person.get('email', 'N/A')} (status: {person.get('email_status', '?')})\n"
+                f"Phone: {phone_str}\n"
+                f"LinkedIn: {person.get('linkedin_url', 'N/A')}\n"
+                f"Twitter: {person.get('twitter_url', 'N/A')}\n"
+                f"City: {person.get('city', 'N/A')}, {person.get('state', 'N/A')}, {person.get('country', 'N/A')}\n"
+                f"Seniority: {person.get('seniority', 'N/A')}\n"
+                f"Departments: {person.get('departments', 'N/A')}\n"
+                f"Company: {org.get('name', 'N/A')}\n"
+                f"Website: {org.get('website_url', 'N/A')}\n"
+                f"Industry: {org.get('industry', 'N/A')}\n"
+                f"Employees: {org.get('estimated_num_employees', 'N/A')}\n"
+                f"Revenue: {org.get('annual_revenue', 'N/A')}\n"
+                f"Founded: {org.get('founded_year', 'N/A')}"
+                f"{history_str}"
+            ), _apollo_credit_cost
+
+        registry.add(
+            name="apollo_enrich",
+            description=(
+                "Enrich a person via Apollo.io to get email, phone number, and full "
+                "company details. Costs 1 credit. Match strength: "
+                "apollo_id > email > domain+name > linkedin_url > name alone."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "apollo_id": {
+                        "type": "string",
+                        "description": "Apollo person ID (from search results — most reliable match)",
+                    },
+                    "first_name": {"type": "string"},
+                    "last_name": {"type": "string"},
+                    "name": {"type": "string", "description": "Full name"},
+                    "email": {"type": "string", "description": "Email address (strongest matching signal after ID)"},
+                    "organization_name": {"type": "string", "description": "Company name (improves matching)"},
+                    "domain": {"type": "string", "description": "Company domain (e.g. 'acme.com', no www)"},
+                    "linkedin_url": {"type": "string", "description": "LinkedIn profile URL"},
+                },
+            },
+            handler=apollo_enrich,
+        )
+
+        async def apollo_enrich_company(args: Dict) -> tuple[str, float]:
+            domain = args.get("domain", "")
+            if not domain:
+                return "Error: domain is required", 0.0
+
+            try:
+                org = await self.apollo_client.enrich_company(domain)
+            except Exception as e:
+                return f"Apollo company enrichment error: {e}", 0.0
+
+            if not org:
+                return f"No company found for domain '{domain}'.", 0.0
+
+            return (
+                f"Company: {org.get('name', 'N/A')}\n"
+                f"Website: {org.get('website_url', 'N/A')}\n"
+                f"Industry: {org.get('industry', 'N/A')}\n"
+                f"Employees: {org.get('estimated_num_employees', 'N/A')}\n"
+                f"Revenue: {org.get('annual_revenue', 'N/A')}\n"
+                f"Founded: {org.get('founded_year', 'N/A')}\n"
+                f"City: {org.get('city', 'N/A')}, {org.get('state', 'N/A')}, {org.get('country', 'N/A')}\n"
+                f"Phone: {org.get('primary_phone', {}).get('number', 'N/A') if isinstance(org.get('primary_phone'), dict) else org.get('primary_phone', 'N/A')}\n"
+                f"LinkedIn: {org.get('linkedin_url', 'N/A')}\n"
+                f"Description: {org.get('short_description', 'N/A')}\n"
+                f"Total funding: {org.get('total_funding', 'N/A')}\n"
+                f"Latest funding: {org.get('latest_funding_stage', 'N/A')}"
+            ), _apollo_credit_cost
+
+        registry.add(
+            name="apollo_enrich_company",
+            description=(
+                "Enrich a company via Apollo.io by domain to get full details: "
+                "revenue, employees, funding, industry, phone, description. Costs 1 credit."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "domain": {
+                        "type": "string",
+                        "description": "Company domain (e.g. 'acme.com', no www or @)",
+                    },
+                },
+                "required": ["domain"],
+            },
+            handler=apollo_enrich_company,
         )
 
     # ── BU V3 SDK web access ────────────────────────────────────────
@@ -701,11 +872,26 @@ class RowGeneratorAgent:
         self._schema = schema
 
         from datetime import date
+        apollo_note = ""
+        if self.apollo_client:
+            apollo_note = (
+                "\n\n## Apollo.io Enrichment\n\n"
+                "You have apollo_enrich and apollo_enrich_company tools. Use them to get "
+                "email addresses, phone numbers, and detailed company info. "
+                "If the candidate has an apollo_id, use that for the most reliable match. "
+                "Otherwise, use name + organization_name or linkedin_url.\n"
+            )
         system_prompt = ROW_GENERATOR_SYSTEM_PROMPT.format(
             conversation=self._format_conversation(),
             schema_str=json.dumps(schema, indent=2),
             current_date=date.today().isoformat(),
-        )
+        ) + apollo_note
+
+        # Built-in web search (OpenAI/Bing grounded) — cheap, fast, pre-indexed.
+        # Model uses this automatically for factual lookups. browse() (BU) is
+        # the fallback for anti-bot, interaction, JS-heavy pages.
+        web_search_tool = {"type": "web_search"}
+        all_extra_tools = [web_search_tool] + self.mcp_tools
 
         conversation = AgentConversation(
             openai_client=self.openai_client,
@@ -718,7 +904,7 @@ class RowGeneratorAgent:
             reasoning={"effort": "low", "summary": "auto"},
             label="row_generator",
             on_cost=self.on_cost,
-            extra_tools=self.mcp_tools,
+            extra_tools=all_extra_tools,
             langfuse_parent=self.langfuse_parent,
         )
 

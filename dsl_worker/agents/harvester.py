@@ -48,35 +48,38 @@ each candidate and turn it into a dataset row — that's not your job.
 
 ## Your Role in the Pipeline
 
-You are the collector, not the validator. Your job is to grab candidates \
-quickly and move on. Row generators downstream will do deep research, \
-verification, and filtering on each candidate individually.
+You are the collector, not the researcher. Your job is to find and submit \
+candidates as fast as possible. A candidate can be as simple as a company name, \
+a person's name, a URL — whatever identifies the entity. Row generators \
+downstream will do all the deep research, enrichment, and validation.
 
 **Yield generously.** If something looks like it could be a valid candidate, \
-produce it. It's worse to miss a good candidate than to produce a borderline \
-one that gets filtered downstream. Only skip things that are obviously wrong \
-based on what you can see at a glance (e.g., clearly wrong category, \
-obviously outside a stated date range).
+submit it. It's worse to miss a good candidate than to submit a borderline \
+one. Only skip things that are obviously wrong at a glance.
 
-**Don't research.** Don't click into individual items, don't verify details, \
-don't reason hard about whether a candidate qualifies. Just extract what's \
-visible on the list/search page and move on.
+**Don't research individual candidates.** Don't look up emails, phone numbers, \
+LinkedIn profiles, or details for individual items. Don't verify if a company \
+qualifies. Just grab the name/identifier and move on. All of that happens \
+downstream in row generators which have enrichment tools (Apollo, web search).
 
 ## How to Work
 
-1. Navigate to the source. Use browse(url, task) to extract candidates.
-2. browse() sends a browser agent to the page — it extracts ALL items \
-and returns them. Each item is buffered as a candidate.
-3. If you spot candidates yourself, call submit_candidate() directly.
-4. After extracting what's available, respond with a short report: \
-how many you found and what lies ahead (more pages? running out?).
-5. Call done() only when the source is fully exhausted.
+1. Navigate to the source and extract candidate lists.
+2. Use **web search** (built-in) for finding the right URLs, discovering \
+list pages, or checking what a source offers.
+3. Use **browse(url, task)** for navigating actual web pages — extracting \
+lists from JS-heavy sites, paginating, scrolling, bypassing anti-bot. \
+browse() launches a full cloud browser with stealth, proxy, and captcha solving.
+4. Submit each candidate with whatever data is visible on the list page. \
+Even just a company name is enough — row generators handle the rest.
+5. After extracting what's available, respond with a short report.
+6. Call done() only when the source is fully exhausted.
 
 ## Rules
 
-- Extract ALL visible data per candidate — the more complete, the less \
-downstream research is needed.
-- Do NOT click into individual items for more data — just grab the list page.
+- Submit candidates quickly. A name + any visible context is sufficient.
+- Do NOT research individual candidates (no email lookups, no phone lookups, \
+no LinkedIn searches per candidate). That's the row generator's job.
 - Keep browse tasks simple: "Extract all listings on this page."
 - For file sources, use code_exec to parse and submit candidates.
 - After extracting a batch, STOP and report. Don't browse endlessly.
@@ -132,6 +135,7 @@ class HarvesterAgent:
         # Batch state
         self._buffer: List[Candidate] = []
         self._bu_session_id: Optional[str] = None
+        self._bu_lock = asyncio.Lock()  # serialize BU calls (one session at a time)
         self._exhausted: bool = False
         self._candidates_total: int = 0
         self._prev_cost: float = 0.0
@@ -172,6 +176,10 @@ class HarvesterAgent:
             current_date=date.today().isoformat(),
         )
 
+        # Built-in web search available to all agents
+        web_search_tool = {"type": "web_search"}
+        all_extra_tools = [web_search_tool] + (mcp_tools or [])
+
         self._conversation = AgentConversation(
             openai_client=openai_client,
             model=model,
@@ -184,7 +192,7 @@ class HarvesterAgent:
             label=f"harvester:{harvester_index}",
             on_tool_call=on_tool_call,
             on_cost=on_cost,
-            extra_tools=mcp_tools or [],
+            extra_tools=all_extra_tools,
             langfuse_parent=langfuse_parent,
         )
 
@@ -229,6 +237,10 @@ class HarvesterAgent:
 
     async def _run_bu_extract(self, url: str, task: str) -> Tuple[str, float]:
         """Extract candidates from a page via BU V3 SDK with session reuse."""
+        async with self._bu_lock:
+            return await self._run_bu_extract_inner(url, task)
+
+    async def _run_bu_extract_inner(self, url: str, task: str) -> Tuple[str, float]:
         scope_id = f"harvester:{self.harvester_index}"
 
         bu_task = (
@@ -282,35 +294,30 @@ class HarvesterAgent:
 
         # --- browse: BU V3 SDK extraction ---
         async def browse(args: Dict) -> tuple[str, float]:
-            url = args.get("url", "")
             task = args.get("task", "")
-            if not url and not task:
-                return "Error: provide url and/or task", 0.0
-            bu_task = task or "Extract all items on this page."
-            return await self._run_bu_extract(url, bu_task)
+            if not task:
+                return "Error: task is required", 0.0
+            return await self._run_bu_extract("", task)
 
         registry.add(
             name="browse",
             description=(
-                "Navigate a page and extract candidates. A browser agent will "
-                "find all items and buffer them as candidates. "
-                "Returns a summary with candidate count."
+                "Launch a full cloud browser to navigate pages and extract candidates. "
+                "The browser can search, navigate, scroll, bypass anti-bot, and extract "
+                "structured data. Each extracted item is buffered as a candidate."
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "url": {
-                        "type": "string",
-                        "description": "URL to navigate to",
-                    },
                     "task": {
                         "type": "string",
                         "description": (
-                            "Extraction task — keep it simple. E.g.: "
-                            "'Extract all job listings on this page'."
+                            "What to do. E.g.: 'Go to apartments.com/pmc/seattle-wa/ "
+                            "and extract all property management company listings.'"
                         ),
                     },
                 },
+                "required": ["task"],
             },
             handler=browse,
         )

@@ -149,32 +149,26 @@ class ResearchAgent:
 
         # --- browse: BU V3 SDK ---
         async def browse(args: Dict) -> tuple[str, float]:
-            url = args.get("url", "")
             task = args.get("task", "")
-            if not url and not task:
-                return "Error: url or task is required", 0.0
-            if url and not task:
-                task = "Extract relevant information from this page."
-            return await self._browse(url, task)
+            if not task:
+                return "Error: task is required", 0.0
+            return await self._browse("", task)
 
         registry.add(
             name="browse",
             description=(
-                "Browse the web — visit a URL or search. "
-                "Provide a URL to visit, or just a task to search the web."
+                "Launch a full cloud browser for web interaction, navigation, "
+                "anti-bot bypass, JS rendering, and captcha solving."
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "url": {
-                        "type": "string",
-                        "description": "URL to visit (optional if task is a search query)",
-                    },
                     "task": {
                         "type": "string",
-                        "description": "What to find or extract",
+                        "description": "What to do. Include URLs if you have them.",
                     },
                 },
+                "required": ["task"],
             },
             handler=browse,
         )
