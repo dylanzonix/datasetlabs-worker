@@ -68,8 +68,15 @@ def _serialize_response_output(output_items) -> list:
             result.append({"type": "message", "content": content})
         elif item.type == "web_search_call":
             action = getattr(item, "action", None)
-            query = getattr(action, "query", "") if action else ""
-            result.append({"type": "web_search_call", "query": query})
+            action_type = getattr(action, "type", "?") if action else "?"
+            entry = {"type": "web_search_call", "action_type": action_type}
+            if action_type == "search":
+                entry["query"] = getattr(action, "query", "") or ""
+            elif action_type == "open_page":
+                entry["url"] = getattr(action, "url", "") or ""
+            elif action_type == "find_in_page":
+                entry["query"] = getattr(action, "query", "") or ""
+            result.append(entry)
     return result
 
 
@@ -173,6 +180,7 @@ class AgentConversation:
         self.total_cost: float = 0.0
         self.total_turns: int = 0
         self._warned_soft_limit: bool = False
+        self._deferred_tasks: List[tuple] = []  # (task, tc) from parallel tools
         # Active Langfuse span for this agent — set in _run_loop_traced,
         # used to create child generation/tool spans inside _run_loop_inner.
         self._current_langfuse_span: Any = None
@@ -405,6 +413,30 @@ class AgentConversation:
                 logger.info(f"[{self.label}] exit_condition met at turn {turn}")
                 break
 
+            # Deliver results from deferred parallel tool tasks
+            if self._deferred_tasks:
+                completed_msgs = []
+                still_pending = []
+                for task, tc in self._deferred_tasks:
+                    if task.done():
+                        try:
+                            text, cost = task.result()
+                            self.total_cost += cost
+                            result.cost_usd = self.total_cost
+                            if self.on_cost and cost > 0:
+                                asyncio.ensure_future(self.on_cost(cost, self.label))
+                            completed_msgs.append(f"[Completed] {tc.name}:\n{text[:TOOL_OUTPUT_LIMIT]}")
+                        except Exception as e:
+                            completed_msgs.append(f"[Completed] {tc.name}: Error: {e}")
+                    else:
+                        still_pending.append((task, tc))
+                self._deferred_tasks = still_pending
+                if completed_msgs:
+                    self.messages.append({
+                        "role": "user",
+                        "content": "\n\n".join(completed_msgs),
+                    })
+
             # Trim oldest messages if approaching context window limit
             self._trim_context()
 
@@ -450,7 +482,10 @@ class AgentConversation:
                     **create_kwargs,
                 )
                 if api_result is None:
-                    # Cancelled by stop_checker
+                    # Cancelled by stop_checker — remove the dangling user message
+                    # so the conversation doesn't have an unanswered turn on resume.
+                    if self.messages and self.messages[-1].get("role") == "user":
+                        self.messages.pop()
                     logger.info(f"[{self.label}] API call cancelled by stop_checker at turn {turn}")
                     result.stopped = True
                     break
@@ -499,8 +534,19 @@ class AgentConversation:
                 if item.type == "web_search_call":
                     # Server-side tool — already executed, results in the
                     # model's text. Don't replay (API may not accept it).
-                    query = getattr(getattr(item, "action", None), "query", None) or "?"
-                    logger.info(f"[{self.label}] web_search: {query[:120]}")
+                    action = getattr(item, "action", None)
+                    action_type = getattr(action, "type", "?") if action else "?"
+                    if action_type == "search":
+                        query = getattr(action, "query", None) or "?"
+                        logger.info(f"[{self.label}] web_search: {query[:120]}")
+                    elif action_type == "open_page":
+                        url = getattr(action, "url", None) or "?"
+                        logger.info(f"[{self.label}] web_open_page: {url[:120]}")
+                    elif action_type == "find_in_page":
+                        query = getattr(action, "query", None) or "?"
+                        logger.info(f"[{self.label}] web_find_in_page: {query[:120]}")
+                    else:
+                        logger.info(f"[{self.label}] web_search_call: type={action_type}")
                     continue
                 elif item.type == "reasoning":
                     summary = []
@@ -603,6 +649,43 @@ class AgentConversation:
                 f"[{self.label}] hit max turns ({self.max_turns})"
             )
 
+        # Collect any deferred tasks before exiting — don't orphan background work.
+        # Give them a short window to finish, then record whatever we have.
+        if self._deferred_tasks:
+            pending_tasks = [(t, tc) for t, tc in self._deferred_tasks if not t.done()]
+            done_tasks = [(t, tc) for t, tc in self._deferred_tasks if t.done()]
+
+            # Wait up to 5s for pending tasks to finish
+            if pending_tasks:
+                tasks_only = [t for t, _ in pending_tasks]
+                finished, still_pending = await asyncio.wait(
+                    tasks_only, timeout=5.0,
+                )
+                # Cancel anything still running
+                for t in still_pending:
+                    t.cancel()
+                if still_pending:
+                    await asyncio.gather(*still_pending, return_exceptions=True)
+                # Add finished to done list
+                task_to_tc = {t: tc for t, tc in pending_tasks}
+                for t in finished:
+                    done_tasks.append((t, task_to_tc[t]))
+
+            # Append results to messages so they're captured in checkpoint
+            for task, tc in done_tasks:
+                try:
+                    result_text, cost = task.result()
+                    self.total_cost += cost
+                    self.messages.append({
+                        "type": "function_call_output",
+                        "call_id": tc.call_id,
+                        "output": str(result_text)[:8000],
+                    })
+                except Exception:
+                    pass
+
+            self._deferred_tasks.clear()
+
         logger.info(
             f"[{self.label}] loop done — {self.total_turns} turns, "
             f"${self.total_cost:.4f}, {len(self.messages)} messages"
@@ -658,41 +741,81 @@ class AgentConversation:
     ) -> None:
         """Execute multiple tool calls concurrently.
 
-        Note: function_call items are already in self.messages from parsing.
-        This method only appends the function_call_output items.
+        Uses FIRST_COMPLETED: when any tool finishes, gives remaining tools
+        a brief grace period (2s) for other fast tools to complete, then
+        returns. Still-running tools get "Pending" output and continue in
+        the background — their results are delivered via drain_events.
         """
+        # Launch all
+        tasks: Dict[asyncio.Task, Any] = {}
+        for tc in tool_calls:
+            task = asyncio.create_task(self._execute_tool(tc))
+            tasks[task] = tc
 
-        async def run_one(tc):
-            result_text, tool_cost = await self._execute_tool(tc)
-            return tc, result_text, tool_cost
+        outputs: Dict[str, str] = {}
+        costs: Dict[str, float] = {}
+        pending = set(tasks.keys())
 
-        results = await asyncio.gather(
-            *[run_one(tc) for tc in tool_calls],
-            return_exceptions=True,
+        # Wait for first completion
+        done, pending = await asyncio.wait(
+            pending, return_when=asyncio.FIRST_COMPLETED,
         )
+        self._collect_done_tasks(done, tasks, outputs, costs, result)
 
-        for i, r in enumerate(results):
-            tc = tool_calls[i]
+        # Grace period — let other fast tools finish (apollo, create_harvester)
+        if pending:
+            done2, pending = await asyncio.wait(pending, timeout=2.0)
+            self._collect_done_tasks(done2, tasks, outputs, costs, result)
 
-            if isinstance(r, BaseException):
-                logger.error(f"Parallel tool error for {tc.name}: {r}")
-                output_text = f"Error executing tool: {r}"
-            else:
-                _, output_text, tool_cost = r
-                self.total_cost += tool_cost
-                result.cost_usd = self.total_cost
-                if self.on_cost and tool_cost > 0:
-                    await self.on_cost(tool_cost, self.label)
-                output_text = output_text[:TOOL_OUTPUT_LIMIT]
+        # Still-running tools get "Pending" and continue in background.
+        # Include current status via drain_events so orchestrator has context.
+        pending_status = ""
+        if pending and self.drain_events:
+            pending_status = self.drain_events()
 
-            # Append drain_events to the last tool output
-            if i == len(results) - 1 and self.drain_events:
-                events = self.drain_events()
-                if events:
-                    output_text += events
+        for task in pending:
+            tc = tasks[task]
+            outputs[tc.call_id] = (
+                f"Still running — results will appear on your next action."
+                f"{pending_status}"
+            )
+            pending_status = ""  # only attach status to first pending
+            self._deferred_tasks.append((task, tc))
 
+        # Append drain_events to last output
+        last_id = tool_calls[-1].call_id
+        if self.drain_events:
+            events = self.drain_events()
+            if events and last_id in outputs:
+                outputs[last_id] += events
+
+        # Append all outputs in original order
+        for tc in tool_calls:
             self.messages.append({
                 "type": "function_call_output",
                 "call_id": tc.call_id,
-                "output": output_text,
+                "output": (outputs.get(tc.call_id, "Error: no result"))[:TOOL_OUTPUT_LIMIT],
             })
+
+    def _collect_done_tasks(
+        self,
+        done: set,
+        tasks: Dict,
+        outputs: Dict[str, str],
+        costs: Dict[str, float],
+        result: Any,
+    ) -> None:
+        """Process completed tasks from asyncio.wait."""
+        for task in done:
+            tc = tasks[task]
+            try:
+                text, tool_cost = task.result()
+                self.total_cost += tool_cost
+                result.cost_usd = self.total_cost
+                if self.on_cost and tool_cost > 0:
+                    asyncio.ensure_future(self.on_cost(tool_cost, self.label))
+                outputs[tc.call_id] = text
+                costs[tc.call_id] = tool_cost
+            except Exception as e:
+                logger.error(f"Parallel tool error for {tc.name}: {e}")
+                outputs[tc.call_id] = f"Error executing tool: {e}"

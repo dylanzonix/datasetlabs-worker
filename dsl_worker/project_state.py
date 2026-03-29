@@ -104,7 +104,7 @@ class ProjectState:
             .filter(
                 ProjectEvent.project_id == self.project_id,
                 ProjectEvent.version_id == self.version_id,
-                ProjectEvent.event_type.in_(["paused", "running", "completed", "failed"]),
+                ProjectEvent.event_type.in_(["paused", "running", "resumed", "completed", "failed"]),
                 ProjectEvent.created_at > pause_request.created_at
             )
             .first()

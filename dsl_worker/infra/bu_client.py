@@ -103,8 +103,15 @@ class BUClient:
         # Stop takes priority — if both finished, prefer stopping
         if stop_fut in done:
             task.cancel()
+            # Wait briefly for the task to die (avoids orphaned coroutines)
+            try:
+                await asyncio.wait({task}, timeout=3.0)
+            except Exception:
+                pass
             # Stop the BU cloud session so it doesn't keep running
             sid = getattr(session_run, 'session_id', None)
+            if not sid:
+                sid = getattr(session_run, '_session_id', None)
             if sid:
                 try:
                     await self._client.sessions.stop(sid)

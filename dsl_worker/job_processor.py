@@ -34,6 +34,7 @@ from dsl_api.models.project_event import ProjectEvent
 from dsl_api.models.chat_message import ChatMessage
 from dsl_api.models.project_file import ProjectFile
 from dsl_api.models.project_connector import ProjectConnector
+from dsl_api.models.sample import Sample
 
 from dsl_worker.config import settings
 
@@ -265,6 +266,9 @@ class JobProcessor:
         (workspace_dir / "downloads").mkdir(exist_ok=True)
         self._workspace_dir = workspace_dir
 
+        # Restore browser downloads from blob (survives pause/resume)
+        self._restore_downloads_from_blob(project.id, workspace_dir)
+
         # Generate SAS URLs for uploaded files (sandbox service fetches them directly)
         uploaded_file_urls = self._generate_file_urls(db, project.id)
 
@@ -293,25 +297,20 @@ class JobProcessor:
             except Exception as e:
                 logger.error(f"[Billing] on_cost callback error: {e}")
 
-        # Check if resuming from execution phase
-        if checkpoint.current_phase == "execution" and checkpoint.work_items:
+        # Seed cost tracker from checkpoint if resuming
+        if checkpoint.total_cost_usd > 0:
+            cost_tracker.seed_from_checkpoint(checkpoint.total_cost_usd)
+
+        # --- Detect resume: check if rows already exist for this version ---
+        db.refresh(version)
+        existing_row_count = version.generated_count or 0
+        is_resume = existing_row_count > 0
+
+        if is_resume:
             logger.info(
-                f"[Pipeline] Resuming execution: "
-                f"{len(checkpoint.processed_indices)}/{len(checkpoint.work_items)} done"
+                f"[Pipeline] RESUMING: {existing_row_count}/{state.num_samples} rows "
+                f"already generated, checkpoint cost=${checkpoint.total_cost_usd:.4f}"
             )
-
-            if checkpoint.total_cost_usd > 0:
-                cost_tracker.seed_from_checkpoint(checkpoint.total_cost_usd)
-
-            version.progress_detail = {"phase": "generating"}
-            db.commit()
-            return await self._run_generation_from_checkpoint(
-                db, project, version, state, tracked_client, cost_tracker,
-                checkpoint_mgr, checkpoint, workspace_dir, stop_checker,
-                on_cost=on_cost,
-            )
-
-        # --- Fresh run ---
 
         # Load conversation history
         chat_history = self._load_chat_history(db, project.id)
@@ -335,6 +334,12 @@ class JobProcessor:
             for f in project_files
         ]
 
+        # Enrich file metadata — inspect CSVs/JSONs for columns, row counts, previews
+        if uploaded_files and uploaded_file_urls:
+            uploaded_files = await self._enrich_file_metadata(
+                uploaded_files, uploaded_file_urls,
+            )
+
         # Load connectors for MCP tool injection
         connectors = (
             db.query(ProjectConnector)
@@ -347,15 +352,16 @@ class JobProcessor:
         mcp_tools = self._build_mcp_tools(connectors)
         self._mcp_tools = mcp_tools
 
-        logger.info(f"[Pipeline] Starting V6 pipeline with {len(chat_history)} chat messages")
+        logger.info(f"[Pipeline] Starting V11 pipeline with {len(chat_history)} chat messages")
 
         # === Shared state ===
+        # Seed from DB so resume knows how many rows already exist
         generation_stats = {
-            "rows_generated": 0,
+            "rows_generated": existing_row_count,
             "errors": 0,
             "skipped": 0,
             "in_progress": 0,
-            "total_cost": 0.0,
+            "total_cost": checkpoint.total_cost_usd,
         }
 
         # Feedback context for re-planning iterations
@@ -384,7 +390,7 @@ class JobProcessor:
             except (json.JSONDecodeError, Exception):
                 pass
 
-        # --- Progress tracking ---
+        # --- Progress tracking + checkpointing ---
         progress_counters: Dict[str, Any] = {"phase": "orchestrating"}
         last_progress_flush = time.time()
         last_langfuse_flush = time.time()
@@ -393,8 +399,7 @@ class JobProcessor:
             nonlocal last_progress_flush, last_langfuse_flush
 
             phase_map = {
-                "browse": "researching",
-                "explore_agent": "researching",
+                "code_exec": "researching",
                 "create_harvester": "harvesting",
                 "apollo_search": "harvesting",
                 "apollo_search_companies": "harvesting",
@@ -429,6 +434,7 @@ class JobProcessor:
                 if lf:
                     lf.flush()
                 last_langfuse_flush = now
+
 
         # --- Browser session tracking ---
         browser_sessions: Dict[str, Dict[str, str]] = {}
@@ -466,6 +472,22 @@ class JobProcessor:
 
         dedup_store = DedupStore()
 
+        # Seed DedupStore with existing rows so resume doesn't create duplicates
+        if is_resume:
+            from dsl_worker.agents.row import _tokenize
+            existing_samples = (
+                db.query(Sample)
+                .filter(Sample.version_id == version.id)
+                .all()
+            )
+            for sample in existing_samples:
+                row_data = sample.row or {}
+                row_id = str(sample.id)
+                dedup_store._submitted[row_id] = row_data
+                for col_name, value in row_data.items():
+                    dedup_store._token_cache[(row_id, col_name)] = _tokenize(value)
+            logger.info(f"[Pipeline] Seeded DedupStore with {len(existing_samples)} existing rows")
+
         from dsl_worker.infra.bu_client import BUClient
         bu_client = BUClient(
             api_key=settings.browser_use_api_key,
@@ -497,6 +519,34 @@ class JobProcessor:
                 return None
             return await row_saver._save_row(row, tags=tags or {})
 
+        # Build resume context for orchestrator
+        resume_context = None
+        if is_resume:
+            resume_context = {
+                "rows_generated": existing_row_count,
+                "target": state.num_samples,
+                "remaining": state.num_samples - existing_row_count,
+                "prior_cost_usd": checkpoint.total_cost_usd,
+                "previous_sources": (checkpoint.source_stats or {}).get("sources", []),
+            }
+
+        # Checkpoint callback — called by orchestrator after state changes
+        def on_checkpoint(orch):
+            try:
+                state_data = orch.export_state()
+                asyncio.create_task(checkpoint_mgr.save_pipeline_state(
+                    orchestrator_messages=state_data["orchestrator_conversation"]["messages"],
+                    orchestrator_cost=state_data["orchestrator_conversation"]["total_cost"],
+                    orchestrator_turns=state_data["orchestrator_conversation"]["total_turns"],
+                    sources=state_data["sources"],
+                    generation_stats=state_data["generation_stats"],
+                    harvester_counter=state_data["harvester_counter"],
+                    apollo_counter=state_data["apollo_counter"],
+                    research_counter=state_data["research_counter"],
+                ))
+            except Exception as e:
+                logger.warning(f"[Pipeline] Checkpoint callback error: {e}")
+
         logger.info("[Pipeline] Running V11 orchestrator")
 
         orchestrator = OrchestratorAgent(
@@ -521,10 +571,23 @@ class JobProcessor:
             project_id=project.id,
             on_tool_call=on_tool_call,
             on_cost=on_cost,
+            on_checkpoint=on_checkpoint,
             uploaded_file_urls=uploaded_file_urls if uploaded_file_urls else None,
             mcp_tools=mcp_tools,
             feedback_context=feedback_context,
+            resume_context=resume_context,
         )
+
+        # Restore full state from checkpoint if available
+        if is_resume and checkpoint.has_v11_state:
+            orchestrator.restore_state({
+                "orchestrator_conversation": checkpoint.orchestrator_conversation,
+                "sources": checkpoint.sources,
+                "generation_stats": checkpoint.generation_stats,
+                "harvester_counter": checkpoint.harvester_counter,
+                "apollo_counter": checkpoint.apollo_counter,
+                "research_counter": checkpoint.research_counter,
+            })
 
         try:
             result = await orchestrator.run()
@@ -533,7 +596,28 @@ class JobProcessor:
                 f"cost=${orchestrator.cost_usd:.4f}, turns={result.turns_taken}"
             )
         finally:
+            # Force-save full state before cleanup — this is the final checkpoint
+            # that will be used if this is a pause/stop
+            try:
+                state_data = orchestrator.export_state()
+                await checkpoint_mgr.save_pipeline_state(
+                    orchestrator_messages=state_data["orchestrator_conversation"]["messages"],
+                    orchestrator_cost=state_data["orchestrator_conversation"]["total_cost"],
+                    orchestrator_turns=state_data["orchestrator_conversation"]["total_turns"],
+                    sources=state_data["sources"],
+                    generation_stats=state_data["generation_stats"],
+                    harvester_counter=state_data["harvester_counter"],
+                    apollo_counter=state_data["apollo_counter"],
+                    research_counter=state_data["research_counter"],
+                )
+                await checkpoint_mgr.force_save()
+            except Exception as e:
+                logger.warning(f"[Pipeline] Final checkpoint save error: {e}")
+
             await orchestrator.cleanup()
+            # Brief pause to let any orphaned BU polling tasks settle before
+            # closing the httpx client (prevents "client has been closed" errors)
+            await asyncio.sleep(0.5)
             await bu_client.close()
             if apollo_client:
                 await apollo_client.close()
@@ -778,6 +862,167 @@ class JobProcessor:
 
         return history
 
+    async def _enrich_file_metadata(
+        self,
+        uploaded_files: List[Dict],
+        uploaded_file_urls: Dict[str, str],
+    ) -> List[Dict]:
+        """Inspect uploaded files and add metadata (columns, row count, preview).
+
+        Creates a temporary sandbox session, uploads the files, runs a quick
+        inspection script, and destroys the session. Takes 1-3 seconds.
+        """
+        from dsl_worker.infra.sandbox import SandboxSession
+
+        inspectable = {
+            f["filename"] for f in uploaded_files
+            if f.get("content_type", "") in (
+                "text/csv", "application/json", "application/vnd.ms-excel",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ) or f.get("filename", "").lower().endswith((".csv", ".json", ".jsonl", ".xlsx", ".xls", ".tsv"))
+        }
+
+        if not inspectable:
+            return uploaded_files
+
+        try:
+            session_client = await self._sandbox.create_session()
+            session = SandboxSession(session_client, self._sandbox)
+
+            # Upload files
+            urls_to_fetch = {k: v for k, v in uploaded_file_urls.items() if k in inspectable}
+            await session.upload_workspace(self._workspace_dir, urls_to_fetch)
+
+            # Inspection script
+            script = '''
+import os, json, csv
+
+results = {}
+upload_dir = "/workspace/uploads"
+for fname in os.listdir(upload_dir):
+    path = os.path.join(upload_dir, fname)
+    if not os.path.isfile(path):
+        continue
+    info = {}
+    try:
+        lower = fname.lower()
+        if lower.endswith(".csv") or lower.endswith(".tsv"):
+            delim = "\\t" if lower.endswith(".tsv") else ","
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                reader = csv.DictReader(f, delimiter=delim)
+                cols = reader.fieldnames or []
+                rows = sum(1 for _ in reader)
+            info = {"type": "csv", "columns": cols, "row_count": rows}
+            # Preview first 3 rows
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                reader = csv.DictReader(f, delimiter=delim)
+                preview = []
+                for i, row in enumerate(reader):
+                    if i >= 3:
+                        break
+                    preview.append(dict(row))
+                info["preview"] = preview
+        elif lower.endswith(".json"):
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                info = {"type": "json_array", "item_count": len(data)}
+                if data and isinstance(data[0], dict):
+                    info["keys"] = list(data[0].keys())
+                    info["preview"] = data[:3]
+            elif isinstance(data, dict):
+                info = {"type": "json_object", "keys": list(data.keys())[:20]}
+        elif lower.endswith(".jsonl"):
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+            info = {"type": "jsonl", "line_count": len(lines)}
+            if lines:
+                first = json.loads(lines[0])
+                if isinstance(first, dict):
+                    info["keys"] = list(first.keys())
+                    info["preview"] = [json.loads(l) for l in lines[:3]]
+        elif lower.endswith((".xlsx", ".xls")):
+            import openpyxl
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            sheets = wb.sheetnames
+            ws = wb[sheets[0]]
+            rows_list = list(ws.iter_rows(max_row=4, values_only=True))
+            wb.close()
+            cols = [str(c) if c else "" for c in rows_list[0]] if rows_list else []
+            info = {"type": "xlsx", "sheets": sheets, "columns": cols, "row_count": ws.max_row - 1 if ws.max_row else 0}
+            if len(rows_list) > 1:
+                info["preview"] = [dict(zip(cols, [str(v) if v else "" for v in r])) for r in rows_list[1:4]]
+    except Exception as e:
+        info = {"error": str(e)}
+    results[fname] = info
+
+print(json.dumps(results))
+'''
+            result = await session.execute(script, timeout=30)
+            await session.close()
+
+            if result.success and result.stdout.strip():
+                try:
+                    file_info = json.loads(result.stdout.strip())
+                except json.JSONDecodeError:
+                    logger.warning(f"[Pipeline] File inspection output not JSON: {result.stdout[:200]}")
+                    return uploaded_files
+
+                enriched = []
+                for f in uploaded_files:
+                    entry = dict(f)
+                    info = file_info.get(f["filename"])
+                    if info and "error" not in info:
+                        entry["inspection"] = info
+                        logger.info(
+                            f"[Pipeline] Inspected {f['filename']}: "
+                            f"type={info.get('type')}, "
+                            f"rows={info.get('row_count', info.get('item_count', info.get('line_count', '?')))}, "
+                            f"cols={len(info.get('columns', info.get('keys', [])))}"
+                        )
+                    enriched.append(entry)
+                return enriched
+            else:
+                logger.warning(f"[Pipeline] File inspection failed: {result.stderr[:200] if result.stderr else 'no output'}")
+                return uploaded_files
+
+        except Exception as e:
+            logger.warning(f"[Pipeline] File inspection error: {e}")
+            return uploaded_files
+
+    def _restore_downloads_from_blob(self, project_id, workspace_dir: Path) -> None:
+        """Restore browser-downloaded files from blob into workspace/downloads/.
+
+        Files are uploaded to blob during execution by ResearchTools._upload_download_to_blob().
+        On resume, we restore them so the sandbox and agents have access again.
+        """
+        prefix = f"projects/{project_id}/downloads/"
+        downloads_dir = workspace_dir / "downloads"
+        try:
+            container_client = self.blob_service_client.get_container_client(
+                settings.azure_storage_container_name
+            )
+            blobs = list(container_client.list_blobs(name_starts_with=prefix))
+            if not blobs:
+                return
+
+            for blob in blobs:
+                filename = blob.name[len(prefix):]
+                if not filename:
+                    continue
+                local_path = downloads_dir / filename
+                try:
+                    blob_client = container_client.get_blob_client(blob.name)
+                    data = blob_client.download_blob().readall()
+                    local_path.write_bytes(data)
+                    logger.info(f"[Pipeline] Restored download: {filename} ({len(data)} bytes)")
+                except Exception as e:
+                    logger.warning(f"[Pipeline] Failed to restore {filename}: {e}")
+
+            logger.info(f"[Pipeline] Restored {len(blobs)} browser downloads from blob")
+        except Exception as e:
+            logger.debug(f"[Pipeline] No downloads to restore: {e}")
+
     def _generate_file_urls(self, db: Session, project_id) -> Dict[str, str]:
         """Generate short-lived SAS URLs for uploaded files (no local download needed).
 
@@ -966,21 +1211,34 @@ class JobProcessor:
         cost_tracker: CostTracker,
         reason: str
     ) -> None:
-        """Handle force-stop."""
+        """Handle force-stop. Credit exhaustion → paused (resumable), other → failed."""
         logger.warning(f"Force-stopping: {reason}")
         db.refresh(version)
 
         cost_tracker.charge_remaining()
 
-        version.status = "failed"
-        version.error = reason
-        version.finished_at = datetime.now(timezone.utc)
-        version.progress_detail = None
+        is_credit_stop = reason in ("insufficient_balance", "credit_exhausted")
+        generated = version.generated_count or 0
 
-        self._emit_event(
-            db, project, version, "failed",
-            reason,
-            {"reason": reason}
-        )
+        if is_credit_stop and generated > 0:
+            # Credit exhaustion with partial progress → paused (user can buy credits & resume)
+            version.status = "paused"
+            version.error = reason
+            self._emit_event(
+                db, project, version, "paused",
+                f"Paused: {reason} ({generated} rows generated)",
+                {"reason": reason, "generated_count": generated}
+            )
+        else:
+            # Real failure or no progress
+            version.status = "failed"
+            version.error = reason
+            version.finished_at = datetime.now(timezone.utc)
+            version.progress_detail = None
+            self._emit_event(
+                db, project, version, "failed",
+                reason,
+                {"reason": reason}
+            )
 
         db.commit()

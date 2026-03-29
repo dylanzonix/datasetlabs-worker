@@ -1,12 +1,24 @@
 """
-Pipeline Checkpointing
+Pipeline Checkpointing — V11
 
-Handles saving and restoring pipeline state for pause/resume.
+Saves and restores the full pipeline state for pause/resume.
 
-Checkpoints are stored as JSON in Azure Blob Storage.
+What we save:
+- Orchestrator conversation (messages, cost, turns) — this is the brain
+- Each harvester's conversation (messages, cost, turns) — so they pick up mid-source
+- Source states (stats, candidates buffer, exhaustion flags)
+- Generation stats (rows_generated, skipped, errors)
+- Counters (harvester/apollo/research IDs)
+- Total cost
 
-V9: Work items stored as-is (pass-through). No format remapping.
-Phases: orchestrator | execution | completed.
+What we DON'T save (recreated on resume):
+- Async primitives (locks, semaphores, events, tasks)
+- HTTP clients (BU, sandbox, OpenAI)
+- BU browser sessions (server-side, die on their own — harvesters create new ones)
+- Sandbox sessions (recreated on demand)
+- Langfuse spans
+
+Storage: JSON in Azure Blob at checkpoints/{project_id}/{version_id}/state.json
 """
 
 import asyncio
@@ -21,17 +33,47 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class ConversationState:
+    """Serialized state of an AgentConversation."""
+    messages: List[Dict[str, Any]] = field(default_factory=list)
+    total_cost: float = 0.0
+    total_turns: int = 0
+
+
+@dataclass
+class SourceCheckpoint:
+    """Serialized state of a SourceState (minus the live agent)."""
+    id: str = ""
+    source: str = ""
+    description: str = ""
+    total_harvested: int = 0
+    total_processed: int = 0
+    rows_produced: int = 0
+    duplicates: int = 0
+    skipped: int = 0
+    errors: int = 0
+    harvest_cost: float = 0.0
+    process_cost: float = 0.0
+    batches: int = 0
+    exhausted: bool = False
+    last_report: str = ""
+    # Buffered candidates (list of dicts with values/source_id/source_context/metadata)
+    candidates: List[Dict[str, Any]] = field(default_factory=list)
+    # Harvester conversation (if this source has a harvester agent)
+    harvester_conversation: Optional[Dict[str, Any]] = None
+    # Harvester metadata for reconstruction
+    harvester_candidates_total: int = 0
+    harvester_exhausted: bool = False
+    harvester_bu_session_id: Optional[str] = None
+
+
+@dataclass
 class PipelineCheckpoint:
     """
-    Full pipeline state.
-
-    Designed to be:
-    - Small (no duplicate data)
-    - Complete (can fully resume from it)
-    - Debuggable (human-readable JSON)
+    Full V11 pipeline state. Everything needed to resume exactly where we left off.
     """
 
-    version: str = "3.0"
+    version: str = "4.0"
 
     # Identity
     project_id: str = ""
@@ -41,26 +83,31 @@ class PipelineCheckpoint:
     created_at: str = ""
     updated_at: str = ""
 
-    # Phase tracking: 'orchestrator' | 'execution' | 'completed'
-    current_phase: str = "orchestrator"
-
-    # Work items — stored as-is from the pipeline (opaque dicts).
-    # Each item gets "status" and "row_id" fields added for tracking.
-    work_items: List[Dict] = field(default_factory=list)
-
-    # Generation progress — just indices, actual rows are in DB
-    processed_indices: List[int] = field(default_factory=list)
-
-    # Recipe (stored for debugging/resume context)
-    recipe: Optional[str] = None
-
     # Cost tracking
     total_cost_usd: float = 0.0
 
-    # Error tracking
-    errors: List[Dict] = field(default_factory=list)
+    # --- V11 state ---
 
-    # V10: Source stats for CandidatePool Thompson Sampling state
+    # Orchestrator conversation (the brain — every decision, tool call, result)
+    orchestrator_conversation: Optional[Dict[str, Any]] = None
+
+    # Source states (stats + candidate buffers + harvester conversations)
+    sources: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Generation stats
+    generation_stats: Optional[Dict[str, Any]] = None
+
+    # Counters for ID generation
+    harvester_counter: int = 0
+    apollo_counter: int = 0
+    research_counter: int = 0
+
+    # --- Legacy fields (kept for backward compat on load) ---
+    current_phase: str = "orchestrator"
+    work_items: List[Dict] = field(default_factory=list)
+    processed_indices: List[int] = field(default_factory=list)
+    recipe: Optional[str] = None
+    errors: List[Dict] = field(default_factory=list)
     source_stats: Optional[Dict[str, Any]] = None
 
     def to_json(self) -> str:
@@ -99,29 +146,28 @@ class PipelineCheckpoint:
             if key not in known_fields:
                 data.pop(key)
 
-        # Bump version
-        data["version"] = "3.0"
-
         return cls(**data)
 
+    @property
+    def has_v11_state(self) -> bool:
+        """Check if this checkpoint has V11 conversation state."""
+        return self.orchestrator_conversation is not None
+
+    # Legacy compat methods (used by _run_generation_from_checkpoint)
     def add_work_item(self, item: Dict) -> None:
-        """Add a work item (stored as-is with status tracking)."""
         item.setdefault("status", "pending")
         item.setdefault("row_id", None)
         self.work_items.append(item)
 
     def mark_processed(self, index: int, success: bool, row_id: Optional[str] = None) -> None:
-        """Mark a work item as processed."""
         if index not in self.processed_indices:
             self.processed_indices.append(index)
-
         if index < len(self.work_items):
             self.work_items[index]["status"] = "completed" if success else "failed"
             if row_id:
                 self.work_items[index]["row_id"] = row_id
 
     def get_pending_indices(self) -> List[int]:
-        """Get indices of work items not yet processed."""
         processed = set(self.processed_indices)
         return [i for i in range(len(self.work_items)) if i not in processed]
 
@@ -130,12 +176,13 @@ class PipelineCheckpoint:
         """Get summary stats."""
         return {
             "phase": self.current_phase,
+            "has_v11_state": self.has_v11_state,
+            "sources": len(self.sources),
+            "total_cost_usd": self.total_cost_usd,
+            "orchestrator_messages": len((self.orchestrator_conversation or {}).get("messages", [])),
+            # Legacy
             "total_work_items": len(self.work_items),
             "processed": len(self.processed_indices),
-            "pending": len(self.work_items) - len(self.processed_indices),
-            "has_recipe": self.recipe is not None,
-            "total_cost_usd": self.total_cost_usd,
-            "errors": len(self.errors),
         }
 
 
@@ -152,8 +199,8 @@ class CheckpointManager:
         container_name: str,
         project_id: UUID,
         version_id: UUID,
-        auto_save_interval: int = 30,  # seconds
-        auto_save_count: int = 10,     # pending updates
+        auto_save_interval: int = 15,  # seconds (was 30, tightened for V11)
+        auto_save_count: int = 5,      # pending updates (was 10)
     ):
         self.blob_client = blob_service_client
         self.container_name = container_name
@@ -177,11 +224,13 @@ class CheckpointManager:
         existing = await self.load()
 
         if existing:
+            stats = existing.stats
             logger.info(
-                f"[CheckpointManager] Resuming from checkpoint: "
-                f"phase={existing.current_phase}, "
-                f"work_items={len(existing.work_items)}, "
-                f"processed={len(existing.processed_indices)}"
+                f"[Checkpoint] Resuming: "
+                f"v11={stats['has_v11_state']}, "
+                f"sources={stats['sources']}, "
+                f"orch_msgs={stats['orchestrator_messages']}, "
+                f"cost=${stats['total_cost_usd']:.4f}"
             )
             self._checkpoint = existing
         else:
@@ -190,7 +239,7 @@ class CheckpointManager:
                 version_id=str(self.version_id),
                 created_at=datetime.now(timezone.utc).isoformat(),
             )
-            logger.info("[CheckpointManager] Created new checkpoint")
+            logger.info("[Checkpoint] Created new checkpoint")
 
         return self._checkpoint
 
@@ -210,7 +259,7 @@ class CheckpointManager:
             json_data = blob.download_blob().readall().decode('utf-8')
             return PipelineCheckpoint.from_json(json_data)
         except Exception as e:
-            logger.debug(f"[CheckpointManager] No checkpoint found: {e}")
+            logger.debug(f"[Checkpoint] No checkpoint found: {e}")
             return None
 
     async def save(self, force: bool = False) -> None:
@@ -244,35 +293,51 @@ class CheckpointManager:
                 self._pending_updates = 0
                 self._last_save_time = now
 
+                size_kb = len(json_data) / 1024
                 stats = self._checkpoint.stats
                 logger.info(
-                    f"[CheckpointManager] Saved: "
-                    f"phase={stats['phase']}, "
-                    f"work_items={stats['total_work_items']}, "
-                    f"processed={stats['processed']}"
+                    f"[Checkpoint] Saved ({size_kb:.1f}KB): "
+                    f"sources={stats['sources']}, "
+                    f"orch_msgs={stats['orchestrator_messages']}, "
+                    f"cost=${stats['total_cost_usd']:.4f}"
                 )
 
             except Exception as e:
-                logger.error(f"[CheckpointManager] Save failed: {e}")
+                logger.error(f"[Checkpoint] Save failed: {e}")
                 raise
 
-    async def add_work_item(self, work_item: Dict) -> None:
-        """Add a work item to the checkpoint (stored as-is)."""
+    async def save_pipeline_state(
+        self,
+        orchestrator_messages: List[Dict[str, Any]],
+        orchestrator_cost: float,
+        orchestrator_turns: int,
+        sources: List[Dict[str, Any]],
+        generation_stats: Dict[str, Any],
+        harvester_counter: int,
+        apollo_counter: int,
+        research_counter: int,
+    ) -> None:
+        """Save the full V11 pipeline state. Called after every orchestrator tool call."""
         async with self._lock:
-            self._checkpoint.add_work_item(dict(work_item))
+            cp = self._checkpoint
+            cp.orchestrator_conversation = {
+                "messages": orchestrator_messages,
+                "total_cost": orchestrator_cost,
+                "total_turns": orchestrator_turns,
+            }
+            cp.sources = sources
+            cp.generation_stats = dict(generation_stats)
+            cp.harvester_counter = harvester_counter
+            cp.apollo_counter = apollo_counter
+            cp.research_counter = research_counter
             self._pending_updates += 1
 
         await self.save()
 
-    async def mark_processed(
-        self,
-        index: int,
-        success: bool,
-        row_id: Optional[str] = None,
-    ) -> None:
-        """Mark a work item as processed."""
+    async def add_cost(self, cost_usd: float) -> None:
+        """Add to total cost."""
         async with self._lock:
-            self._checkpoint.mark_processed(index, success, row_id)
+            self._checkpoint.total_cost_usd += cost_usd
             self._pending_updates += 1
 
         await self.save()
@@ -285,16 +350,29 @@ class CheckpointManager:
         await self.save(force=True)
 
     async def set_recipe(self, recipe: str) -> None:
-        """Store context for resume."""
+        """Store context for resume (legacy compat)."""
         async with self._lock:
             self._checkpoint.recipe = recipe
 
         await self.save(force=True)
 
-    async def add_cost(self, cost_usd: float) -> None:
-        """Add to total cost. Bumps pending updates so cost is included in next save."""
+    async def add_work_item(self, work_item: Dict) -> None:
+        """Legacy compat."""
         async with self._lock:
-            self._checkpoint.total_cost_usd += cost_usd
+            self._checkpoint.add_work_item(dict(work_item))
+            self._pending_updates += 1
+
+        await self.save()
+
+    async def mark_processed(
+        self,
+        index: int,
+        success: bool,
+        row_id: Optional[str] = None,
+    ) -> None:
+        """Legacy compat."""
+        async with self._lock:
+            self._checkpoint.mark_processed(index, success, row_id)
             self._pending_updates += 1
 
         await self.save()
@@ -308,19 +386,18 @@ class CheckpointManager:
             })
 
     async def delete(self) -> None:
-        """Delete checkpoint and any history blobs (after successful completion)."""
-        # Delete main checkpoint
+        """Delete checkpoint (after successful completion)."""
         try:
             blob = self.blob_client.get_blob_client(
                 container=self.container_name,
                 blob=self._checkpoint_path
             )
             blob.delete_blob()
-            logger.info("[CheckpointManager] Checkpoint deleted")
+            logger.info("[Checkpoint] Deleted")
         except Exception as e:
-            logger.warning(f"[CheckpointManager] Could not delete checkpoint: {e}")
+            logger.warning(f"[Checkpoint] Could not delete: {e}")
 
-        # Clean up any legacy history blobs
+        # Clean up legacy history blobs
         try:
             container_client = self.blob_client.get_container_client(self.container_name)
             history_prefix = f"checkpoints/{self.project_id}/{self.version_id}/history/"
@@ -330,32 +407,21 @@ class CheckpointManager:
                     container_client.delete_blob(blob.name)
                 except Exception:
                     pass
-            if blobs:
-                logger.info(f"[CheckpointManager] Cleaned up {len(blobs)} history blobs")
-        except Exception as e:
-            logger.debug(f"[CheckpointManager] History cleanup skipped: {e}")
+        except Exception:
+            pass
 
     async def force_save(self) -> None:
         """Force immediate save."""
         await self.save(force=True)
 
 
+# Legacy compat
 def checkpoints_to_work_items(checkpoint_items: List[Dict]) -> List[Dict]:
-    """
-    Convert checkpoint work item dicts to the format expected by
-    GenerationWorkerPool.process_work_items().
-
-    Strips checkpoint-only fields (status, row_id) and returns
-    the work items as-is. Handles legacy formats for backward compat.
-    """
+    """Convert checkpoint work items for GenerationWorkerPool (legacy)."""
     work_items = []
     for item in checkpoint_items:
-        # Copy and strip checkpoint tracking fields
         wi = {k: v for k, v in item.items() if k not in ("status", "row_id")}
-
-        # Legacy V4/V5 → V9 migration: convert old format to current
         if "template" in wi and "instructions" not in wi:
-            # V5 format: template + seed_values → instructions + candidate
             wi = {
                 "instructions": wi.get("template", ""),
                 "candidate": wi.get("seed_values", {}),
@@ -363,12 +429,10 @@ def checkpoints_to_work_items(checkpoint_items: List[Dict]) -> List[Dict]:
                 "tags": wi.get("tags", {}),
             }
         elif "instruction" in wi and "instructions" not in wi:
-            # V4 format: instruction + context → instructions + candidate
             wi = {
                 "instructions": wi.get("instruction", ""),
                 "candidate": wi.get("context", ""),
                 "tags": wi.get("tags", {}),
             }
-
         work_items.append(wi)
     return work_items

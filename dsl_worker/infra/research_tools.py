@@ -1148,13 +1148,16 @@ except ImportError:
     load_workbook = None
 
 # Clear previous seeds file
-import os
 _seeds_path = os.path.join("/workspace", ".dsl_seeds.jsonl")
 if os.path.exists(_seeds_path):
     os.remove(_seeds_path)
 
 # User script
 {script}
+
+# Signal whether seeds were submitted (avoids 404 on read)
+if os.path.exists(_seeds_path):
+    print("__SEEDS_EXIST__")
 """
 
         session = await self._get_sandbox_session()
@@ -1163,19 +1166,20 @@ if os.path.exists(_seeds_path):
             timeout=120,
         )
 
-        # Read any seeds that were submitted (from sandbox filesystem)
+        # Read seeds only if the script actually submitted any
         new_seeds = []
-        try:
-            seeds_content = await session.read_file(".dsl_seeds.jsonl")
-            for line in seeds_content.strip().split('\n'):
-                if line:
-                    try:
-                        seed_data = json.loads(line)
-                        new_seeds.append(seed_data)
-                    except json.JSONDecodeError:
-                        pass
-        except Exception:
-            pass  # No seeds file = no seeds submitted
+        if result.success and "__SEEDS_EXIST__" in (result.stdout or ""):
+            try:
+                seeds_content = await session.read_file(".dsl_seeds.jsonl")
+                for line in seeds_content.strip().split('\n'):
+                    if line:
+                        try:
+                            seed_data = json.loads(line)
+                            new_seeds.append(seed_data)
+                        except json.JSONDecodeError:
+                            pass
+            except Exception as e:
+                logger.warning(f"[ResearchTools] Failed to read seeds file: {e}")
 
         # Add seeds to our collection
         for seed_data in new_seeds:
@@ -1185,7 +1189,10 @@ if os.path.exists(_seeds_path):
         output_parts = []
 
         if result.stdout:
-            output_parts.append(result.stdout)
+            # Strip internal seed marker from output
+            stdout = result.stdout.replace("__SEEDS_EXIST__\n", "").replace("__SEEDS_EXIST__", "")
+            if stdout.strip():
+                output_parts.append(stdout)
 
         if not result.success and result.stderr:
             output_parts.append(f"Error: {result.stderr}")

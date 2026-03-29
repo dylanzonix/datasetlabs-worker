@@ -74,66 +74,58 @@ try a different source, adjust filters, or pivot strategy.
 
 ## Your Tools
 
-**explore_agent(task)** — Inspect uploaded files, data, schemas via code execution. \
-No web access.
+**Web search** (built-in) — Use for general research: finding information, \
+discovering sources, verifying facts. Fast, cheap, pre-indexed rendered web content.
 
-**Web search** (built-in) is available for general research — quick factual lookups, \
-finding URLs, verifying information. It uses pre-indexed, rendered web content.
-
-**browse(task)** — Launch a full cloud browser for tasks that need live interaction: \
-navigating JS-heavy sites, bypassing anti-bot/captcha, scrolling through paginated \
-content, filling forms, or accessing content that wouldn't be indexed. Write the task \
-as a clear instruction, not keywords. The browser has anti-bot stealth, residential \
-proxy, and automatic captcha solving.
+**code_exec(script)** — Run Python in a sandbox. Files are at /workspace/uploads/. \
+Use for quick data inspection if needed, but file metadata is already shown in \
+Resources below.
 
 {apollo_tools_section}\
-**create_harvester(source, candidate_description)** — Set up a web/file harvester \
-for a source. The candidate_description tells the harvester what to look for. \
-Returns a source_id. Use for websites, search results, uploaded files — anything \
-that needs browser navigation or code execution.
+## Tools
+
+**create_harvester(source, candidate_description)** — Set up a harvester for a \
+specific source. One harvester = one specific search query, page, or data slice. \
+If you have 3 different search terms on the same site, create 3 harvesters. \
+For uploaded files, point the harvester at the file path — it can run Python \
+scripts to parse CSVs, JSON, etc. and programmatically submit hundreds of \
+candidates in one shot.
 
 **process(source_id, batch_size)** — Start continuously processing candidates from \
-a source. Keeps the pipeline fed automatically — you call it once per source, not \
-per batch. Returns after the first batch completes with initial results. The loop \
-keeps running in the background, reporting results as batches finish. Stops when \
-the buffer is empty or target is reached.
+a source. Keeps the pipeline fed automatically — call it once per source. Returns \
+after the first batch completes with results. The loop keeps running, reporting \
+results as batches finish. Stops when the buffer empties or target is reached.
 
 **close_source(source_id)** — Close a source and free its resources.
 
-## Writing Good Candidate Descriptions (for create_harvester)
+## Candidate Descriptions (for create_harvester)
 
-The candidate_description tells the harvester what to look for ON LIST PAGES. \
-Keep it simple — the harvester just grabs names/identifiers, row generators do \
-all the deep research and enrichment.
+The candidate_description tells the harvester what to look for. Keep it focused \
+on the WHAT, not the HOW. The harvester discovers and yields candidates — row \
+generators handle all enrichment (emails, phones, LinkedIn, etc.).
 
-Include:
-- What entity to look for (company, person, job posting, etc.)
-- Any obvious surface-level dealbreakers (wrong category, wrong location)
+For list-based sources (directories, search results): just describe what entity \
+to grab and obvious surface-level dealbreakers.
 
-Do NOT ask the harvester to find emails, phone numbers, LinkedIn profiles, or \
-detailed info per candidate. That's the row generator's job.
-
-Example: "Apartment property management companies in the Seattle/Bellevue/Tacoma WA \
-area. Skip anything that's clearly not a property management company (staffing firms, \
-real estate brokerages, industry associations)."
+For open-ended research (niche leads with no clean list): the harvester may need \
+to do quick validation per candidate (e.g. "is this actually a taco shell \
+manufacturer?") but should NOT enrich candidates with contact details.
 
 ## Strategy
 
-- If you know or can guess the source, go straight to action. \
-You likely already know how major sites work (URL patterns, search params, etc.) — \
-use that knowledge directly instead of researching first.
-- **Read the results.** process() tells you exactly what happened — how many rows, \
-how many skipped and WHY, duplicates, errors. Use this to decide your next move. \
-If a source has low fertility or bad skip reasons, stop using it.
-- process() starts a continuous processing loop on a source — call it once, not \
-per batch. It keeps feeding candidates into row generators automatically. You \
-see results as batches complete. Multiple process() calls on different sources \
+- **Apollo first for B2B.** Apollo is a structured business database (like \
+LinkedIn data via API). Search is free, enrichment is cheap. For any project \
+involving businesses, professionals, or companies, start with Apollo. It won't \
+help for non-business entities (rappers, restaurants, etc.).
+- **Read the results.** process() tells you exactly what happened — rows, skips \
+(with reasons), duplicates, errors. React to this. If a source has low fertility \
+or bad skip reasons, stop using it.
+- **Don't create backup sources preemptively.** Start Apollo or one harvester, \
+see the results, THEN decide if you need more sources. Don't hedge by creating \
+harvesters before seeing how the first source performs.
+- process() starts a continuous loop — call it once per source. Multiple sources \
 run concurrently.
-- Start small to validate a source, then scale up as confidence grows. \
-Stay aware of how many rows you still need (shown in the status).
-- Close sources that aren't producing.
-- The browser (browse tool) handles JavaScript, anti-bot, CAPTCHAs, and dynamic \
-pages. JS is almost never the issue if something isn't loading.
+- Stay aware of how many rows you still need (shown in the status).
 
 Today's date: {current_date}
 
@@ -182,14 +174,17 @@ class OrchestratorAgent:
         project_id: Optional[Any] = None,
         on_tool_call: Optional[Callable[[str, str], None]] = None,
         on_cost: Optional[Callable] = None,
+        on_checkpoint: Optional[Callable] = None,
         uploaded_file_urls: Optional[Dict[str, str]] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
         apollo_client: Optional[ApolloClient] = None,
         feedback_context: Optional[Dict[str, Any]] = None,
+        resume_context: Optional[Dict[str, Any]] = None,
         harvester_model: str = "",
         generation_model: str = "",
     ) -> None:
         self.feedback_context = feedback_context
+        self.resume_context = resume_context
         self.chat_history = chat_history
         self.columns = columns
         self.num_samples = num_samples
@@ -205,6 +200,7 @@ class OrchestratorAgent:
         self.project_id = project_id
         self.on_tool_call = on_tool_call
         self.on_cost = on_cost
+        self._on_checkpoint = on_checkpoint
         self.uploaded_file_urls = uploaded_file_urls
         self.uploaded_files = uploaded_files
         self.mcp_tools = mcp_tools or []
@@ -223,6 +219,7 @@ class OrchestratorAgent:
         self._sources: Dict[str, SourceState] = {}
         self._pending_batches: List[asyncio.Task] = []
         self._completed_results: List[str] = []
+        self._last_checkpoint_time: float = 0.0
 
         from dsl_worker.config import settings
         self._generation_semaphore = asyncio.Semaphore(
@@ -280,18 +277,20 @@ class OrchestratorAgent:
         if not self.apollo_client:
             return ""
         return (
-            "**apollo_search(...)** — Search Apollo.io's 210M+ contact database. FREE, \\\n"
-            "no credits. Returns people with title, company, LinkedIn. Each result is \\\n"
-            "auto-buffered as a candidate. Use structured filters: titles, seniorities, \\\n"
-            "locations, industries, company size, revenue, tech stack, email status. \\\n"
-            "Paginate with page param (100/page, up to 500 pages). Call process() on \\\n"
-            "the returned source_id to start row generation.\n\n"
-            "**apollo_search_companies(...)** — Search Apollo.io's 30M+ company database. \\\n"
-            "Filter by industry, location, size, revenue, funding stage, founding year, \\\n"
-            "tech stack. Each result auto-buffered as a candidate.\n\n"
-            "Row generators have **apollo_enrich** to get emails, phones, and full details \\\n"
-            "(1 credit/person). You don't need to enrich — row generators do it automatically \\\n"
-            "when they see an apollo_id in the candidate.\n\n"
+            "## Apollo.io\n\n"
+            "Apollo is a B2B database — 210M+ professionals and 30M+ companies. Think of \\\n"
+            "it like LinkedIn data via API. Great for: business contacts, company lists, \\\n"
+            "lead generation, professional searches. Not useful for: non-business entities \\\n"
+            "(artists, restaurants, events, etc.).\n\n"
+            "**apollo_search(...)** — Search people. FREE, no credits. Filter by title, \\\n"
+            "seniority, location, industry, company size, etc. 100 results per page. \\\n"
+            "Results are auto-buffered as candidates.\n\n"
+            "**apollo_search_companies(...)** — Search companies. Filter by industry, \\\n"
+            "location, size, revenue, funding stage, tech stack, founding year.\n\n"
+            "Apollo search is free and fast — much cheaper than web harvesting. Prefer \\\n"
+            "it over harvesters when the project involves businesses or professionals. \\\n"
+            "Row generators automatically enrich Apollo candidates with emails, phones, \\\n"
+            "and full details — you don't need to do that.\n\n"
         )
 
     def _format_conversation(self) -> str:
@@ -307,7 +306,7 @@ class OrchestratorAgent:
     def _format_resources(self, uploaded_files: Optional[List[Dict[str, Any]]]) -> str:
         if not uploaded_files:
             return "No uploaded files."
-        lines = ["Uploaded files (accessible in harvester via code_exec):"]
+        lines = ["Uploaded files (create a harvester pointed at the file path — it can parse programmatically):"]
         for f in uploaded_files:
             name = f.get("filename", "unknown")
             size = f.get("size_bytes", 0)
@@ -319,6 +318,23 @@ class OrchestratorAgent:
             else:
                 size_str = f"{size} bytes"
             lines.append(f"  - /workspace/uploads/{name} ({ctype}, {size_str})")
+
+            # Rich metadata from file inspection
+            inspection = f.get("inspection")
+            if inspection:
+                ftype = inspection.get("type", "")
+                row_count = inspection.get("row_count") or inspection.get("item_count") or inspection.get("line_count")
+                cols = inspection.get("columns") or inspection.get("keys") or []
+                if row_count is not None:
+                    lines.append(f"    {row_count} rows, {len(cols)} columns")
+                if cols:
+                    cols_str = ", ".join(cols[:20])
+                    if len(cols) > 20:
+                        cols_str += f" ... ({len(cols)} total)"
+                    lines.append(f"    Columns: {cols_str}")
+                preview = inspection.get("preview")
+                if preview:
+                    lines.append(f"    Sample row: {json.dumps(preview[0], default=str)[:300]}")
         return "\n".join(lines)
 
     def _format_feedback(self) -> str:
@@ -333,6 +349,19 @@ class OrchestratorAgent:
             f"The previous results were discarded. Design a new pipeline "
             f"based on this feedback."
         )
+
+    def _maybe_checkpoint(self, force: bool = False) -> None:
+        """Fire checkpoint callback if enough time has passed (15s throttle)."""
+        if not self._on_checkpoint:
+            return
+        now = time.time()
+        if not force and now - self._last_checkpoint_time < 15.0:
+            return
+        self._last_checkpoint_time = now
+        try:
+            self._on_checkpoint(self)
+        except Exception as e:
+            logger.warning(f"[orchestrator] checkpoint callback error: {e}")
 
     def _format_source_status(self) -> str:
         """Format full status of all sources for tool output."""
@@ -382,120 +411,34 @@ class OrchestratorAgent:
 
     def _register_tools(self, registry: ToolRegistry) -> None:
 
-        # --- browse (full cloud browser via BU) ---
-        async def browse(args: Dict) -> tuple[str, float]:
-            task = args.get("task", "")
-            if not task:
-                return "Error: task is required", 0.0
-
-            if not self.bu_client:
-                return "Error: browser not available (no BU client)", 0.0
-
-            fast_task = (
-                f"{task}\n\n"
-                "Be fast and direct. Take the shortest path to the answer. "
-                "Do not explore or enumerate page elements — just do what's needed and return."
-            )
-            text, cost, _sid = await self.bu_client.research(fast_task)
-
-            if self.on_cost and cost > 0:
-                await self.on_cost(cost, "browse")
-
-            if len(text) > 6000:
-                text = text[:6000] + "\n\n[Truncated]"
-
-            return text or "(no results)", cost
-
-        registry.add(
-            name="browse",
-            description=(
-                "Launch a full cloud browser to interact with web pages. Use for "
-                "tasks that need live navigation, anti-bot bypass, JS rendering, "
-                "captcha solving, form filling, or scrolling. Write as a clear "
-                "instruction. Prefer the built-in web search for simple lookups."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "task": {
-                        "type": "string",
-                        "description": (
-                            "A clear instruction for the browser. "
-                            "Example: 'Go to upwork.com/nx/search/jobs and figure out "
-                            "the URL parameters for filtering by recency and date posted. "
-                            "Return the full URL with the correct filters applied.'"
-                        ),
-                    },
-                },
-                "required": ["task"],
-            },
-            handler=browse,
-        )
-
-        # --- explore_agent ---
-        async def explore_agent(args: Dict) -> tuple[str, float]:
-            from dsl_worker.agents.code_exec import CodeExecAgent
-            from dsl_worker.config import settings as worker_settings
-
-            task = args.get("task", "")
-            budget = args.get("budget", 6)
-
-            if not task:
-                return "Error: task is required", 0.0
-
-            agent = CodeExecAgent(
-                openai_client=self.openai_client,
-                model=worker_settings.research_subagent_model,
+        # --- code_exec ---
+        self._sandbox_impl = None
+        if self.sandbox:
+            from dsl_worker.infra.research_tools import ResearchTools, ResearchScope
+            self._sandbox_impl = ResearchTools(
                 workspace_dir=self.workspace_dir,
+                schema=[],
+                brave_api_key=None,
+                openai_client=self.openai_client,
+                model=self.model,
                 sandbox=self.sandbox,
                 stop_checker=self.stop_checker,
-                max_turns=budget,
-                tool_budget=budget,
                 blob_service_client=self.blob_service_client,
                 project_id=self.project_id,
                 uploaded_file_urls=self.uploaded_file_urls,
             )
-
-            try:
-                result = await agent.ask_full(task)
-            finally:
-                await agent.cleanup()
-
-            if self.on_cost and result.cost_usd > 0:
-                await self.on_cost(result.cost_usd, "explore_agent")
-
-            n = self._research_counter
-            self._research_counter += 1
-            research_dir = self.workspace_dir / "research"
-            research_dir.mkdir(exist_ok=True)
-            try:
-                (research_dir / f"finding_{n}.md").write_text(
-                    f"# Explore: {task}\n\n{result.text}", encoding="utf-8"
-                )
-            except Exception as e:
-                logger.warning(f"Failed to save finding: {e}")
-
-            return f"[Saved to research/finding_{n}.md]\n\n{result.text}", 0.0
-
-        registry.add(
-            name="explore_agent",
-            description=(
-                "Inspect files, data, and connected resources via code execution. "
-                "No web access. Use this to understand uploaded files, schemas, etc."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "task": {"type": "string", "description": "What to inspect or analyze"},
-                    "budget": {
-                        "type": "integer",
-                        "description": "Max tool calls (default 6). 3 for quick, 10 for deep.",
-                    },
-                },
-                "required": ["task"],
-            },
-            handler=explore_agent,
-        )
+            self._sandbox_impl.set_scope(ResearchScope(
+                id="orchestrator",
+                description="",
+                quota=0,
+            ))
+            self._sandbox_impl.register_on(
+                registry,
+                exclude=[
+                    "brave_search", "open", "find", "click",
+                    "interact", "shell_exec", "list_files",
+                ],
+            )
 
         # --- Apollo tools (direct on orchestrator) ---
         if self.apollo_client:
@@ -545,6 +488,7 @@ class OrchestratorAgent:
                 agent=harvester,
             )
             self._sources[source_id] = state
+            self._maybe_checkpoint(force=True)
 
             return (
                 f"Harvester {source_id} created for: {source}\n"
@@ -625,13 +569,15 @@ class OrchestratorAgent:
 
             # Launch continuous processing loop for this source
             task = asyncio.create_task(
-                self._process_source_continuous(source_id, state, batch_size)
+                self._process_source_continuous(source_id, state, report_every=batch_size)
             )
             self._pending_batches.append(task)
 
-            # Wait for the first batch to complete so we have initial results
-            pending = [t for t in self._pending_batches if not t.done()]
-            if pending:
+            # Wait until we have initial results to report
+            while not self._completed_results:
+                pending = [t for t in self._pending_batches if not t.done()]
+                if not pending:
+                    break  # All done (fast source or error)
                 await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                 await asyncio.sleep(0.01)
 
@@ -641,7 +587,7 @@ class OrchestratorAgent:
                 lines.append(completed_text)
             pending_count = len([t for t in self._pending_batches if not t.done()])
             if pending_count:
-                lines.append(f"\n{pending_count} source(s) still processing.")
+                lines.append(f"\n{pending_count} source(s) still processing in background.")
             lines.append(self._format_source_status())
 
             return "\n".join(lines), harvest_cost
@@ -1109,31 +1055,113 @@ class OrchestratorAgent:
         self,
         source_id: str,
         state: SourceState,
-        batch_size: int,
+        report_every: int,
     ) -> None:
-        """Continuously feed candidates from a source into row generators.
+        """Continuously feed candidates into the semaphore one at a time.
 
-        Keeps the semaphore full by launching new row generators as slots
-        free up. Runs until buffer is empty or target is reached.
-        Reports results per batch via _completed_results.
+        No batching — as each row generator finishes, its semaphore slot is
+        immediately filled by the next candidate. Reports results to the
+        orchestrator every `report_every` completions via _completed_results.
         """
-        while state.candidates:
-            # Check target
-            rows_done = self._generation_stats.get("rows_generated", 0)
-            if rows_done >= self.num_samples:
-                logger.info(f"[orchestrator] {source_id}: target reached, stopping")
-                break
+        active: set = set()
+        completed_count = 0
+        batch_rows = 0
+        batch_skipped = 0
+        batch_dupes = 0
+        batch_errors = 0
+        batch_cost = 0.0
+        batch_skip_reasons: List[str] = []
 
-            # Check stop
+        def _should_stop_source() -> bool:
+            if self._generation_stats.get("rows_generated", 0) >= self.num_samples:
+                return True
             if self.stop_checker and self.stop_checker():
+                return True
+            return False
+
+        def _report_batch() -> None:
+            nonlocal completed_count, batch_rows, batch_skipped, batch_dupes
+            nonlocal batch_errors, batch_cost, batch_skip_reasons
+            if completed_count == 0:
+                return
+            total_rows = self._generation_stats.get("rows_generated", 0)
+            lines = [
+                f"[batch_complete] {source_id}: {completed_count} processed → "
+                f"{batch_rows} rows, {batch_skipped} skipped, "
+                f"{batch_dupes} dupes, {batch_errors} errors. "
+                f"Cost: ${batch_cost:.4f}. Progress: {total_rows}/{self.num_samples}.",
+            ]
+            if batch_skip_reasons:
+                lines.append("  Skip reasons:")
+                for reason in batch_skip_reasons[:5]:
+                    lines.append(f"    - {reason[:120]}")
+            lines.append(self._format_source_status())
+            self._completed_results.append("\n".join(lines))
+            logger.info(
+                f"[orchestrator] {source_id}: {completed_count} processed → "
+                f"{batch_rows} rows. Progress: {total_rows}/{self.num_samples}."
+            )
+            self._maybe_checkpoint()
+            completed_count = 0
+            batch_rows = 0
+            batch_skipped = 0
+            batch_dupes = 0
+            batch_errors = 0
+            batch_cost = 0.0
+            batch_skip_reasons = []
+
+        def _handle_completed(task: asyncio.Task) -> None:
+            nonlocal completed_count, batch_rows, batch_skipped, batch_dupes
+            nonlocal batch_errors, batch_cost, batch_skip_reasons
+            try:
+                gen_row, cost, saved = task.result()
+                batch_cost += cost
+                if gen_row.success:
+                    batch_rows += 1
+                elif gen_row.skipped:
+                    if gen_row.is_duplicate:
+                        batch_dupes += 1
+                    else:
+                        batch_skipped += 1
+                        if gen_row.skip_reason:
+                            batch_skip_reasons.append(gen_row.skip_reason)
+                else:
+                    batch_errors += 1
+            except Exception as e:
+                batch_errors += 1
+                logger.error(f"Row generation error: {e}")
+            completed_count += 1
+
+        # Feed candidates one at a time. Candidates stay in the buffer until
+        # we actually acquire a semaphore slot. On pause, unstarted candidates
+        # are still in the buffer and get checkpointed.
+
+        while True:
+            if _should_stop_source():
                 break
 
-            # Dequeue a batch
-            to_process = state.candidates[:batch_size]
-            state.candidates = state.candidates[batch_size:]
+            # Drain completed tasks (non-blocking)
+            if active:
+                done_now = {t for t in active if t.done()}
+                if done_now:
+                    active -= done_now
+                    for task in done_now:
+                        _handle_completed(task)
 
-            # Run this batch (row gens acquire semaphore internally)
-            await self._run_batch_background(source_id, state, to_process)
+            # Report if threshold reached
+            if completed_count >= report_every:
+                state.rows_produced += batch_rows
+                state.skipped += batch_skipped
+                state.duplicates += batch_dupes
+                state.errors += batch_errors
+                state.process_cost += batch_cost
+                self._generation_stats["skipped"] = (
+                    self._generation_stats.get("skipped", 0) + batch_skipped + batch_dupes
+                )
+                self._generation_stats["errors"] = (
+                    self._generation_stats.get("errors", 0) + batch_errors
+                )
+                _report_batch()
 
             # If buffer empty, try to fetch more from harvester
             if not state.candidates and not state.exhausted and state.agent is not None:
@@ -1149,7 +1177,68 @@ class OrchestratorAgent:
                     state.exhausted = state.agent.exhausted
                 except Exception as e:
                     logger.error(f"[orchestrator] {source_id} fetch error: {e}")
-                    break
+
+            # Nothing to do — wait for active tasks or exit
+            if not state.candidates and not active:
+                break
+            if not state.candidates:
+                # No more candidates but tasks still running — wait for one
+                done, active = await asyncio.wait(
+                    active, return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                    _handle_completed(task)
+                continue
+
+            # Acquire semaphore BEFORE popping candidate. This is the key:
+            # candidate stays in buffer (checkpointable) until we actually
+            # have a slot to process it.
+            try:
+                await self._generation_semaphore.acquire()
+            except asyncio.CancelledError:
+                break
+
+            if _should_stop_source():
+                self._generation_semaphore.release()
+                break
+
+            # NOW pop the candidate — we have a slot
+            candidate = state.candidates.pop(0)
+            state.total_processed += 1
+
+            # Launch task (semaphore already acquired, task releases it)
+            task = asyncio.create_task(
+                self._generate_row_with_slot(candidate, state)
+            )
+            active.add(task)
+
+        # Cancel remaining active tasks on stop
+        if active:
+            for t in active:
+                t.cancel()
+            await asyncio.gather(*active, return_exceptions=True)
+            # Collect results from any that finished before cancel took effect
+            for t in active:
+                if t.done() and not t.cancelled():
+                    try:
+                        _handle_completed(t)
+                    except Exception:
+                        pass
+
+        # Final report for any unreported completions
+        if completed_count > 0:
+            state.rows_produced += batch_rows
+            state.skipped += batch_skipped
+            state.duplicates += batch_dupes
+            state.errors += batch_errors
+            state.process_cost += batch_cost
+            self._generation_stats["skipped"] = (
+                self._generation_stats.get("skipped", 0) + batch_skipped + batch_dupes
+            )
+            self._generation_stats["errors"] = (
+                self._generation_stats.get("errors", 0) + batch_errors
+            )
+            _report_batch()
 
         logger.info(f"[orchestrator] {source_id}: continuous processing ended")
 
@@ -1162,106 +1251,22 @@ class OrchestratorAgent:
         self._completed_results.clear()
         return f"\n--- Completed Batches ---\n{results}"
 
-    async def _run_batch_background(
-        self,
-        source_id: str,
-        state: SourceState,
-        candidates: List[Candidate],
-    ) -> None:
-        """Run row generators for a batch. Pushes result to _completed_results."""
-        try:
-            results = await asyncio.gather(*[
-                self._generate_row(candidate, state)
-                for candidate in candidates
-            ], return_exceptions=True)
-
-            rows = 0
-            skipped = 0
-            dupes = 0
-            errors = 0
-            process_cost = 0.0
-            skip_reasons = []
-
-            for r in results:
-                if isinstance(r, Exception):
-                    errors += 1
-                    logger.error(f"Row generation error: {r}")
-                    continue
-                gen_row, cost, saved = r
-                process_cost += cost
-                if gen_row.success:
-                    rows += 1
-                elif gen_row.skipped:
-                    if gen_row.is_duplicate:
-                        dupes += 1
-                    else:
-                        skipped += 1
-                        if gen_row.skip_reason:
-                            skip_reasons.append(gen_row.skip_reason)
-                else:
-                    errors += 1
-
-            state.total_processed += len(candidates)
-            state.rows_produced += rows
-            state.duplicates += dupes
-            state.skipped += skipped
-            state.errors += errors
-            state.process_cost += process_cost
-
-            self._generation_stats["skipped"] = (
-                self._generation_stats.get("skipped", 0) + skipped + dupes
-            )
-            self._generation_stats["errors"] = (
-                self._generation_stats.get("errors", 0) + errors
-            )
-
-            total_rows = self._generation_stats.get("rows_generated", 0)
-
-            lines = [
-                f"[batch_complete] {source_id}: {len(candidates)} processed → "
-                f"{rows} rows, {skipped} skipped, {dupes} dupes, {errors} errors. "
-                f"Cost: ${process_cost:.4f}. Progress: {total_rows}/{self.num_samples}.",
-            ]
-            if skip_reasons:
-                lines.append("  Skip reasons:")
-                for reason in skip_reasons[:5]:
-                    lines.append(f"    - {reason[:120]}")
-            lines.append(self._format_source_status())
-
-            self._completed_results.append("\n".join(lines))
-
-            logger.info(
-                f"[orchestrator] batch done {source_id}: {len(candidates)} → "
-                f"{rows} rows, {skipped} skipped, {dupes} dupes, {errors} errors. "
-                f"Progress: {total_rows}/{self.num_samples}."
-            )
-
-        except Exception as e:
-            logger.error(f"[orchestrator] Batch error {source_id}: {e}")
-            self._completed_results.append(f"[batch_error] {source_id}: {e}")
 
     # ── Row generation ────────────────────────────────────────────────
 
-    async def _generate_row(
+    async def _generate_row_with_slot(
         self,
         candidate: Candidate,
         state: SourceState,
     ) -> tuple:
-        """Generate one row from a candidate. Semaphore-limited for concurrency."""
+        """Generate one row. Semaphore already acquired — released on exit."""
         from dsl_worker.agents.row import RowGeneratorAgent, GeneratedRow
 
-        # Skip if target already reached (avoids wasting LLM calls)
-        rows_done = self._generation_stats.get("rows_generated", 0)
-        if rows_done >= self.num_samples:
-            return GeneratedRow(success=False, skipped=True, skip_reason="target reached"), 0.0, False
-
-        async with self._generation_semaphore:
-            # Re-check after acquiring semaphore (may have been queued)
+        try:
             rows_done = self._generation_stats.get("rows_generated", 0)
             if rows_done >= self.num_samples:
                 return GeneratedRow(success=False, skipped=True, skip_reason="target reached"), 0.0, False
 
-            # Row gen stop checker: also stops when target is reached
             def _row_stop():
                 if self.stop_checker and self.stop_checker():
                     return True
@@ -1297,12 +1302,15 @@ class OrchestratorAgent:
                         row_id = await self._save_row(result.row)
                         saved = row_id is not None
                         if saved:
-                            # Update immediately so other row gens see it
                             self._generation_stats["rows_generated"] = (
                                 self._generation_stats.get("rows_generated", 0) + 1
                             )
 
                 return result, result.cost_usd, saved
+
+            except asyncio.CancelledError:
+                # Stopped mid-generation — not an error, just interrupted
+                return GeneratedRow(success=False, skipped=True, skip_reason="stopped"), 0.0, False
 
             except Exception as e:
                 logger.error(f"Row generation error: {e}", exc_info=True)
@@ -1313,21 +1321,13 @@ class OrchestratorAgent:
                     await agent.cleanup()
                 except Exception:
                     pass
+        finally:
+            # Always release the semaphore slot
+            self._generation_semaphore.release()
 
     # ── Run ───────────────────────────────────────────────────────────
 
     async def run(self) -> AgentResult:
-        if self.feedback_context:
-            message = (
-                "Begin. The user reviewed previous results and gave feedback "
-                "(shown in system prompt). Research as needed and design a new pipeline."
-            )
-        else:
-            message = (
-                "Begin. Read the conversation history and resources, reason about "
-                "strategy, then start harvesting candidate sources."
-            )
-
         def _should_exit() -> bool:
             rows_done = self._generation_stats.get("rows_generated", 0)
             if rows_done >= self.num_samples:
@@ -1337,6 +1337,40 @@ class OrchestratorAgent:
                 return True
             return False
 
+        # If conversation was restored from checkpoint, just continue the loop.
+        # No injected message — the LLM sees its full prior conversation and
+        # picks up exactly where it left off (same tool calls, same results).
+        if self._conversation.messages:
+            logger.info(
+                f"[orchestrator] Resuming from checkpoint: "
+                f"{len(self._conversation.messages)} messages, "
+                f"{self._generation_stats.get('rows_generated', 0)}/{self.num_samples} rows"
+            )
+            return await self._conversation._run_loop(exit_condition=_should_exit)
+
+        # Fresh start
+        if self.feedback_context:
+            message = (
+                "Begin. The user reviewed previous results and gave feedback "
+                "(shown in system prompt). Research as needed and design a new pipeline."
+            )
+        elif self.resume_context:
+            # Resume without V11 checkpoint state (legacy checkpoint or first V11 resume)
+            rc = self.resume_context
+            message = (
+                f"RESUME. This job was paused and is now continuing. "
+                f"{rc['rows_generated']}/{rc['target']} rows already generated "
+                f"({rc['remaining']} remaining). Prior cost: ${rc['prior_cost_usd']:.4f}.\n\n"
+                f"Pick up where the previous run left off. The conversation history "
+                f"has all the context. Focus on generating the remaining "
+                f"{rc['remaining']} rows. Existing rows are in the dedup store."
+            )
+        else:
+            message = (
+                "Begin. Read the conversation history and resources, reason about "
+                "strategy, then start harvesting candidate sources."
+            )
+
         return await self._conversation.send(
             message,
             exit_condition=_should_exit,
@@ -1345,6 +1379,183 @@ class OrchestratorAgent:
     @property
     def cost_usd(self) -> float:
         return self._conversation.total_cost
+
+    def export_state(self) -> Dict[str, Any]:
+        """Export full pipeline state for checkpointing.
+
+        Takes a snapshot of all mutable state. Safe to call from on_tool_call
+        since orchestrator tools run sequentially (no concurrent mutation).
+        """
+        sources = []
+        for sid, state in list(self._sources.items()):
+            source_data = {
+                "id": state.id,
+                "source": state.source,
+                "description": state.description,
+                "total_harvested": state.total_harvested,
+                "total_processed": state.total_processed,
+                "rows_produced": state.rows_produced,
+                "duplicates": state.duplicates,
+                "skipped": state.skipped,
+                "errors": state.errors,
+                "exhausted": state.exhausted,
+                "harvest_cost": state.harvest_cost,
+                "process_cost": state.process_cost,
+                "batches": state.batches,
+                "last_report": state.last_report,
+                # Snapshot candidate buffer (copy to avoid mutation during save)
+                "candidates": [
+                    {
+                        "values": c.values,
+                        "source_id": c.source_id,
+                        "source_context": c.source_context,
+                        "metadata": c.metadata,
+                    }
+                    for c in list(state.candidates)
+                ],
+                # Serialize harvester conversation if alive
+                "harvester_conversation": None,
+                "harvester_candidates_total": 0,
+                "harvester_exhausted": False,
+                "harvester_bu_session_id": None,
+            }
+            if state.agent is not None:
+                agent = state.agent
+                source_data["harvester_conversation"] = {
+                    "messages": agent._conversation.messages,
+                    "total_cost": agent._conversation.total_cost,
+                    "total_turns": agent._conversation.total_turns,
+                }
+                source_data["harvester_candidates_total"] = agent._candidates_total
+                source_data["harvester_exhausted"] = agent._exhausted
+                source_data["harvester_bu_session_id"] = agent._bu_session_id
+            sources.append(source_data)
+
+        return {
+            "orchestrator_conversation": {
+                "messages": list(self._conversation.messages),
+                "total_cost": self._conversation.total_cost,
+                "total_turns": self._conversation.total_turns,
+            },
+            "sources": sources,
+            "generation_stats": dict(self._generation_stats),
+            "harvester_counter": self._harvester_counter,
+            "apollo_counter": self._apollo_counter,
+            "research_counter": self._research_counter,
+        }
+
+    def restore_state(self, state: Dict[str, Any]) -> None:
+        """Restore pipeline state from checkpoint. Call BEFORE run()."""
+        # Restore orchestrator conversation
+        conv = state.get("orchestrator_conversation")
+        if conv:
+            self._conversation.messages = conv["messages"]
+            self._conversation.total_cost = conv.get("total_cost", 0.0)
+            self._conversation.total_turns = conv.get("total_turns", 0)
+            logger.info(
+                f"[orchestrator] Restored conversation: "
+                f"{len(conv['messages'])} messages, "
+                f"{conv.get('total_turns', 0)} turns, "
+                f"${conv.get('total_cost', 0):.4f}"
+            )
+
+        # Restore counters
+        self._harvester_counter = state.get("harvester_counter", 0)
+        self._apollo_counter = state.get("apollo_counter", 0)
+        self._research_counter = state.get("research_counter", 0)
+
+        # Restore generation stats (merge — DB-seeded values take priority)
+        saved_stats = state.get("generation_stats", {})
+        for key in ("skipped", "errors", "total_cost"):
+            if key in saved_stats:
+                self._generation_stats[key] = saved_stats[key]
+
+        # Restore source states — recreate harvester agents from saved conversations
+        for src in state.get("sources", []):
+            candidates = [
+                Candidate(
+                    values=c["values"],
+                    source_id=c["source_id"],
+                    source_context=c.get("source_context", ""),
+                    metadata=c.get("metadata", {}),
+                )
+                for c in src.get("candidates", [])
+            ]
+
+            # Recreate harvester agent if conversation was saved and source not exhausted
+            agent = None
+            harvester_conv = src.get("harvester_conversation")
+            if harvester_conv and not src.get("exhausted", False):
+                try:
+                    from dsl_worker.agents.harvester import HarvesterAgent
+                    # Extract index from source ID (e.g. "harvest:2" → 2)
+                    idx = int(src["id"].split(":")[1]) if ":" in src["id"] else 0
+
+                    agent = HarvesterAgent(
+                        source=src["source"],
+                        description=src["description"],
+                        source_id=src["id"],
+                        openai_client=self.openai_client,
+                        model=self.harvester_model,
+                        workspace_dir=self.workspace_dir,
+                        bu_client=self.bu_client,
+                        harvester_index=idx,
+                        sandbox=self.sandbox,
+                        stop_checker=self.stop_checker,
+                        stop_event=self.stop_event,
+                        blob_service_client=self.blob_service_client,
+                        project_id=self.project_id,
+                        on_tool_call=self.on_tool_call,
+                        on_cost=self.on_cost,
+                        uploaded_file_urls=self.uploaded_file_urls,
+                        uploaded_files=self.uploaded_files,
+                        mcp_tools=self.mcp_tools,
+                    )
+                    # Restore conversation state
+                    agent._conversation.messages = harvester_conv["messages"]
+                    agent._conversation.total_cost = harvester_conv.get("total_cost", 0.0)
+                    agent._conversation.total_turns = harvester_conv.get("total_turns", 0)
+                    agent._candidates_total = src.get("harvester_candidates_total", 0)
+                    agent._exhausted = src.get("harvester_exhausted", False)
+                    # BU session is dead (server-side timeout), new one created on demand
+                    agent._bu_session_id = None
+
+                    logger.info(
+                        f"[orchestrator] Restored harvester for {src['id']}: "
+                        f"{len(harvester_conv['messages'])} messages, "
+                        f"{harvester_conv.get('total_turns', 0)} turns"
+                    )
+                except Exception as e:
+                    logger.warning(f"[orchestrator] Failed to restore harvester for {src['id']}: {e}")
+                    agent = None
+
+            source_state = SourceState(
+                id=src["id"],
+                source=src["source"],
+                description=src["description"],
+                agent=agent,
+                candidates=candidates,
+                total_harvested=src.get("total_harvested", 0),
+                total_processed=src.get("total_processed", 0),
+                rows_produced=src.get("rows_produced", 0),
+                duplicates=src.get("duplicates", 0),
+                skipped=src.get("skipped", 0),
+                errors=src.get("errors", 0),
+                harvest_cost=src.get("harvest_cost", 0.0),
+                process_cost=src.get("process_cost", 0.0),
+                batches=src.get("batches", 0),
+                exhausted=src.get("exhausted", False),
+                last_report=src.get("last_report", ""),
+            )
+            self._sources[src["id"]] = source_state
+            logger.info(
+                f"[orchestrator] Restored source {src['id']}: "
+                f"{src.get('total_harvested', 0)} harvested, "
+                f"{src.get('rows_produced', 0)} rows, "
+                f"{'exhausted' if src.get('exhausted') else 'active'}, "
+                f"{len(candidates)} buffered candidates, "
+                f"{'agent restored' if agent else 'no agent'}"
+            )
 
     async def cleanup(self) -> None:
         """Cancel pending batches and close all sources."""
@@ -1362,3 +1573,9 @@ class OrchestratorAgent:
                 except Exception as e:
                     logger.warning(f"Source {sid} cleanup error: {e}")
         self._sources.clear()
+
+        if self._sandbox_impl:
+            try:
+                await self._sandbox_impl.cleanup()
+            except Exception:
+                pass
