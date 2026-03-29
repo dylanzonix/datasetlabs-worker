@@ -154,6 +154,7 @@ class GeneratedRow:
     """Result of row generation."""
     success: bool
     row: Optional[Dict[str, Any]] = None
+    sources: Optional[Dict[str, str]] = None  # column_name → source/citation
     error: Optional[str] = None
     cost_usd: float = 0.0
     skipped: bool = False
@@ -227,6 +228,10 @@ note "not found" — but never stop working on the row entirely.
 call skip_row(reason="...").
 - If you can't find information after several attempts, put "not found" in the \
 column rather than making something up.
+- When calling set_column, include the source parameter if you know where the \
+value came from — a URL, "company website", "business directory", "uploaded file", \
+etc. This helps the user verify the data. Not required for every column, just \
+when you have a clear source.
 """
 
 
@@ -355,6 +360,7 @@ class RowGeneratorAgent:
         async def set_column(args: Dict) -> tuple[str, float]:
             name = args.get("name", "")
             value = args.get("value")
+            source = args.get("source")
 
             col_def = self._get_col_def(name)
             if col_def:
@@ -363,6 +369,12 @@ class RowGeneratorAgent:
                     return f"Error: column '{name}' {error}", 0.0
 
             self._current_row[name] = value
+
+            # Track source/citation for this column
+            if source:
+                if not hasattr(self, '_current_sources'):
+                    self._current_sources = {}
+                self._current_sources[name] = source
 
             # Register in dedup store so concurrent generators can see it
             await self.dedup_store.register_in_flight(self._row_id, name, value)
@@ -393,14 +405,22 @@ class RowGeneratorAgent:
         registry.add(
             name="set_column",
             description=(
-                "Set a column value. Returns warnings if similar values "
-                "exist in other rows — check them for duplicates."
+                "Set a column value. Optionally include the source URL or "
+                "description for citation. Returns warnings if similar values "
+                "exist in other rows."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Column name"},
                     "value": {"description": "Column value"},
+                    "source": {
+                        "type": "string",
+                        "description": (
+                            "Where this value came from — URL, 'business directory', "
+                            "'uploaded file', 'company website', etc. Optional but helpful."
+                        ),
+                    },
                 },
                 "required": ["name", "value"],
             },
@@ -870,6 +890,7 @@ class RowGeneratorAgent:
             source_context = instructions
 
         self._current_row = {}
+        self._current_sources = {}
         self._submitted = False
         self._skipped = False
         self._is_duplicate = False
@@ -959,7 +980,12 @@ class RowGeneratorAgent:
 
         if self._submitted:
             await self.dedup_store.promote_to_submitted(self._row_id, self._current_row)
-            return GeneratedRow(success=True, row=self._current_row, cost_usd=cost)
+            return GeneratedRow(
+                success=True,
+                row=self._current_row,
+                sources=self._current_sources if self._current_sources else None,
+                cost_usd=cost,
+            )
 
         await self.dedup_store.remove_in_flight(self._row_id)
         return GeneratedRow(

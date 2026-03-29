@@ -1314,7 +1314,10 @@ class OrchestratorAgent:
                 saved = False
                 if result.success and result.row:
                     async with self._save_lock:
-                        row_id = await self._save_row(result.row)
+                        row_id = await self._save_row(
+                            result.row,
+                            tags={"sources": result.sources} if result.sources else {},
+                        )
                         saved = row_id is not None
                         if saved:
                             self._generation_stats["rows_generated"] = (

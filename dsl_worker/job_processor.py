@@ -391,12 +391,33 @@ class JobProcessor:
                 pass
 
         # --- Progress tracking + checkpointing ---
-        progress_counters: Dict[str, Any] = {"phase": "orchestrating"}
+        progress_counters: Dict[str, Any] = {"phase": "orchestrating", "steps": []}
         last_progress_flush = time.time()
         last_langfuse_flush = time.time()
 
+        # User-friendly step labels for orchestrator tool calls
+        STEP_LABELS: Dict[str, str] = {
+            "code_exec": "Setting up...",
+            "create_harvester": "Finding sources...",
+            "apollo_search": "Searching database...",
+            "apollo_search_companies": "Searching database...",
+            "process": "Filling in details...",
+        }
+
         def on_tool_call(agent_label: str, tool_name: str):
             nonlocal last_progress_flush, last_langfuse_flush
+
+            # Only orchestrator tool calls become steps
+            if agent_label == "orchestrator" and tool_name in STEP_LABELS:
+                steps = progress_counters.get("steps", [])
+                label = STEP_LABELS[tool_name]
+                # Mark previous step as done
+                if steps and not steps[-1].get("done"):
+                    steps[-1]["done"] = True
+                # Don't duplicate consecutive identical labels
+                if not steps or steps[-1].get("label") != label:
+                    steps.append({"label": label, "done": False})
+                progress_counters["steps"] = steps
 
             phase_map = {
                 "code_exec": "researching",
@@ -408,20 +429,6 @@ class JobProcessor:
             }
             if tool_name in phase_map:
                 progress_counters["phase"] = phase_map[tool_name]
-
-            counter_map = {
-                "browse": "pages_browsed",
-                "code_exec": "code_runs",
-                "create_harvester": "harvesters_created",
-                "process": "batches_processed",
-                "apollo_search": "apollo_searches",
-                "apollo_search_companies": "apollo_searches",
-                "apollo_enrich": "apollo_enrichments",
-                "apollo_enrich_company": "apollo_enrichments",
-            }
-            if tool_name in counter_map:
-                key = counter_map[tool_name]
-                progress_counters[key] = progress_counters.get(key, 0) + 1
 
             now = time.time()
             if now - last_progress_flush >= 2.0:
