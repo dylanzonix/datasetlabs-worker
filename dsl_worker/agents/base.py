@@ -263,12 +263,52 @@ class AgentConversation:
             dropped += 1
 
         if dropped > 0:
+            # Never leave an orphaned reasoning item at the new start.
+            # A reasoning item must be followed by its associated output
+            # (message or function_call). If we'd start on a reasoning
+            # item, skip it too.
+            while (
+                dropped < len(self.messages)
+                and isinstance(self.messages[dropped], dict)
+                and self.messages[dropped].get("type") == "reasoning"
+            ):
+                total -= msg_tokens[dropped]
+                dropped += 1
+
             self.messages = self.messages[dropped:]
             logger.warning(
                 f"[{self.label}] trimmed {dropped} oldest messages "
                 f"to fit context window ({total} tokens remaining, "
                 f"budget {budget})"
             )
+
+    def _scrub_orphaned_reasoning(self) -> None:
+        """Remove reasoning items whose required following item is missing.
+
+        The Responses API requires every reasoning item to be immediately
+        followed by a message or function_call from the same response.
+        If context trimming or an error leaves a reasoning item at the end
+        of the history (or followed by a non-output item like a user
+        message), remove it.
+        """
+        cleaned = []
+        for i, msg in enumerate(self.messages):
+            if (
+                isinstance(msg, dict)
+                and msg.get("type") == "reasoning"
+            ):
+                # Check if next item is a valid following item
+                next_msg = self.messages[i + 1] if i + 1 < len(self.messages) else None
+                if next_msg is None or (
+                    isinstance(next_msg, dict)
+                    and next_msg.get("type") not in ("message", "function_call", "web_search_call", "reasoning")
+                ):
+                    logger.warning(
+                        f"[{self.label}] removing orphaned reasoning item {msg.get('id', '?')}"
+                    )
+                    continue
+            cleaned.append(msg)
+        self.messages = cleaned
 
     async def send(
         self,
@@ -492,6 +532,10 @@ class AgentConversation:
                 response, cost = api_result
             except Exception as e:
                 logger.error(f"API call failed: {e}", exc_info=True)
+                # If the error is about orphaned reasoning items, scrub
+                # them from the history so the next turn can succeed.
+                if "reasoning" in str(e) and "required following item" in str(e):
+                    self._scrub_orphaned_reasoning()
                 self.messages.append({
                     "role": "user",
                     "content": f"API error occurred: {e}. Please continue.",
@@ -532,8 +576,9 @@ class AgentConversation:
                 # `summary` field into None when the API returns null,
                 # and model_dump(exclude_none=True) then strips it entirely.
                 if item.type == "web_search_call":
-                    # Server-side tool — already executed, results in the
-                    # model's text. Don't replay (API may not accept it).
+                    # Server-side tool — already executed by the API, but
+                    # must be kept in history to preserve reasoning item
+                    # pairing (reasoning → web_search_call linkage).
                     action = getattr(item, "action", None)
                     action_type = getattr(action, "type", "?") if action else "?"
                     if action_type == "search":
@@ -547,7 +592,7 @@ class AgentConversation:
                         logger.info(f"[{self.label}] web_find_in_page: {query[:120]}")
                     else:
                         logger.info(f"[{self.label}] web_search_call: type={action_type}")
-                    continue
+                    dumped = item.model_dump(exclude_none=True)
                 elif item.type == "reasoning":
                     summary = []
                     if item.summary:
