@@ -228,11 +228,12 @@ note "not found" — but never stop working on the row entirely.
 call skip_row(reason="...").
 - If you can't find information after several attempts, put "not found" in the \
 column rather than making something up.
-- When calling set_column, include the source parameter if you know where the \
-value came from — a URL, "company website", "business directory", "uploaded file", \
-etc. This helps the user verify the data. Not required for every column, just \
-when you have a clear source. For enrichment tools (apollo_enrich, etc.), cite \
-the source as "business directory" — do NOT mention specific vendor names.
+- When calling set_column, include sources if you know where the value came from. \
+Each source has a type: "url" (with the URL), "file" (with the file number from \
+the file list), "enrichment" (for business database lookups — no value needed), \
+or "note" (free-form context like "No direct line found"). Multiple sources OK. \
+Not required for every column — just include when you have a clear source.
+- Capitalize values properly — "Not found" not "not found", "N/A" not "n/a".
 """
 
 
@@ -271,6 +272,7 @@ class RowGeneratorAgent:
         blob_service_client: Optional[Any] = None,
         project_id: Optional[Any] = None,
         uploaded_file_urls: Optional[Dict[str, str]] = None,
+        uploaded_files: Optional[List[Dict[str, Any]]] = None,
         apollo_client: Optional[ApolloClient] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
         on_cost: Optional[Callable] = None,
@@ -287,6 +289,7 @@ class RowGeneratorAgent:
         self.dedup_store = dedup_store or DedupStore()
         self.bu_client = bu_client
         self.apollo_client = apollo_client
+        self.uploaded_files = uploaded_files or []
         self.stop_checker = stop_checker
         self.stop_event = stop_event
         self.mcp_tools = mcp_tools or []
@@ -361,7 +364,7 @@ class RowGeneratorAgent:
         async def set_column(args: Dict) -> tuple[str, float]:
             name = args.get("name", "")
             value = args.get("value")
-            source = args.get("source")
+            sources = args.get("sources")
 
             col_def = self._get_col_def(name)
             if col_def:
@@ -371,11 +374,9 @@ class RowGeneratorAgent:
 
             self._current_row[name] = value
 
-            # Track source/citation for this column
-            if source:
-                if not hasattr(self, '_current_sources'):
-                    self._current_sources = {}
-                self._current_sources[name] = source
+            # Track structured sources/citations for this column
+            if sources and isinstance(sources, list):
+                self._current_sources[name] = sources
 
             # Register in dedup store so concurrent generators can see it
             await self.dedup_store.register_in_flight(self._row_id, name, value)
@@ -406,21 +407,37 @@ class RowGeneratorAgent:
         registry.add(
             name="set_column",
             description=(
-                "Set a column value. Optionally include the source URL or "
-                "description for citation. Returns warnings if similar values "
-                "exist in other rows."
+                "Set a column value. Optionally include sources for citation."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Column name"},
                     "value": {"description": "Column value"},
-                    "source": {
-                        "type": "string",
-                        "description": (
-                            "Where this value came from — URL, 'business directory', "
-                            "'uploaded file', 'company website', etc. Optional but helpful."
-                        ),
+                    "sources": {
+                        "type": "array",
+                        "description": "Where this value came from. Each source has a type.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": {
+                                    "type": "string",
+                                    "enum": ["url", "file", "enrichment", "note"],
+                                    "description": (
+                                        "url = web page, file = uploaded file (use file number), "
+                                        "enrichment = business directory, note = free-form context"
+                                    ),
+                                },
+                                "value": {
+                                    "type": "string",
+                                    "description": (
+                                        "URL for url type, file number for file type, "
+                                        "text for note type. Omit for enrichment."
+                                    ),
+                                },
+                            },
+                            "required": ["type"],
+                        },
                     },
                 },
                 "required": ["name", "value"],
@@ -923,11 +940,19 @@ class RowGeneratorAgent:
                 schema_lines.append(f"- **{name}**")
         schema_str = "\n".join(schema_lines) if schema_lines else "(no columns defined)"
 
+        # Build file list for citation references
+        files_note = ""
+        if self.uploaded_files:
+            file_lines = ["\n\n## Uploaded Files (for source citations, use file number)"]
+            for idx, f in enumerate(self.uploaded_files, 1):
+                file_lines.append(f"  [{idx}] {f.get('filename', 'unknown')}")
+            files_note = "\n".join(file_lines)
+
         system_prompt = ROW_GENERATOR_SYSTEM_PROMPT.format(
             conversation=self._format_conversation(),
             schema_str=schema_str,
             current_date=date.today().isoformat(),
-        ) + apollo_note
+        ) + apollo_note + files_note
 
         # Built-in web search (OpenAI/Bing grounded) — cheap, fast, pre-indexed.
         # Model uses this automatically for factual lookups. browse() (BU) is

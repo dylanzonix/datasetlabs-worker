@@ -322,7 +322,7 @@ class OrchestratorAgent:
         if not uploaded_files:
             return "No uploaded files."
         lines = ["Uploaded files (create a harvester pointed at the file path — it can parse programmatically):"]
-        for f in uploaded_files:
+        for idx, f in enumerate(uploaded_files, 1):
             name = f.get("filename", "unknown")
             size = f.get("size_bytes", 0)
             ctype = f.get("content_type", "")
@@ -332,7 +332,7 @@ class OrchestratorAgent:
                 size_str = f"{size / 1_000:.0f} KB"
             else:
                 size_str = f"{size} bytes"
-            lines.append(f"  - /workspace/uploads/{name} ({ctype}, {size_str})")
+            lines.append(f"  [{idx}] /workspace/uploads/{name} ({ctype}, {size_str})")
 
             # Rich metadata from file inspection
             inspection = f.get("inspection")
@@ -1300,6 +1300,7 @@ class OrchestratorAgent:
                 blob_service_client=self.blob_service_client,
                 project_id=self.project_id,
                 uploaded_file_urls=self.uploaded_file_urls,
+                uploaded_files=self.uploaded_files,
                 apollo_client=self.apollo_client,
                 mcp_tools=self.mcp_tools,
                 on_cost=self.on_cost,
