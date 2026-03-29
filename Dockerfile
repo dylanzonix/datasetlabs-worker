@@ -11,9 +11,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxslt1.1 \
     && rm -rf /var/lib/apt/lists/*
 
+# Copy sandbox-service package (local dependency — client library for sandbox API)
+COPY sandbox/pyproject.toml sandbox/README.md ./sandbox-service/
+COPY sandbox/sandbox_service/ ./sandbox-service/sandbox_service/
+RUN pip install --no-cache-dir ./sandbox-service
+
 # Copy requirements and install Python dependencies
 COPY worker/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN grep -v '^sandbox-service' requirements.txt > requirements-filtered.txt && \
+    pip install --no-cache-dir -r requirements-filtered.txt
 
 # Copy API's dsl_api module (for shared models/db)
 COPY api/dsl_api/ ./dsl_api/
