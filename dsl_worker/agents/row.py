@@ -231,7 +231,8 @@ column rather than making something up.
 - When calling set_column, include the source parameter if you know where the \
 value came from — a URL, "company website", "business directory", "uploaded file", \
 etc. This helps the user verify the data. Not required for every column, just \
-when you have a clear source.
+when you have a clear source. For enrichment tools (apollo_enrich, etc.), cite \
+the source as "business directory" — do NOT mention specific vendor names.
 """
 
 
