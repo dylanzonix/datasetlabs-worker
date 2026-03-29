@@ -67,9 +67,6 @@ class WorkerSettings(BaseSettings):
     # Credential pool service URL (serves authenticated cookies per session)
     credential_pool_url: str = ""
 
-    # Local browser viewer (auto-opens a page showing live browser sessions for the current job)
-    browser_viewer_enabled: bool = False
-
     # Apollo.io (optional — leave blank to disable)
     apollo_api_key: str = ""
     apollo_cost_per_credit: float = 0.0238  # $60 / 2520 credits

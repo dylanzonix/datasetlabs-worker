@@ -1,15 +1,5 @@
 """
-Job Processor — V6 pipeline
-
-Flow:
-1. Load conversation history and uploaded files
-2. Create shared infrastructure (SeedProcessor, generation consumer)
-3. Run orchestrator: research, write template, spawn yielders/synthesizers, submit seeds
-4. Drain generation, backfill if needed
-5. COMPLETE
-
-V6: Single phase — the orchestrator stays in the loop and coordinates everything.
-Generation runs in the background as seeds flow in.
+Job Processor — orchestrator-driven pipeline.
 """
 
 import asyncio
@@ -64,7 +54,6 @@ from dsl_worker.checkpoint import CheckpointManager, checkpoints_to_work_items
 from dsl_worker.agents import OrchestratorAgent
 from dsl_worker.agents.row import DedupStore
 from dsl_worker.infra.generation_pool import GenerationWorkerPool
-from dsl_worker.infra.browser_viewer import BrowserViewer
 from sandbox_service import SandboxClient
 
 logger = logging.getLogger(__name__)
@@ -446,28 +435,17 @@ class JobProcessor:
         # --- Browser session tracking ---
         browser_sessions: Dict[str, Dict[str, str]] = {}
 
-        # Local browser viewer (worker-only, auto-opens on first session)
-        browser_viewer: Optional[BrowserViewer] = None
-        if settings.browser_viewer_enabled:
-            browser_viewer = BrowserViewer(project_name=project.name or "")
-            await browser_viewer.start()
-            self._browser_viewer = browser_viewer
-
         def on_browser_started(live_url: str, session_id: str):
             browser_sessions[session_id] = {
                 "live_url": live_url,
                 "session_id": session_id,
             }
             progress_counters["browser_sessions"] = list(browser_sessions.values())
-            if browser_viewer:
-                browser_viewer.add_session(live_url, session_id)
             logger.info(f"[Pipeline] Cloud browser started: {live_url}")
 
         def on_browser_stopped(session_id: str):
             browser_sessions.pop(session_id, None)
             progress_counters["browser_sessions"] = list(browser_sessions.values())
-            if browser_viewer:
-                browser_viewer.remove_session(session_id)
             logger.info(f"[Pipeline] Cloud browser stopped: {session_id}")
 
         version.progress_detail = {"phase": "orchestrating"}
@@ -1109,14 +1087,6 @@ print(json.dumps(results))
 
     async def _cleanup(self):
         """Cleanup resources."""
-        viewer = getattr(self, "_browser_viewer", None)
-        if viewer:
-            try:
-                await viewer.stop()
-            except Exception as e:
-                logger.warning(f"Browser viewer cleanup error: {e}")
-            self._browser_viewer = None
-
         if self._sandbox:
             try:
                 await self._sandbox.__aexit__(None, None, None)
