@@ -229,7 +229,22 @@ class OrchestratorAgent:
         registry = ToolRegistry()
         self._register_tools(registry)
 
-        columns_desc = json.dumps(columns, indent=2) if columns else "(no columns defined)"
+        # Format columns as readable lines (supports both old type-based and new format-based)
+        if columns:
+            col_lines = []
+            for col in columns:
+                name = col.get("name", "?")
+                fmt = col.get("format", "")
+                col_type = col.get("type", "")
+                if fmt:
+                    col_lines.append(f"- {name} — {fmt}")
+                elif col_type:
+                    col_lines.append(f"- {name} ({col_type})")
+                else:
+                    col_lines.append(f"- {name}")
+            columns_desc = "\n".join(col_lines)
+        else:
+            columns_desc = "(no columns defined)"
         convo_summary = self._format_conversation()
         resources_section = self._format_resources(uploaded_files)
         feedback_section = self._format_feedback()

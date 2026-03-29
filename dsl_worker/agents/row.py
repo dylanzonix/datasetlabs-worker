@@ -886,9 +886,24 @@ class RowGeneratorAgent:
                 "If the candidate has an apollo_id, use that for the most reliable match. "
                 "Otherwise, use name + organization_name or linkedin_url.\n"
             )
+        # Format schema as readable lines instead of raw JSON
+        schema_lines = []
+        for col in schema:
+            name = col.get("name", "?")
+            fmt = col.get("format", "")
+            # Support both old (type-based) and new (format-based) schemas
+            col_type = col.get("type", "")
+            if fmt:
+                schema_lines.append(f"- **{name}** — {fmt}")
+            elif col_type:
+                schema_lines.append(f"- **{name}** ({col_type})")
+            else:
+                schema_lines.append(f"- **{name}**")
+        schema_str = "\n".join(schema_lines) if schema_lines else "(no columns defined)"
+
         system_prompt = ROW_GENERATOR_SYSTEM_PROMPT.format(
             conversation=self._format_conversation(),
-            schema_str=json.dumps(schema, indent=2),
+            schema_str=schema_str,
             current_date=date.today().isoformat(),
         ) + apollo_note
 
