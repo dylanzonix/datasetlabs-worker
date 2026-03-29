@@ -376,7 +376,19 @@ class RowGeneratorAgent:
 
             # Track structured sources/citations for this column
             if sources and isinstance(sources, list):
-                self._current_sources[name] = sources
+                # Resolve file numbers to filenames
+                resolved = []
+                for src in sources:
+                    if isinstance(src, dict):
+                        if src.get("type") == "file" and src.get("value"):
+                            try:
+                                idx = int(src["value"]) - 1
+                                if 0 <= idx < len(self.uploaded_files):
+                                    src = {**src, "value": self.uploaded_files[idx].get("filename", src["value"])}
+                            except (ValueError, IndexError):
+                                pass
+                        resolved.append(src)
+                self._current_sources[name] = resolved
 
             # Register in dedup store so concurrent generators can see it
             await self.dedup_store.register_in_flight(self._row_id, name, value)
