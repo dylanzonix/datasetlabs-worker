@@ -157,6 +157,7 @@ class AgentConversation:
         self.reasoning = reasoning if reasoning is not None else {"effort": "medium", "summary": "detailed"}
         self.label = label
         self.continue_on_text = continue_on_text
+        self._consecutive_text_turns = 0  # for capping continue_on_text retries
         self.context_window = context_window
         self.on_tool_call = on_tool_call
         self.on_cost = on_cost
@@ -276,6 +277,33 @@ class AgentConversation:
                 dropped += 1
 
             self.messages = self.messages[dropped:]
+
+            # Remove orphaned function_call_output items whose matching
+            # function_call was dropped. The API requires every
+            # function_call_output to be preceded by its function_call
+            # (matched by call_id).
+            surviving_call_ids = set()
+            for msg in self.messages:
+                if isinstance(msg, dict) and msg.get("type") == "function_call":
+                    cid = msg.get("call_id")
+                    if cid:
+                        surviving_call_ids.add(cid)
+
+            cleaned = []
+            for msg in self.messages:
+                if (
+                    isinstance(msg, dict)
+                    and msg.get("type") == "function_call_output"
+                    and msg.get("call_id") not in surviving_call_ids
+                ):
+                    logger.warning(
+                        f"[{self.label}] removing orphaned function_call_output "
+                        f"(call_id={msg.get('call_id')}) after context trim"
+                    )
+                    continue
+                cleaned.append(msg)
+            self.messages = cleaned
+
             logger.warning(
                 f"[{self.label}] trimmed {dropped} oldest messages "
                 f"to fit context window ({total} tokens remaining, "
@@ -307,6 +335,33 @@ class AgentConversation:
                         f"[{self.label}] removing orphaned reasoning item {msg.get('id', '?')}"
                     )
                     continue
+            cleaned.append(msg)
+        self.messages = cleaned
+
+    def _scrub_orphaned_tool_outputs(self) -> None:
+        """Remove function_call_output items whose function_call is missing.
+
+        The Responses API requires every function_call_output to be preceded
+        by a function_call with the same call_id. Context trimming or errors
+        can leave orphaned outputs.
+        """
+        call_ids = {
+            msg.get("call_id")
+            for msg in self.messages
+            if isinstance(msg, dict) and msg.get("type") == "function_call"
+        }
+        cleaned = []
+        for msg in self.messages:
+            if (
+                isinstance(msg, dict)
+                and msg.get("type") == "function_call_output"
+                and msg.get("call_id") not in call_ids
+            ):
+                logger.warning(
+                    f"[{self.label}] removing orphaned function_call_output "
+                    f"(call_id={msg.get('call_id')})"
+                )
+                continue
             cleaned.append(msg)
         self.messages = cleaned
 
@@ -532,10 +587,15 @@ class AgentConversation:
                 response, cost = api_result
             except Exception as e:
                 logger.error(f"API call failed: {e}", exc_info=True)
+                err_str = str(e)
                 # If the error is about orphaned reasoning items, scrub
                 # them from the history so the next turn can succeed.
-                if "reasoning" in str(e) and "required following item" in str(e):
+                if "reasoning" in err_str and "required following item" in err_str:
                     self._scrub_orphaned_reasoning()
+                # If a function_call_output lost its matching function_call
+                # (e.g. after context trim), remove the orphan.
+                if "No tool call found" in err_str or "function call output" in err_str.lower():
+                    self._scrub_orphaned_tool_outputs()
                 self.messages.append({
                     "role": "user",
                     "content": f"API error occurred: {e}. Please continue.",
@@ -627,6 +687,7 @@ class AgentConversation:
                 preview = output_text[:120].replace("\n", " ")
                 logger.info(f"[{self.label}] turn {turn} — text response ({len(output_text)} chars): {preview}")
                 result.text = output_text
+                self._consecutive_text_turns += 1
 
                 if self.on_idle is not None:
                     # Event-driven mode: block until an event arrives or exit.
@@ -638,8 +699,15 @@ class AgentConversation:
                         "role": "user",
                         "content": event_msg,
                     })
+                    self._consecutive_text_turns = 0
                     continue
                 elif self.continue_on_text:
+                    if self._consecutive_text_turns >= 2:
+                        logger.warning(
+                            f"[{self.label}] {self._consecutive_text_turns} consecutive "
+                            f"text responses — giving up (likely repeated refusal)"
+                        )
+                        break
                     # Don't break — inject a continuation prompt so the agent
                     # keeps working (e.g. orchestrator thinking before acting).
                     self.messages.append({
@@ -652,6 +720,7 @@ class AgentConversation:
 
             # Execute tools and append function_call_output items
             # (function_call items are already in self.messages from parsing above)
+            self._consecutive_text_turns = 0
             tool_names = [tc.name for tc in tool_calls]
             logger.info(f"[{self.label}] turn {turn} — {len(tool_calls)} tool call(s): {', '.join(tool_names)}")
 
@@ -716,16 +785,15 @@ class AgentConversation:
                 for t in finished:
                     done_tasks.append((t, task_to_tc[t]))
 
-            # Append results to messages so they're captured in checkpoint
+            # Collect costs but do NOT append duplicate function_call_output
+            # items — the "Still running" output was already appended during
+            # parallel execution, and the actual results were delivered as
+            # user messages during the loop. Adding another function_call_output
+            # with the same call_id would confuse the API on replay.
             for task, tc in done_tasks:
                 try:
-                    result_text, cost = task.result()
+                    _result_text, cost = task.result()
                     self.total_cost += cost
-                    self.messages.append({
-                        "type": "function_call_output",
-                        "call_id": tc.call_id,
-                        "output": str(result_text)[:8000],
-                    })
                 except Exception:
                     pass
 
