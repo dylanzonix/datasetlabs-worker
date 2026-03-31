@@ -287,19 +287,10 @@ class HarvesterAgent:
 
         bu_task = (
             f"{task}\n\n"
-            "INSTRUCTIONS:\n"
-            "- Extract items visible on THIS page only. Use JavaScript/evaluate to "
-            "parse the DOM programmatically where possible.\n"
-            "- Include all visible fields per item (title, URL, description, price, "
-            "date, etc.).\n"
-            "- Do NOT navigate away, follow links, or explore the rest of the site. "
-            "Stay on this page.\n"
-            "- If anti-bot or CAPTCHA blocks you after 2 attempts, STOP and report "
-            "'blocked' — do not keep retrying.\n"
-            "- After extracting, end with a brief REPORT: how many items you found, "
-            "whether pagination or 'load more' exists (and total pages/items if "
-            "visible), and any other navigation you noticed (tabs, filters, "
-            "categories) that could yield more candidates."
+            "Stay on this page only — do not follow links or navigate elsewhere. "
+            "If blocked by anti-bot after 2 attempts, stop and report 'blocked'. "
+            "After extracting, briefly report: how many items found, whether "
+            "pagination or 'load more' exists, and any other navigation visible."
         )
 
         logger.info(f"[{scope_id}] BU extract START: {task[:100]}")
