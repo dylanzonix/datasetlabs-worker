@@ -1434,10 +1434,16 @@ class OrchestratorAgent:
         for sid, state in list(self._sources.items()):
             if state.task and not state.task.done():
                 state.task.cancel()
-        # Wait for cancellation
+        # Wait for cancellation with timeout
         tasks = [s.task for s in self._sources.values() if s.task and not s.task.done()]
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[orchestrator] Cleanup: some tasks didn't stop in 10s")
 
         # Close harvester resources
         for sid, state in list(self._sources.items()):
