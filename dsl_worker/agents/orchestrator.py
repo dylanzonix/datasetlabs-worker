@@ -402,9 +402,16 @@ class OrchestratorAgent:
                 results = self._dispatcher.get_source_results(sid)
                 total_src = state.harvest_cost + results.process_cost
                 cpr = f"${total_src / results.rows:.3f}" if results.rows > 0 else "—"
-                status = "exhausted" if state.exhausted else (
-                    f"error: {state.error[:30]}" if state.error else "active"
-                )
+                if state.exhausted:
+                    status = "exhausted"
+                elif state.error:
+                    status = f"error: {state.error[:30]}"
+                elif state.task and not state.task.done() and state.total_harvested == 0:
+                    status = "harvesting (first batch)"
+                elif state.task and not state.task.done():
+                    status = "active"
+                else:
+                    status = "idle"
                 lines.append(
                     f"  {sid} {state.source[:35]:<35} "
                     f"{state.total_harvested:>5} {results.processed:>5} {results.pending:>5} "

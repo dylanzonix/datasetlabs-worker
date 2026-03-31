@@ -137,10 +137,13 @@ class CandidateDispatcher:
             logger.info(f"[dispatcher] Added source: {source_id}")
 
     def remove_source(self, source_id: str) -> None:
-        """Stop pulling from a source. Remaining buffer still drains."""
-        if source_id in self._source_order:
-            self._source_order.remove(source_id)
-            logger.info(f"[dispatcher] Removed source from rotation: {source_id}")
+        """Mark a source as stopped. Remaining buffered candidates still get processed.
+
+        Does NOT remove from rotation — the dispatcher keeps pulling from
+        the queue until it's drained. Only removed from rotation once the
+        queue is empty.
+        """
+        logger.info(f"[dispatcher] Source {source_id} marked stopped (buffer will drain)")
 
     def submit_batch(
         self, source_id: str, candidates: List[Candidate],
