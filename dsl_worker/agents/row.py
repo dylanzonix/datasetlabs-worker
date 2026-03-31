@@ -185,41 +185,40 @@ Today's date: {current_date}
 
 ## How to work — FOLLOW THIS ORDER
 
-**Step 1: Enrich first.** If the candidate has an apollo_id or company domain, \
-call apollo_enrich / apollo_enrich_company FIRST. These are instant (<1s) and \
-return name, email, phone, company details, LinkedIn. Wait for results before \
-doing anything else.
+**Step 1: Validate.** Before spending any time or money on this candidate, check \
+if it's worth processing. Candidate data comes from search snippets which may \
+be stale or cached — treat it as a lead, not verified truth. Do a quick web \
+search to confirm the candidate is real and current. If it's a dead link, \
+removed listing, or doesn't match the project requirements, call skip_row() \
+immediately. Also check for duplicates — if it looks like something already \
+in the dataset, call mark_duplicate().
 
-**Step 2: Verify the candidate.** If the candidate has a URL, do a quick web \
-search for it to confirm the data is current. Candidate data comes from search \
-snippets which may be stale (cached dates, removed listings). Use the live page \
-as the source of truth — if the page is gone or the data doesn't match, skip it.
-
-**Step 3: Fill columns.** Use set_column() for everything you know from the \
-verified candidate data + enrichment results.
+**Step 2: Fill what you have.** Use set_column() for everything you already \
+know from the candidate data that you've now confirmed is valid.
    - When you set a column, the system warns if similar values exist. \
 If the match is close on something unique (name, URL, email), call \
 mark_duplicate(reason="...").
 
-**Step 4: Research only what's missing.** If columns are still empty after \
-enrichment, THEN do web research:
+**Step 3: Research gaps.** If columns are still empty, research them:
    - **Use web search** (built-in) for almost everything — looking up company \
 info, finding contact names, checking team pages, verifying a company, finding \
 phone numbers, LinkedIn profiles. Even "find who works at X company" is a web \
 search, not a browse. Web search has access to pre-indexed, rendered content from \
 most websites.
+   - **Use apollo_enrich / apollo_enrich_company** if the candidate has an \
+apollo_id or company domain. Instant (<1s), returns name, email, phone, company \
+details, LinkedIn.
    - **Use browse(task) ONLY** when web search already failed for the specific \
 info you need AND you believe a live browser could succeed — e.g., the data is \
 behind a login, requires filling a form, is on an infinite-scroll feed, or the \
 site actively blocks search indexing. This is rare.
 
-**Step 5: Submit or skip.**
+**Step 4: Submit or skip.**
    - Call submit_row() when all columns are filled.
    - Call skip_row(reason="...") if the candidate doesn't qualify.
 
-**IMPORTANT: Work sequentially.** Enrich → verify → fill → research gaps → fill → submit. \
-Do NOT call apollo_enrich and browse at the same time. Enrichment is instant; \
-wait for it and see what you still need before launching expensive web research.
+**IMPORTANT: Work sequentially.** Validate → fill → research gaps → submit. \
+Don't spend money researching or enriching a candidate before confirming it's valid.
 
 ## Rules
 
