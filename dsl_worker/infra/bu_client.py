@@ -261,6 +261,39 @@ class BUClient:
             logger.error(f"[BUClient] research error: {e}")
             return f"Research error: {e}", 0.0, session_id
 
+    def _get_api_key(self) -> str:
+        """Extract the API key from the SDK's inner HTTP client."""
+        return self._client._http._client.headers["x-browser-use-api-key"]
+
+    async def get_session_status(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Poll a BU session for live status (step count, cost, last step).
+
+        Returns dict with keys: status, step_count, total_cost_usd, llm_cost_usd,
+        browser_cost_usd, last_step, title. Returns None on error.
+        """
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=5.0) as http:
+                resp = await http.get(
+                    f"https://api.browser-use.com/api/v3/sessions/{session_id}",
+                    headers={"X-Browser-Use-API-Key": self._get_api_key()},
+                )
+                if resp.status_code == 200:
+                    d = resp.json()
+                    return {
+                        "status": d.get("status", "unknown"),
+                        "step_count": d.get("stepCount", 0),
+                        "total_cost_usd": float(d.get("totalCostUsd", 0) or 0),
+                        "llm_cost_usd": float(d.get("llmCostUsd", 0) or 0),
+                        "browser_cost_usd": float(d.get("browserCostUsd", 0) or 0),
+                        "last_step": d.get("lastStepSummary") or "",
+                        "title": d.get("title") or "",
+                    }
+                return None
+        except Exception as e:
+            logger.debug(f"[BUClient] session status poll failed: {e}")
+            return None
+
     async def stop_session(self, session_id: str) -> None:
         """Stop a keep_alive session to free browser resources."""
         try:

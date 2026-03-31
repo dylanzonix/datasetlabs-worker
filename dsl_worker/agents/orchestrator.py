@@ -222,6 +222,7 @@ class OrchestratorAgent:
         self._checkin_cost_trigger: float = 0.50  # dollars
         self._cost_at_last_checkin: float = 0.0
         self._force_checkin = asyncio.Event()
+        self._live_bu_cache: Dict[str, Dict[str, Any]] = {}  # populated by _build_dashboard
 
         registry = ToolRegistry()
         self._register_tools(registry)
@@ -367,18 +368,50 @@ class OrchestratorAgent:
 
     # ── Dashboard ─────────────────────────────────────────────────────
 
-    def _build_dashboard(self) -> str:
+    async def _poll_live_bu_status(self) -> Dict[str, Dict[str, Any]]:
+        """Poll live BU session status for all active harvesters.
+
+        Returns {source_id: {status, step_count, total_cost_usd, last_step, ...}}
+        Only polls sources that have an active BU session.
+        """
+        live = {}
+        if not self.bu_client:
+            return live
+        tasks = {}
+        for sid, state in self._sources.items():
+            if (state.agent
+                    and not state.exhausted
+                    and hasattr(state.agent, '_bu_session_id')
+                    and state.agent._bu_session_id):
+                tasks[sid] = self.bu_client.get_session_status(
+                    state.agent._bu_session_id
+                )
+        if tasks:
+            results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+            for sid_key, result in zip(tasks.keys(), results):
+                if isinstance(result, dict):
+                    live[sid_key] = result
+        return live
+
+    async def _build_dashboard(self) -> str:
         """Build the dashboard string injected at each check-in."""
+        # Poll live BU status for active harvesters
+        live_bu = await self._poll_live_bu_status()
+        self._live_bu_cache = live_bu  # cache for _get_total_cost
+
         rows_done = self._generation_stats.get("rows_generated", 0)
         total_skipped = self._generation_stats.get("skipped", 0)
         total_errors = self._generation_stats.get("errors", 0)
         elapsed = time.time() - self._start_time
 
-        # Compute total cost across sources
+        # Compute total cost across sources (including live BU sessions)
         total_cost = 0.0
         for sid, state in self._sources.items():
             results = self._dispatcher.get_source_results(sid)
+            bu = live_bu.get(sid)
             total_cost += state.harvest_cost + results.process_cost
+            if bu:
+                total_cost += bu["total_cost_usd"]
 
         avg_cpr = f"${total_cost / rows_done:.3f}" if rows_done > 0 else "N/A"
 
@@ -398,18 +431,29 @@ class OrchestratorAgent:
             )
             for sid, state in self._sources.items():
                 results = self._dispatcher.get_source_results(sid)
-                total_src = state.harvest_cost + results.process_cost
-                cpr = f"${total_src / results.rows:.3f}" if results.rows > 0 else "—"
+                bu_info = live_bu.get(sid)
                 if state.exhausted:
                     status = "exhausted"
                 elif state.error:
                     status = f"error: {state.error[:30]}"
+                elif bu_info and bu_info["status"] == "running":
+                    status = (
+                        f"BU running (step {bu_info['step_count']}, "
+                        f"${bu_info['total_cost_usd']:.3f}, "
+                        f"\"{bu_info['last_step'][:40]}\")"
+                    )
                 elif state.task and not state.task.done() and state.total_harvested == 0:
                     status = "harvesting (first batch)"
                 elif state.task and not state.task.done():
                     status = "active"
                 else:
                     status = "idle"
+
+                # Include live BU cost in source total
+                live_bu_cost = bu_info["total_cost_usd"] if bu_info else 0.0
+                total_src = state.harvest_cost + results.process_cost + live_bu_cost
+                cpr = f"${total_src / results.rows:.3f}" if results.rows > 0 else "—"
+
                 lines.append(
                     f"  {sid} {state.source[:35]:<35} "
                     f"{state.total_harvested:>5} {results.processed:>5} {results.pending:>5} "
@@ -422,11 +466,14 @@ class OrchestratorAgent:
             lines.append("COST BREAKDOWN:")
             for sid, state in self._sources.items():
                 results = self._dispatcher.get_source_results(sid)
-                total_src = state.harvest_cost + results.process_cost
+                bu = live_bu.get(sid)
+                live_bu_cost = bu["total_cost_usd"] if bu else 0.0
+                total_src = state.harvest_cost + results.process_cost + live_bu_cost
                 cpr = f"${total_src / results.rows:.3f}" if results.rows > 0 else "—"
+                bu_part = f" bu_live=${live_bu_cost:.3f}" if live_bu_cost > 0 else ""
                 lines.append(
                     f"  {sid}: harvest=${state.harvest_cost:.3f} "
-                    f"process=${results.process_cost:.3f} "
+                    f"process=${results.process_cost:.3f}{bu_part} "
                     f"total=${total_src:.3f} → {cpr}/row"
                 )
 
@@ -662,10 +709,15 @@ class OrchestratorAgent:
             lines = []
 
             if candidate_idx is not None:
-                # TODO: implement candidate/row-gen drill-down
-                # For now, show what we have
-                lines.append(f"Candidate {candidate_idx} detail not yet implemented.")
-                lines.append("Use the dashboard for per-source outcomes.")
+                # Candidate-level drill-down: show dispatcher results for this candidate
+                results = self._dispatcher.get_source_results(source_id)
+                lines.append(f"Source {source_id}: {results.rows} rows, "
+                             f"{results.skipped} skipped, {results.duplicates} dupes "
+                             f"from {results.candidates_total} candidates")
+                if results.skip_reasons:
+                    lines.append("Recent skip reasons:")
+                    for r in results.skip_reasons[-5:]:
+                        lines.append(f"  - {r[:150]}")
             elif step_idx is not None and state.agent:
                 # Show a specific harvester step
                 msgs = state.agent._conversation.messages
@@ -676,25 +728,51 @@ class OrchestratorAgent:
                 else:
                     lines.append(f"Step {step_idx} not found ({len(msgs)} total)")
             elif state.agent:
-                # Show harvester overview: tool calls with cost/time
+                # Show harvester overview with structured tool call summary
                 msgs = state.agent._conversation.messages
+                results = self._dispatcher.get_source_results(source_id)
                 lines.append(f"Harvester {source_id}: {len(msgs)} messages, "
                              f"{state.batches} batches, ${state.harvest_cost:.3f}")
+                lines.append(f"  Downstream: {results.rows} rows, {results.skipped} skipped, "
+                             f"{results.duplicates} dupes, ${results.process_cost:.3f} process cost")
+
+                # Live BU status if available
+                if (hasattr(state.agent, '_bu_session_id')
+                        and state.agent._bu_session_id
+                        and self.bu_client):
+                    bu = await self.bu_client.get_session_status(state.agent._bu_session_id)
+                    if bu:
+                        lines.append(f"  BU session: {bu['status']} | step {bu['step_count']} | "
+                                     f"${bu['total_cost_usd']:.3f} | \"{bu['last_step'][:60]}\"")
+
+                # Summarize tool calls (not raw messages)
                 lines.append("")
+                tool_calls_shown = 0
                 for i, msg in enumerate(msgs):
-                    if isinstance(msg, dict):
-                        role = msg.get("role", "?")
-                        # Summarize tool calls
-                        if role == "assistant":
-                            content = msg.get("content", "")
-                            if isinstance(content, str):
-                                lines.append(f"  [{i}] {role}: {content[:150]}")
-                        elif "tool_call_id" in msg or role == "tool":
-                            content = msg.get("content", "")
-                            if isinstance(content, str):
-                                lines.append(f"  [{i}] tool: {content[:150]}")
-                    if len(lines) > 50:
-                        lines.append(f"  ... ({len(msgs) - i - 1} more messages)")
+                    if not isinstance(msg, dict):
+                        continue
+                    role = msg.get("role", "?")
+                    if role == "assistant":
+                        # Show tool call names from output items
+                        output = msg.get("output", msg.get("content", ""))
+                        if isinstance(output, list):
+                            for item in output:
+                                if isinstance(item, dict) and item.get("type") == "function_call":
+                                    name = item.get("name", "?")
+                                    args_str = str(item.get("arguments", ""))[:100]
+                                    lines.append(f"  [{i}] tool: {name}({args_str})")
+                                    tool_calls_shown += 1
+                        elif isinstance(output, str) and output:
+                            lines.append(f"  [{i}] text: {output[:150]}")
+                            tool_calls_shown += 1
+                    elif role == "tool":
+                        content = msg.get("content", "")
+                        if isinstance(content, str) and content:
+                            lines.append(f"  [{i}] result: {content[:150]}")
+                            tool_calls_shown += 1
+                    if tool_calls_shown > 40:
+                        remaining = len(msgs) - i - 1
+                        lines.append(f"  ... ({remaining} more messages, use step=N for detail)")
                         break
             else:
                 # Apollo or no-agent source
@@ -1193,6 +1271,7 @@ class OrchestratorAgent:
 
         start_cost = self._get_total_cost()
         deadline = asyncio.get_event_loop().time() + interval
+        last_bu_poll = 0.0
 
         while asyncio.get_event_loop().time() < deadline:
             # Structural events force immediate check-in
@@ -1204,17 +1283,27 @@ class OrchestratorAgent:
             # Target reached
             if self._generation_stats.get("rows_generated", 0) >= self.num_samples:
                 return
-            # Cost trigger (pre-first-row only, or if set)
+            # Refresh live BU cache every ~15s for accurate cost tracking
+            now = time.time()
+            if cost_trigger and (now - last_bu_poll) >= 15.0:
+                self._live_bu_cache = await self._poll_live_bu_status()
+                last_bu_poll = now
+            # Cost trigger
             if cost_trigger and (self._get_total_cost() - start_cost) >= cost_trigger:
                 return
             await asyncio.sleep(2.0)
 
     def _get_total_cost(self) -> float:
-        """Current total cost across all sources."""
+        """Current total cost across all sources (including live BU sessions)."""
         total = 0.0
+        live_bu = getattr(self, '_live_bu_cache', {})
         for sid, state in self._sources.items():
             results = self._dispatcher.get_source_results(sid)
             total += state.harvest_cost + results.process_cost
+            # Add live BU cost if a session is currently running
+            bu = live_bu.get(sid)
+            if bu:
+                total += bu["total_cost_usd"]
         return total
 
     def _should_stop(self) -> bool:
@@ -1260,7 +1349,7 @@ class OrchestratorAgent:
                         state.task = asyncio.create_task(
                             self._run_harvester_loop(sid)
                         )
-                dashboard = self._build_dashboard()
+                dashboard = await self._build_dashboard()
                 initial_msg = f"RESUMED. Here is the current state:\n\n{dashboard}"
             elif self.feedback_context:
                 initial_msg = (
@@ -1292,7 +1381,7 @@ class OrchestratorAgent:
                 if self._should_exit():
                     break
 
-                dashboard = self._build_dashboard()
+                dashboard = await self._build_dashboard()
                 result = await self._conversation.send(dashboard)
 
                 if result and result.text:

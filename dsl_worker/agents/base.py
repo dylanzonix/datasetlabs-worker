@@ -115,7 +115,7 @@ class AgentConversation:
             model="gpt-5.2",
             system_prompt="You are a research agent.",
             tools=tools,
-            reasoning={"effort": "medium", "summary": "auto"},
+            reasoning={"effort": "high", "summary": "detailed"},
         )
 
         result = await agent.send("Research X topic")
@@ -154,7 +154,7 @@ class AgentConversation:
         self.max_turns = max_turns
         self.soft_turn_limit = soft_turn_limit
         self.max_output_tokens = max_output_tokens
-        self.reasoning = reasoning if reasoning is not None else {"effort": "medium", "summary": "detailed"}
+        self.reasoning = reasoning if reasoning is not None else {"effort": "high", "summary": "detailed"}
         self.label = label
         self.continue_on_text = continue_on_text
         self._consecutive_text_turns = 0  # for capping continue_on_text retries
