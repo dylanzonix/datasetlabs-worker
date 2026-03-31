@@ -377,25 +377,6 @@ class CostTracker:
 
         return True, None
 
-    def get_sample_cost_report(self, samples_generated: int, total_target_rows: int) -> dict:
-        """Get cost report after sample phase for transparency UI."""
-        with self._lock:
-            total_credits = self._total_costs_credits_unlocked()
-
-        if samples_generated > 0:
-            per_row_estimate = total_credits / samples_generated
-            estimated_total = per_row_estimate * total_target_rows
-        else:
-            estimated_total = 0
-
-        return {
-            "samples_generated": samples_generated,
-            "sample_credits_used": round(total_credits, 2),
-            "estimated_total_credits": round(estimated_total, 2),
-            "estimated_remaining_credits": round(estimated_total - total_credits, 2),
-            "user_balance_credits": round(self.get_user_balance_credits(), 2),
-        }
-
     def get_summary(self) -> dict:
         """Get a summary of costs and charges."""
         with self._lock:

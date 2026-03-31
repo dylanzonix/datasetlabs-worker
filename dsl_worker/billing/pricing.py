@@ -66,10 +66,6 @@ class PricingConfig:
             logger.error(f"Failed to load pricing config: {e}")
             raise
 
-    def get_pricing(self, model: str) -> Optional[ModelPricing]:
-        """Get pricing for a model."""
-        return self._models.get(model)
-
     def calculate_cost(
         self,
         model: str,

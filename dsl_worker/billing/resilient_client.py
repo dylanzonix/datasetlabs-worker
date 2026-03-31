@@ -175,42 +175,6 @@ class ResilientClient:
                     # Not a rate limit, don't retry
                     raise
 
-    async def chat_completion(
-        self,
-        model: str,
-        messages: List[Dict[str, Any]],
-        estimated_tokens: int = 0,
-        **kwargs,
-    ):
-        """Create chat completion with rate limiting."""
-        return await self._execute_with_rate_limiting(
-            self._client.chat.completions.create,
-            estimated_tokens=estimated_tokens,
-            model=model,
-            messages=messages,
-            **kwargs,
-        )
-
-    async def embeddings_create(
-        self,
-        model: str,
-        input: List[str],
-        estimated_tokens: int = 0,
-        **kwargs,
-    ):
-        """Create embeddings with rate limiting."""
-        if estimated_tokens == 0:
-            estimated_tokens = sum(len(text) // 4 for text in input)
-
-        return await self._execute_with_rate_limiting(
-            self._client.embeddings.create,
-            estimated_tokens=estimated_tokens,
-            model=model,
-            input=input,
-            encoding_format="float",
-            **kwargs,
-        )
-
     async def responses_create(
         self,
         model: str,

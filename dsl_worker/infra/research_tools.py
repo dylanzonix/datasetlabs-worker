@@ -17,7 +17,6 @@ Tools:
 - breakdown(children) → split scope
 - submit_seed(ref_id, lines, content) → create seed from source
 - done(reason) → finish when seeds exhausted
-- interact(url_or_ref_id, task) → browser agent for complex interactions
 """
 
 import asyncio
@@ -65,9 +64,9 @@ from dsl_worker.infra.artifacts import (
 
 logger = logging.getLogger(__name__)
 
-# Browser Use Cloud SDK
+# Browser Use Cloud SDK (v3 — v2 is legacy)
 try:
-    from browser_use_sdk import AsyncBrowserUse
+    from browser_use_sdk.v3 import AsyncBrowserUse
     from playwright.async_api import async_playwright
     BROWSER_AVAILABLE = True
 except ImportError:
@@ -234,8 +233,6 @@ class ResearchTools:
         self._live_url: Optional[str] = None            # Live debugging URL
         self._playwright: Optional[Any] = None          # Playwright instance
         self._cloud_files_seen: set = set()             # Track known remote files
-        self._bu_agent: Optional[Any] = None             # Persistent Browser Use agent
-
         # Sandbox session - lazy initialized, owned by this instance
         self._sandbox_session: Optional[Any] = None
         self._sandbox_session_lock = asyncio.Lock()
@@ -308,7 +305,7 @@ class ResearchTools:
                 self._cloud_client = AsyncBrowserUse(
                     api_key=settings.browser_use_api_key,
                 )
-                cloud_browser = await self._cloud_client.browsers.create_browser_session(
+                cloud_browser = await self._cloud_client.browsers.create(
                     proxy_country_code=settings.browser_use_proxy_country,
                 )
                 self._cloud_session_id = cloud_browser.id
@@ -387,104 +384,8 @@ class ResearchTools:
 
         return self._sandbox_session
 
-    async def _disconnect_playwright(self):
-        """Disconnect Playwright from the cloud browser.
-
-        Used before BU Agent runs to avoid dual CDP connections.
-        The cloud browser session stays alive — only the Playwright
-        CDP connection is dropped.
-        """
-        if self._playwright:
-            try:
-                await self._playwright.stop()
-            except Exception as e:
-                logger.debug(f"[ResearchTools] Error disconnecting Playwright: {e}")
-            self._playwright = None
-            self._browser_context = None
-
-    async def _reconnect_playwright(self):
-        """Reconnect Playwright to the cloud browser after BU Agent finishes.
-
-        Assumes the cloud browser session is still alive. If connection
-        fails (e.g., browser died), nullifies state so _get_browser()
-        will create a fresh session on next call.
-        """
-        if not self._cdp_url:
-            return
-        try:
-            self._playwright = await async_playwright().start()
-            browser = await self._playwright.chromium.connect_over_cdp(
-                self._cdp_url,
-            )
-            self._browser_context = browser.contexts[0]
-        except Exception as e:
-            logger.warning(f"[ResearchTools] Failed to reconnect Playwright: {e}")
-            # Browser session likely died — clear state so _get_browser()
-            # creates a fresh session on next call
-            self._playwright = None
-            self._browser_context = None
-            self._cdp_url = None
-            self._cloud_session_id = None
-
-    async def _stop_bu_cdp_client(self, agent: Any) -> None:
-        """Force-stop the BU Agent's internal CDPClient.
-
-        With keep_alive=True, agent.close() does NOT stop the CDPClient.
-        We must reach in and stop it explicitly to avoid a lingering CDP
-        WebSocket connection that conflicts with Playwright's.
-
-        CRITICAL: Must set _intentional_stop=True BEFORE stopping the
-        CDPClient. Otherwise BU's auto-reconnect callback fires when
-        the WebSocket drops and reconnects the CDPClient within seconds.
-        """
-        try:
-            session = getattr(agent, 'browser_session', None)
-            if session is None:
-                return
-            # Prevent auto-reconnect (3 retries) when WebSocket drops
-            session._intentional_stop = True
-            cdp_client = getattr(session, '_cdp_client_root', None)
-            if cdp_client is not None:
-                await cdp_client.stop()
-                logger.debug("[ResearchTools] BU CDPClient stopped")
-        except Exception as e:
-            logger.debug(f"[ResearchTools] Error stopping BU CDPClient: {e}")
-
-    @staticmethod
-    async def _kill_event_bus(agent) -> None:
-        """Ensure BU agent's EventBus is fully dead after cleanup."""
-        try:
-            session = getattr(agent, 'browser_session', None)
-            if not session:
-                return
-            bus = getattr(session, 'event_bus', None)
-            if not bus:
-                return
-            if getattr(bus, '_is_running', False):
-                await bus.stop(clear=True, timeout=2)
-            task = getattr(bus, '_runloop_task', None)
-            if task and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
-        except Exception:
-            pass
-
     async def cleanup(self):
-        """Cleanup browser, BU agent, and sandbox sessions."""
-        # Cleanup BU agent — stop its CDPClient first, then close
-        if self._bu_agent:
-            try:
-                await self._stop_bu_cdp_client(self._bu_agent)
-                await self._bu_agent.close()
-                await self._kill_event_bus(self._bu_agent)
-                logger.info("[ResearchTools] BU agent closed")
-            except Exception as e:
-                logger.warning(f"[ResearchTools] Error closing BU agent: {e}")
-            self._bu_agent = None
-
+        """Cleanup browser and sandbox sessions."""
         # Cleanup sandbox session
         if self._sandbox_session:
             try:
@@ -502,8 +403,8 @@ class ResearchTools:
             if self._cloud_client and self._cloud_session_id:
                 stopped_session_id = self._cloud_session_id
                 try:
-                    await self._cloud_client.browsers.update_browser_session(
-                        self._cloud_session_id, action="stop",
+                    await self._cloud_client.browsers.stop(
+                        self._cloud_session_id,
                     )
                     scope_id = self.scope.id if self.scope else "unknown"
                     logger.info(f"[ResearchTools] Cloud browser session stopped for scope {scope_id}")
@@ -554,7 +455,6 @@ class ResearchTools:
         self._browser_context = None
         self._cdp_url = None
         self._cloud_session_id = None
-        self._bu_agent = None
         if self._on_browser_stopped and stopped_session_id:
             try:
                 result = self._on_browser_stopped(stopped_session_id)
@@ -1432,445 +1332,6 @@ if os.path.exists(_seeds_path):
         return self.remaining_quota == 0
     
     # =========================================================================
-    # interact (Browser Agent)
-    # =========================================================================
-    
-    # BU system prompt extension — set once when the agent is created.
-    # BU keeps its own navigation/DOM prompt; this just clarifies its role.
-    _BU_SYSTEM_PROMPT = (
-        "\n\n## Your Role\n\n"
-        "You are a navigation assistant inside a larger system. A senior AI agent "
-        "is controlling you — it can see the page directly and makes all decisions.\n\n"
-        "Your job is simple: execute the specific navigation task you're given, then "
-        "call done(). That's it.\n\n"
-        "Rules:\n"
-        "- Do exactly what's asked. No more, no less.\n"
-        "- Do NOT summarize, describe, or extract page content — the controller "
-        "sees the page and doesn't need your interpretation.\n"
-        "- Do NOT research, explore links, or investigate beyond the task.\n"
-        "- Do NOT make decisions about what to do next — you'll be given the next task.\n"
-        "- Keep done() messages brief: \"Done — clicked Next\", \"Done — page loaded\", "
-        "\"Failed — button not found\".\n"
-    )
-
-    async def _get_or_create_bu_agent(self, task: str) -> Any:
-        """Create a fresh BU agent for an interact() call.
-
-        A new agent is created each time — interact() cleans up after each
-        call to avoid lingering CDPClient connections.
-        """
-        from browser_use import Agent
-        from browser_use.browser.profile import BrowserProfile
-        from browser_use.llm.browser_use import ChatBrowserUse
-
-        if self._bu_agent is not None:
-            # Reuse existing agent with new task
-            self._bu_agent.add_new_task(task)
-            return self._bu_agent
-
-        # First call — create the agent
-        from dsl_worker.config import settings
-        import os
-        os.environ.setdefault("BROWSER_USE_API_KEY", settings.browser_use_api_key)
-
-        # Connect to our existing cloud browser. keep_alive=True so
-        # agent.close() doesn't kill the browser — we manage that in cleanup().
-        profile = BrowserProfile(
-            cdp_url=self._cdp_url,
-            keep_alive=True,
-        )
-
-        # Disable search action — BU should never navigate to Google/DuckDuckGo.
-        # Keep extract enabled — BU may need it to see the page for navigation
-        # decisions, but our agent always gets raw markdown regardless.
-        try:
-            from browser_use.tools.service import Tools as BUTools
-            bu_tools = BUTools(exclude_actions=['search'])
-        except ImportError:
-            bu_tools = None
-
-        async def should_stop():
-            return bool(self.stop_checker and self.stop_checker())
-
-        llm = ChatBrowserUse(model='bu-2-0')
-
-        agent_kwargs = dict(
-            task=task,
-            llm=llm,
-            browser_profile=profile,
-            extend_system_message=self._BU_SYSTEM_PROMPT,
-            register_should_stop_callback=should_stop,
-            max_actions_per_step=3,
-            use_judge=False,           # We decide success, not BU's judge
-            directly_open_url=True,    # BU navigates to URL, triggering cloud captcha solver
-        )
-        if bu_tools is not None:
-            agent_kwargs["tools"] = bu_tools
-
-        self._bu_agent = Agent(**agent_kwargs)
-        return self._bu_agent
-
-    def _make_bu_supervisor(
-        self, checkpoint_interval: int = 10, hard_ceiling: int = 50,
-    ) -> Callable:
-        """Create an on_step_end callback for BU supervision.
-
-        Logs every step for visibility, plus safety checks.
-        Collects step data in supervisor.steps for Langfuse tracing.
-        """
-        _recent_urls: list = []
-        scope_id = self.scope.id if self.scope else "unknown"
-
-        async def on_step_end(agent) -> None:
-            step = agent.state.n_steps
-            step_time = time.time()
-
-            # --- Extract step info for logging ---
-            current_url = None
-            last_action = None
-            if agent.history and agent.history.history:
-                last = agent.history.history[-1]
-                if hasattr(last, 'state') and last.state:
-                    current_url = last.state.url
-                if hasattr(last, 'model_output') and last.model_output:
-                    mo = last.model_output
-                    if hasattr(mo, 'action') and mo.action:
-                        actions = mo.action if isinstance(mo.action, list) else [mo.action]
-                        action_names = []
-                        for a in actions:
-                            if hasattr(a, 'model_dump'):
-                                d = a.model_dump(exclude_unset=True)
-                                action_names.extend(d.keys())
-                            elif isinstance(a, dict):
-                                action_names.extend(a.keys())
-                        last_action = ", ".join(action_names) if action_names else None
-
-            short_url = current_url[:80] if current_url else "?"
-            action_str = last_action or "?"
-            logger.info(
-                f"[BU {scope_id}] step {step}: {action_str} | {short_url}"
-            )
-
-            # Collect for Langfuse span
-            on_step_end.steps.append({
-                "step": step,
-                "action": action_str,
-                "url": short_url,
-                "t": round(step_time - on_step_end.t0, 1),
-            })
-
-            _recent_urls.append(current_url)
-
-            # --- Per-step checks ---
-
-            if self.stop_checker and self.stop_checker():
-                agent.state.stopped = True
-                on_step_end.stop_reason = "external stop"
-                logger.info(f"[BU {scope_id}] Stopped at step {step}: external stop")
-                return
-
-            if agent.state.consecutive_failures >= 3:
-                agent.state.stopped = True
-                on_step_end.stop_reason = f"{agent.state.consecutive_failures} consecutive failures"
-                logger.info(
-                    f"[BU {scope_id}] Stopped at step {step}: "
-                    f"{agent.state.consecutive_failures} consecutive failures"
-                )
-                return
-
-            # --- Hard ceiling ---
-            if step >= hard_ceiling:
-                agent.state.stopped = True
-                on_step_end.stop_reason = f"hard ceiling ({hard_ceiling})"
-                logger.info(f"[BU {scope_id}] Stopped at step {step}: hard ceiling ({hard_ceiling})")
-                return
-
-            # --- Checkpoint evaluation (every N steps) ---
-            if step > 0 and step % checkpoint_interval == 0:
-                window = _recent_urls[-checkpoint_interval:]
-                unique_in_window = set(u for u in window if u)
-
-                if len(unique_in_window) <= 1:
-                    agent.state.stopped = True
-                    on_step_end.stop_reason = f"same URL for {checkpoint_interval} steps"
-                    logger.info(
-                        f"[BU {scope_id}] Stopped at step {step}: "
-                        f"same URL for {checkpoint_interval} steps"
-                    )
-                    return
-
-                if len(unique_in_window) >= checkpoint_interval // 2:
-                    agent.state.stopped = True
-                    on_step_end.stop_reason = (
-                        f"spiraling ({len(unique_in_window)} unique URLs "
-                        f"in {checkpoint_interval} steps)"
-                    )
-                    logger.info(
-                        f"[BU {scope_id}] Stopped at step {step}: "
-                        f"spiraling ({len(unique_in_window)} unique URLs "
-                        f"in {checkpoint_interval} steps)"
-                    )
-                    return
-
-        # Attach data collectors to the callback
-        on_step_end.steps = []
-        on_step_end.t0 = time.time()
-        on_step_end.stop_reason = None
-
-        return on_step_end
-
-    async def _extract_page_content(self, target_url: str) -> Tuple[Optional[str], Optional[str]]:
-        """Extract page content from our Playwright connection after BU acts.
-
-        Returns (formatted_content, ref_id) or (None, None) if extraction fails.
-        """
-        context = self._browser_context
-        if not context or not context.pages:
-            return None, None
-
-        # Find the best page: prefer one matching target URL,
-        # otherwise use the last page (most recently active/opened)
-        page = context.pages[-1]
-        for p in context.pages:
-            try:
-                p_url = p.url
-                if target_url in p_url:
-                    page = p
-                    break
-            except Exception:
-                continue
-
-        current_url = page.url
-
-        html = ""
-        for attempt in range(3):
-            if self.stop_checker and self.stop_checker():
-                break
-            try:
-                html = await page.evaluate('() => document.body.innerHTML')
-                if html and len(html.strip()) > 100:
-                    break
-            except Exception:
-                pass
-            await asyncio.sleep(1.0)
-
-        if not html or len(html.strip()) == 0:
-            return None, None
-
-        markdown = md(html, heading_style='ATX')
-        lines = markdown.split('\n')
-        links = extract_links_from_markdown(markdown, current_url)
-
-        page_view = PageView(
-            url=current_url,
-            fetched_at=datetime.now(timezone.utc).isoformat(),
-            lines=lines,
-            total_lines=len(lines),
-            links=links,
-        )
-        ref_id = self.artifacts.store_page(page_view)
-
-        viewport = format_viewport(lines, 0, 150, ref_id, current_url)
-        links_table = format_links_table(links)
-
-        return f"{viewport}\n{links_table}", ref_id
-
-    async def interact(self, url_or_ref_id: str, task: str) -> Tuple[str, float]:
-        """
-        Use Browser Use agent to perform an action on the shared cloud browser.
-
-        interact() shares the same cloud browser session as open()/find()/click().
-        A fresh BU agent is created per call to avoid lingering CDP connections.
-
-        CRITICAL: Playwright and BU's CDPClient MUST NOT be connected to the
-        same browser simultaneously. Both use Target.setAutoAttach which causes
-        CDP target management conflicts, leading to "Target.detachedFromTarget"
-        crashes. We disconnect Playwright before BU runs, then reconnect after.
-
-        After BU finishes, we extract raw page content via our Playwright
-        connection and return line-numbered markdown (same format as open()).
-        """
-        langfuse = _get_langfuse()
-        if langfuse:
-            with langfuse.start_as_current_observation(
-                as_type="span",
-                name="tool:interact",
-                input={"task": task[:200], "url_or_ref_id": url_or_ref_id},
-            ) as span:
-                result_text, cost = await self._do_interact(url_or_ref_id, task, span)
-                return result_text, cost
-        return await self._do_interact(url_or_ref_id, task, None)
-
-    async def _do_interact(
-        self, url_or_ref_id: str, task: str, span: Any,
-    ) -> Tuple[str, float]:
-        """interact() implementation — optionally traced via Langfuse span."""
-        try:
-            from browser_use import Agent
-        except ImportError:
-            return "browser-use not installed", 0.0
-
-        # Resolve URL
-        url = url_or_ref_id
-        page_artifact = self.artifacts.get_page(url_or_ref_id)
-        if page_artifact:
-            url = page_artifact.url
-        elif not url.startswith(("http://", "https://")):
-            url = "https://" + url
-
-        scope_id = self.scope.id if self.scope else "unknown"
-
-        try:
-            # Ensure shared cloud browser exists (reuses existing session)
-            await self._get_browser()
-
-            if not self._cdp_url:
-                return "No cloud browser session available", 0.0
-
-            # CRITICAL: Disconnect Playwright before BU runs.
-            await self._disconnect_playwright()
-
-            # Truncate task to prevent agents from embedding research
-            # goals into BU's task.
-            clean_task = task[:120].split("\n")[0]
-
-            bu_task = (
-                f"{clean_task}\n\n"
-                f"Navigate to: {url}"
-            )
-
-            logger.info(
-                f"[interact {scope_id}] START task={clean_task!r} url={url[:80]}"
-            )
-            t0 = time.time()
-
-            bu_summary = "action failed"
-            bu_steps = 0
-            supervisor = None
-            bu_history_steps = []
-            try:
-                agent = await self._get_or_create_bu_agent(bu_task)
-                t_agent = time.time()
-
-                supervisor = self._make_bu_supervisor()
-                try:
-                    result = await agent.run(max_steps=100, on_step_end=supervisor)
-                    bu_summary = result.final_result() if result.final_result() else "action completed"
-                    bu_steps = agent.state.n_steps
-                except Exception as run_err:
-                    logger.warning(f"[interact {scope_id}] BU run error (will still extract): {run_err}")
-                    bu_summary = "action completed (with BU internal error)"
-                    bu_steps = getattr(agent.state, 'n_steps', 0)
-
-                t_run = time.time()
-
-                # Extract BU's own per-step timing from agent.history
-                try:
-                    for h in agent.history.history:
-                        step_info = {}
-                        if h.metadata:
-                            step_info["step"] = h.metadata.step_number
-                            step_info["duration_s"] = round(h.metadata.duration_seconds, 1)
-                        if h.state:
-                            step_info["url"] = h.state.url or ""
-                        if h.model_output:
-                            if h.model_output.action:
-                                actions = h.model_output.action if isinstance(h.model_output.action, list) else [h.model_output.action]
-                                names = []
-                                for a in actions:
-                                    if hasattr(a, 'model_dump'):
-                                        names.extend(a.model_dump(exclude_unset=True).keys())
-                                step_info["actions"] = names
-                            if h.model_output.thinking:
-                                step_info["thinking"] = h.model_output.thinking[:200]
-                        if h.result:
-                            for r in h.result:
-                                if r.error:
-                                    step_info["error"] = str(r.error)[:200]
-                                if r.is_done:
-                                    step_info["is_done"] = True
-                        bu_history_steps.append(step_info)
-                except Exception as hist_err:
-                    logger.warning(f"[interact {scope_id}] History extraction error: {hist_err}")
-
-                logger.info(
-                    f"[interact {scope_id}] BU done: {bu_steps} steps, "
-                    f"agent_create={t_agent - t0:.1f}s, "
-                    f"run={t_run - t_agent:.1f}s, "
-                    f"summary={bu_summary!r}"
-                )
-                for hs in bu_history_steps:
-                    logger.info(f"[interact {scope_id}]   step {hs.get('step','?')}: "
-                                f"{hs.get('duration_s','?')}s | {hs.get('actions',[])} | "
-                                f"{hs.get('thinking','')[:80]}")
-            finally:
-                if self._bu_agent:
-                    await self._stop_bu_cdp_client(self._bu_agent)
-                    try:
-                        await self._bu_agent.close()
-                    except Exception:
-                        pass
-                    # Kill any EventBus that restarted during cleanup
-                    await self._kill_event_bus(self._bu_agent)
-                    self._bu_agent = None
-
-                await self._reconnect_playwright()
-
-            # Extract raw page content via Playwright
-            try:
-                content, ref_id = await self._extract_page_content(url)
-                t_extract = time.time()
-
-                logger.info(
-                    f"[interact {scope_id}] DONE total={t_extract - t0:.1f}s "
-                    f"(agent={t_agent - t0:.1f}s + run={t_run - t_agent:.1f}s + "
-                    f"reconnect+extract={t_extract - t_run:.1f}s) "
-                    f"steps={bu_steps} content={'yes' if content else 'no'}"
-                )
-
-                # Update Langfuse span with full details
-                if span:
-                    span.update(output={
-                        "summary": bu_summary[:200],
-                        "step_count": bu_steps,
-                        "total_seconds": round(t_extract - t0, 1),
-                        "agent_create_seconds": round(t_agent - t0, 1),
-                        "run_seconds": round(t_run - t_agent, 1),
-                        "reconnect_extract_seconds": round(t_extract - t_run, 1),
-                        "stop_reason": supervisor.stop_reason if supervisor else None,
-                        "content_extracted": bool(content),
-                        "supervisor_steps": supervisor.steps if supervisor else [],
-                        "bu_history": bu_history_steps,
-                    })
-
-                if content:
-                    return (
-                        f"Browser action: {bu_summary}\n\n"
-                        f"{content}"
-                    ), 0.0
-
-                return f"Browser action: {bu_summary} (no page content extracted)", 0.0
-
-            except Exception as extract_err:
-                logger.warning(f"[interact {scope_id}] Extraction failed: {extract_err}")
-                if span:
-                    span.update(output={
-                        "summary": bu_summary[:200],
-                        "step_count": bu_steps,
-                        "stop_reason": supervisor.stop_reason if supervisor else None,
-                        "error": f"extraction failed: {extract_err}",
-                        "bu_history": bu_history_steps,
-                    })
-                return f"Browser action: {bu_summary} (extraction failed: {extract_err})", 0.0
-
-        except Exception as e:
-            logger.error(f"[interact {scope_id}] Failed: {e}", exc_info=True)
-            self._bu_agent = None
-            if span:
-                span.update(output={"error": str(e)})
-            return f"Browser agent error: {e}", 0.0
-    
-    # =========================================================================
     # Tool Registration for Agent Framework
     # =========================================================================
 
@@ -1878,8 +1339,8 @@ if os.path.exists(_seeds_path):
         """
         Register browsing/research tools onto an agent ToolRegistry.
 
-        Registers: brave_search, open, find, click, list_files, code_exec,
-        interact. Skips scope-dependent tools (note, conclude_research,
+        Registers: brave_search, open, find, click, list_files, code_exec.
+        Skips scope-dependent tools (note, conclude_research,
         submit_seed, breakdown, done).
 
         Args:
@@ -1922,10 +1383,6 @@ if os.path.exists(_seeds_path):
                 command=args.get("command", ""),
                 description=args.get("description", ""),
             ),
-            "interact": lambda args: self.interact(
-                url_or_ref_id=args.get("url_or_ref_id", ""),
-                task=args.get("task", ""),
-            ),
         }
 
         for defn in self._research_tools():
@@ -1946,20 +1403,6 @@ if os.path.exists(_seeds_path):
                 "search_context_size": "medium",
             })
 
-    # =========================================================================
-    # Tool Definitions for LLM
-    # =========================================================================
-
-    def get_tool_definitions(self, phase: str = None) -> List[Dict]:
-        """Get tool definitions for current or specified phase."""
-        if phase is None:
-            phase = "research" if self.state == ResearchState.RESEARCHING else "decision"
-        
-        if phase == "research":
-            return self._research_tools()
-        else:
-            return self._decision_tools()
-    
     def _research_tools(self) -> List[Dict]:
         """Tools available during research phase."""
         return [
@@ -2149,159 +1592,12 @@ Working directory is /workspace. Files at /workspace/uploads/ and /workspace/dow
                     "required": ["summary"]
                 }
             },
-            {
-                "type": "function",
-                "name": "interact",
-                "description": "Send a SHORT, ATOMIC action to a browser navigation agent. The agent is dumb — it only clicks, scrolls, and bypasses challenges. It shouldn't research, extract, or strategize. You see the page content yourself after it acts. ONLY use when you need to do an action on the website to navigate to content.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "url_or_ref_id": {
-                            "type": "string",
-                            "description": "URL or ref_id of the page"
-                        },
-                        "task": {
-                            "type": "string",
-                            "description": "One short action. Examples: 'bypass Cloudflare', 'click Next Page', 'scroll down', 'click Accept Cookies'. Do NOT include your research goal — the agent shouldn't help with that.",
-                            "maxLength": 100
-                        },
-                    },
-                    "required": ["url_or_ref_id", "task"]
-                }
-            },
-        ]
-    
-    def _decision_tools(self) -> List[Dict]:
-        """Tools available during decision/seeding phase."""
-        return [
-            {
-                "type": "function",
-                "name": "breakdown",
-                "description": "Break scope into sub-scopes. Each child becomes its own research agent.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "children": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "description": {"type": "string"},
-                                    "weight": {"type": "number"},
-                                },
-                                "required": ["description"]
-                            },
-                            "description": "Sub-scopes with descriptions and relative weights"
-                        },
-                    },
-                    "required": ["children"]
-                }
-            },
-            {
-                "type": "function",
-                "name": "submit_seed",
-                "description": "Submit a seed for row generation. Provide source extraction (ref_id + lines), written content, or both.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "ref_id": {
-                            "type": "string",
-                            "description": "Page ref_id to extract from (optional)"
-                        },
-                        "lines": {
-                            "type": "array",
-                            "items": {"type": "integer"},
-                            "minItems": 2,
-                            "maxItems": 2,
-                            "description": "[start, end] line range to extract (requires ref_id)"
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "Written seed content or additional context (optional)"
-                        },
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "name": "done",
-                "description": "Finish when seeds are exhausted before reaching quota. Use when seeds are finite (real items that exist or don't) and you've found all that exist. Don't use to quit early.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "reason": {
-                            "type": "string",
-                            "description": "Why seeds are exhausted"
-                        },
-                    },
-                    "required": ["reason"]
-                }
-            },
-            {
-                "type": "function",
-                "name": "note",
-                "description": "Record a note. Use to track coverage while seeding.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "content": {
-                            "type": "string",
-                            "description": "What you observed or decided"
-                        },
-                    },
-                    "required": ["content"]
-                }
-            },
-            {
-                "type": "function",
-                "name": "brave_search",
-                "description": "Search the web. Still available if you need to check something while seeding.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Search query"
-                        },
-                        "response_length": {
-                            "type": "string",
-                            "enum": ["short", "medium", "long"],
-                            "description": "short=5, medium=10, long=20 results"
-                        },
-                    },
-                    "required": ["query"]
-                }
-            },
-            {
-                "type": "function",
-                "name": "open",
-                "description": "Open a URL or view lines from existing page. Still available for reference.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "ref_id_or_url": {
-                            "type": "string",
-                            "description": "URL to fetch, or ref_id (p0, p1...) to view existing"
-                        },
-                        "start_line": {
-                            "type": "integer",
-                            "description": "Line to start from (default: 0)"
-                        },
-                        "response_length": {
-                            "type": "string",
-                            "enum": ["short", "medium", "long"],
-                            "description": "short=60, medium=150, long=300 lines"
-                        },
-                    },
-                    "required": ["ref_id_or_url"]
-                }
-            },
         ]
     
     async def execute_tool(self, name: str, args: Dict) -> Tuple[str, float]:
         """Execute tool by name with args. Returns (result, cost)."""
         # Track research activity
-        if name in ("brave_search", "open", "click", "find", "interact"):
+        if name in ("brave_search", "open", "click", "find"):
             self.research_actions += 1
         
         try:
@@ -2365,12 +1661,6 @@ Working directory is /workspace. Files at /workspace/uploads/ and /workspace/dow
             
             elif name == "done":
                 return self.done(reason=args.get("reason", ""))
-            
-            elif name == "interact":
-                return await self.interact(
-                    url_or_ref_id=args.get("url_or_ref_id", ""),
-                    task=args.get("task", ""),
-                )
             
             else:
                 return f"Unknown tool: {name}", 0.0

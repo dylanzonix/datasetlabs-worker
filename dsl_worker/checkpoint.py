@@ -33,41 +33,6 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class ConversationState:
-    """Serialized state of an AgentConversation."""
-    messages: List[Dict[str, Any]] = field(default_factory=list)
-    total_cost: float = 0.0
-    total_turns: int = 0
-
-
-@dataclass
-class SourceCheckpoint:
-    """Serialized state of a SourceState (minus the live agent)."""
-    id: str = ""
-    source: str = ""
-    description: str = ""
-    total_harvested: int = 0
-    total_processed: int = 0
-    rows_produced: int = 0
-    duplicates: int = 0
-    skipped: int = 0
-    errors: int = 0
-    harvest_cost: float = 0.0
-    process_cost: float = 0.0
-    batches: int = 0
-    exhausted: bool = False
-    last_report: str = ""
-    # Buffered candidates (list of dicts with values/source_id/source_context/metadata)
-    candidates: List[Dict[str, Any]] = field(default_factory=list)
-    # Harvester conversation (if this source has a harvester agent)
-    harvester_conversation: Optional[Dict[str, Any]] = None
-    # Harvester metadata for reconstruction
-    harvester_candidates_total: int = 0
-    harvester_exhausted: bool = False
-    harvester_bu_session_id: Optional[str] = None
-
-
-@dataclass
 class PipelineCheckpoint:
     """
     Full V11 pipeline state. Everything needed to resume exactly where we left off.
@@ -152,24 +117,6 @@ class PipelineCheckpoint:
     def has_v11_state(self) -> bool:
         """Check if this checkpoint has V11 conversation state."""
         return self.orchestrator_conversation is not None
-
-    # Legacy compat methods (used by _run_generation_from_checkpoint)
-    def add_work_item(self, item: Dict) -> None:
-        item.setdefault("status", "pending")
-        item.setdefault("row_id", None)
-        self.work_items.append(item)
-
-    def mark_processed(self, index: int, success: bool, row_id: Optional[str] = None) -> None:
-        if index not in self.processed_indices:
-            self.processed_indices.append(index)
-        if index < len(self.work_items):
-            self.work_items[index]["status"] = "completed" if success else "failed"
-            if row_id:
-                self.work_items[index]["row_id"] = row_id
-
-    def get_pending_indices(self) -> List[int]:
-        processed = set(self.processed_indices)
-        return [i for i in range(len(self.work_items)) if i not in processed]
 
     @property
     def stats(self) -> Dict:
@@ -349,42 +296,6 @@ class CheckpointManager:
 
         await self.save(force=True)
 
-    async def set_recipe(self, recipe: str) -> None:
-        """Store context for resume (legacy compat)."""
-        async with self._lock:
-            self._checkpoint.recipe = recipe
-
-        await self.save(force=True)
-
-    async def add_work_item(self, work_item: Dict) -> None:
-        """Legacy compat."""
-        async with self._lock:
-            self._checkpoint.add_work_item(dict(work_item))
-            self._pending_updates += 1
-
-        await self.save()
-
-    async def mark_processed(
-        self,
-        index: int,
-        success: bool,
-        row_id: Optional[str] = None,
-    ) -> None:
-        """Legacy compat."""
-        async with self._lock:
-            self._checkpoint.mark_processed(index, success, row_id)
-            self._pending_updates += 1
-
-        await self.save()
-
-    async def add_error(self, error: Dict) -> None:
-        """Record an error."""
-        async with self._lock:
-            self._checkpoint.errors.append({
-                **error,
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            })
-
     async def delete(self) -> None:
         """Delete checkpoint (after successful completion)."""
         try:
@@ -413,26 +324,3 @@ class CheckpointManager:
     async def force_save(self) -> None:
         """Force immediate save."""
         await self.save(force=True)
-
-
-# Legacy compat
-def checkpoints_to_work_items(checkpoint_items: List[Dict]) -> List[Dict]:
-    """Convert checkpoint work items for GenerationWorkerPool (legacy)."""
-    work_items = []
-    for item in checkpoint_items:
-        wi = {k: v for k, v in item.items() if k not in ("status", "row_id")}
-        if "template" in wi and "instructions" not in wi:
-            wi = {
-                "instructions": wi.get("template", ""),
-                "candidate": wi.get("seed_values", {}),
-                "research_context": wi.get("filter_findings", ""),
-                "tags": wi.get("tags", {}),
-            }
-        elif "instruction" in wi and "instructions" not in wi:
-            wi = {
-                "instructions": wi.get("instruction", ""),
-                "candidate": wi.get("context", ""),
-                "tags": wi.get("tags", {}),
-            }
-        work_items.append(wi)
-    return work_items

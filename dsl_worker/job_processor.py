@@ -49,7 +49,7 @@ except ImportError:
         return _noop()
 from dsl_worker.project_state import ProjectState
 from dsl_worker.billing import CostTracker, TrackedOpenAIClient
-from dsl_worker.checkpoint import CheckpointManager, checkpoints_to_work_items
+from dsl_worker.checkpoint import CheckpointManager
 
 from dsl_worker.agents import OrchestratorAgent
 from dsl_worker.agents.row import DedupStore
@@ -476,7 +476,7 @@ class JobProcessor:
         from dsl_worker.infra.bu_client import BUClient
         bu_client = BUClient(
             api_key=settings.browser_use_api_key,
-            model=getattr(settings, 'bu_model', 'bu-max'),
+            model="bu-mini",
             stop_event=stop_event,
         )
 
@@ -723,145 +723,6 @@ class JobProcessor:
         await checkpoint_mgr.force_save()
         self._handle_force_stop(db, project, version, cost_tracker, "No rows generated")
         return False
-
-    # _run_generation_consumer removed in V11 — orchestrator drives processing directly
-
-    async def _run_generation_from_checkpoint(
-        self,
-        db: Session,
-        project: Project,
-        version: ProjectVersion,
-        state: ProjectState,
-        tracked_client: TrackedOpenAIClient,
-        cost_tracker: CostTracker,
-        checkpoint_mgr: CheckpointManager,
-        checkpoint,
-        workspace_dir: Path,
-        stop_checker,
-        on_cost: Optional[Callable] = None,
-    ) -> bool:
-        """Resume generation from a saved checkpoint."""
-
-        work_items = checkpoints_to_work_items(checkpoint.work_items)
-
-        # Filter to pending items only
-        pending_indices = checkpoint.get_pending_indices()
-        pending_items = [work_items[i] for i in pending_indices]
-
-        if not pending_items:
-            logger.info("[Pipeline] All work items already processed")
-            await checkpoint_mgr.delete()
-            self._handle_completion(db, project, version, cost_tracker)
-            return True
-
-        logger.info(
-            f"[Pipeline] Resuming generation: "
-            f"{len(pending_items)} pending of {len(work_items)} total"
-        )
-
-        concurrency = settings.generation_parallel_samples
-
-        # Generate SAS URLs for uploaded files (needed by row generators)
-        uploaded_file_urls = self._generate_file_urls(db, project.id)
-
-        # Langfuse parent not available for checkpoint resume (no active span)
-        pool = GenerationWorkerPool(
-            workspace_dir=workspace_dir,
-            openai_client=tracked_client,
-            db_session=db,
-            project_id=project.id,
-            version_id=version.id,
-            model=settings.generation_model,
-            brave_api_key=settings.brave_api_key,
-            sandbox=self._sandbox,
-            num_workers=concurrency,
-            stop_checker=stop_checker,
-                stop_event=stop_event,
-            cost_tracker=cost_tracker,
-            checkpoint_callback=lambda idx, success, row_id: asyncio.create_task(
-                checkpoint_mgr.mark_processed(pending_indices[idx], success, row_id)
-            ),
-            blob_service_client=self.blob_service_client,
-            uploaded_file_urls=uploaded_file_urls if uploaded_file_urls else None,
-            mcp_tools=self._mcp_tools,
-            on_cost=on_cost,
-        )
-
-        total_success, total_errors = await pool.process_work_items(
-            pending_items, state.columns
-        )
-
-        # Check balance
-        can_continue, stop_reason = cost_tracker.check_balance_and_charge()
-        if not can_continue:
-            await checkpoint_mgr.force_save()
-            self._handle_force_stop(db, project, version, cost_tracker, stop_reason)
-            return False
-
-        # Handle final state
-        state.refresh()
-        if state.paused:
-            await checkpoint_mgr.force_save()
-            self._handle_pause(db, project, version, cost_tracker)
-            return True
-
-        total_processed = len(checkpoint.processed_indices) + total_success
-
-        if total_processed > 0:
-            await checkpoint_mgr.delete()
-            self._handle_completion(db, project, version, cost_tracker)
-            return True
-
-        await checkpoint_mgr.force_save()
-        self._handle_force_stop(db, project, version, cost_tracker, "No rows generated")
-        return False
-
-    def _create_feedback_version(
-        self,
-        db: Session,
-        project: Project,
-        old_version: ProjectVersion,
-    ) -> ProjectVersion:
-        """Create a new version for a feedback iteration.
-
-        The old version is finalized with status 'succeeded' — its sample
-        rows are preserved. The new version starts fresh.
-        """
-        from sqlalchemy import func as sql_func
-
-        max_num = (
-            db.query(sql_func.max(ProjectVersion.version_number))
-            .filter(ProjectVersion.project_id == project.id)
-            .scalar() or 0
-        )
-
-        new_version = ProjectVersion(
-            project_id=project.id,
-            version_number=max_num + 1,
-            num_samples=old_version.num_samples,
-            generation_prompt=old_version.generation_prompt,
-            columns=old_version.columns,
-            files_snapshot=old_version.files_snapshot,
-            examples_snapshot=old_version.examples_snapshot,
-            status="running",
-            started_at=datetime.now(timezone.utc),
-        )
-        db.add(new_version)
-        db.flush()
-
-        old_version.status = "succeeded"
-        old_version.finished_at = datetime.now(timezone.utc)
-        old_version.progress_detail = None
-
-        project.current_version_id = new_version.id
-        db.commit()
-
-        logger.info(
-            f"[Pipeline] Created feedback version {new_version.version_number} "
-            f"(old v{old_version.version_number} finalized)"
-        )
-
-        return new_version
 
     def _load_chat_history(self, db: Session, project_id: UUID) -> List[Dict[str, str]]:
         """Load chat messages and format for the orchestrator.

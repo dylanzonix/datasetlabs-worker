@@ -95,12 +95,6 @@ class SlidingWindowCounter:
 
             return wait_time
 
-    async def get_usage(self) -> Tuple[int, int]:
-        """Get current (rpm, tpm) usage."""
-        async with self._lock:
-            now = time.monotonic()
-            self._prune_old(now)
-            return len(self._requests), sum(r.tokens for r in self._tokens)
 
 
 class RateLimiter:
@@ -162,18 +156,3 @@ class RateLimiter:
 
         return wait_time
 
-    async def get_usage(self, model: str) -> Tuple[int, int]:
-        """Get current (rpm, tpm) usage for a model."""
-        counter = self._get_counter(model)
-        return await counter.get_usage()
-
-    def update_limits(self, model: str, rpm_limit: int, tpm_limit: int) -> None:
-        """Dynamically update limits for a model."""
-        self._configs[model] = RateLimitConfig(model, rpm_limit, tpm_limit)
-
-        if model in self._counters:
-            counter = self._counters[model]
-            counter.rpm_limit = rpm_limit
-            counter.tpm_limit = tpm_limit
-
-        logger.info(f"Updated rate limits for {model}: {rpm_limit} rpm, {tpm_limit} tpm")

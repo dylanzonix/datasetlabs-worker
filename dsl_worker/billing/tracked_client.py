@@ -3,24 +3,15 @@ Tracked OpenAI client that calculates costs for all API calls.
 """
 
 import logging
-from dataclasses import dataclass
 from typing import List, Optional, Any, Dict, Tuple
 
 from openai import AsyncOpenAI
-from openai.types import CreateEmbeddingResponse
 
 from dsl_worker.billing.pricing import get_pricing_config, UsageCost
 from dsl_worker.billing.rate_limiter import RateLimiter
 from dsl_worker.billing.resilient_client import ResilientClient, RetryConfig
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class TrackedEmbeddingResponse:
-    """Embedding response with cost tracking."""
-    response: CreateEmbeddingResponse
-    cost: UsageCost
 
 
 class TrackedOpenAIClient:
@@ -112,36 +103,6 @@ class TrackedOpenAIClient:
         logger.debug(
             f"Responses API: model={model}, "
             f"input={non_cached_input_tokens}, cached={cached_input_tokens}, output={output_tokens}, "
-            f"cost=${cost.total_cost_usd:.6f}"
-        )
-
-        return response, cost
-
-    async def embeddings_create(
-        self,
-        model: str,
-        input: List[str],
-        **kwargs,
-    ) -> Tuple[CreateEmbeddingResponse, UsageCost]:
-        """Create embeddings and track the cost."""
-        response = await self._resilient.embeddings_create(
-            model=model,
-            input=input,
-            **kwargs,
-        )
-
-        usage = response.usage
-        input_tokens = usage.total_tokens if usage else 0
-
-        cost = self._pricing.calculate_cost(
-            model=model,
-            input_tokens=input_tokens,
-            output_tokens=0,
-        )
-
-        logger.debug(
-            f"Embeddings: model={model}, "
-            f"input={input_tokens}, "
             f"cost=${cost.total_cost_usd:.6f}"
         )
 
