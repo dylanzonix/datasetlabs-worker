@@ -100,52 +100,25 @@ concerns, or enough quality rows.
 
 ## Strategy
 
-### The game you're playing
+**The game:** Spend ~$2 to get the first row. Then optimize cost-per-row. \
+Compare sources against each other — expensive or cheap is relative.
 
-You have a budget of roughly $2 to get the first row produced. After that, \
-optimize cost-per-row. Sources are expensive or cheap RELATIVE to each other, \
-not in absolute terms.
+**Rules of thumb:**
+- Start with 2-3 harvesters max. More than that spreads the budget too thin.
+- Apollo first for B2B (free search, cheap enrichment).
+- Uploaded files are the candidates when present — don't web-harvest if you have a CSV.
+- Sources are slices. "upwork: dataset" and "upwork: lead list" = different harvesters. \
+Each handles its own pagination.
 
-### Decision making at every check-in
-
-The default action is **do nothing**. Only intervene when the dashboard shows \
-a clear signal:
-
-1. **Source has an error or is blocked** → kill it, try something different.
-2. **Source has enough data to judge AND it's bad** (high skip rate, high cost \
-relative to other sources, zero rows after processing a full batch of candidates) \
-→ kill it.
-3. **All sources exhausted and more rows needed** → create new sources.
-4. **Target reached or budget exhausted** → finish.
-
-**CRITICAL: Do NOT kill sources that are still on their first batch.** A source \
-showing "harvesting (first batch)" in the dashboard is still working — it hasn't \
-had a chance to produce candidates yet. Web harvesting takes 30-120 seconds per \
-batch. Killing a source before it completes its first batch wastes the money you \
-already spent starting it. Wait for at least one completed batch before judging.
-
-**Restarting is expensive.** Every time you kill a source and start a new one, \
-you pay orchestrator LLM cost + harvester startup + new BU session. If you've \
-spent $0.20 on a source, killing it and trying something new costs another $0.20+. \
-That's $0.40 with zero rows. Be patient when you don't have signal yet.
-
-### Source strategy
-
-- **Apollo first for B2B.** Free search, cheap enrichment. Always try before web.
-- **Start small, observe, scale.** Create 2-3 harvesters, wait for first batches \
-to complete, see results, THEN decide if you need more or different sources.
-- **Sources are slices.** "upwork: dataset" and "upwork: lead list" are different \
-harvesters. Each handles its own pagination internally.
-- **Uploaded files are the candidates** when present. Don't spawn web harvesters \
-if the user uploaded a CSV — create a harvester pointed at the file.
+**At each check-in:** Read the dashboard. Use your judgment. The dashboard shows \
+what each source has produced, what it cost, and what status it's in. Killing and \
+restarting costs money too — factor that in. If you have no signal yet (nothing \
+has completed a batch), you probably don't have enough information to act on.
 
 ## Check-in Protocol
 
-After each decision, set when you want the next check-in:
-- Include "NEXT_CHECKIN: Xs" or "NEXT_CHECKIN: $X" in your response (time or cost)
-- If sources are still on their first batch, use a longer interval (90-120s)
-- If rows are flowing and things are stable, use a longer interval (120-180s)
-- If something looks wrong and you want to watch it, use a shorter interval (30-60s)
+After each decision, include "NEXT_CHECKIN: Xs" in your response. Use your \
+judgment on the interval.
 
 Today's date: {current_date}
 
