@@ -287,7 +287,7 @@ class HarvesterAgent:
 
         bu_task = (
             f"{task}\n\n"
-            "Stay on this page only — do not follow links or navigate elsewhere. "
+            "Stick to the scope of the task. "
             "If blocked by anti-bot after 2 attempts, stop and report 'blocked'. "
             "After extracting, briefly report: how many items found, whether "
             "pagination or 'load more' exists, and any other navigation visible."
