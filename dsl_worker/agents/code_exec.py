@@ -111,7 +111,7 @@ class CodeExecAgent:
             stop_checker=stop_checker,
             max_turns=hard_cap,
             soft_turn_limit=soft_limit,
-            reasoning={"effort": "low", "summary": "auto"},
+            reasoning={"effort": "high", "summary": "detailed"},
             label="code_exec",
             on_tool_call=on_tool_call,
         )
@@ -122,7 +122,7 @@ class CodeExecAgent:
             registry,
             exclude=[
                 "brave_search", "open", "find", "click",
-                "interact", "shell_exec",
+                "shell_exec",
             ],
             include_builtins=False,
         )
