@@ -50,10 +50,10 @@ class BUClient:
     Shared Browser Use V3 SDK client for all web interactions.
 
     Usage:
-        client = BUClient(api_key="bu__xxx", model="bu-mini")
+        client = BUClient(api_key="bu__xxx", model="bu-max")
 
         # Extraction (harvesters)
-        items, cost = await client.extract("Navigate to ... and extract all listings")
+        items, cost, sid, summary = await client.extract("Navigate to ... and extract all listings")
 
         # Research (row generators, orchestrator)
         text, cost = await client.research("Find the CEO of Acme Corp")
@@ -62,7 +62,7 @@ class BUClient:
     def __init__(
         self,
         api_key: str,
-        model: str = "bu-mini",
+        model: str = "bu-max",
         proxy_country: Optional[str] = "us",
         stop_event: Optional[asyncio.Event] = None,
     ) -> None:
@@ -174,11 +174,12 @@ class BUClient:
         session_id: Optional[str] = None,
         keep_alive: bool = False,
         timeout: float = 900,
-    ) -> Tuple[List[Dict[str, Any]], float, Optional[str]]:
+    ) -> Tuple[List[Dict[str, Any]], float, Optional[str], str]:
         """
         Extract structured items from a page. For harvesters.
 
-        Returns (items, cost_usd, session_id).
+        Returns (items, cost_usd, session_id, summary).
+        summary contains BU's last step summary — useful for pagination/nav reports.
         Pass session_id from a previous call to reuse the same browser session.
         Set keep_alive=True to keep the session open for subsequent calls.
         """
@@ -192,21 +193,33 @@ class BUClient:
                 session_id=session_id,
                 keep_alive=keep_alive,
             )
+            # SDK defaults to 14400s (4h) — override with our safety-net
+            # timeout. SDK doesn't expose timeout via run(), so we set the
+            # private attr directly.
             session_run._timeout = timeout
             result = await self._run_cancellable(session_run)
             cost = self._parse_cost(result)
             self._log_cost_breakdown(result, "extract")
             sid = self._get_session_id(result)
+            # Extract the last step summary for pagination/nav reporting
+            summary = ""
+            try:
+                session = getattr(result, "session", result)
+                summary = getattr(session, "last_step_summary", "") or ""
+                if not summary:
+                    summary = getattr(session, "lastStepSummary", "") or ""
+            except Exception:
+                pass
             if result.output and hasattr(result.output, "items"):
                 items = [item.data for item in result.output.items]
-                return items, cost, sid
-            return [], cost, sid
+                return items, cost, sid, summary
+            return [], cost, sid, summary
         except asyncio.CancelledError:
             logger.info("[BUClient] extract cancelled (stop requested)")
-            return [], 0.0, session_id
+            return [], 0.0, session_id, ""
         except Exception as e:
             logger.error(f"[BUClient] extract error: {e}")
-            return [], 0.0, session_id
+            return [], 0.0, session_id, ""
 
     async def research(
         self,
@@ -231,6 +244,7 @@ class BUClient:
                 session_id=session_id,
                 keep_alive=keep_alive,
             )
+            # SDK defaults to 14400s (4h) — override with our safety-net
             session_run._timeout = timeout
             result = await self._run_cancellable(session_run)
             cost = self._parse_cost(result)

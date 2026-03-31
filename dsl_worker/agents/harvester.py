@@ -52,8 +52,11 @@ You are the candidate collector. Row generators downstream handle all enrichment
 (emails, phones, LinkedIn, verification). Your job is to discover and yield \
 candidate entities as efficiently as possible.
 
-**Yield generously.** If something looks like it could be a valid candidate, \
-submit it. Only skip things that are obviously wrong at a glance.
+**Yield generously, but glance before submitting.** If something looks like it \
+could be a valid candidate, submit it. But skip things that are obviously wrong \
+at a glance based on data you already have — e.g., a listing clearly dated \
+outside the requested time range, or an item in a completely wrong category. \
+Don't research to verify — just use what's already visible in the extracted data.
 
 **By default, don't research individual candidates.** When you're iterating a \
 list (directory, search results, file), just grab what's visible and move on. \
@@ -68,22 +71,36 @@ enrich — no email/phone/contact lookups. That's the row generator's job.
 
 **Web search** (built-in) — Use for general research: finding sources, \
 discovering list pages, looking up directories, verifying what's available. \
-Fast and cheap.
+Fast and cheap. 10x faster and cheaper than browse. Always try web search first.
 
-**browse(task)** — Full cloud browser. Use when you have a specific target site \
-AND need to interact with it: extract listings from JS-heavy pages, scroll \
-through paginated content, fill out search forms, bypass anti-bot/captcha. \
-Don't use browse for general googling — use web search for that.
+**browse(task)** — Full cloud browser. EXPENSIVE and SLOW (1-5 minutes per call). \
+Use ONLY when you have a specific URL AND need a real browser to extract from it \
+(JS-heavy pages, infinite scroll, anti-bot, forms). Never use browse for general \
+searching or research — use web search for that.
+
+### How to use browse effectively
+
+Browse works in **page-scoped batches**. Each call should target ONE page:
+- Give it a specific URL + what to extract. E.g.: "Go to apartments.com/pmc/seattle-wa/ \
+and extract all property management company listings."
+- Browse extracts what's visible on that page and returns items + a report.
+- YOU (the harvester) decide what to do next based on the report: send browse \
+to page 2? A different URL? Enough candidates?
+- Do NOT ask browse to explore a site, follow links, or find more pages. \
+That's YOUR job using web search.
+- If browse reports "blocked" (anti-bot), don't retry the same URL. Try a \
+different source or search approach.
 
 ## How to Work
 
 1. Use **web search** to find the right sources, URLs, and list pages.
-2. Use **browse** to extract candidate lists from specific sites that need \
-a real browser (JS rendering, pagination, anti-bot).
-3. Submit each candidate with whatever data is visible. Even just a name is \
+2. Use **browse** to extract from specific pages that need a real browser.
+3. Read the browse report — if it says pagination exists, decide whether \
+to send browse to the next page or if you have enough candidates.
+4. Submit each candidate with whatever data is visible. Even just a name is \
 enough — row generators handle enrichment.
-4. After extracting what's available, respond with a short report.
-5. Call done() only when the source is fully exhausted.
+5. After each browse batch, respond with a short report of your own.
+6. Call done() only when the source is fully exhausted.
 
 ## File Sources
 
@@ -103,6 +120,8 @@ Each call adds one candidate to the buffer.
 - One harvester = one specific search/query/page. Don't try to cover multiple \
 search terms or slices in one harvester.
 - Submit candidates quickly. A name + any visible context is sufficient.
+- Only include URLs you actually saw in search results or on a page. \
+Never construct or guess URLs — many sites use IDs or slugs that can't be inferred from titles.
 - Do NOT enrich individual candidates (no email/phone/LinkedIn lookups).
 - After extracting a batch, STOP and report.
 
@@ -116,7 +135,7 @@ class HarvesterAgent:
     """
     Harvester — navigates sources and produces candidates in batches.
 
-    Uses BU V3 SDK for web extraction (bu-mini, server-side).
+    Uses BU V3 SDK for web extraction (bu-max, server-side).
     Code_exec for file sources (sandbox).
     BU sessions are reused between batches for efficiency.
     """
@@ -257,26 +276,36 @@ class HarvesterAgent:
 
     # ── BU V3 SDK extraction ─────────────────────────────────────────
 
-    async def _run_bu_extract(self, url: str, task: str) -> Tuple[str, float]:
+    async def _run_bu_extract(self, task: str) -> Tuple[str, float]:
         """Extract candidates from a page via BU V3 SDK with session reuse."""
         async with self._bu_lock:
-            return await self._run_bu_extract_inner(url, task)
+            return await self._run_bu_extract_inner(task)
 
-    async def _run_bu_extract_inner(self, url: str, task: str) -> Tuple[str, float]:
+    async def _run_bu_extract_inner(self, task: str) -> Tuple[str, float]:
         scope_id = f"harvester:{self.harvester_index}"
 
         bu_task = (
-            f"Navigate to: {url}\n\n{task}\n\n"
-            "Extract ALL items from the page using JavaScript/evaluate where possible. "
-            "Include all visible fields (title, URL, description, price, date, etc.). "
-            "Be fast — extract and return, don't over-explore."
-        ) if url else task
+            f"{task}\n\n"
+            "INSTRUCTIONS:\n"
+            "- Extract items visible on THIS page only. Use JavaScript/evaluate to "
+            "parse the DOM programmatically where possible.\n"
+            "- Include all visible fields per item (title, URL, description, price, "
+            "date, etc.).\n"
+            "- Do NOT navigate away, follow links, or explore the rest of the site. "
+            "Stay on this page.\n"
+            "- If anti-bot or CAPTCHA blocks you after 2 attempts, STOP and report "
+            "'blocked' — do not keep retrying.\n"
+            "- After extracting, end with a brief REPORT: how many items you found, "
+            "whether pagination or 'load more' exists (and total pages/items if "
+            "visible), and any other navigation you noticed (tabs, filters, "
+            "categories) that could yield more candidates."
+        )
 
-        logger.info(f"[{scope_id}] BU extract START: {url[:80] if url else 'no url'}")
+        logger.info(f"[{scope_id}] BU extract START: {task[:100]}")
         t0 = time.time()
 
         try:
-            items, bu_cost, session_id = await self.bu_client.extract(
+            items, bu_cost, session_id, bu_summary = await self.bu_client.extract(
                 bu_task,
                 session_id=self._bu_session_id,
                 keep_alive=True,
@@ -295,10 +324,15 @@ class HarvesterAgent:
                 f"{elapsed:.1f}s, ${bu_cost:.4f}"
             )
 
-            return (
+            # Include BU's summary so the harvester can act on pagination/nav info
+            report = (
                 f"Extracted {len(items)} candidates from the page.\n"
                 f"Total candidates this session: {self._candidates_total}"
-            ), bu_cost
+            )
+            if bu_summary:
+                report += f"\nBrowser report: {bu_summary[:500]}"
+
+            return report, bu_cost
 
         except Exception as e:
             elapsed = time.time() - t0
@@ -319,14 +353,17 @@ class HarvesterAgent:
             task = args.get("task", "")
             if not task:
                 return "Error: task is required", 0.0
-            return await self._run_bu_extract("", task)
+            return await self._run_bu_extract(task)
 
         registry.add(
             name="browse",
             description=(
-                "Launch a full cloud browser to navigate pages and extract candidates. "
-                "The browser can search, navigate, scroll, bypass anti-bot, and extract "
-                "structured data. Each extracted item is buffered as a candidate."
+                "Launch a full cloud browser to extract candidates from a specific page. "
+                "EXPENSIVE (~$0.10-0.50 per call, 1-5 min). Use only when web search "
+                "can't get the data (JS-heavy pages, anti-bot, forms, infinite scroll). "
+                "Give it ONE specific URL + extraction task per call. It returns extracted "
+                "items plus a report on pagination/navigation it saw. "
+                "Cannot process video or audio — don't use on YouTube, TikTok, etc."
             ),
             parameters={
                 "type": "object",
@@ -334,8 +371,10 @@ class HarvesterAgent:
                     "task": {
                         "type": "string",
                         "description": (
-                            "What to do. E.g.: 'Go to apartments.com/pmc/seattle-wa/ "
-                            "and extract all property management company listings.'"
+                            "A specific URL + what to extract from THAT page. "
+                            "E.g.: 'Go to apartments.com/pmc/seattle-wa/ and "
+                            "extract all property management company listings.' "
+                            "Keep it to one page — don't ask it to explore the site."
                         ),
                     },
                 },
@@ -350,7 +389,7 @@ class HarvesterAgent:
                 registry,
                 exclude=[
                     "brave_search", "open", "find", "click",
-                    "interact", "shell_exec",
+                    "shell_exec",
                 ],
             )
 
