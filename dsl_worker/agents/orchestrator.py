@@ -100,18 +100,42 @@ concerns, or enough quality rows.
 
 ## Strategy
 
-**Budget hint:** Aim for ~$2 to produce the first row (exploration budget). \
-Once you know cost-per-row from real results, optimize. A source is expensive \
-or cheap RELATIVE to other sources, not in absolute terms.
+### The game you're playing
+
+You have a budget of roughly $2 to get the first row produced. After that, \
+optimize cost-per-row. Sources are expensive or cheap RELATIVE to each other, \
+not in absolute terms.
+
+### Decision making at every check-in
+
+The default action is **do nothing**. Only intervene when the dashboard shows \
+a clear signal:
+
+1. **Source has an error or is blocked** → kill it, try something different.
+2. **Source has enough data to judge AND it's bad** (high skip rate, high cost \
+relative to other sources, zero rows after processing a full batch of candidates) \
+→ kill it.
+3. **All sources exhausted and more rows needed** → create new sources.
+4. **Target reached or budget exhausted** → finish.
+
+**CRITICAL: Do NOT kill sources that are still on their first batch.** A source \
+showing "harvesting (first batch)" in the dashboard is still working — it hasn't \
+had a chance to produce candidates yet. Web harvesting takes 30-120 seconds per \
+batch. Killing a source before it completes its first batch wastes the money you \
+already spent starting it. Wait for at least one completed batch before judging.
+
+**Restarting is expensive.** Every time you kill a source and start a new one, \
+you pay orchestrator LLM cost + harvester startup + new BU session. If you've \
+spent $0.20 on a source, killing it and trying something new costs another $0.20+. \
+That's $0.40 with zero rows. Be patient when you don't have signal yet.
+
+### Source strategy
 
 - **Apollo first for B2B.** Free search, cheap enrichment. Always try before web.
-- **Start small, observe, scale.** Create 1-2 harvesters, see results, then decide.
-- **React to the dashboard.** High skip rate? Kill it, try different keywords. \
-High cost but good rows? Acceptable if it's the best source. Zero rows after \
-a batch? Definitely kill it.
+- **Start small, observe, scale.** Create 2-3 harvesters, wait for first batches \
+to complete, see results, THEN decide if you need more or different sources.
 - **Sources are slices.** "upwork: dataset" and "upwork: lead list" are different \
-harvesters. Don't make multiple harvesters for depth (page 1, page 2) — each \
-harvester handles its own pagination.
+harvesters. Each handles its own pagination internally.
 - **Uploaded files are the candidates** when present. Don't spawn web harvesters \
 if the user uploaded a CSV — create a harvester pointed at the file.
 
@@ -119,8 +143,9 @@ if the user uploaded a CSV — create a harvester pointed at the file.
 
 After each decision, set when you want the next check-in:
 - Include "NEXT_CHECKIN: Xs" or "NEXT_CHECKIN: $X" in your response (time or cost)
-- Be conservative — shorter intervals when uncertain, longer when things are stable
-- Default: 60s if you don't specify
+- If sources are still on their first batch, use a longer interval (90-120s)
+- If rows are flowing and things are stable, use a longer interval (120-180s)
+- If something looks wrong and you want to watch it, use a shorter interval (30-60s)
 
 Today's date: {current_date}
 
@@ -166,7 +191,6 @@ class OrchestratorAgent:
         sandbox: Optional[Any] = None,
         stop_checker: Optional[Callable[[], bool]] = None,
         stop_event: Optional[asyncio.Event] = None,
-        cost_checker: Optional[Callable[[], tuple[bool, Optional[str]]]] = None,
         blob_service_client: Optional[Any] = None,
         project_id: Optional[Any] = None,
         on_tool_call: Optional[Callable[[str, str], None]] = None,
@@ -192,7 +216,6 @@ class OrchestratorAgent:
         self.sandbox = sandbox
         self.stop_checker = stop_checker
         self.stop_event = stop_event
-        self.cost_checker = cost_checker
         self.blob_service_client = blob_service_client
         self.project_id = project_id
         self.on_tool_call = on_tool_call
