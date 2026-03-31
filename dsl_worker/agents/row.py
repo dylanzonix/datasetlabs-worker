@@ -190,13 +190,18 @@ call apollo_enrich / apollo_enrich_company FIRST. These are instant (<1s) and \
 return name, email, phone, company details, LinkedIn. Wait for results before \
 doing anything else.
 
-**Step 2: Fill what you have.** Use set_column() for everything you already \
-know from the candidate data + enrichment results.
+**Step 2: Verify the candidate.** If the candidate has a URL, do a quick web \
+search for it to confirm the data is current. Candidate data comes from search \
+snippets which may be stale (cached dates, removed listings). Use the live page \
+as the source of truth — if the page is gone or the data doesn't match, skip it.
+
+**Step 3: Fill columns.** Use set_column() for everything you know from the \
+verified candidate data + enrichment results.
    - When you set a column, the system warns if similar values exist. \
 If the match is close on something unique (name, URL, email), call \
 mark_duplicate(reason="...").
 
-**Step 3: Research only what's missing.** If columns are still empty after \
+**Step 4: Research only what's missing.** If columns are still empty after \
 enrichment, THEN do web research:
    - **Use web search** (built-in) for almost everything — looking up company \
 info, finding contact names, checking team pages, verifying a company, finding \
@@ -208,11 +213,11 @@ info you need AND you believe a live browser could succeed — e.g., the data is
 behind a login, requires filling a form, is on an infinite-scroll feed, or the \
 site actively blocks search indexing. This is rare.
 
-**Step 4: Submit or skip.**
+**Step 5: Submit or skip.**
    - Call submit_row() when all columns are filled.
    - Call skip_row(reason="...") if the candidate doesn't qualify.
 
-**IMPORTANT: Work sequentially.** Enrich → fill → research gaps → fill → submit. \
+**IMPORTANT: Work sequentially.** Enrich → verify → fill → research gaps → fill → submit. \
 Do NOT call apollo_enrich and browse at the same time. Enrichment is instant; \
 wait for it and see what you still need before launching expensive web research.
 
@@ -230,9 +235,13 @@ call skip_row(reason="...").
 column rather than making something up.
 - When calling set_column, include sources if you know where the value came from. \
 Each source has a type: "url" (with the URL), "file" (with the file number from \
-the file list), "enrichment" (for business database lookups — no value needed), \
-or "note" (free-form context like "No direct line found"). Multiple sources OK. \
-Not required for every column — just include when you have a clear source.
+the file list), or "enrichment" (for business database lookups — no value needed). \
+Multiple sources OK. Not required for every column — just include when you have a \
+clear source.
+- Always cite the actual URL you found information on. If you got it from web \
+search results, use the URL from those results — don't reuse the candidate URL \
+if it didn't actually load the right content. Never describe a source in prose \
+when you can just include the URL.
 - Capitalize values properly — "Not found" not "not found", "N/A" not "n/a".
 """
 
@@ -434,17 +443,17 @@ class RowGeneratorAgent:
                             "properties": {
                                 "type": {
                                     "type": "string",
-                                    "enum": ["url", "file", "enrichment", "note"],
+                                    "enum": ["url", "file", "enrichment"],
                                     "description": (
                                         "url = web page, file = uploaded file (use file number), "
-                                        "enrichment = business directory, note = free-form context"
+                                        "enrichment = business directory"
                                     ),
                                 },
                                 "value": {
                                     "type": "string",
                                     "description": (
                                         "URL for url type, file number for file type, "
-                                        "text for note type. Omit for enrichment."
+                                        "Omit for enrichment."
                                     ),
                                 },
                             },
@@ -668,7 +677,7 @@ class RowGeneratorAgent:
                 registry,
                 exclude=[
                     "brave_search", "open", "find", "click",
-                    "interact", "shell_exec",
+                    "shell_exec",
                 ],
                 include_builtins=False,
             )
@@ -690,7 +699,7 @@ class RowGeneratorAgent:
                 "Launch a full cloud browser for tasks that need live interaction, "
                 "anti-bot bypass, JS rendering, captcha solving, or accessing content "
                 "that wouldn't be indexed. Slow and expensive — prefer web search for "
-                "simple lookups."
+                "simple lookups. Cannot process video or audio — don't use on YouTube, TikTok, etc."
             ),
             parameters={
                 "type": "object",
