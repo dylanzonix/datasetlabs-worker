@@ -117,8 +117,10 @@ has completed a batch), you probably don't have enough information to act on.
 
 ## Check-in Protocol
 
-After each decision, include "NEXT_CHECKIN: Xs" in your response. Use your \
-judgment on the interval.
+Before the first row is produced, check-ins happen automatically every 60s or \
+$0.50 spent (whichever comes first). After the first row, you control the \
+interval via the set_checkin tool — set both a time and cost threshold based \
+on how things are going.
 
 Today's date: {current_date}
 
@@ -755,6 +757,41 @@ class OrchestratorAgent:
             handler=finish,
         )
 
+        # --- set_checkin ---
+        async def set_checkin(args: Dict) -> tuple[str, float]:
+            seconds = args.get("seconds", 120)
+            cost = args.get("cost", 1.0)
+            self._checkin_interval = max(15.0, min(300.0, float(seconds)))
+            self._checkin_cost_trigger = max(0.10, float(cost))
+            return (
+                f"Next check-in: {self._checkin_interval:.0f}s or "
+                f"${self._checkin_cost_trigger:.2f} spent, whichever first."
+            ), 0.0
+
+        registry.add(
+            name="set_checkin",
+            description=(
+                "Set the next check-in interval. Available after the first row "
+                "is produced. Set both a time and cost threshold — whichever "
+                "triggers first fires the check-in."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "seconds": {
+                        "type": "number",
+                        "description": "Seconds until next check-in (15-300)",
+                    },
+                    "cost": {
+                        "type": "number",
+                        "description": "Dollar amount spent that triggers check-in (e.g. 0.50)",
+                    },
+                },
+                "required": ["seconds", "cost"],
+            },
+            handler=set_checkin,
+        )
+
     # ── Apollo tools ──────────────────────────────────────────────────
 
     def _register_apollo_tools(self, registry: ToolRegistry) -> None:
@@ -1199,16 +1236,7 @@ class OrchestratorAgent:
             return True
         return False
 
-    def _parse_checkin_interval(self, text: str) -> None:
-        """Parse NEXT_CHECKIN from orchestrator's response."""
-        import re
-        match = re.search(r'NEXT_CHECKIN:\s*(\d+)\s*s', text, re.IGNORECASE)
-        if match:
-            self._checkin_interval = max(15.0, min(300.0, float(match.group(1))))
-            return
-        match = re.search(r'NEXT_CHECKIN:\s*\$?([\d.]+)', text, re.IGNORECASE)
-        if match:
-            self._checkin_cost_trigger = max(0.10, float(match.group(1)))
+    # Check-in interval is set via set_checkin tool, not string parsing
 
     # ── Run ───────────────────────────────────────────────────────────
 
@@ -1255,7 +1283,7 @@ class OrchestratorAgent:
             # First check-in
             result = await self._conversation.send(initial_msg)
             if result and result.text:
-                self._parse_checkin_interval(result.text)
+                pass  # check-in interval set via set_checkin tool
 
             # Check-in loop
             while not self._should_exit():
@@ -1268,7 +1296,7 @@ class OrchestratorAgent:
                 result = await self._conversation.send(dashboard)
 
                 if result and result.text:
-                    self._parse_checkin_interval(result.text)
+                    pass  # check-in interval set via set_checkin tool
 
                 self._maybe_checkpoint()
 
