@@ -112,8 +112,21 @@ Each handles its own pagination.
 
 **At each check-in:** Read the dashboard. Use your judgment. The dashboard shows \
 what each source has produced, what it cost, and what status it's in. Killing and \
-restarting costs money too — factor that in. If you have no signal yet (nothing \
-has completed a batch), you probably don't have enough information to act on.
+restarting costs money too — factor that in.
+
+**When to do nothing (most important skill):**
+- If pending candidates >> generator slots (e.g. 50+ pending, 10/10 generators active), \
+the bottleneck is processing, not harvesting. Creating more harvesters just adds \
+to the backlog and wastes harvester cost. Let the pipeline drain.
+- If sources are still on their first batch, they haven't had a chance yet. Wait.
+- If things are flowing (rows being produced, cost reasonable), don't intervene. \
+Doing nothing is usually the right call when the pipeline is healthy.
+
+**When to act:**
+- A source has been running a while with 0 candidates AND high BU-live cost — kill it.
+- All sources exhausted and pipeline is draining — maybe create more if target isn't met.
+- A source's skip/dupe rate is very high compared to others — kill it.
+- Processing is idle (0 pending, generators idle) but target not reached — need more sources.
 
 ## Check-in Protocol
 
