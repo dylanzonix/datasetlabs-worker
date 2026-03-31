@@ -116,6 +116,7 @@ class CandidateDispatcher:
         self._source_queues: Dict[str, List[_PendingCandidate]] = {}
         self._source_results: Dict[str, SourceResults] = {}
         self._source_order: List[str] = []
+        self._stream_tokens: Dict[str, BatchToken] = {}  # for streaming candidates
 
         # Tracking
         self._active_tasks: set = set()
@@ -177,6 +178,51 @@ class CandidateDispatcher:
 
         self._pending_batch_tokens.append(token)
         self._has_work.set()
+        return token
+
+    def stream_candidate(self, source_id: str, candidate: Candidate) -> None:
+        """Stream a single candidate immediately (called from harvester callback).
+
+        Uses a per-source streaming token. The harvester loop calls
+        finalize_stream() after run_batch() returns to wait for all
+        streamed candidates to be processed (backpressure).
+        """
+        if source_id not in self._source_queues:
+            self.add_source(source_id)
+
+        # Get or create the streaming token for this source
+        if source_id not in self._stream_tokens:
+            self._stream_tokens[source_id] = BatchToken(source_id=source_id, count=0)
+            self._pending_batch_tokens.append(self._stream_tokens[source_id])
+
+        token = self._stream_tokens[source_id]
+        token.count += 1
+
+        results = self._source_results[source_id]
+        results.candidates_total += 1
+        results.pending += 1
+
+        self._source_queues[source_id].append(
+            _PendingCandidate(
+                candidate=candidate,
+                source_id=source_id,
+                batch_token=token,
+            )
+        )
+        self._has_work.set()
+
+    def finalize_stream(self, source_id: str) -> Optional[BatchToken]:
+        """Finalize the streaming token for a source after run_batch() returns.
+
+        Returns the token to await for backpressure (or None if no candidates
+        were streamed). Creates a fresh token for the next batch.
+        """
+        token = self._stream_tokens.pop(source_id, None)
+        if token and token.count == 0:
+            token.event.set()
+            return None
+        if token and token.completed >= token.count:
+            token.event.set()
         return token
 
     # ── Results ───────────────────────────────────────────────────

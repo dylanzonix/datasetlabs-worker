@@ -598,6 +598,7 @@ class OrchestratorAgent:
                 uploaded_file_urls=self.uploaded_file_urls,
                 uploaded_files=self.uploaded_files,
                 mcp_tools=self.mcp_tools,
+                on_candidate=lambda c, sid=source_id: self._dispatcher.stream_candidate(sid, c),
             )
 
             state = SourceState(
@@ -673,6 +674,8 @@ class OrchestratorAgent:
                     logger.warning(f"[orchestrator] Error closing {source_id}: {e}")
 
             state.exhausted = True
+            # Finalize any streamed candidates so they get processed
+            self._dispatcher.finalize_stream(source_id)
             # Don't remove from dispatcher — let remaining buffer drain
             self._dispatcher.remove_source(source_id)
 
@@ -1237,16 +1240,15 @@ class OrchestratorAgent:
 
                 self._maybe_checkpoint()
 
-                if not candidates:
-                    if state.exhausted:
+                # Candidates were already streamed to dispatcher via on_candidate callback.
+                # Finalize the stream token and wait for backpressure.
+                token = self._dispatcher.finalize_stream(source_id)
+                if token:
+                    try:
+                        await token.event.wait()
+                    except asyncio.CancelledError:
                         break
-                    continue
-
-                # Push to dispatcher and wait for backpressure
-                token = self._dispatcher.submit_batch(source_id, candidates)
-                try:
-                    await token.event.wait()
-                except asyncio.CancelledError:
+                elif state.exhausted:
                     break
 
         except asyncio.CancelledError:
@@ -1498,10 +1500,11 @@ class OrchestratorAgent:
                     from dsl_worker.agents.harvester import HarvesterAgent
                     idx = int(src["id"].split(":")[1]) if ":" in src["id"] else 0
 
+                    sid = src["id"]
                     agent = HarvesterAgent(
                         source=src["source"],
                         description=src["description"],
-                        source_id=src["id"],
+                        source_id=sid,
                         openai_client=self.openai_client,
                         model=self.harvester_model,
                         workspace_dir=self.workspace_dir,
@@ -1517,6 +1520,7 @@ class OrchestratorAgent:
                         uploaded_file_urls=self.uploaded_file_urls,
                         uploaded_files=self.uploaded_files,
                         mcp_tools=self.mcp_tools,
+                        on_candidate=lambda c, s=sid: self._dispatcher.stream_candidate(s, c),
                     )
                     agent._conversation.messages = harvester_conv["messages"]
                     agent._conversation.total_cost = harvester_conv.get("total_cost", 0.0)

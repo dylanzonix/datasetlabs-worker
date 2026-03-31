@@ -159,6 +159,7 @@ class HarvesterAgent:
         uploaded_files: Optional[List[Dict[str, Any]]] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
         langfuse_parent: Optional[Any] = None,
+        on_candidate: Optional[Callable[[Candidate], None]] = None,
     ) -> None:
         self.source = source
         self.description = description
@@ -169,6 +170,7 @@ class HarvesterAgent:
         self.stop_checker = stop_checker
         self.on_tool_call = on_tool_call
         self.on_cost = on_cost
+        self._on_candidate = on_candidate
 
         # Batch state
         self._buffer: List[Candidate] = []
@@ -254,7 +256,7 @@ class HarvesterAgent:
     # ── Buffer management ─────────────────────────────────────────────
 
     def _add_to_buffer(self, content: Any, origin: str = "browse") -> None:
-        """Add a candidate to the internal buffer."""
+        """Add a candidate and stream it to the dispatcher immediately."""
         candidate = Candidate(
             values=content,
             source_id=self.source_id,
@@ -263,6 +265,8 @@ class HarvesterAgent:
         )
         self._buffer.append(candidate)
         self._candidates_total += 1
+        if self._on_candidate:
+            self._on_candidate(candidate)
 
     async def _handle_code_seed(self, seed_data: Dict) -> None:
         """Bridge code_exec submit_seed() calls to internal buffer."""
