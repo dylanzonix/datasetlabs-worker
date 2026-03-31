@@ -476,7 +476,7 @@ class JobProcessor:
         from dsl_worker.infra.bu_client import BUClient
         bu_client = BUClient(
             api_key=settings.browser_use_api_key,
-            model=getattr(settings, 'bu_model', 'bu-mini'),
+            model=getattr(settings, 'bu_model', 'bu-max'),
             stop_event=stop_event,
         )
 
@@ -532,7 +532,90 @@ class JobProcessor:
             except Exception as e:
                 logger.warning(f"[Pipeline] Checkpoint callback error: {e}")
 
-        logger.info("[Pipeline] Running V11 orchestrator")
+        logger.info("[Pipeline] Running V12 orchestrator")
+
+        # V12: Create dispatcher for automatic candidate → row processing
+        from dsl_worker.infra.dispatcher import CandidateDispatcher
+        from dsl_worker.agents.row import RowGeneratorAgent, GeneratedRow
+
+        generation_semaphore = asyncio.Semaphore(settings.generation_parallel_samples)
+        _save_lock = asyncio.Lock()
+
+        async def generate_row_fn(candidate, source_id):
+            """Row generation function passed to dispatcher."""
+            rows_done = generation_stats.get("rows_generated", 0)
+            if rows_done >= state.num_samples:
+                return GeneratedRow(success=False, skipped=True, skip_reason="target reached"), 0.0, False
+
+            def _row_stop():
+                if stop_checker and stop_checker():
+                    return True
+                return generation_stats.get("rows_generated", 0) >= state.num_samples
+
+            agent = RowGeneratorAgent(
+                openai_client=tracked_client,
+                model=settings.generation_model,
+                workspace_dir=workspace_dir,
+                chat_history=chat_history,
+                dedup_store=dedup_store,
+                bu_client=bu_client,
+                sandbox=self._sandbox,
+                stop_checker=_row_stop,
+                stop_event=stop_event,
+                blob_service_client=self.blob_service_client,
+                project_id=project.id,
+                uploaded_file_urls=uploaded_file_urls if uploaded_file_urls else None,
+                uploaded_files=uploaded_files if uploaded_files else None,
+                apollo_client=apollo_client,
+                mcp_tools=mcp_tools,
+                on_cost=on_cost,
+            )
+            try:
+                # Get source context from the source state description
+                source_context = candidate.source_context or ""
+                result = await agent.generate(
+                    candidate=candidate.values,
+                    schema=state.columns,
+                    source_context=source_context,
+                )
+
+                saved = False
+                if result.success and result.row:
+                    async with _save_lock:
+                        row_id = await save_row(
+                            result.row,
+                            tags={"sources": result.sources} if result.sources else {},
+                        )
+                        saved = row_id is not None
+                        if saved:
+                            generation_stats["rows_generated"] = (
+                                generation_stats.get("rows_generated", 0) + 1
+                            )
+                elif result.skipped:
+                    generation_stats["skipped"] = generation_stats.get("skipped", 0) + 1
+                else:
+                    generation_stats["errors"] = generation_stats.get("errors", 0) + 1
+
+                return result, result.cost_usd, saved
+
+            except asyncio.CancelledError:
+                return GeneratedRow(success=False, skipped=True, skip_reason="stopped"), 0.0, False
+            except Exception as e:
+                logger.error(f"Row generation error: {e}", exc_info=True)
+                return GeneratedRow(success=False, error=str(e)), 0.0, False
+            finally:
+                try:
+                    await agent.cleanup()
+                except Exception:
+                    pass
+
+        dispatcher = CandidateDispatcher(
+            generate_row_fn=generate_row_fn,
+            semaphore=generation_semaphore,
+            generation_stats=generation_stats,
+            num_samples=state.num_samples,
+            stop_checker=stop_checker,
+        )
 
         orchestrator = OrchestratorAgent(
             chat_history=chat_history,
@@ -544,6 +627,7 @@ class JobProcessor:
             generation_stats=generation_stats,
             dedup_store=dedup_store,
             save_row=save_row,
+            dispatcher=dispatcher,
             harvester_model=settings.seed_yielder_model,
             generation_model=settings.generation_model,
             uploaded_files=uploaded_files if uploaded_files else None,
@@ -807,8 +891,13 @@ class JobProcessor:
                 if "plan" in changes:
                     plan = changes["plan"]
                     if isinstance(plan, dict):
+                        title = plan.get("title", "")
+                        bullets = plan.get("bullets", [])
                         overview = plan.get("overview", "")
-                        if overview:
+                        if title and bullets:
+                            plan_text = f"{title}\n" + "\n".join(f"- {b}" for b in bullets)
+                            content += f"\n\n<plan>\n{plan_text}\n</plan>"
+                        elif overview:
                             content += f"\n\n<plan>\n{overview}\n</plan>"
                     elif isinstance(plan, str):
                         content += f"\n\n<plan>\n{plan}\n</plan>"
