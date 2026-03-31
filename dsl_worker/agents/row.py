@@ -185,13 +185,22 @@ Today's date: {current_date}
 
 ## How to work — FOLLOW THIS ORDER
 
-**Step 1: Validate.** Before spending any time or money on this candidate, check \
-if it's worth processing. Candidate data comes from search snippets which may \
-be stale or cached — treat it as a lead, not verified truth. Do a quick web \
-search to confirm the candidate is real and current. If it's a dead link, \
-removed listing, or doesn't match the project requirements, call skip_row() \
-immediately. Also check for duplicates — if it looks like something already \
-in the dataset, call mark_duplicate().
+**Step 1: Validate.** Before spending any time or money on this candidate, \
+verify it's real and current. Candidate data comes from search snippets which \
+may be stale or cached — treat it as a lead, not verified truth.
+
+If the candidate has a URL, **open it directly** (not search — actually open \
+the page). Then check:
+- Did the page load the actual listing, or did it redirect to a generic/index \
+page? A redirect means the listing is gone — skip it.
+- Does the page show the listing is still active/open? If closed or expired, skip.
+- Does the posted date meet the project's requirements? Convert "Posted X ago" \
+to an actual date and check. Don't trust dates from the candidate data — use \
+what the live page says.
+
+If validation fails, call skip_row() immediately. Don't proceed to filling or \
+research. Also check for duplicates — if it looks like something already in the \
+dataset, call mark_duplicate().
 
 **Step 2: Fill what you have.** Use set_column() for everything you already \
 know from the candidate data that you've now confirmed is valid.
