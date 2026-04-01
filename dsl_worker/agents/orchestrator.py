@@ -278,7 +278,7 @@ class OrchestratorAgent:
             stop_checker=stop_checker,
             stop_event=stop_event,
             max_turns=max_turns,
-            reasoning={"effort": "high", "summary": "detailed"},
+            reasoning={"effort": "medium", "summary": "detailed"},
             label="orchestrator",
             continue_on_text=False,  # V12: we control the loop, not AgentConversation
             on_tool_call=on_tool_call,

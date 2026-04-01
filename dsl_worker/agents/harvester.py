@@ -228,7 +228,7 @@ class HarvesterAgent:
             stop_checker=stop_checker,
             stop_event=stop_event,
             max_turns=30,
-            reasoning={"effort": "high", "summary": "detailed"},
+            reasoning={"effort": "medium", "summary": "detailed"},
             label=f"harvester:{harvester_index}",
             on_tool_call=on_tool_call,
             on_cost=on_cost,

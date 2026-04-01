@@ -115,7 +115,7 @@ class AgentConversation:
             model="gpt-5.2",
             system_prompt="You are a research agent.",
             tools=tools,
-            reasoning={"effort": "high", "summary": "detailed"},
+            reasoning={"effort": "medium", "summary": "detailed"},
         )
 
         result = await agent.send("Research X topic")
@@ -154,7 +154,7 @@ class AgentConversation:
         self.max_turns = max_turns
         self.soft_turn_limit = soft_turn_limit
         self.max_output_tokens = max_output_tokens
-        self.reasoning = reasoning if reasoning is not None else {"effort": "high", "summary": "detailed"}
+        self.reasoning = reasoning if reasoning is not None else {"effort": "medium", "summary": "detailed"}
         self.label = label
         self.continue_on_text = continue_on_text
         self._consecutive_text_turns = 0  # for capping continue_on_text retries
@@ -478,9 +478,15 @@ class AgentConversation:
                     response, cost = result
                     usage_details = None
                     if hasattr(response, "usage") and response.usage:
+                        usage = response.usage
+                        output_tokens = getattr(usage, "output_tokens", 0) or 0
+                        # Extract reasoning tokens from output_tokens_details
+                        otd = getattr(usage, "output_tokens_details", None)
+                        reasoning_tokens = getattr(otd, "reasoning_tokens", 0) if otd else 0
                         usage_details = {
-                            "input": getattr(response.usage, "input_tokens", 0),
-                            "output": getattr(response.usage, "output_tokens", 0),
+                            "input": getattr(usage, "input_tokens", 0) or 0,
+                            "output": output_tokens,
+                            "reasoning": reasoning_tokens,
                         }
                     gen_obs.update(
                         output=_serialize_response_output(response.output),

@@ -997,7 +997,7 @@ class RowGeneratorAgent:
             stop_checker=self.stop_checker,
             stop_event=self.stop_event,
             max_turns=MAX_GENERATION_TURNS,
-            reasoning={"effort": "high", "summary": "detailed"},
+            reasoning={"effort": "medium", "summary": "detailed"},
             label="row_generator",
             on_cost=self.on_cost,
             extra_tools=all_extra_tools,

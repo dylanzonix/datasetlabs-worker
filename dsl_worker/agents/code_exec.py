@@ -111,7 +111,7 @@ class CodeExecAgent:
             stop_checker=stop_checker,
             max_turns=hard_cap,
             soft_turn_limit=soft_limit,
-            reasoning={"effort": "high", "summary": "detailed"},
+            reasoning={"effort": "medium", "summary": "detailed"},
             label="code_exec",
             on_tool_call=on_tool_call,
         )
