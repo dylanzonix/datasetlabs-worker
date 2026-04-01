@@ -51,7 +51,7 @@ class WorkerSettings(BaseSettings):
 
     # V10 pipeline settings
     research_subagent_model: str = "gpt-5.4"           # model for research subagents
-    seed_yielder_model: str = "gpt-5.4"               # model for harvesters
+    seed_yielder_model: str = "gpt-5-mini"              # model for harvesters
     max_research_subagents: int = 10             # cap on parallel research
     max_seed_yielders: int = 10                  # cap on parallel seed yielders
     orchestrator_max_turns: int = 40             # hard cap on orchestrator turns

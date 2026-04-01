@@ -19,6 +19,7 @@ The LLM judges whether matches are true duplicates based on context.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import random
@@ -989,6 +990,10 @@ class RowGeneratorAgent:
         web_search_tool = {"type": "web_search"}
         all_extra_tools = [web_search_tool] + self.mcp_tools
 
+        # Derive a prompt_cache_key from the system prompt so all row generators
+        # sharing the same prefix get routed to the same backend → cache hits.
+        cache_key = hashlib.sha256(system_prompt.encode()).hexdigest()[:16]
+
         conversation = AgentConversation(
             openai_client=self.openai_client,
             model=self.model,
@@ -1003,6 +1008,7 @@ class RowGeneratorAgent:
             extra_tools=all_extra_tools,
             langfuse_parent=self.langfuse_parent,
             continue_on_text=True,  # Retry on refusals — text is never valid output
+            prompt_cache_key=cache_key,
         )
 
         # Candidate goes in the user message (not system prompt) so the system

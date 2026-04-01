@@ -144,6 +144,7 @@ class AgentConversation:
         langfuse_parent: Optional[Any] = None,
         on_idle: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
         drain_events: Optional[Callable[[], str]] = None,
+        prompt_cache_key: Optional[str] = None,
     ) -> None:
         self.openai_client = openai_client
         self.model = model
@@ -173,6 +174,10 @@ class AgentConversation:
         # drain_events: called after tool execution to collect background updates.
         # Returns a string to append to the tool output, or "" if nothing pending.
         self.drain_events = drain_events
+        # prompt_cache_key: routing hint for Azure/OpenAI prompt caching.
+        # Requests sharing the same key are routed to the same backend,
+        # dramatically improving cache hit rates for identical system prompts.
+        self.prompt_cache_key = prompt_cache_key
 
         # Conversation state — this IS the context sent to the API each turn.
         # Contains user messages, reasoning items, assistant messages,
@@ -477,20 +482,34 @@ class AgentConversation:
                 try:
                     response, cost = result
                     usage_details = None
+                    cost_details = None
                     if hasattr(response, "usage") and response.usage:
                         usage = response.usage
+                        total_input_tokens = getattr(usage, "input_tokens", 0) or 0
                         output_tokens = getattr(usage, "output_tokens", 0) or 0
                         # Extract reasoning tokens from output_tokens_details
                         otd = getattr(usage, "output_tokens_details", None)
                         reasoning_tokens = getattr(otd, "reasoning_tokens", 0) if otd else 0
+                        # Extract cached input tokens
+                        itd = getattr(usage, "input_tokens_details", None)
+                        cached_tokens = getattr(itd, "cached_tokens", 0) if itd else 0
                         usage_details = {
-                            "input": getattr(usage, "input_tokens", 0) or 0,
+                            "input": total_input_tokens - cached_tokens,
                             "output": output_tokens,
                             "reasoning": reasoning_tokens,
+                            "input_cached_tokens": cached_tokens,
+                        }
+                        # Send actual cost so Langfuse doesn't recompute
+                        # (its model DB doesn't know our cached pricing)
+                        cost_details = {
+                            "input": cost.input_cost_usd,
+                            "output": cost.output_cost_usd,
+                            "input_cached_tokens": cost.cached_input_cost_usd,
                         }
                     gen_obs.update(
                         output=_serialize_response_output(response.output),
                         usage_details=usage_details,
+                        cost_details=cost_details,
                         metadata={"cost_usd": str(round(cost.total_cost_usd, 6))},
                     )
                 except Exception:
@@ -566,6 +585,8 @@ class AgentConversation:
             create_kwargs: Dict[str, Any] = {}
             if self.reasoning is not None:
                 create_kwargs["reasoning"] = self.reasoning
+            if self.prompt_cache_key is not None:
+                create_kwargs["prompt_cache_key"] = self.prompt_cache_key
 
             # Merge function tools with extra tools (MCP connectors, built-in web_search, etc.)
             all_tools = (self.tools.get_definitions() or []) + self.extra_tools
@@ -616,14 +637,14 @@ class AgentConversation:
             result.turns_taken = self.total_turns
 
             # Log cached token counts for prompt caching verification
-            if hasattr(response, "usage") and response.usage and logger.isEnabledFor(logging.DEBUG):
+            if hasattr(response, "usage") and response.usage:
                 usage = response.usage
                 input_tokens = getattr(usage, "input_tokens", 0)
                 cached = getattr(usage, "input_tokens_details", None)
                 cached_tokens = getattr(cached, "cached_tokens", 0) if cached else 0
-                if input_tokens > 0:
-                    logger.debug(
-                        f"[{self.label}] turn {turn} cache stats: "
+                if input_tokens > 0 and cached_tokens > 0:
+                    logger.info(
+                        f"[{self.label}] turn {turn} cache hit: "
                         f"{cached_tokens}/{input_tokens} input tokens cached "
                         f"({cached_tokens * 100 // input_tokens}%)"
                     )
