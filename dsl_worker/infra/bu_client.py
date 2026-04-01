@@ -100,15 +100,18 @@ class BUClient:
         for p in pending:
             p.cancel()
 
-        # Stop takes priority — if both finished, prefer stopping
+        # If the BU task completed, return its result even if stop also fired.
+        # Don't throw away finished work.
+        if task in done and not task.cancelled() and task.exception() is None:
+            return task.result()
+
+        # Stop fired and task isn't done — cancel it
         if stop_fut in done:
             task.cancel()
-            # Wait briefly for the task to die (avoids orphaned coroutines)
             try:
                 await asyncio.wait({task}, timeout=3.0)
             except Exception:
                 pass
-            # Stop the BU cloud session so it doesn't keep running
             sid = getattr(session_run, 'session_id', None)
             if not sid:
                 sid = getattr(session_run, '_session_id', None)
@@ -212,7 +215,42 @@ class BUClient:
                 pass
             if result.output and hasattr(result.output, "items"):
                 items = [item.data for item in result.output.items]
-                return items, cost, sid, summary
+                if items:
+                    return items, cost, sid, summary
+
+            # SDK returned 0 items. For keep_alive sessions, BU may still be
+            # updating the output after going idle. Re-poll the session to check.
+            if sid and keep_alive:
+                for retry in range(3):
+                    await asyncio.sleep(2.0)
+                    status_data = await self.get_session_status(sid)
+                    if not status_data:
+                        break
+                    # Check raw output via API
+                    import httpx
+                    async with httpx.AsyncClient(timeout=5.0) as http:
+                        resp = await http.get(
+                            f"https://api.browser-use.com/api/v3/sessions/{sid}",
+                            headers={"X-Browser-Use-API-Key": self._get_api_key()},
+                        )
+                        if resp.status_code == 200:
+                            d = resp.json()
+                            raw_output = d.get("output")
+                            if isinstance(raw_output, dict):
+                                raw_items = raw_output.get("items", [])
+                                if raw_items:
+                                    logger.info(
+                                        f"[BUClient] Retry poll #{retry+1} recovered "
+                                        f"{len(raw_items)} items from session {sid[:12]}"
+                                    )
+                                    try:
+                                        parsed = ExtractionResult.model_validate(raw_output)
+                                        items = [item.data for item in parsed.items]
+                                        cost = float(d.get("totalCostUsd", 0) or 0)
+                                        return items, cost, sid, summary
+                                    except Exception:
+                                        pass
+
             return [], cost, sid, summary
         except asyncio.CancelledError:
             logger.info("[BUClient] extract cancelled (stop requested)")
