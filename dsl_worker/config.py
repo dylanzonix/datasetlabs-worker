@@ -71,6 +71,9 @@ class WorkerSettings(BaseSettings):
     apollo_api_key: str = ""
     apollo_cost_per_credit: float = 0.0238  # $60 / 2520 credits
 
+    # Google APIs (Maps Places + YouTube Data v3, optional)
+    google_api_key: str = ""
+
     # Langfuse observability (optional — leave blank to disable)
     langfuse_secret_key: str = ""
     langfuse_public_key: str = ""

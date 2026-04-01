@@ -292,6 +292,8 @@ class RowGeneratorAgent:
         uploaded_file_urls: Optional[Dict[str, str]] = None,
         uploaded_files: Optional[List[Dict[str, Any]]] = None,
         apollo_client: Optional[ApolloClient] = None,
+        google_maps_client: Optional[Any] = None,
+        youtube_client: Optional[Any] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
         on_cost: Optional[Callable] = None,
         langfuse_parent: Optional[Any] = None,
@@ -307,6 +309,8 @@ class RowGeneratorAgent:
         self.dedup_store = dedup_store or DedupStore()
         self.bu_client = bu_client
         self.apollo_client = apollo_client
+        self.google_maps_client = google_maps_client
+        self.youtube_client = youtube_client
         self.uploaded_files = uploaded_files or []
         self.stop_checker = stop_checker
         self.stop_event = stop_event
@@ -695,6 +699,12 @@ class RowGeneratorAgent:
         if self.apollo_client:
             self._register_apollo_tools(registry)
 
+        # --- Google Maps (if available) ---
+        self._register_google_maps_tools(registry)
+
+        # --- YouTube (if available) ---
+        self._register_youtube_tools(registry)
+
         # --- browse: BU V3 SDK ---
         async def browse(args: Dict) -> tuple[str, float]:
             task = args.get("task", "")
@@ -882,6 +892,173 @@ class RowGeneratorAgent:
                 "required": ["domain"],
             },
             handler=apollo_enrich_company,
+        )
+
+    # ── Google Maps Places API ─────────────────────────────────────
+
+    def _register_google_maps_tools(self, registry) -> None:
+        """Register Google Maps tools if client is available."""
+        if not self.google_maps_client:
+            return
+
+        async def google_maps_search(args: Dict) -> tuple[str, float]:
+            query = args.get("query", "")
+            if not query:
+                return "Error: query is required", 0.0
+            data = await self.google_maps_client.text_search(query)
+            results = data.get("results", [])
+            if not results:
+                return "No results found.", 0.0
+            lines = [f"Found {len(results)} businesses:"]
+            for r in results:
+                name = r.get("name", "?")
+                addr = r.get("formatted_address", "?")
+                rating = r.get("rating", "N/A")
+                place_id = r.get("place_id", "")
+                lines.append(f"- {name} | {addr} | rating: {rating} | place_id: {place_id}")
+            if data.get("next_page_token"):
+                lines.append(f"\n(More results available)")
+            return "\n".join(lines), 0.0
+
+        registry.add(
+            name="google_maps_search",
+            description=(
+                "Search Google Maps for businesses by query. Returns up to 20 "
+                "results with name, address, rating, place_id. "
+                "Fast and cheap (~$0.003). Use for local business lookups."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query, e.g. 'towing companies in Fresno CA'",
+                    },
+                },
+                "required": ["query"],
+            },
+            handler=google_maps_search,
+        )
+
+        async def google_maps_details(args: Dict) -> tuple[str, float]:
+            place_id = args.get("place_id", "")
+            if not place_id:
+                return "Error: place_id is required", 0.0
+            result = await self.google_maps_client.place_details(place_id)
+            if not result:
+                return f"No details found for place_id '{place_id}'.", 0.0
+            return (
+                f"Name: {result.get('name', 'N/A')}\n"
+                f"Address: {result.get('formatted_address', 'N/A')}\n"
+                f"Phone: {result.get('formatted_phone_number', 'N/A')}\n"
+                f"Website: {result.get('website', 'N/A')}\n"
+                f"Google Maps: {result.get('url', 'N/A')}\n"
+                f"Rating: {result.get('rating', 'N/A')} ({result.get('user_ratings_total', 0)} reviews)\n"
+                f"Status: {result.get('business_status', 'N/A')}\n"
+                f"Types: {result.get('types', [])}"
+            ), 0.0
+
+        registry.add(
+            name="google_maps_details",
+            description=(
+                "Get full details for a Google Maps business by place_id: "
+                "phone, website, address, rating, reviews, business status. "
+                "Use after google_maps_search to get contact info."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "place_id": {
+                        "type": "string",
+                        "description": "Google Maps place_id from search results",
+                    },
+                },
+                "required": ["place_id"],
+            },
+            handler=google_maps_details,
+        )
+
+    # ── YouTube Data API ──────────────────────────────────────────────
+
+    def _register_youtube_tools(self, registry) -> None:
+        """Register YouTube tools if client is available."""
+        if not self.youtube_client:
+            return
+
+        async def youtube_search(args: Dict) -> tuple[str, float]:
+            query = args.get("query", "")
+            search_type = args.get("type", "video")
+            if not query:
+                return "Error: query is required", 0.0
+            data = await self.youtube_client.search(query, search_type=search_type)
+            items = data.get("items", [])
+            if not items:
+                return "No results found.", 0.0
+            lines = [f"Found {len(items)} {search_type}s:"]
+            for item in items:
+                if search_type == "channel":
+                    lines.append(f"- {item['title']} | {item['url']} | channel_id: {item.get('channel_id', '')}")
+                else:
+                    lines.append(f"- {item['title']} | {item['url']} | {item.get('channel_title', '')}")
+            return "\n".join(lines), 0.0
+
+        registry.add(
+            name="youtube_search",
+            description=(
+                "Search YouTube for videos or channels. Free. "
+                "Returns titles, URLs, channel names. "
+                "Use type='channel' to find YouTube creators."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    "type": {
+                        "type": "string",
+                        "description": "Search type: 'video' or 'channel'",
+                        "enum": ["video", "channel"],
+                    },
+                },
+                "required": ["query"],
+            },
+            handler=youtube_search,
+        )
+
+        async def youtube_channel_details(args: Dict) -> tuple[str, float]:
+            channel_ids = args.get("channel_ids", [])
+            if isinstance(channel_ids, str):
+                channel_ids = [c.strip() for c in channel_ids.split(",")]
+            if not channel_ids:
+                return "Error: channel_ids is required", 0.0
+            results = await self.youtube_client.channel_details(channel_ids)
+            if not results:
+                return "No channel details found.", 0.0
+            lines = []
+            for ch in results:
+                lines.append(
+                    f"{ch['name']} | {ch['subscriber_count']:,} subs | "
+                    f"{ch['view_count']:,} views | {ch['video_count']} videos | "
+                    f"country: {ch.get('country', '?')} | {ch['url']}"
+                )
+            return "\n".join(lines), 0.0
+
+        registry.add(
+            name="youtube_channel_details",
+            description=(
+                "Get YouTube channel stats: subscriber count, total views, "
+                "video count, country. Batch up to 50 channel IDs. Free."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "channel_ids": {
+                        "type": "string",
+                        "description": "Comma-separated channel IDs from search results",
+                    },
+                },
+                "required": ["channel_ids"],
+            },
+            handler=youtube_channel_details,
         )
 
     # ── BU V3 SDK web access ────────────────────────────────────────

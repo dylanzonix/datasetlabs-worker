@@ -160,6 +160,8 @@ class HarvesterAgent:
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
         langfuse_parent: Optional[Any] = None,
         on_candidate: Optional[Callable[[Candidate], None]] = None,
+        google_maps_client: Optional[Any] = None,
+        youtube_client: Optional[Any] = None,
     ) -> None:
         self.source = source
         self.description = description
@@ -171,6 +173,8 @@ class HarvesterAgent:
         self.on_tool_call = on_tool_call
         self.on_cost = on_cost
         self._on_candidate = on_candidate
+        self.google_maps_client = google_maps_client
+        self.youtube_client = youtube_client
 
         # Batch state
         self._buffer: List[Candidate] = []
@@ -374,6 +378,47 @@ class HarvesterAgent:
             },
             handler=browse,
         )
+
+        # --- Google Maps search (if available) ---
+        if self.google_maps_client:
+            async def google_maps_search(args: Dict) -> tuple[str, float]:
+                query = args.get("query", "")
+                if not query:
+                    return "Error: query is required", 0.0
+                data = await self.google_maps_client.text_search(query)
+                results = data.get("results", [])
+                if not results:
+                    return "No results found.", 0.0
+                lines = [f"Found {len(results)} businesses:"]
+                for r in results:
+                    name = r.get("name", "?")
+                    addr = r.get("formatted_address", "?")
+                    rating = r.get("rating", "N/A")
+                    place_id = r.get("place_id", "")
+                    lines.append(f"- {name} | {addr} | rating: {rating} | place_id: {place_id}")
+                if data.get("next_page_token"):
+                    lines.append(f"\n(More results available)")
+                return "\n".join(lines), 0.0
+
+            registry.add(
+                name="google_maps_search",
+                description=(
+                    "Search Google Maps for businesses. Returns up to 20 results "
+                    "with name, address, rating, place_id. Fast and cheap (~$0.003). "
+                    "Use for local business discovery instead of browse."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query, e.g. 'towing companies in Fresno CA'",
+                        },
+                    },
+                    "required": ["query"],
+                },
+                handler=google_maps_search,
+            )
 
         # --- code_exec + list_files from sandbox ---
         if self._sandbox_impl:

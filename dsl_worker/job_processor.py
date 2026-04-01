@@ -487,6 +487,20 @@ class JobProcessor:
             apollo_client = ApolloClient(api_key=settings.apollo_api_key)
             logger.info("[Pipeline] Apollo.io client initialized")
 
+        # Google Maps Places API (optional — for local business data)
+        google_maps_client = None
+        if settings.google_api_key:
+            from dsl_worker.infra.google_maps_client import GoogleMapsClient
+            google_maps_client = GoogleMapsClient(api_key=settings.google_api_key)
+            logger.info("[Pipeline] Google Maps client initialized")
+
+        # YouTube Data API (optional — for video/channel data)
+        youtube_client = None
+        if settings.google_api_key:
+            from dsl_worker.infra.youtube_client import YouTubeClient
+            youtube_client = YouTubeClient(api_key=settings.google_api_key)
+            logger.info("[Pipeline] YouTube client initialized")
+
         # Row saver — reuses GenerationWorkerPool's _save_row for DB writes
         row_saver = GenerationWorkerPool(
             workspace_dir=workspace_dir,
@@ -567,6 +581,8 @@ class JobProcessor:
                 uploaded_file_urls=uploaded_file_urls if uploaded_file_urls else None,
                 uploaded_files=uploaded_files if uploaded_files else None,
                 apollo_client=apollo_client,
+                google_maps_client=google_maps_client,
+                youtube_client=youtube_client,
                 mcp_tools=mcp_tools,
                 on_cost=on_cost,
             )
@@ -633,6 +649,8 @@ class JobProcessor:
             uploaded_files=uploaded_files if uploaded_files else None,
             bu_client=bu_client,
             apollo_client=apollo_client,
+            google_maps_client=google_maps_client,
+            youtube_client=youtube_client,
             sandbox=self._sandbox,
             stop_checker=stop_checker,
             stop_event=stop_event,

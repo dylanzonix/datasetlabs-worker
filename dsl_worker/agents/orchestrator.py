@@ -98,6 +98,15 @@ the dashboard shows something wrong and you need to understand why.
 **finish(reason)** — End the job early. Use when: target is reached, budget \
 concerns, or enough quality rows.
 
+## Integrations Available to Harvesters & Row Generators
+
+Harvesters and row generators have access to these integrations as tools:
+- **Apollo.io** — B2B contact/company enrichment (if configured)
+- **Google Maps** — local business search + details (name, address, phone, website, rating). \
+Much faster and cheaper than browse for local business data.
+- **YouTube** — video/channel search + channel stats (subscribers, views, country). \
+Free. Use for creator/influencer discovery.
+
 ## Strategy
 
 **The game:** Spend ~$2 to get the first row. Then optimize cost-per-row. \
@@ -193,6 +202,8 @@ class OrchestratorAgent:
         uploaded_file_urls: Optional[Dict[str, str]] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
         apollo_client: Optional[ApolloClient] = None,
+        google_maps_client: Optional[Any] = None,
+        youtube_client: Optional[Any] = None,
         feedback_context: Optional[Dict[str, Any]] = None,
         resume_context: Optional[Dict[str, Any]] = None,
         harvester_model: str = "",
@@ -219,6 +230,8 @@ class OrchestratorAgent:
         self.uploaded_files = uploaded_files
         self.mcp_tools = mcp_tools or []
         self.apollo_client = apollo_client
+        self.google_maps_client = google_maps_client
+        self.youtube_client = youtube_client
         self.harvester_model = harvester_model or model
         self.generation_model = generation_model or "gpt-5-mini"
 
@@ -605,6 +618,8 @@ class OrchestratorAgent:
                 uploaded_files=self.uploaded_files,
                 mcp_tools=self.mcp_tools,
                 on_candidate=lambda c, sid=source_id: self._dispatcher.stream_candidate(sid, c),
+                google_maps_client=self.google_maps_client,
+                youtube_client=self.youtube_client,
             )
 
             state = SourceState(
@@ -1527,6 +1542,8 @@ class OrchestratorAgent:
                         uploaded_files=self.uploaded_files,
                         mcp_tools=self.mcp_tools,
                         on_candidate=lambda c, s=sid: self._dispatcher.stream_candidate(s, c),
+                        google_maps_client=self.google_maps_client,
+                        youtube_client=self.youtube_client,
                     )
                     agent._conversation.messages = harvester_conv["messages"]
                     agent._conversation.total_cost = harvester_conv.get("total_cost", 0.0)
