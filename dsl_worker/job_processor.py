@@ -277,12 +277,22 @@ class JobProcessor:
         stop_event = asyncio.Event()
         stop_checker = self._make_stop_checker(state, stop_event)
 
+        # Track whether we stopped due to credit exhaustion
+        credit_exhausted = False
+
         # Per-turn cost callback — fires on every API call in every agent.
         async def on_cost(cost_usd: float, label: str):
+            nonlocal credit_exhausted
             try:
                 cost_tracker.add_cost(phase=label, cost_usd=cost_usd)
                 cost_tracker.charge_if_needed()
                 await checkpoint_mgr.add_cost(cost_usd)
+
+                # Stop the pipeline if credits are exhausted
+                if not credit_exhausted and not cost_tracker.has_sufficient_balance():
+                    credit_exhausted = True
+                    logger.warning("[Billing] Credits exhausted — stopping pipeline")
+                    stop_event.set()
             except Exception as e:
                 logger.error(f"[Billing] on_cost callback error: {e}")
 
