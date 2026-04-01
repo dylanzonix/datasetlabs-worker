@@ -103,6 +103,12 @@ concerns, or enough quality rows.
 **The game:** Spend ~$2 to get the first row. Then optimize cost-per-row. \
 Compare sources against each other — expensive or cheap is relative.
 
+**Understand the source before harvesting.** If you're not sure how to access \
+the data (e.g. unfamiliar site, unclear URL structure), do a few quick web \
+searches first. This is nearly free and prevents wasting money on harvesters \
+pointed at inaccessible pages. Skip this when the source is obvious (uploaded \
+files, Apollo, well-known site patterns).
+
 **Rules of thumb:**
 - Start with 2-3 harvesters max. More than that spreads the budget too thin.
 - Apollo first for B2B (free search, cheap enrichment).
