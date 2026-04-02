@@ -101,7 +101,7 @@ class JobProcessor:
         """
         def checker():
             state.refresh()
-            should_stop = self.should_stop or state.paused
+            should_stop = self.should_stop or state.paused or stop_event.is_set()
             if should_stop and not stop_event.is_set():
                 stop_event.set()
             return should_stop
@@ -292,6 +292,7 @@ class JobProcessor:
                 if not credit_exhausted and not cost_tracker.has_sufficient_balance():
                     credit_exhausted = True
                     logger.warning("[Billing] Credits exhausted — stopping pipeline")
+                    self.should_stop = True
                     stop_event.set()
             except Exception as e:
                 logger.error(f"[Billing] on_cost callback error: {e}")
