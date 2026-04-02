@@ -365,8 +365,15 @@ class CostTracker:
         return int(self.get_user_balance_credits() * CENTS_PER_CREDIT)
 
     def has_sufficient_balance(self) -> bool:
-        """Check if user has enough balance to continue."""
-        return self.get_user_balance_credits() > 0.01
+        """Check if user has enough balance to continue.
+
+        Compares DB balance against uncharged costs — if uncharged costs
+        exceed the balance, the user is effectively out of credits even
+        though the DB hasn't been updated yet.
+        """
+        balance = self.get_user_balance_credits()
+        uncharged = self.uncharged_credits
+        return (balance - uncharged) > 0.01
 
     def check_balance_and_charge(self) -> tuple[bool, Optional[str]]:
         """Combined check: charge if needed, then verify balance."""
