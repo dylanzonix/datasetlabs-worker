@@ -109,6 +109,8 @@ class JobProcessor:
 
     async def process_job(self, message_body: Dict[str, Any]) -> bool:
         """Process a job."""
+        # Reset stop flag from previous job (credit exhaustion sets this)
+        self.should_stop = False
 
         project_id_str = message_body.get("project_id")
         version_id_str = message_body.get("version_id")
