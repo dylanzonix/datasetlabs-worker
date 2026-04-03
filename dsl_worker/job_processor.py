@@ -487,7 +487,7 @@ class JobProcessor:
         from dsl_worker.infra.bu_client import BUClient
         bu_client = BUClient(
             api_key=settings.browser_use_api_key,
-            model="bu-max",
+            model="bu-mini",
             stop_event=stop_event,
         )
 

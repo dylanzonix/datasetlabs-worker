@@ -496,6 +496,7 @@ class AgentConversation:
                         usage_details = {
                             "input": total_input_tokens - cached_tokens,
                             "output": output_tokens,
+                            "total": total_input_tokens + output_tokens,
                             "reasoning": reasoning_tokens,
                             "input_cached_tokens": cached_tokens,
                         }
@@ -504,6 +505,7 @@ class AgentConversation:
                         cost_details = {
                             "input": cost.input_cost_usd,
                             "output": cost.output_cost_usd,
+                            "total": cost.total_cost_usd,
                             "input_cached_tokens": cost.cached_input_cost_usd,
                         }
                     gen_obs.update(
