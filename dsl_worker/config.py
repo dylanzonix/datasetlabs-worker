@@ -74,6 +74,9 @@ class WorkerSettings(BaseSettings):
     # Google APIs (Maps Places + YouTube Data v3, optional)
     google_api_key: str = ""
 
+    # Pipeline version (v12 = default, v13 = new blocking orchestrator)
+    pipeline_version: str = "v12"
+
     # Langfuse observability (optional — leave blank to disable)
     langfuse_secret_key: str = ""
     langfuse_public_key: str = ""

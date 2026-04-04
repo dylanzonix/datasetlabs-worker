@@ -1105,8 +1105,20 @@ class RowGeneratorAgent:
         # Backward compat: old callers may pass instructions kwarg
         instructions: Optional[str] = None,
         source_content: Optional[str] = None,
+        # V13 additions
+        note: Optional[str] = None,
+        preset_fields: Optional[Dict[str, str]] = None,
+        candidate_data: Optional[Any] = None,
     ) -> GeneratedRow:
-        """Generate a single row from a candidate."""
+        """Generate a single row from a candidate.
+
+        V13 additions:
+        - note: orchestrator's handoff briefing (included in system prompt)
+        - preset_fields: dict mapping {schema_column: candidate_field} for
+          pre-filling columns from candidate_data before the LLM runs
+        - candidate_data: structured candidate data (dict). If provided and
+          candidate is a string, this is used for preset_fields lookups.
+        """
         if schema is None:
             schema = []
 
@@ -1121,6 +1133,14 @@ class RowGeneratorAgent:
         self._is_duplicate = False
         self._skip_reason = ""
         self._schema = schema
+
+        # Normalize candidate_data: if it's a string, try to parse as JSON
+        if candidate_data is not None:
+            if isinstance(candidate_data, str):
+                try:
+                    candidate_data = json.loads(candidate_data)
+                except (json.JSONDecodeError, ValueError):
+                    candidate_data = None
 
         from datetime import date
         apollo_note = ""
@@ -1155,11 +1175,67 @@ class RowGeneratorAgent:
                 file_lines.append(f"  [{idx}] {f.get('filename', 'unknown')}")
             files_note = "\n".join(file_lines)
 
+        # V13: orchestrator note
+        note_section = ""
+        if note:
+            note_section = f"\n\nNote from orchestrator: {note}"
+
         system_prompt = ROW_GENERATOR_SYSTEM_PROMPT.format(
             conversation=self._format_conversation(),
             schema_str=schema_str,
             current_date=date.today().isoformat(),
-        ) + apollo_note + files_note
+        ) + apollo_note + files_note + note_section
+
+        # V13: pre-fill columns from preset_fields before the LLM starts.
+        # This uses the same validation + dedup logic as set_column.
+        prefilled_columns: List[str] = []
+        if preset_fields and isinstance(preset_fields, dict) and candidate_data and isinstance(candidate_data, dict):
+            for schema_col, candidate_field in preset_fields.items():
+                value = candidate_data.get(candidate_field)
+                if value is None:
+                    continue
+                # Validate against schema
+                col_def = None
+                for col in schema:
+                    if col.get("name") == schema_col:
+                        col_def = col
+                        break
+                if col_def:
+                    error = self._validate_value(col_def, value)
+                    if error:
+                        logger.debug(
+                            f"[row_gen] preset_fields: skipping {schema_col} — {error}"
+                        )
+                        continue
+
+                self._current_row[schema_col] = value
+                await self.dedup_store.register_in_flight(self._row_id, schema_col, value)
+
+                # Check for duplicates (same as set_column)
+                similar = await self.dedup_store.find_similar(schema_col, value, self._row_id)
+                if similar:
+                    # If high-confidence duplicate on a pre-filled column, skip early
+                    top_sim = similar[0][0]
+                    if top_sim >= 0.95:
+                        await self.dedup_store.remove_in_flight(self._row_id)
+                        return GeneratedRow(
+                            success=False, skipped=True, is_duplicate=True,
+                            skip_reason=f"Pre-fill dedup: {schema_col} matched existing row at {top_sim:.0%}",
+                            cost_usd=0.0,
+                        )
+
+                prefilled_columns.append(schema_col)
+
+        # Add pre-filled columns info to system prompt so the LLM knows
+        if prefilled_columns:
+            cols_str = ", ".join(prefilled_columns)
+            vals_str = ", ".join(
+                f"{c}={self._current_row[c]!r}" for c in prefilled_columns
+            )
+            system_prompt += (
+                f"\n\nPre-filled columns (already set, do not re-set unless wrong): "
+                f"{vals_str}"
+            )
 
         # Built-in web search (OpenAI/Bing grounded) — cheap, fast, pre-indexed.
         # Model uses this automatically for factual lookups. browse() (BU) is

@@ -189,6 +189,12 @@ class JobProcessor:
             # propagate_attributes sets session_id/user_id/tags on every
             # observation created within the block, including sub-agent spans
             # in asyncio tasks that inherit the contextvars context.
+            # Select pipeline version
+            pipeline_fn = self._run_pipeline
+            if settings.pipeline_version == "v13":
+                pipeline_fn = self._run_pipeline_v13
+                logger.info("[Pipeline] Using V13 pipeline")
+
             with propagate_attributes(
                 session_id=str(project_id),
                 user_id=str(project.user_id),
@@ -205,11 +211,11 @@ class JobProcessor:
                         as_type="span",
                         name=f"job:{project.name} v{version.version_number}",
                     ):
-                        result = await self._run_pipeline(
+                        result = await pipeline_fn(
                             db, project, version, state, tracked_client, cost_tracker,
                         )
                 else:
-                    result = await self._run_pipeline(
+                    result = await pipeline_fn(
                         db, project, version, state, tracked_client, cost_tracker
                     )
             return result
@@ -726,6 +732,416 @@ class JobProcessor:
         # COMPLETE — Check results
         # ====================================================================
 
+        await checkpoint_mgr.set_phase("completed")
+
+        state.refresh()
+        if state.paused:
+            await checkpoint_mgr.force_save()
+            self._handle_pause(db, project, version, cost_tracker)
+            return True
+
+        can_continue, stop_reason = cost_tracker.check_balance_and_charge()
+        if not can_continue:
+            await checkpoint_mgr.force_save()
+            self._handle_force_stop(db, project, version, cost_tracker, stop_reason)
+            return False
+
+        db.refresh(version)
+        generated = version.generated_count or 0
+        if generated > 0:
+            if generated < state.num_samples:
+                logger.warning(
+                    f"[Pipeline] Completed with {generated}/{state.num_samples} rows"
+                )
+            await checkpoint_mgr.force_save()
+            self._handle_completion(db, project, version, cost_tracker)
+            return True
+
+        await checkpoint_mgr.force_save()
+        self._handle_force_stop(db, project, version, cost_tracker, "No rows generated")
+        return False
+
+    async def _run_pipeline_v13(
+        self,
+        db: Session,
+        project: Project,
+        version: ProjectVersion,
+        state: ProjectState,
+        tracked_client: TrackedOpenAIClient,
+        cost_tracker: CostTracker,
+    ) -> bool:
+        """Run the V13 pipeline: blocking orchestrator, file-based candidate flow."""
+        from dsl_worker.agents.orchestrator_v13 import OrchestratorV13
+        from dsl_worker.agents.row import RowGeneratorAgent, GeneratedRow
+
+        # Create workspace
+        workspace_dir = Path(f"./workspace_{project.id}_{version.id}")
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+        (workspace_dir / "downloads").mkdir(exist_ok=True)
+        self._workspace_dir = workspace_dir
+
+        # Restore browser downloads from blob (survives pause/resume)
+        self._restore_downloads_from_blob(project.id, workspace_dir)
+
+        # Generate SAS URLs for uploaded files
+        uploaded_file_urls = self._generate_file_urls(db, project.id)
+
+        # Initialize sandbox client
+        self._sandbox = SandboxClient(settings.sandbox_service_url, timeout=150.0)
+        await self._sandbox.__aenter__()
+
+        # Initialize checkpoint manager
+        checkpoint_mgr = CheckpointManager(
+            blob_service_client=self.blob_service_client,
+            container_name=settings.azure_storage_container_name,
+            project_id=project.id,
+            version_id=version.id,
+        )
+        checkpoint = await checkpoint_mgr.initialize()
+
+        stop_event = asyncio.Event()
+        stop_checker = self._make_stop_checker(state, stop_event)
+
+        credit_exhausted = False
+
+        async def on_cost(cost_usd: float, label: str):
+            nonlocal credit_exhausted
+            try:
+                cost_tracker.add_cost(phase=label, cost_usd=cost_usd)
+                cost_tracker.charge_if_needed()
+                await checkpoint_mgr.add_cost(cost_usd)
+                if not credit_exhausted and not cost_tracker.has_sufficient_balance():
+                    credit_exhausted = True
+                    logger.warning("[Billing] Credits exhausted — stopping pipeline")
+                    self.should_stop = True
+                    stop_event.set()
+            except Exception as e:
+                logger.error(f"[Billing] on_cost callback error: {e}")
+
+        if checkpoint.total_cost_usd > 0:
+            cost_tracker.seed_from_checkpoint(checkpoint.total_cost_usd)
+
+        # Detect resume
+        db.refresh(version)
+        existing_row_count = version.generated_count or 0
+        is_resume = existing_row_count > 0
+
+        if is_resume:
+            logger.info(
+                f"[Pipeline] RESUMING: {existing_row_count}/{state.num_samples} rows "
+                f"already generated, checkpoint cost=${checkpoint.total_cost_usd:.4f}"
+            )
+
+        chat_history = self._load_chat_history(db, project.id)
+
+        # Build uploaded files metadata
+        project_files = (
+            db.query(ProjectFile)
+            .filter(
+                ProjectFile.project_id == project.id,
+                ProjectFile.deleted_at.is_(None),
+                ProjectFile.status == "uploaded",
+            )
+            .all()
+        )
+        uploaded_files = [
+            {
+                "filename": f.filename,
+                "content_type": f.content_type,
+                "size_bytes": f.size_bytes,
+            }
+            for f in project_files
+        ]
+
+        if uploaded_files and uploaded_file_urls:
+            uploaded_files = await self._enrich_file_metadata(
+                uploaded_files, uploaded_file_urls,
+            )
+
+        # Load connectors for MCP tools
+        connectors = (
+            db.query(ProjectConnector)
+            .filter(
+                ProjectConnector.project_id == project.id,
+                ProjectConnector.deleted_at.is_(None),
+            )
+            .all()
+        )
+        mcp_tools = self._build_mcp_tools(connectors)
+        self._mcp_tools = mcp_tools
+
+        logger.info(f"[Pipeline] Starting V13 pipeline with {len(chat_history)} chat messages")
+
+        # Shared state
+        generation_stats = {
+            "rows_generated": existing_row_count,
+            "errors": 0,
+            "skipped": 0,
+            "in_progress": 0,
+            "total_cost": checkpoint.total_cost_usd,
+        }
+
+        # Feedback context
+        feedback_context = None
+        if checkpoint.recipe:
+            try:
+                prev_config = json.loads(checkpoint.recipe)
+                feedback_msg = (
+                    db.query(ChatMessage)
+                    .filter(
+                        ChatMessage.project_id == project.id,
+                        ChatMessage.role == "user",
+                        ChatMessage.created_at > version.started_at,
+                    )
+                    .order_by(ChatMessage.created_at.desc())
+                    .first()
+                )
+                if feedback_msg:
+                    feedback_context = {
+                        "previous_config": prev_config,
+                        "user_feedback": feedback_msg.content,
+                    }
+            except (json.JSONDecodeError, Exception):
+                pass
+
+        # Progress tracking
+        version.progress_detail = {"phase": "orchestrating"}
+        db.commit()
+
+        dedup_store = DedupStore()
+
+        # Seed DedupStore with existing rows for resume
+        if is_resume:
+            from dsl_worker.agents.row import _tokenize
+            existing_samples = (
+                db.query(Sample)
+                .filter(Sample.version_id == version.id)
+                .all()
+            )
+            for sample in existing_samples:
+                row_data = sample.row or {}
+                row_id = str(sample.id)
+                dedup_store._submitted[row_id] = row_data
+                for col_name, value in row_data.items():
+                    dedup_store._token_cache[(row_id, col_name)] = _tokenize(value)
+            logger.info(f"[Pipeline] Seeded DedupStore with {len(existing_samples)} existing rows")
+
+        from dsl_worker.infra.bu_client import BUClient
+        bu_client = BUClient(
+            api_key=settings.browser_use_api_key,
+            model="bu-mini",
+            stop_event=stop_event,
+        )
+
+        apollo_client = None
+        if settings.apollo_api_key:
+            from dsl_worker.infra.apollo_client import ApolloClient
+            apollo_client = ApolloClient(api_key=settings.apollo_api_key)
+
+        google_maps_client = None
+        if settings.google_api_key:
+            from dsl_worker.infra.google_maps_client import GoogleMapsClient
+            google_maps_client = GoogleMapsClient(api_key=settings.google_api_key)
+
+        youtube_client = None
+        if settings.google_api_key:
+            from dsl_worker.infra.youtube_client import YouTubeClient
+            youtube_client = YouTubeClient(api_key=settings.google_api_key)
+
+        # Row saver
+        row_saver = GenerationWorkerPool(
+            workspace_dir=workspace_dir,
+            openai_client=tracked_client,
+            db_session=db,
+            project_id=project.id,
+            version_id=version.id,
+        )
+
+        async def save_row(row: Dict, tags: Dict = None) -> Optional[str]:
+            db.refresh(version)
+            if (version.generated_count or 0) >= state.num_samples:
+                return None
+            return await row_saver._save_row(row, tags=tags or {})
+
+        # Resume context
+        resume_context = None
+        if is_resume:
+            resume_context = {
+                "rows_generated": existing_row_count,
+                "target": state.num_samples,
+                "remaining": state.num_samples - existing_row_count,
+                "prior_cost_usd": checkpoint.total_cost_usd,
+                "previous_sources": (checkpoint.source_stats or {}).get("sources", []),
+            }
+
+        # V13 checkpoint callback
+        def on_checkpoint(orch):
+            try:
+                state_data = orch.export_state()
+                asyncio.create_task(checkpoint_mgr.save_pipeline_state(
+                    orchestrator_messages=state_data["orchestrator_conversation"]["messages"],
+                    orchestrator_cost=state_data["orchestrator_conversation"]["total_cost"],
+                    orchestrator_turns=state_data["orchestrator_conversation"]["total_turns"],
+                    sources=[],
+                    generation_stats=state_data["generation_stats"],
+                    harvester_counter=0,
+                    apollo_counter=0,
+                    research_counter=state_data.get("web_research_counter", 0),
+                ))
+            except Exception as e:
+                logger.warning(f"[Pipeline] Checkpoint callback error: {e}")
+
+        # Row generation function — V13 passes Candidate objects with metadata
+        _save_lock = asyncio.Lock()
+
+        async def generate_row_fn(candidate, source_id):
+            """Row generation function for V13 orchestrator."""
+            rows_done = generation_stats.get("rows_generated", 0)
+            if rows_done >= state.num_samples:
+                return GeneratedRow(success=False, skipped=True, skip_reason="target reached"), 0.0, False
+
+            def _row_stop():
+                if stop_checker and stop_checker():
+                    return True
+                return generation_stats.get("rows_generated", 0) >= state.num_samples
+
+            agent = RowGeneratorAgent(
+                openai_client=tracked_client,
+                model=settings.generation_model,
+                workspace_dir=workspace_dir,
+                chat_history=chat_history,
+                dedup_store=dedup_store,
+                bu_client=bu_client,
+                sandbox=self._sandbox,
+                stop_checker=_row_stop,
+                stop_event=stop_event,
+                blob_service_client=self.blob_service_client,
+                project_id=project.id,
+                uploaded_file_urls=uploaded_file_urls if uploaded_file_urls else None,
+                uploaded_files=uploaded_files if uploaded_files else None,
+                apollo_client=apollo_client,
+                google_maps_client=google_maps_client,
+                youtube_client=youtube_client,
+                mcp_tools=mcp_tools,
+                on_cost=on_cost,
+            )
+            try:
+                # Extract V13-specific fields from Candidate metadata
+                metadata = getattr(candidate, "metadata", {}) or {}
+                preset_fields = metadata.get("preset_fields")
+                candidate_data = metadata.get("candidate_data")
+                source_context = getattr(candidate, "source_context", "") or ""
+
+                result = await agent.generate(
+                    candidate=candidate.values,
+                    schema=state.columns,
+                    source_context=source_context,
+                    note=source_context,  # V13: note is the orchestrator's handoff briefing
+                    preset_fields=preset_fields,
+                    candidate_data=candidate_data,
+                )
+
+                saved = False
+                if result.success and result.row:
+                    async with _save_lock:
+                        row_id = await save_row(
+                            result.row,
+                            tags={"sources": result.sources} if result.sources else {},
+                        )
+                        saved = row_id is not None
+                        if saved:
+                            generation_stats["rows_generated"] = (
+                                generation_stats.get("rows_generated", 0) + 1
+                            )
+                elif result.skipped:
+                    generation_stats["skipped"] = generation_stats.get("skipped", 0) + 1
+                else:
+                    generation_stats["errors"] = generation_stats.get("errors", 0) + 1
+
+                return result, result.cost_usd, saved
+
+            except asyncio.CancelledError:
+                return GeneratedRow(success=False, skipped=True, skip_reason="stopped"), 0.0, False
+            except Exception as e:
+                logger.error(f"Row generation error: {e}", exc_info=True)
+                return GeneratedRow(success=False, error=str(e)), 0.0, False
+            finally:
+                try:
+                    await agent.cleanup()
+                except Exception:
+                    pass
+
+        # Build the V13 orchestrator
+        orchestrator = OrchestratorV13(
+            chat_history=chat_history,
+            columns=state.columns,
+            num_samples=state.num_samples,
+            openai_client=tracked_client,
+            model=settings.research_model,
+            workspace_dir=workspace_dir,
+            generation_stats=generation_stats,
+            dedup_store=dedup_store,
+            save_row=save_row,
+            generate_row_fn=generate_row_fn,
+            uploaded_files=uploaded_files if uploaded_files else None,
+            bu_client=bu_client,
+            sandbox=self._sandbox,
+            stop_checker=stop_checker,
+            stop_event=stop_event,
+            blob_service_client=self.blob_service_client,
+            project_id=project.id,
+            on_tool_call=None,
+            on_cost=on_cost,
+            on_checkpoint=on_checkpoint,
+            uploaded_file_urls=uploaded_file_urls if uploaded_file_urls else None,
+            mcp_tools=mcp_tools,
+            apollo_client=apollo_client,
+            google_maps_client=google_maps_client,
+            youtube_client=youtube_client,
+            feedback_context=feedback_context,
+            resume_context=resume_context,
+        )
+
+        # Restore state from checkpoint if resuming
+        if is_resume and checkpoint.has_v11_state:
+            orchestrator.restore_state({
+                "orchestrator_conversation": checkpoint.orchestrator_conversation,
+                "generation_stats": checkpoint.generation_stats,
+                "web_research_counter": checkpoint.research_counter or 0,
+                "bu_extract_counter": 0,
+                "current_file": None,
+            })
+
+        try:
+            result = await orchestrator.run()
+            logger.info(
+                f"[Pipeline] V13 orchestrator finished: "
+                f"cost=${orchestrator.cost_usd:.4f}, turns={result.turns_taken}"
+            )
+        finally:
+            try:
+                state_data = orchestrator.export_state()
+                await checkpoint_mgr.save_pipeline_state(
+                    orchestrator_messages=state_data["orchestrator_conversation"]["messages"],
+                    orchestrator_cost=state_data["orchestrator_conversation"]["total_cost"],
+                    orchestrator_turns=state_data["orchestrator_conversation"]["total_turns"],
+                    sources=[],
+                    generation_stats=state_data["generation_stats"],
+                    harvester_counter=0,
+                    apollo_counter=0,
+                    research_counter=state_data.get("web_research_counter", 0),
+                )
+                await checkpoint_mgr.force_save()
+            except Exception as e:
+                logger.warning(f"[Pipeline] Final checkpoint save error: {e}")
+
+            await orchestrator.cleanup()
+            await asyncio.sleep(0.5)
+            await bu_client.close()
+            if apollo_client:
+                await apollo_client.close()
+
+        # === COMPLETE — Check results ===
         await checkpoint_mgr.set_phase("completed")
 
         state.refresh()
