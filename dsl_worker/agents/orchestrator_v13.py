@@ -530,23 +530,20 @@ class OrchestratorV13:
             idx = self._web_research_counter
             self._web_research_counter += 1
             timestamp = int(time.time())
-            output_file = (
-                self.workspace_dir / "candidates"
-                / f"web_research_{idx}_{timestamp}.jsonl"
-            )
-            output_file.parent.mkdir(parents=True, exist_ok=True)
+            filename = f"web_research_{idx}_{timestamp}.jsonl"
 
             total_cost = 0.0
             candidates_found = 0
+            collected_lines: List[str] = []
 
             try:
                 # Build the subagent
                 sub_registry = ToolRegistry()
                 sub_system_prompt = self._build_web_research_prompt(
-                    query, candidate_description, str(output_file),
+                    query, candidate_description, f"/workspace/candidates/{filename}",
                 )
 
-                # yield_candidate tool — appends to the JSONL output file
+                # yield_candidate tool — accumulates lines in memory
                 async def yield_candidate(yc_args: Dict) -> Tuple[str, float]:
                     nonlocal candidates_found
                     data = yc_args.get("data", {})
@@ -554,8 +551,7 @@ class OrchestratorV13:
                         return "Error: data is required.", 0.0
                     try:
                         line = json.dumps(data, ensure_ascii=False)
-                        with open(output_file, "a", encoding="utf-8") as f:
-                            f.write(line + "\n")
+                        collected_lines.append(line)
                         candidates_found += 1
                         return f"Candidate #{candidates_found} saved.", 0.0
                     except Exception as e:
@@ -622,19 +618,18 @@ class OrchestratorV13:
                     f"available on the open web."
                 ), total_cost
 
-            # Read a sample for the summary
+            # Write all collected lines to sandbox + local
+            output_path = await self._write_candidates_file(
+                filename, "\n".join(collected_lines) + "\n"
+            )
+
+            # Build sample from collected lines
             sample_lines = []
-            try:
-                with open(output_file, "r", encoding="utf-8") as f:
-                    for i, line in enumerate(f):
-                        if i >= 3:
-                            break
-                        try:
-                            sample_lines.append(json.loads(line.strip()))
-                        except json.JSONDecodeError:
-                            pass
-            except Exception:
-                pass
+            for raw_line in collected_lines[:3]:
+                try:
+                    sample_lines.append(json.loads(raw_line))
+                except json.JSONDecodeError:
+                    pass
 
             sample_str = ""
             if sample_lines:
@@ -648,7 +643,7 @@ class OrchestratorV13:
 
             return (
                 f"Web research complete: {candidates_found} candidates found.\n"
-                f"File: {self._to_workspace_path(output_file)}\n"
+                f"File: {output_path}\n"
                 f"Cost: ${total_cost:.4f}{sample_str}"
             ), total_cost
 
@@ -716,11 +711,7 @@ class OrchestratorV13:
             idx = self._bu_extract_counter
             self._bu_extract_counter += 1
             timestamp = int(time.time())
-            output_file = (
-                self.workspace_dir / "candidates"
-                / f"bu_extract_{idx}_{timestamp}.jsonl"
-            )
-            output_file.parent.mkdir(parents=True, exist_ok=True)
+            filename = f"bu_extract_{idx}_{timestamp}.jsonl"
 
             try:
                 items, cost, session_id, summary = await self.bu_client.extract(
@@ -729,9 +720,14 @@ class OrchestratorV13:
                 )
 
                 if items:
-                    with open(output_file, "w", encoding="utf-8") as f:
-                        for item in items:
-                            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+                    # Build JSONL content
+                    lines = []
+                    for item in items:
+                        lines.append(json.dumps(item, ensure_ascii=False))
+
+                    output_path = await self._write_candidates_file(
+                        filename, "\n".join(lines) + "\n"
+                    )
 
                     # Build sample for summary
                     sample_str = ""
@@ -746,7 +742,7 @@ class OrchestratorV13:
 
                     return (
                         f"BU extraction complete: {len(items)} items extracted.\n"
-                        f"File: {self._to_workspace_path(output_file)}\n"
+                        f"File: {output_path}\n"
                         f"Cost: ${cost:.4f}\n"
                         f"BU summary: {summary[:300]}{sample_str}"
                     ), cost
@@ -973,11 +969,7 @@ class OrchestratorV13:
         async def apollo_search(args: Dict) -> Tuple[str, float]:
             page = args.get("page", 1)
             timestamp = int(time.time())
-            output_file = (
-                self.workspace_dir / "candidates"
-                / f"apollo_people_{timestamp}.jsonl"
-            )
-            output_file.parent.mkdir(parents=True, exist_ok=True)
+            filename = f"apollo_people_{timestamp}.jsonl"
 
             try:
                 people, total = await self.apollo_client.search_people(
@@ -1011,27 +1003,31 @@ class OrchestratorV13:
                     f"Try broader filters or different keywords."
                 ), 0.0
 
-            # Write to JSONL
-            with open(output_file, "w", encoding="utf-8") as f:
-                for person in people:
-                    org = person.get("organization") or {}
-                    record = {
-                        "apollo_id": person.get("id"),
-                        "name": person.get("name"),
-                        "first_name": person.get("first_name"),
-                        "last_name": person.get("last_name"),
-                        "title": person.get("title"),
-                        "headline": person.get("headline"),
-                        "linkedin_url": person.get("linkedin_url"),
-                        "city": person.get("city"),
-                        "state": person.get("state"),
-                        "country": person.get("country"),
-                        "seniority": person.get("seniority"),
-                        "departments": person.get("departments"),
-                        "organization_name": org.get("name"),
-                        "organization_id": person.get("organization_id"),
-                    }
-                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            # Build JSONL content
+            lines = []
+            for person in people:
+                org = person.get("organization") or {}
+                record = {
+                    "apollo_id": person.get("id"),
+                    "name": person.get("name"),
+                    "first_name": person.get("first_name"),
+                    "last_name": person.get("last_name"),
+                    "title": person.get("title"),
+                    "headline": person.get("headline"),
+                    "linkedin_url": person.get("linkedin_url"),
+                    "city": person.get("city"),
+                    "state": person.get("state"),
+                    "country": person.get("country"),
+                    "seniority": person.get("seniority"),
+                    "departments": person.get("departments"),
+                    "organization_name": org.get("name"),
+                    "organization_id": person.get("organization_id"),
+                }
+                lines.append(json.dumps(record, ensure_ascii=False))
+
+            output_path = await self._write_candidates_file(
+                filename, "\n".join(lines) + "\n"
+            )
 
             # Pagination info
             if total > 0:
@@ -1053,7 +1049,7 @@ class OrchestratorV13:
 
             return (
                 f"Apollo people search: {len(people)} results, {pagination}.\n"
-                f"File: {self._to_workspace_path(output_file)}\n"
+                f"File: {output_path}\n"
                 f"For more pages: apollo_search(..., page={page + 1}){sample_str}"
             ), 0.0
 
@@ -1150,11 +1146,7 @@ class OrchestratorV13:
         async def apollo_search_companies(args: Dict) -> Tuple[str, float]:
             page = args.get("page", 1)
             timestamp = int(time.time())
-            output_file = (
-                self.workspace_dir / "candidates"
-                / f"apollo_companies_{timestamp}.jsonl"
-            )
-            output_file.parent.mkdir(parents=True, exist_ok=True)
+            filename = f"apollo_companies_{timestamp}.jsonl"
 
             try:
                 orgs, total = await self.apollo_client.search_companies(
@@ -1180,26 +1172,31 @@ class OrchestratorV13:
             if not orgs:
                 return "Apollo company search returned 0 results.", 0.0
 
-            with open(output_file, "w", encoding="utf-8") as f:
-                for org in orgs:
-                    record = {
-                        "apollo_org_id": org.get("id"),
-                        "company_name": org.get("name"),
-                        "website": org.get("website_url"),
-                        "industry": org.get("industry"),
-                        "keywords": org.get("keywords"),
-                        "estimated_employees": org.get("estimated_num_employees"),
-                        "city": org.get("city"),
-                        "state": org.get("state"),
-                        "country": org.get("country"),
-                        "linkedin_url": org.get("linkedin_url"),
-                        "short_description": org.get("short_description"),
-                        "founded_year": org.get("founded_year"),
-                        "annual_revenue": org.get("annual_revenue"),
-                        "total_funding": org.get("total_funding"),
-                        "latest_funding_stage": org.get("latest_funding_stage"),
-                    }
-                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            # Build JSONL content
+            lines = []
+            for org in orgs:
+                record = {
+                    "apollo_org_id": org.get("id"),
+                    "company_name": org.get("name"),
+                    "website": org.get("website_url"),
+                    "industry": org.get("industry"),
+                    "keywords": org.get("keywords"),
+                    "estimated_employees": org.get("estimated_num_employees"),
+                    "city": org.get("city"),
+                    "state": org.get("state"),
+                    "country": org.get("country"),
+                    "linkedin_url": org.get("linkedin_url"),
+                    "short_description": org.get("short_description"),
+                    "founded_year": org.get("founded_year"),
+                    "annual_revenue": org.get("annual_revenue"),
+                    "total_funding": org.get("total_funding"),
+                    "latest_funding_stage": org.get("latest_funding_stage"),
+                }
+                lines.append(json.dumps(record, ensure_ascii=False))
+
+            output_path = await self._write_candidates_file(
+                filename, "\n".join(lines) + "\n"
+            )
 
             if total > 0:
                 total_pages = min((total + 99) // 100, 500)
@@ -1218,7 +1215,7 @@ class OrchestratorV13:
 
             return (
                 f"Apollo company search: {len(orgs)} companies, {pagination}.\n"
-                f"File: {self._to_workspace_path(output_file)}\n"
+                f"File: {output_path}\n"
                 f"For more pages: apollo_search_companies(..., page={page + 1})"
                 f"{sample_str}"
             ), 0.0
