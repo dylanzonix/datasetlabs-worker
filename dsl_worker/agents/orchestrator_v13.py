@@ -764,17 +764,32 @@ class OrchestratorV13:
             if not file_path:
                 return "Error: file is required.", 0.0
 
-            # Resolve file path
-            path = Path(file_path)
-            if not path.is_absolute():
-                path = self.workspace_dir / file_path
-            if not path.exists():
-                return f"Error: file not found: {path}", 0.0
+            # The file lives in the sandbox. Read it via sandbox API
+            # and write to local workspace so _process_batch can read it.
+            sandbox_path = file_path
+            if sandbox_path.startswith("/workspace/"):
+                sandbox_path = sandbox_path[len("/workspace/"):]
 
-            # Count lines in the file
+            local_path = self.workspace_dir / sandbox_path
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+
+            try:
+                if self._sandbox_impl and self._sandbox_impl._sandbox_session:
+                    content = await self._sandbox_impl._sandbox_session.read_file(sandbox_path)
+                    local_path.write_text(content, encoding="utf-8")
+                elif local_path.exists():
+                    pass  # File already exists locally (e.g., from API tool)
+                else:
+                    return f"Error: cannot read file — sandbox not available and file not found locally: {local_path}", 0.0
+            except Exception as e:
+                # File might already be local (written by API tools, not code_exec)
+                if not local_path.exists():
+                    return f"Error reading file from sandbox: {e}", 0.0
+
+            # Count lines
             total_lines = 0
             try:
-                with open(path, "r", encoding="utf-8") as f:
+                with open(local_path, "r", encoding="utf-8") as f:
                     for _ in f:
                         total_lines += 1
             except Exception as e:
@@ -785,7 +800,7 @@ class OrchestratorV13:
 
             # Set up file processing state
             self._current_file = _FileProcessingState(
-                file_path=str(path),
+                file_path=str(local_path),
                 note=note,
                 preset_fields=preset_fields if isinstance(preset_fields, dict) else {},
                 total_lines=total_lines,
