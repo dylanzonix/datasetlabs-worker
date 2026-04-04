@@ -254,7 +254,7 @@ class SandboxSession:
                     logger.warning(f"Failed to fetch {filename} into sandbox: {e}")
 
         # Upload local dirs (downloads from browser, etc.)
-        for subdir in ["downloads", "web", "extracted"]:
+        for subdir in ["downloads", "web", "extracted", "candidates"]:
             src = workspace_dir / subdir
             if src.exists() and any(src.iterdir()):
                 try:
@@ -262,6 +262,14 @@ class SandboxSession:
                     logger.info(f"Uploaded {count} files from {subdir}/ to sandbox")
                 except Exception as e:
                     logger.warning(f"Failed to upload {subdir}/ to sandbox: {e}")
+
+        # Upload dsl_tools module so LLM can do: from dsl_tools import ...
+        try:
+            from dsl_worker.infra.dsl_tools_module import DSL_TOOLS_SOURCE
+            await self._session.write_file("dsl_tools.py", DSL_TOOLS_SOURCE)
+            logger.info("Uploaded dsl_tools.py to sandbox")
+        except Exception as e:
+            logger.warning(f"Failed to upload dsl_tools.py to sandbox: {e}")
 
     async def read_file(self, path: str) -> str:
         """Read a file from the sandbox workspace (with Langfuse span)."""
