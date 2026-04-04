@@ -271,6 +271,10 @@ class SandboxSession:
         except Exception as e:
             logger.warning(f"Failed to upload dsl_tools.py to sandbox: {e}")
 
+    async def write_file(self, path: str, content: str) -> None:
+        """Write a file to the sandbox workspace."""
+        await self._session.write_file(path, content)
+
     async def read_file(self, path: str) -> str:
         """Read a file from the sandbox workspace (with Langfuse span)."""
         langfuse = _get_langfuse()
