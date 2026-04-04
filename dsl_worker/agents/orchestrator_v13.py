@@ -425,27 +425,18 @@ class OrchestratorV13:
         return local_str
 
     async def _write_candidates_file(self, filename: str, content: str) -> str:
-        """Write a candidate file to the sandbox and return the /workspace/ path.
+        """Write a candidate file locally and return the /workspace/ path.
 
-        All candidate files live in the sandbox's /workspace/candidates/.
-        This ensures the LLM always sees consistent /workspace/ paths and
-        code_exec can access the files directly.
+        Files are written to workspace_dir/candidates/ locally. They get
+        synced to the sandbox automatically before each code_exec call.
+        The LLM sees /workspace/candidates/ paths consistently.
         """
         sandbox_path = f"candidates/{filename}"
         workspace_path = f"/workspace/{sandbox_path}"
 
-        # Also write locally (for submit_candidates to read without sandbox roundtrip)
         local_path = self.workspace_dir / sandbox_path
         local_path.parent.mkdir(parents=True, exist_ok=True)
         local_path.write_text(content, encoding="utf-8")
-
-        # Write to sandbox so code_exec can see it
-        try:
-            if self._sandbox_impl:
-                session = await self._sandbox_impl._get_sandbox_session()
-                await session.write_file(sandbox_path, content)
-        except Exception as e:
-            logger.warning(f"[orchestrator] Failed to sync {filename} to sandbox: {e}")
 
         return workspace_path
 
@@ -506,14 +497,46 @@ class OrchestratorV13:
             description="",
             quota=0,
         ))
-        # Only register code_exec — other tools (brave_search, open, etc.)
-        # are not needed since the orchestrator uses web_research subagent.
-        self._sandbox_impl.register_on(
-            registry,
-            exclude=[
-                "brave_search", "open", "find", "click",
-                "shell_exec", "list_files",
-            ],
+        # Wrap code_exec to sync candidate files to sandbox before each call.
+        # Integration tools write candidates locally; we need them visible
+        # in the sandbox for the LLM's Python scripts.
+        original_code_exec = self._sandbox_impl.code_exec
+
+        async def synced_code_exec(script: str, description: str = "") -> Tuple[str, float]:
+            # Sync local candidates/ to sandbox before running script
+            candidates_dir = self.workspace_dir / "candidates"
+            if candidates_dir.exists():
+                try:
+                    session = await self._sandbox_impl._get_sandbox_session()
+                    for f in candidates_dir.iterdir():
+                        if f.is_file() and not f.name.startswith("."):
+                            content = f.read_text(encoding="utf-8", errors="replace")
+                            await session.write_file(f"candidates/{f.name}", content)
+                except Exception as e:
+                    logger.warning(f"[orchestrator] Failed to sync candidates to sandbox: {e}")
+
+            return await original_code_exec(script, description)
+
+        registry.add(
+            name="code_exec",
+            description=(
+                "Run Python in a sandbox. Files at /workspace/uploads/ "
+                "(user files) and /workspace/candidates/ (your output). "
+                "pandas, json, csv, openpyxl, pdfplumber available. "
+                "Use from dsl_tools import read_jsonl, write_jsonl, preview "
+                "for common operations."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "script": {
+                        "type": "string",
+                        "description": "Python script to execute.",
+                    },
+                },
+                "required": ["script"],
+            },
+            handler=lambda args: synced_code_exec(args.get("script", ""), args.get("description", "")),
         )
 
     # --- web_research ---
