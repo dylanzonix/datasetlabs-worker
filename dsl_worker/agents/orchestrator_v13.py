@@ -413,6 +413,42 @@ class OrchestratorV13:
 
         return ""
 
+    # ── File helpers ───────────────────────────────────────────────────
+
+    def _to_workspace_path(self, local_path) -> str:
+        """Convert a local file path to /workspace/ path for the LLM."""
+        local_str = str(local_path)
+        workspace_str = str(self.workspace_dir)
+        if local_str.startswith(workspace_str):
+            relative = local_str[len(workspace_str):].lstrip("/")
+            return f"/workspace/{relative}"
+        return local_str
+
+    async def _write_candidates_file(self, filename: str, content: str) -> str:
+        """Write a candidate file to the sandbox and return the /workspace/ path.
+
+        All candidate files live in the sandbox's /workspace/candidates/.
+        This ensures the LLM always sees consistent /workspace/ paths and
+        code_exec can access the files directly.
+        """
+        sandbox_path = f"candidates/{filename}"
+        workspace_path = f"/workspace/{sandbox_path}"
+
+        # Also write locally (for submit_candidates to read without sandbox roundtrip)
+        local_path = self.workspace_dir / sandbox_path
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_text(content, encoding="utf-8")
+
+        # Write to sandbox so code_exec can see it
+        try:
+            if self._sandbox_impl:
+                session = await self._sandbox_impl._get_sandbox_session()
+                await session.write_file(sandbox_path, content)
+        except Exception as e:
+            logger.warning(f"[orchestrator] Failed to sync {filename} to sandbox: {e}")
+
+        return workspace_path
+
     # ── Tool registration ─────────────────────────────────────────────
 
     def _register_tools(self, registry: ToolRegistry) -> None:
@@ -612,7 +648,7 @@ class OrchestratorV13:
 
             return (
                 f"Web research complete: {candidates_found} candidates found.\n"
-                f"File: {output_file}\n"
+                f"File: {self._to_workspace_path(output_file)}\n"
                 f"Cost: ${total_cost:.4f}{sample_str}"
             ), total_cost
 
@@ -710,7 +746,7 @@ class OrchestratorV13:
 
                     return (
                         f"BU extraction complete: {len(items)} items extracted.\n"
-                        f"File: {output_file}\n"
+                        f"File: {self._to_workspace_path(output_file)}\n"
                         f"Cost: ${cost:.4f}\n"
                         f"BU summary: {summary[:300]}{sample_str}"
                     ), cost
@@ -764,27 +800,32 @@ class OrchestratorV13:
             if not file_path:
                 return "Error: file is required.", 0.0
 
-            # The file lives in the sandbox. Read it via sandbox API
-            # and write to local workspace so _process_batch can read it.
-            sandbox_path = file_path
-            if sandbox_path.startswith("/workspace/"):
-                sandbox_path = sandbox_path[len("/workspace/"):]
+            # Resolve file to local path. Files are written both locally
+            # and to sandbox by _write_candidates_file, so local should
+            # always exist. /workspace/X maps to workspace_dir/X.
+            if file_path.startswith("/workspace/"):
+                local_path = self.workspace_dir / file_path[len("/workspace/"):]
+            else:
+                local_path = Path(file_path)
+                if not local_path.is_absolute():
+                    local_path = self.workspace_dir / file_path
 
-            local_path = self.workspace_dir / sandbox_path
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-
-            try:
-                if self._sandbox_impl and self._sandbox_impl._sandbox_session:
-                    content = await self._sandbox_impl._sandbox_session.read_file(sandbox_path)
-                    local_path.write_text(content, encoding="utf-8")
-                elif local_path.exists():
-                    pass  # File already exists locally (e.g., from API tool)
-                else:
-                    return f"Error: cannot read file — sandbox not available and file not found locally: {local_path}", 0.0
-            except Exception as e:
-                # File might already be local (written by API tools, not code_exec)
-                if not local_path.exists():
-                    return f"Error reading file from sandbox: {e}", 0.0
+            # If not found locally, try reading from sandbox (code_exec case)
+            if not local_path.exists():
+                sandbox_path = file_path
+                if sandbox_path.startswith("/workspace/"):
+                    sandbox_path = sandbox_path[len("/workspace/"):]
+                try:
+                    if self._sandbox_impl:
+                        session = await self._sandbox_impl._get_sandbox_session()
+                        content = await session.read_file(sandbox_path)
+                        local_path.parent.mkdir(parents=True, exist_ok=True)
+                        local_path.write_text(content, encoding="utf-8")
+                        logger.info(f"[orchestrator] Synced {sandbox_path} from sandbox to local")
+                    else:
+                        return f"Error: file not found: {file_path}", 0.0
+                except Exception as e:
+                    return f"Error: file not found locally or in sandbox: {file_path} ({e})", 0.0
 
             # Count lines
             total_lines = 0
@@ -1012,7 +1053,7 @@ class OrchestratorV13:
 
             return (
                 f"Apollo people search: {len(people)} results, {pagination}.\n"
-                f"File: {output_file}\n"
+                f"File: {self._to_workspace_path(output_file)}\n"
                 f"For more pages: apollo_search(..., page={page + 1}){sample_str}"
             ), 0.0
 
@@ -1177,7 +1218,7 @@ class OrchestratorV13:
 
             return (
                 f"Apollo company search: {len(orgs)} companies, {pagination}.\n"
-                f"File: {output_file}\n"
+                f"File: {self._to_workspace_path(output_file)}\n"
                 f"For more pages: apollo_search_companies(..., page={page + 1})"
                 f"{sample_str}"
             ), 0.0
@@ -1222,11 +1263,7 @@ class OrchestratorV13:
                 return "Error: query is required.", 0.0
 
             timestamp = int(time.time())
-            output_file = (
-                self.workspace_dir / "candidates"
-                / f"google_maps_{timestamp}.jsonl"
-            )
-            output_file.parent.mkdir(parents=True, exist_ok=True)
+            filename = f"google_maps_{timestamp}.jsonl"
 
             try:
                 result = await self.google_maps_client.text_search(
@@ -1241,22 +1278,26 @@ class OrchestratorV13:
             if not places:
                 return "Google Maps search returned 0 results.", 0.0
 
-            with open(output_file, "w", encoding="utf-8") as f:
-                for place in places:
-                    record = {
-                        "name": place.get("name"),
-                        "address": place.get("formatted_address"),
-                        "place_id": place.get("place_id"),
-                        "rating": place.get("rating"),
-                        "user_ratings_total": place.get("user_ratings_total"),
-                        "types": place.get("types"),
-                        "business_status": place.get("business_status"),
-                    }
-                    location = place.get("geometry", {}).get("location", {})
-                    if location:
-                        record["lat"] = location.get("lat")
-                        record["lng"] = location.get("lng")
-                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            lines = []
+            for place in places:
+                record = {
+                    "name": place.get("name"),
+                    "address": place.get("formatted_address"),
+                    "place_id": place.get("place_id"),
+                    "rating": place.get("rating"),
+                    "user_ratings_total": place.get("user_ratings_total"),
+                    "types": place.get("types"),
+                    "business_status": place.get("business_status"),
+                }
+                location = place.get("geometry", {}).get("location", {})
+                if location:
+                    record["lat"] = location.get("lat")
+                    record["lng"] = location.get("lng")
+                lines.append(json.dumps(record, ensure_ascii=False))
+
+            output_path = await self._write_candidates_file(
+                filename, "\n".join(lines) + "\n"
+            )
 
             sample = places[0] if places else {}
             sample_str = ""
@@ -1276,7 +1317,7 @@ class OrchestratorV13:
 
             return (
                 f"Google Maps: {len(places)} businesses found.\n"
-                f"File: {output_file}{sample_str}{pagination_str}"
+                f"File: {output_path}{sample_str}{pagination_str}"
             ), 0.0
 
         registry.add(
