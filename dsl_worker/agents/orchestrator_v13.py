@@ -254,6 +254,10 @@ class OrchestratorV13:
         self.apollo_client = apollo_client
         self.google_maps_client = google_maps_client
         self.apify_client = apify_client
+        self.apify_available = bool(apify_client) or any(
+            t.get("server_label") == "apify"
+            for t in (mcp_tools or [])
+        )
         self.youtube_client = youtube_client
         self.feedback_context = feedback_context
         self.resume_context = resume_context
@@ -413,16 +417,14 @@ class OrchestratorV13:
                 "website, hours). Use after google_maps_search to enrich.\n"
             )
 
-        if self.apify_client:
+        if self.apify_available:
             sections.append(
-                "**apify_search(query)** — Search 22,000+ pre-built web scrapers on "
-                "Apify. Returns actor names, descriptions, and popularity. Use to "
-                "discover scrapers for specific sites (Upwork, LinkedIn, Reddit, Yelp, "
-                "etc).\n\n"
-                "**apify_run(actor_id, input)** — Run an Apify scraper. Returns "
-                "structured data + file path. Faster and cheaper than BU for sites "
-                "with a pre-built scraper. Check apify_search first to find the right "
-                "actor.\n"
+                "**Apify** (via MCP) — 22,000+ pre-built web scrapers for specific "
+                "sites (Upwork, LinkedIn, Reddit, Yelp, Zillow, etc). Faster and "
+                "cheaper than BU. Use search-actors to find a scraper, "
+                "fetch-actor-details to see its input schema, then call-actor to "
+                "run it. Results come back as structured data. Save results to a "
+                "candidate file via code_exec, then submit_candidates.\n"
             )
 
         if not sections:
@@ -493,8 +495,9 @@ class OrchestratorV13:
             self._register_apollo_tools(registry)
         if self.google_maps_client:
             self._register_google_maps(registry)
-        if self.apify_client:
-            self._register_apify_tools(registry)
+        # Apify tools are provided via MCP connector (not custom tools).
+        # The MCP server at https://mcp.apify.com handles discovery,
+        # input schemas, and execution automatically.
 
     # --- code_exec ---
 
@@ -1492,7 +1495,8 @@ class OrchestratorV13:
             return (
                 f"Found {len(results)} Apify actors for \"{query}\":\n\n"
                 + "\n\n".join(lines)
-                + "\n\nUse apify_run(actor_id, input) to run one."
+                + "\n\nUse apify_actor_details(actor_id) to see what input an actor "
+                + "expects, then apify_run(actor_id, input) to run it."
             ), 0.0
 
         async def apify_run(args: Dict) -> Tuple[str, float]:
@@ -1570,6 +1574,54 @@ class OrchestratorV13:
             handler=apify_search,
         )
 
+        async def apify_actor_details(args: Dict) -> Tuple[str, float]:
+            actor_id = args.get("actor_id", "")
+            if not actor_id:
+                return "Error: actor_id is required.", 0.0
+
+            try:
+                details = await self.apify_client.get_actor_details(actor_id)
+            except Exception as e:
+                return f"Error getting actor details: {e}", 0.0
+
+            if not details:
+                return f"Actor not found: {actor_id}", 0.0
+
+            parts = [
+                f"**{details['title']}**",
+                f"URL: {details['url']}",
+                "",
+                details["description"],
+            ]
+            if details.get("readme_summary"):
+                parts.append("")
+                parts.append(details["readme_summary"][:1000])
+            if details.get("example_input"):
+                parts.append("")
+                parts.append(f"Example input: {details['example_input']}")
+
+            return "\n".join(parts), 0.0
+
+        registry.add(
+            name="apify_actor_details",
+            description=(
+                "Get full details for an Apify actor — description, readme, "
+                "and example input. Use after apify_search to understand what "
+                "input parameters an actor expects before running it."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "actor_id": {
+                        "type": "string",
+                        "description": "Actor ID (e.g. 'neatrat/upwork-job-scraper')",
+                    },
+                },
+                "required": ["actor_id"],
+            },
+            handler=apify_actor_details,
+        )
+
         registry.add(
             name="apify_run",
             description=(
@@ -1586,7 +1638,12 @@ class OrchestratorV13:
                     },
                     "input": {
                         "type": "object",
-                        "description": "Input parameters for the actor. Check the actor's page for schema.",
+                        "description": (
+                            "Input JSON for the actor. Use apify_actor_details to "
+                            "find what parameters the actor expects. Common patterns: "
+                            "search URL scrapers take {\"searchUrl\": \"...\"}, "
+                            "keyword scrapers take {\"searchQuery\": \"...\", \"maxItems\": N}."
+                        ),
                     },
                     "max_items": {
                         "type": "integer",

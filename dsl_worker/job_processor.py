@@ -868,6 +868,18 @@ class JobProcessor:
             .all()
         )
         mcp_tools = self._build_mcp_tools(connectors)
+
+        # Add Apify MCP server as automatic connector (if configured)
+        if settings.apify_api_key:
+            mcp_tools.append({
+                "type": "mcp",
+                "server_label": "apify",
+                "server_url": f"https://mcp.apify.com?tools=actors",
+                "headers": {"Authorization": f"Bearer {settings.apify_api_key}"},
+                "require_approval": "never",
+            })
+            logger.info("[Pipeline] Apify MCP server added")
+
         self._mcp_tools = mcp_tools
 
         logger.info(f"[Pipeline] Starting V13 pipeline with {len(chat_history)} chat messages")
