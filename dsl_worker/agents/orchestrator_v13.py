@@ -229,6 +229,7 @@ class OrchestratorV13:
         apollo_client: Optional[Any] = None,
         google_maps_client: Optional[Any] = None,
         youtube_client: Optional[Any] = None,
+        apify_client: Optional[Any] = None,
         feedback_context: Optional[Dict[str, Any]] = None,
         resume_context: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -252,7 +253,7 @@ class OrchestratorV13:
         self.mcp_tools = mcp_tools or []
         self.apollo_client = apollo_client
         self.google_maps_client = google_maps_client
-        self.apify_client = kwargs.get("apify_client")
+        self.apify_client = apify_client
         self.youtube_client = youtube_client
         self.feedback_context = feedback_context
         self.resume_context = resume_context
