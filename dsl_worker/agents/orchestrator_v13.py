@@ -254,10 +254,6 @@ class OrchestratorV13:
         self.apollo_client = apollo_client
         self.google_maps_client = google_maps_client
         self.apify_client = apify_client
-        self.apify_available = bool(apify_client) or any(
-            t.get("server_label") == "apify"
-            for t in (mcp_tools or [])
-        )
         self.youtube_client = youtube_client
         self.feedback_context = feedback_context
         self.resume_context = resume_context
@@ -417,14 +413,16 @@ class OrchestratorV13:
                 "website, hours). Use after google_maps_search to enrich.\n"
             )
 
-        if self.apify_available:
+        if self.apify_client:
             sections.append(
-                "**Apify** (via MCP) — 22,000+ pre-built web scrapers for specific "
-                "sites (Upwork, LinkedIn, Reddit, Yelp, Zillow, etc). Faster and "
-                "cheaper than BU. Use search-actors to find a scraper, "
-                "fetch-actor-details to see its input schema, then call-actor to "
-                "run it. Results come back as structured data. Save results to a "
-                "candidate file via code_exec, then submit_candidates.\n"
+                "**apify_search(query)** — Search 22,000+ pre-built web scrapers on "
+                "Apify for specific sites (Upwork, LinkedIn, Reddit, Yelp, etc).\n\n"
+                "**apify_actor_details(actor_id)** — Get full details including "
+                "description, readme, and input schema. Always check this before "
+                "running an actor to know what input to pass.\n\n"
+                "**apify_run(actor_id, input)** — Run a scraper. Returns structured "
+                "data written to file. Faster and cheaper than BU.\n\n"
+                "Apify workflow: apify_search → apify_actor_details → apify_run.\n"
             )
 
         if not sections:
@@ -495,9 +493,8 @@ class OrchestratorV13:
             self._register_apollo_tools(registry)
         if self.google_maps_client:
             self._register_google_maps(registry)
-        # Apify tools are provided via MCP connector (not custom tools).
-        # The MCP server at https://mcp.apify.com handles discovery,
-        # input schemas, and execution automatically.
+        if self.apify_client:
+            self._register_apify_tools(registry)
 
     # --- code_exec ---
 
