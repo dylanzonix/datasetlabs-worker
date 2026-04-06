@@ -526,7 +526,41 @@ class OrchestratorV13:
                 except Exception as e:
                     logger.warning(f"[orchestrator] Failed to sync candidates to sandbox: {e}")
 
-            return await original_code_exec(script, description)
+            result = await original_code_exec(script, description)
+
+            # After code_exec: sync any new/modified files FROM sandbox back to local.
+            # This ensures local is always the source of truth — sandbox can die
+            # and we lose nothing.
+            try:
+                if self._sandbox_impl and self._sandbox_impl._sandbox_session:
+                    session = self._sandbox_impl._sandbox_session
+                    # List files in sandbox candidates/ and download any we don't have locally
+                    try:
+                        listing = await session.exec_shell(
+                            "ls -1 /workspace/candidates/ 2>/dev/null || true", timeout=5
+                        )
+                        if listing.success and listing.stdout.strip():
+                            sandbox_files = set(listing.stdout.strip().split("\n"))
+                            local_files = set(
+                                f.name for f in candidates_dir.iterdir()
+                                if f.is_file()
+                            ) if candidates_dir.exists() else set()
+
+                            new_files = sandbox_files - local_files
+                            for fname in new_files:
+                                if fname.startswith("."):
+                                    continue
+                                try:
+                                    content = await session.read_file(f"candidates/{fname}")
+                                    (candidates_dir / fname).write_text(content, encoding="utf-8")
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.warning(f"[orchestrator] Post-exec sync error: {e}")
+
+            return result
 
         registry.add(
             name="code_exec",
