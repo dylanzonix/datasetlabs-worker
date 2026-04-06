@@ -357,6 +357,15 @@ class ResearchTools:
         from sandbox_service.models import SessionConfig
 
         async with self._sandbox_session_lock:
+            # Recreate session if it died (404 / timeout / destroyed)
+            if self._sandbox_session is not None and getattr(self._sandbox_session, '_dead', False):
+                logger.warning("[ResearchTools] Sandbox session dead, recreating...")
+                try:
+                    await self._sandbox_session.close()
+                except Exception:
+                    pass
+                self._sandbox_session = None
+
             if self._sandbox_session is None:
                 langfuse = _get_langfuse()
                 if langfuse:

@@ -118,6 +118,7 @@ class SandboxSession:
     def __init__(self, session_client: SandboxSessionClient, sandbox_client: SandboxClient):
         self._session = session_client
         self._client = sandbox_client
+        self._dead = False
 
     @property
     def session_id(self) -> str:
@@ -145,6 +146,11 @@ class SandboxSession:
                 return result
         return await self._do_execute(script, timeout)
 
+    def _is_session_dead(self, error: Exception) -> bool:
+        """Check if the error indicates the sandbox session no longer exists."""
+        err_str = str(error)
+        return "404" in err_str or "Not Found" in err_str or "session" in err_str.lower() and "not found" in err_str.lower()
+
     async def _do_execute(self, script: str, timeout: int) -> SandboxResult:
         """Execute Python code, return result."""
         wrapped = CODE_PREFIX + script + CODE_SUFFIX
@@ -161,7 +167,11 @@ class SandboxSession:
                 error=(result.stderr or None) if result.exit_code != 0 else None,
             )
         except Exception as e:
-            logger.error(f"Sandbox execution failed: {e}")
+            if self._is_session_dead(e):
+                logger.warning(f"Sandbox session appears dead: {e}")
+                self._dead = True
+            else:
+                logger.error(f"Sandbox execution failed: {e}")
             return SandboxResult(
                 success=False,
                 stdout="",
@@ -273,7 +283,12 @@ class SandboxSession:
 
     async def write_file(self, path: str, content: str) -> None:
         """Write a file to the sandbox workspace."""
-        await self._session.upload_content(content, path)
+        try:
+            await self._session.upload_content(content, path)
+        except Exception as e:
+            if self._is_session_dead(e):
+                self._dead = True
+            raise
 
     async def read_file(self, path: str) -> str:
         """Read a file from the sandbox workspace (with Langfuse span)."""
