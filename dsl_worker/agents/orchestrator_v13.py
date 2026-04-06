@@ -131,6 +131,13 @@ submitting. The feedback from processed rows is more valuable than a \
 perfect candidate set. Submit what you have, read the feedback report, \
 then gather more if needed. You can always submit additional batches.
 
+**Candidates don't need to be complete.** A candidate just identifies the \
+entity — a company name, a URL, a person's name. It does NOT need all \
+schema columns filled. Row generators handle enrichment: finding contact \
+info, verifying details, filling missing fields. Your job is to find \
+entities, not to build complete rows. Don't try to enrich candidates \
+before submitting — that's the row generator's job.
+
 **Prep matters, but don't over-prep.** Use code_exec to filter obvious \
 junk before submitting, but don't spend multiple turns perfecting \
 candidates. A quick filter and submit beats a thorough analysis that \
@@ -138,7 +145,8 @@ delays row generation.
 
 **preset_fields saves money.** If your candidates already have data that maps \
 directly to schema columns, set those in preset_fields. The row generator \
-won't need to re-research that information, cutting cost per row significantly.
+won't need to re-research that information, cutting cost per row significantly. \
+But don't delay submission to pre-fill — submit what you have.
 
 **Use real data.** Default to finding real data through research, APIs, and \
 web sources — not generating content from your own knowledge. Exceptions: \
