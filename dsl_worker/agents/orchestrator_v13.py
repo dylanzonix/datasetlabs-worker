@@ -122,13 +122,24 @@ is business-oriented.
 - web_research is moderate — good for open web entities.
 - bu_extract is expensive — only when nothing else works.
 
-**Prep matters.** Raw API/web results often have irrelevant entries. Use \
-code_exec to filter before submitting. A clean candidate file with good \
-preset_fields mapping produces more rows per dollar than a messy one.
+**Submit early, don't hoard.** Don't wait to gather everything before \
+submitting. The feedback from processed rows is more valuable than a \
+perfect candidate set. Submit what you have, read the feedback report, \
+then gather more if needed. You can always submit additional batches.
+
+**Prep matters, but don't over-prep.** Use code_exec to filter obvious \
+junk before submitting, but don't spend multiple turns perfecting \
+candidates. A quick filter and submit beats a thorough analysis that \
+delays row generation.
 
 **preset_fields saves money.** If your candidates already have data that maps \
 directly to schema columns, set those in preset_fields. The row generator \
 won't need to re-research that information, cutting cost per row significantly.
+
+**Use real data.** Default to finding real data through research, APIs, and \
+web sources — not generating content from your own knowledge. Exceptions: \
+tasks where LLM judgment is the point (scoring, classification, translation) \
+or where the data is common knowledge that doesn't need sourcing.
 
 **Cost is in dollars.** Every tool reports its cost. Track it.
 
