@@ -78,11 +78,15 @@ searches the web, opens pages, and yields candidates to a file. Returns \
 summary + file path. ~30s, moderate cost. Good for finding entities on the \
 open web.
 
-**bu_extract(task)** — Delegate to a BU cloud browser agent. Include the URL \
-in the task text. The agent navigates, handles CAPTCHAs, extracts data, and \
-writes results to a file. Returns summary + file path. 1-5 min, expensive. \
-Use as a LAST RESORT — only when sites require JavaScript rendering, login, \
-or anti-bot bypass that web_research can't handle.
+**bu_extract(task)** — Delegate to a BU cloud browser agent. The agent \
+navigates a real browser, handles CAPTCHAs and anti-bot. Returns summary + \
+file path. 1-5 min, EXPENSIVE. Rules: \
+(1) LAST RESORT — only after APIs and web_research failed. Never use BU for \
+sites you have an API for (Google Maps, Apollo, YouTube). \
+(2) ONE specific URL, ONE specific extraction task. Not "search 10 queries." \
+(3) Keep the task tightly scoped — extract data from a single page or a \
+single paginated list. If you need data from 5 sites, make 5 separate calls. \
+(4) Include the exact URL in the task.
 
 **submit_candidates(file, note, preset_fields, checkin_after)** — Submit a \
 JSONL file for row generation. Each line is a JSON object (candidate). \
@@ -831,9 +835,9 @@ class OrchestratorV13:
         registry.add(
             name="bu_extract",
             description=(
-                "Delegate to a BU cloud browser agent. Include the URL in the "
-                "task text. Handles CAPTCHAs, JavaScript, anti-bot. Returns "
-                "summary + file path. 1-5 min, expensive. Last resort."
+                "Delegate to a BU cloud browser agent. LAST RESORT — never "
+                "use for sites you have an API for. One URL, one task, tightly "
+                "scoped. Handles CAPTCHAs, JavaScript, anti-bot. 1-5 min, expensive."
             ),
             parameters={
                 "type": "object",
@@ -841,8 +845,9 @@ class OrchestratorV13:
                     "task": {
                         "type": "string",
                         "description": (
-                            "What the browser agent should do. Include the URL "
-                            "and describe what data to extract."
+                            "ONE specific URL + ONE specific extraction task. "
+                            "E.g. 'Go to https://example.com/listings and extract "
+                            "the business names and phone numbers from the table.'"
                         ),
                     },
                 },
@@ -1343,22 +1348,10 @@ class OrchestratorV13:
             if not places:
                 return "Google Maps search returned 0 results.", 0.0
 
+            # Write raw API response — let orchestrator use whatever fields exist
             lines = []
             for place in places:
-                record = {
-                    "name": place.get("name"),
-                    "address": place.get("formatted_address"),
-                    "place_id": place.get("place_id"),
-                    "rating": place.get("rating"),
-                    "user_ratings_total": place.get("user_ratings_total"),
-                    "types": place.get("types"),
-                    "business_status": place.get("business_status"),
-                }
-                location = place.get("geometry", {}).get("location", {})
-                if location:
-                    record["lat"] = location.get("lat")
-                    record["lng"] = location.get("lng")
-                lines.append(json.dumps(record, ensure_ascii=False))
+                lines.append(json.dumps(place, ensure_ascii=False, default=str))
 
             output_path = await self._write_candidates_file(
                 filename, "\n".join(lines) + "\n"
@@ -1371,6 +1364,7 @@ class OrchestratorV13:
                     f"\nSample: {sample.get('name', '?')} — "
                     f"{sample.get('formatted_address', '?')}"
                 )
+            keys_str = f"\nFields: {', '.join(sorted(sample.keys()))}" if sample else ""
 
             pagination_str = ""
             if next_token:
@@ -1382,14 +1376,31 @@ class OrchestratorV13:
 
             return (
                 f"Google Maps: {len(places)} businesses found.\n"
-                f"File: {output_path}{sample_str}{pagination_str}"
+                f"File: {output_path}{keys_str}{sample_str}{pagination_str}"
             ), 0.0
+
+        async def google_maps_details(args: Dict) -> Tuple[str, float]:
+            place_id = args.get("place_id", "")
+
+            if not place_id:
+                return "Error: place_id is required.", 0.0
+
+            try:
+                details = await self.google_maps_client.place_details(place_id)
+            except Exception as e:
+                return f"Google Maps details error: {e}", 0.0
+
+            if not details:
+                return f"No details found for place_id: {place_id}", 0.0
+
+            return json.dumps(details, ensure_ascii=False, default=str), 0.0
 
         registry.add(
             name="google_maps_search",
             description=(
-                "Search Google Maps for local businesses. Fast, cheap "
-                "(~$0.003/search). Results written to file."
+                "Search Google Maps for local businesses. Returns basic info "
+                "(name, address, place_id, rating, types). ~$0.003/search. "
+                "Use google_maps_details for full info (phone, website, hours)."
             ),
             parameters={
                 "type": "object",
@@ -1405,6 +1416,26 @@ class OrchestratorV13:
                 },
             },
             handler=google_maps_search,
+        )
+
+        registry.add(
+            name="google_maps_details",
+            description=(
+                "Get full details for a Google Maps place by place_id. Returns "
+                "phone, website, hours, URL, etc. ~$0.003/call. Use after "
+                "google_maps_search to enrich specific places."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "place_id": {
+                        "type": "string",
+                        "description": "Google Maps place_id from a search result.",
+                    },
+                },
+                "required": ["place_id"],
+            },
+            handler=google_maps_details,
         )
 
     # ── Candidate processing engine ───────────────────────────────────
