@@ -74,6 +74,9 @@ class WorkerSettings(BaseSettings):
     # Google APIs (Maps Places + YouTube Data v3, optional)
     google_api_key: str = ""
 
+    # Apify (optional — leave blank to disable)
+    apify_api_key: str = ""
+
     # Pipeline version (v12 = default, v13 = new blocking orchestrator)
     pipeline_version: str = "v12"
 

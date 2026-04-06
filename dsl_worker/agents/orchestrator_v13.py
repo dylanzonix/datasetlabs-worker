@@ -252,6 +252,7 @@ class OrchestratorV13:
         self.mcp_tools = mcp_tools or []
         self.apollo_client = apollo_client
         self.google_maps_client = google_maps_client
+        self.apify_client = kwargs.get("apify_client")
         self.youtube_client = youtube_client
         self.feedback_context = feedback_context
         self.resume_context = resume_context
@@ -406,7 +407,21 @@ class OrchestratorV13:
             sections.append(
                 "**google_maps_search(query, page_token)** — Search Google Maps for "
                 "local businesses. Returns summary + file path. Fast and cheap "
-                "(~$0.003/search). Better than web research for local business data.\n"
+                "(~$0.003/search). Better than web research for local business data.\n\n"
+                "**google_maps_details(place_id)** — Full details for a place (phone, "
+                "website, hours). Use after google_maps_search to enrich.\n"
+            )
+
+        if self.apify_client:
+            sections.append(
+                "**apify_search(query)** — Search 22,000+ pre-built web scrapers on "
+                "Apify. Returns actor names, descriptions, and popularity. Use to "
+                "discover scrapers for specific sites (Upwork, LinkedIn, Reddit, Yelp, "
+                "etc).\n\n"
+                "**apify_run(actor_id, input)** — Run an Apify scraper. Returns "
+                "structured data + file path. Faster and cheaper than BU for sites "
+                "with a pre-built scraper. Check apify_search first to find the right "
+                "actor.\n"
             )
 
         if not sections:
@@ -477,6 +492,8 @@ class OrchestratorV13:
             self._register_apollo_tools(registry)
         if self.google_maps_client:
             self._register_google_maps(registry)
+        if self.apify_client:
+            self._register_apify_tools(registry)
 
     # --- code_exec ---
 
@@ -1444,6 +1461,140 @@ class OrchestratorV13:
                 "required": ["place_id"],
             },
             handler=google_maps_details,
+        )
+
+    # --- Apify tools ---
+
+    def _register_apify_tools(self, registry: ToolRegistry) -> None:
+
+        async def apify_search(args: Dict) -> Tuple[str, float]:
+            query = args.get("query", "")
+            if not query:
+                return "Error: query is required.", 0.0
+
+            try:
+                results = await self.apify_client.search_actors(query, limit=5)
+            except Exception as e:
+                return f"Apify search error: {e}", 0.0
+
+            if not results:
+                return f"No Apify actors found for: {query}", 0.0
+
+            lines = []
+            for r in results:
+                lines.append(
+                    f"- **{r['actor_id']}** — {r['title']}\n"
+                    f"  {r['description']}\n"
+                    f"  Runs: {r['total_runs']:,} | Users: {r['total_users']:,}"
+                )
+
+            return (
+                f"Found {len(results)} Apify actors for \"{query}\":\n\n"
+                + "\n\n".join(lines)
+                + "\n\nUse apify_run(actor_id, input) to run one."
+            ), 0.0
+
+        async def apify_run(args: Dict) -> Tuple[str, float]:
+            actor_id = args.get("actor_id", "")
+            run_input = args.get("input", {})
+            max_items = args.get("max_items")
+
+            if not actor_id:
+                return "Error: actor_id is required.", 0.0
+
+            logger.info(f"[orchestrator] Running Apify actor: {actor_id}")
+
+            try:
+                result = await self.apify_client.run_actor(
+                    actor_id,
+                    run_input,
+                    timeout=300,
+                    max_items=max_items,
+                )
+            except Exception as e:
+                return f"Apify run error: {e}", 0.0
+
+            if result["status"] != "SUCCEEDED":
+                return (
+                    f"Apify actor {actor_id} failed: {result.get('error', result['status'])}"
+                ), 0.0
+
+            items = result["items"]
+            cost = result.get("cost_usd", 0.0)
+
+            if not items:
+                return f"Apify actor {actor_id} returned 0 items.", cost
+
+            # Write raw results to file
+            timestamp = int(time.time())
+            filename = f"apify_{actor_id.replace('/', '_')}_{timestamp}.jsonl"
+            lines = [json.dumps(item, ensure_ascii=False, default=str) for item in items]
+            output_path = await self._write_candidates_file(
+                filename, "\n".join(lines) + "\n"
+            )
+
+            # Build summary
+            sample = items[0]
+            keys_str = ", ".join(sorted(sample.keys())[:10])
+            sample_str = ""
+            for key in ("title", "name", "Title", "Name"):
+                if key in sample:
+                    sample_str = f"\nSample: {sample[key]}"
+                    break
+
+            return (
+                f"Apify {actor_id}: {len(items)} items returned.\n"
+                f"File: {output_path}\n"
+                f"Fields: {keys_str}\n"
+                f"Cost: ${cost:.4f}{sample_str}"
+            ), cost
+
+        registry.add(
+            name="apify_search",
+            description=(
+                "Search 22,000+ pre-built web scrapers on Apify. Returns actor "
+                "names and descriptions. Use to discover scrapers for specific "
+                "sites before running them."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query (e.g. 'upwork jobs', 'yelp reviews', 'linkedin profiles')",
+                    },
+                },
+                "required": ["query"],
+            },
+            handler=apify_search,
+        )
+
+        registry.add(
+            name="apify_run",
+            description=(
+                "Run an Apify scraper. Find the right actor first with "
+                "apify_search. Returns structured data written to file. "
+                "Faster and cheaper than BU for sites with a pre-built scraper."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "actor_id": {
+                        "type": "string",
+                        "description": "Actor ID from apify_search (e.g. 'neatrat/upwork-job-scraper')",
+                    },
+                    "input": {
+                        "type": "object",
+                        "description": "Input parameters for the actor. Check the actor's page for schema.",
+                    },
+                    "max_items": {
+                        "type": "integer",
+                        "description": "Max items to return (optional).",
+                    },
+                },
+                "required": ["actor_id", "input"],
+            },
+            handler=apify_run,
         )
 
     # ── Candidate processing engine ───────────────────────────────────

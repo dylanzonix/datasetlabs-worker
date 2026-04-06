@@ -948,6 +948,12 @@ class JobProcessor:
             from dsl_worker.infra.youtube_client import YouTubeClient
             youtube_client = YouTubeClient(api_key=settings.google_api_key)
 
+        apify_client = None
+        if settings.apify_api_key:
+            from dsl_worker.infra.apify_client import ApifyClient
+            apify_client = ApifyClient(api_key=settings.apify_api_key)
+            logger.info("[Pipeline] Apify client initialized")
+
         # Row saver
         row_saver = GenerationWorkerPool(
             workspace_dir=workspace_dir,
@@ -1098,6 +1104,7 @@ class JobProcessor:
             apollo_client=apollo_client,
             google_maps_client=google_maps_client,
             youtube_client=youtube_client,
+            apify_client=apify_client,
             feedback_context=feedback_context,
             resume_context=resume_context,
         )
