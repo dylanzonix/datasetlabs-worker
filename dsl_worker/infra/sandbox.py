@@ -266,14 +266,14 @@ class SandboxSession:
         # Upload dsl_tools module so LLM can do: from dsl_tools import ...
         try:
             from dsl_worker.infra.dsl_tools_module import DSL_TOOLS_SOURCE
-            await self._session.write_file("dsl_tools.py", DSL_TOOLS_SOURCE)
+            await self._session.upload_content(DSL_TOOLS_SOURCE, "dsl_tools.py")
             logger.info("Uploaded dsl_tools.py to sandbox")
         except Exception as e:
             logger.warning(f"Failed to upload dsl_tools.py to sandbox: {e}")
 
     async def write_file(self, path: str, content: str) -> None:
         """Write a file to the sandbox workspace."""
-        await self._session.write_file(path, content)
+        await self._session.upload_content(content, path)
 
     async def read_file(self, path: str) -> str:
         """Read a file from the sandbox workspace (with Langfuse span)."""
