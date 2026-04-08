@@ -47,15 +47,15 @@ class WorkerSettings(BaseSettings):
     brave_search_rps: float = 0.5  # requests per second
 
     research_model: str = "gpt-5.4"
-    generation_model: str = "gpt-5.4"
+    generation_model: str = "gpt-5.2"  # 5.4 has persistent refusal issues on Azure
 
     # V10 pipeline settings
     research_subagent_model: str = "gpt-5.4"           # model for research subagents
     seed_yielder_model: str = "gpt-5.4"               # model for harvesters
     max_research_subagents: int = 10             # cap on parallel research
     max_seed_yielders: int = 10                  # cap on parallel seed yielders
-    orchestrator_max_turns: int = 40             # hard cap on orchestrator turns
-    orchestrator_soft_limit: int = 25            # soft nudge to wrap up
+    orchestrator_max_turns: int = 200            # hard cap on orchestrator turns
+    orchestrator_soft_limit: int = 150           # soft nudge to wrap up
 
     # Sandbox service
     sandbox_service_url: str = "http://localhost:8010"

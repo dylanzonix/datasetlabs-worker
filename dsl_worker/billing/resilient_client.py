@@ -183,13 +183,36 @@ class ResilientClient:
         **kwargs,
     ):
         """Create response (Responses API) with rate limiting."""
-        return await self._execute_with_rate_limiting(
+        result = await self._execute_with_rate_limiting(
             self._client.responses.create,
             estimated_tokens=estimated_tokens,
             model=model,
             input=input,
             **kwargs,
         )
+
+        # Debug: dump payload on refusal
+        if hasattr(result, 'output'):
+            for item in result.output:
+                if getattr(item, 'type', '') == 'message':
+                    for c in getattr(item, 'content', []):
+                        text = getattr(c, 'text', '')
+                        if 'sorry' in text.lower() and 'cannot' in text.lower():
+                            import json, time
+                            dump = {
+                                "model": model,
+                                "input": input,
+                                "kwargs": {k: str(v)[:500] for k, v in kwargs.items()},
+                                "output_text": text,
+                                "timestamp": time.time(),
+                            }
+                            dump_path = f"/tmp/refusal_dump_{int(time.time())}.json"
+                            with open(dump_path, "w") as f:
+                                json.dump(dump, f, indent=2, default=str)
+                            logger.warning(f"[REFUSAL DUMP] Saved to {dump_path}")
+                            break
+
+        return result
 
     def get_metrics(self) -> Dict[str, int]:
         """Get client metrics."""

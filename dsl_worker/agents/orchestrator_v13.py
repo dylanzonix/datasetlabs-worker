@@ -6,7 +6,7 @@ Key changes from V12:
 - Blocking tool calls. No timer-based check-in loop.
 - File-based candidate flow. All tools write JSONL to /workspace/candidates/.
 - submit_candidates / continue_processing for row generation with feedback.
-- web_research subagent for multi-page web investigation.
+- web_harvest subagent for multi-page web investigation.
 - bu_extract for BU cloud sessions with file download.
 - finish() only for genuinely impossible tasks.
 - Target reached / credits exhausted handled by the system, not the LLM.
@@ -40,120 +40,163 @@ logger = logging.getLogger(__name__)
 # ── System Prompt ─────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
-# Dataset Builder
+# Dataset Builder — {num_samples} rows
 
-You build structured datasets by finding candidates from various sources, \
-then processing them into rows. Your goal: produce {num_samples} high-quality \
-rows at the lowest possible cost.
+## Your role
 
-## How It Works
+You are the **orchestrator**. Your job is to find the best source of \
+candidates, harvest them, and submit them for processing. That's it.
 
-1. **Find candidates.** Use APIs, web research, code execution, or BU browser \
-to discover entities that match the user's request. All candidate-producing tools \
-write results to files — you never see raw data in context, just summaries and \
-file paths.
+When you call submit_candidates, each candidate is sent to a **row \
+generator** — a separate AI agent that inspects the candidate, researches \
+the entity, fills in schema columns, and decides whether to produce a row \
+or skip. You get a feedback report back with results.
 
-2. **Prep candidates.** Use code_exec to inspect, filter, dedupe, merge, or \
-transform candidate files as needed. Candidates are messy — clean them before \
-submitting.
+Row generators have these tools: **web_search** (built-in, free), \
+**apify_search/apify_actor_details/apify_run** (cheap scrapers), \
+**apollo_enrich/apollo_enrich_company** (contact/company enrichment), \
+**google_maps_search/google_maps_details** (local businesses), \
+**code_exec** (Python sandbox), and **browse** (real browser, expensive \
+last resort). Your instructions should tell them what to do — e.g. "scrape each \
+user's profile using the X apify actor" or "find the company's email \
+and phone" or "all data is in the candidate, no research needed."
 
-3. **Submit for processing.** Call submit_candidates with the file, a note for \
-the row generator, and a preset_fields mapping. The system processes candidates \
-into rows (10 concurrent), checking for duplicates. You get a feedback report \
-after a batch completes.
+**Your loop:** harvest → submit → read feedback → adjust or scale → repeat.
 
-4. **Iterate.** Based on feedback (skip rates, dupe rates, cost), adjust your \
-approach. Continue processing the same file, find new sources, or refine your \
-candidate prep.
+## Harvesting tools
 
-## Your Tools
-
-**code_exec(script)** — Run Python in a sandbox. Files at /workspace/uploads/ \
-(user files, read-only) and /workspace/candidates/ (your output). pandas, json, \
-csv, openpyxl, pdfplumber available. Use to inspect files, transform data, \
-merge sources, filter candidates.
-
-**web_research(query, candidate_description)** — Spawn a research agent that \
-searches the web, opens pages, and yields candidates to a file. Returns \
-summary + file path. ~30s, moderate cost. Good for finding entities on the \
-open web.
-
-**bu_extract(task)** — Delegate to a BU cloud browser agent. The agent \
-navigates a real browser, handles CAPTCHAs and anti-bot. Returns summary + \
-file path. 1-5 min, EXPENSIVE. Rules: \
-(1) LAST RESORT — only after APIs and web_research failed. Never use BU for \
-sites you have an API for (Google Maps, Apollo, YouTube). \
-(2) ONE specific URL, ONE specific extraction task. Not "search 10 queries." \
-(3) Keep the task tightly scoped — extract data from a single page or a \
-single paginated list. If you need data from 5 sites, make 5 separate calls. \
-(4) Include the exact URL in the task.
-
-**submit_candidates(file, note, preset_fields, checkin_after)** — Submit a \
-JSONL file for row generation. Each line is a JSON object (candidate). \
-preset_fields maps schema columns to candidate fields for pre-filling. \
-note tells the row generator where data came from and what to watch for. \
-Blocks until checkin_after candidates are processed, then returns a feedback \
-report.
-
-**continue_processing(checkin_after)** — Resume processing remaining \
-candidates from the last submitted file. Same blocking behavior and \
-feedback report.
+Use these to find candidates. They write results to files.
 
 {integration_tools_section}\
+**web_harvest(query, candidate_description)** — Spawns an agent that \
+googles the query, visits pages, and extracts candidate entities to a \
+file. ~$0.10-0.20/call. Use only when no API or Apify actor exists — \
+this is for harvesting entities from web pages, not for research. Use \
+your built-in web_search tool for quick lookups.
 
-**finish(reason)** — Abort the job. ONLY for genuinely impossible tasks — all \
-feasible approaches exhausted, 100% certainty there's no viable path forward. \
-Do NOT call this when the target is reached or credits run out — the system \
-handles those automatically.
+**bu_extract(task)** — Cloud browser for anti-bot sites. $0.10-0.50/call. \
+Last resort — only when no Apify actor exists and the site needs a real \
+browser. One URL per call.
 
-## Strategy
+**code_exec(script)** — Python sandbox. Files at /workspace/uploads/ \
+(read-only) and /workspace/candidates/ (your output). pandas, json, csv \
+available. Use to inspect, filter, or transform candidate files.
 
-**Start small, then scale.** Find a small set of candidates (~10-20), submit \
-them as a test batch with checkin_after=5. Read the feedback. If the skip rate \
-is high, fix your candidate selection or preset_fields mapping before scaling \
-up. If cost per row is reasonable, scale up aggressively.
+### Source priority (cheapest first)
+1. Uploaded files — free
+2. Apollo — free (B2B contacts/companies)
+3. Google Maps — ~$0.003/search
+4. Apify actors — usually <$0.01/result. **Best for any specific website** \
+— always check apify_search first.
+5. web_harvest — $0.10-0.20/call. Only when no structured source exists.
+6. bu_extract — $0.10-0.50/call. Only when a real browser is required.
 
-**Understand the request.** Read the conversation carefully. The user might \
-want specific entities (companies, people, restaurants) or broad categories. \
-Match your sourcing strategy to what they need.
+## Submission tools
 
-**Use the cheapest source first:**
-- Uploaded files are free — if the user uploaded data, that IS your candidate \
-list. Inspect with code_exec, prep, and submit.
-- Apollo is free for search (B2B contacts/companies). Use it when the request \
-is business-oriented.
-- Google Maps is cheap and fast for local businesses.
-- web_research is moderate — good for open web entities.
-- bu_extract is expensive — only when nothing else works.
+**submit_candidates(file, instructions, checkin_after)** — Send candidates \
+to row generators. Each candidate goes to a separate AI agent that follows \
+your instructions to process it into a row. You can submit raw output from \
+any harvesting tool directly — no reformatting needed.
 
-**Submit early, don't hoard.** Don't wait to gather everything before \
-submitting. The feedback from processed rows is more valuable than a \
-perfect candidate set. Submit what you have, read the feedback report, \
-then gather more if needed. You can always submit additional batches.
+The **instructions** are critical — they tell each row generator exactly \
+how to process these candidates: what the data looks like, which fields \
+map to which schema columns, what needs to be researched for gaps, what \
+makes a candidate valid vs skip-worthy, and any cost-saving tips. Good \
+instructions prevent every row generator from independently rediscovering \
+the same things about the data. Inspect a candidate or two beforehand if \
+you need to understand the structure.
 
-**Candidates don't need to be complete.** A candidate just identifies the \
-entity — a company name, a URL, a person's name. It does NOT need all \
-schema columns filled. Row generators handle enrichment: finding contact \
-info, verifying details, filling missing fields. Your job is to find \
-entities, not to build complete rows. Don't try to enrich candidates \
-before submitting — that's the row generator's job.
+Blocks until checkin_after candidates are processed, then returns a \
+feedback report: rows produced, skips, dupes, cost per row.
 
-**Prep matters, but don't over-prep.** Use code_exec to filter obvious \
-junk before submitting, but don't spend multiple turns perfecting \
-candidates. A quick filter and submit beats a thorough analysis that \
-delays row generation.
+**continue_processing(checkin_after)** — Continue processing remaining \
+candidates from the last file. Same feedback report.
 
-**preset_fields saves money.** If your candidates already have data that maps \
-directly to schema columns, set those in preset_fields. The row generator \
-won't need to re-research that information, cutting cost per row significantly. \
-But don't delay submission to pre-fill — submit what you have.
+**finish(reason)** — Only for genuinely impossible tasks.
 
-**Use real data.** Default to finding real data through research, APIs, and \
-web sources — not generating content from your own knowledge. Exceptions: \
-tasks where LLM judgment is the point (scoring, classification, translation) \
-or where the data is common knowledge that doesn't need sourcing.
+## How to work
+
+**You produce rows by submitting candidates. There is no other way.** \
+Every row in the final dataset comes from a candidate you submitted that \
+a row generator processed. Until you call submit_candidates, zero rows \
+are produced no matter how much data you've harvested.
+
+**Start small, scale up.** Harvest a small test batch (tens, not hundreds), \
+submit it, read the feedback. Scale up what works.
+
+**Submit what you harvest.** The only reason to NOT submit is if you \
+inspect and see a clear mistake — wrong params, wrong site, totally \
+irrelevant data. If candidates roughly match the request, submit them. \
+They won't be perfect — the row generator evaluates each one and skips \
+bad matches. Quick programmatic filtering (dedup by URL, remove junk \
+with code_exec) is fine, but don't spend turns on per-candidate research \
+or quality checks.
+
+**Write good instructions.** Before submitting, think through what each \
+row generator will need to do. Look at a candidate, look at the schema, \
+and ask: is everything already in the candidate data? If not, what's \
+missing? How should the row generator get it? Is there an Apify actor \
+that can scrape the missing data? If so, test it — run it once, check \
+the output, and tell the row generators exactly which actor to use and \
+what params to pass. Don't leave row generators to independently discover \
+tools and strategies — 100 row generators each spending $0.10 on tool \
+discovery is $10 wasted. Figure out the process once, write it in the \
+instructions.
+
+**Stick with what works.** If a source is producing rows, keep using it. \
+Only explore alternatives when the current source clearly won't reach \
+the target. Exploring costs money and produces zero rows.
+
+**Use real data.** Find entities through tools — don't fabricate from \
+your own knowledge.
 
 **Cost is in dollars.** Every tool reports its cost. Track it.
+
+<scenarios>
+Scenario 1 — Large target, scale up, pivot when source runs dry:
+Task: 1000 SaaS company profiles.
+- apollo_search(organization_keywords=["saas"], per_page=25) → 25 results
+- submit_candidates(instructions="Apollo SaaS companies. Fields: name, domain, industry, employee_count, linkedin_url are all in the candidate. Research needed: annual revenue (web search), key product description (check their website via web search).", checkin_after=10) → 8 rows, 2 skips. Good.
+- Scale: apollo_search pages 2-10, submit → 180 rows
+- Apollo returns dupes at page 15 — source drying up at ~400 rows
+- Pivot: web_harvest("top SaaS startups 2026 list") → submit → keep going
+
+Scenario 2 — Bad params, discard, fix, then submit:
+Task: 50 Zillow listings in Miami under $500k.
+- apify_run(searchUrl="https://www.zillow.com/miami-fl/", maxItems=20) → 20 results
+- Quick inspect: all $1M+ — forgot price filter. DON'T submit.
+- apify_run(searchUrl="https://www.zillow.com/miami-fl/?price_max=500000", maxItems=20) → 20 results
+- Prices look right → submit_candidates(instructions="Zillow listings in Miami under $500k from Apify. Data is fresh and complete — address, price, beds, baths, sqft are all in the candidate. Research needed: HOA fees and year built if not in the data (web search the listing URL). Skip if price is above $500k.") → scale up
+
+Scenario 3 — Imperfect candidates, submit with good instructions:
+Task: 80 coworking spaces in Berlin with contact info.
+- google_maps_search("coworking spaces Berlin") → 20 results
+- Mix of coworking spaces + regular offices. Not perfect.
+- submit_candidates(instructions="Google Maps results for coworking in Berlin. Some may be regular offices — check if the listing is actually a coworking/shared workspace and skip if not. place_id is in the data, use google_maps_details for phone/website. For email, try web search on the business name.", checkin_after=10)
+- Feedback: 7 rows, 3 skips (some were just offices). 70% conversion is fine.
+- Search more areas → submit → keep going
+
+Scenario 4 — Good source, don't over-optimize:
+Task: 200 AI podcast episodes.
+- apify_run(query="artificial intelligence", maxItems=30) → 30 episodes
+- submit_candidates(instructions="Spotify podcast episodes about AI. Episode title, show name, duration, publish date, and description are all in the candidate data. Skip if the episode is not primarily about AI/ML. No additional research needed — all schema columns are covered by the candidate data.", checkin_after=10)
+- Feedback: 8 rows, 2 skips. $0.05/row. Great.
+- Scale: maxItems=200, submit, continue_processing until done.
+
+Scenario 5 — Uploaded file, expensive rows are OK:
+Task: 50 enriched company profiles. User uploaded companies.csv.
+- code_exec: inspect file — 200 rows with name, website, industry
+- submit_candidates(file="/workspace/uploads/companies.csv", instructions="User-uploaded company list — all fields (name, website, industry) are trustworthy. Heavy research needed per candidate: find HQ address, employee count, and 2-3 key decision-maker contacts with titles and LinkedIn profiles. Use web search on each company, apollo_enrich_company if you find their domain.", checkin_after=5)
+- Feedback: 5 rows, 0 skips. $1.10/row — expensive but expected. Keep going.
+
+Scenario 6 — Low fertility, explore, come back:
+Task: 100 independent bookstores in rural France.
+- google_maps_search("librairie indépendante France rurale") → 15 results
+- submit_candidates(instructions="Google Maps bookstores. Verify each is actually independent (not a chain like Fnac/Cultura). Use google_maps_details for contact info. Skip chains.", checkin_after=10) → 2 rows, 8 skips. 20% — not great.
+- Try web_harvest → 1 row, 7 skips. Worse.
+- Original source was best. Go back to google_maps, search more regions.
+- 20% conversion is good enough when alternatives are worse.
+</scenarios>
 
 Today's date: {current_date}
 
@@ -168,8 +211,7 @@ Today's date: {current_date}
 <resources>
 {resources_section}
 </resources>
-
-Target: {num_samples} rows.{resume_section}
+{resume_section}
 """
 
 
@@ -273,8 +315,13 @@ class OrchestratorV13:
         self._last_checkpoint_time: float = 0.0
 
         # Counters for unique file naming
-        self._web_research_counter: int = 0
+        self._web_harvest_counter: int = 0
         self._bu_extract_counter: int = 0
+        self._apify_run_counter: int = 0
+
+        # Candidate tracking for status line
+        self._candidates_harvested: int = 0
+        self._candidates_submitted: int = 0
 
         # Build tools and conversation
         registry = ToolRegistry()
@@ -304,6 +351,29 @@ class OrchestratorV13:
             on_cost=on_cost,
             extra_tools=all_extra_tools,
         )
+        self._conversation.after_turn = self._build_status_line
+
+    def _build_status_line(self) -> Optional[str]:
+        """Build a status line injected after every orchestrator turn."""
+        rows = self._generation_stats.get("rows_generated", 0)
+        cost = self._generation_stats.get("total_cost", 0.0)
+        harvested = self._candidates_harvested
+        submitted = self._candidates_submitted
+
+        line = (
+            f"[Status] {rows}/{self.num_samples} rows | "
+            f"{harvested} candidates harvested | "
+            f"{submitted} submitted | "
+            f"${cost:.2f} spent"
+        )
+
+        if harvested > 0 and submitted == 0 and rows == 0:
+            line += (
+                "\n→ You have candidates but haven't submitted any. "
+                "Call submit_candidates to start producing rows."
+            )
+
+        return line
 
     # ── System prompt construction ────────────────────────────────────
 
@@ -346,13 +416,22 @@ class OrchestratorV13:
         parts = []
         for msg in self.chat_history:
             role = msg.get("role", "unknown")
-            content = msg.get("content", "")
+            content = self._clean_conversation_content(msg.get("content", ""))
             ts = msg.get("created_at", "")
             if ts:
                 parts.append(f"[{ts}] **{role}**: {content}")
             else:
                 parts.append(f"**{role}**: {content}")
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _clean_conversation_content(content: str) -> str:
+        """Strip client-side noise from conversation messages."""
+        import re
+        # Remove sort_regex and sort_multiplier from embedded JSON
+        content = re.sub(r',?\s*"sort_regex"\s*:\s*"[^"]*"', '', content)
+        content = re.sub(r',?\s*"sort_multiplier"\s*:\s*\d+', '', content)
+        return content
 
     def _format_resources(self, uploaded_files: Optional[List[Dict[str, Any]]]) -> str:
         if not uploaded_files:
@@ -415,14 +494,15 @@ class OrchestratorV13:
 
         if self.apify_client:
             sections.append(
-                "**apify_search(query)** — Search 22,000+ pre-built web scrapers on "
-                "Apify for specific sites (Upwork, LinkedIn, Reddit, Yelp, etc).\n\n"
-                "**apify_actor_details(actor_id)** — Get full details including "
-                "description, readme, and input schema. Always check this before "
-                "running an actor to know what input to pass.\n\n"
-                "**apify_run(actor_id, input)** — Run a scraper. Returns structured "
-                "data written to file. Faster and cheaper than BU.\n\n"
-                "Apify workflow: apify_search → apify_actor_details → apify_run.\n"
+                "**apify_search(query)** — Find scrapers for a specific site.\n"
+                "**apify_actor_details(actor_id)** — Get input schema and pricing.\n"
+                "**apify_run(actor_id, ...)** — Run the scraper with the actor's "
+                "params passed directly (e.g. startUrls, maxItems). Returns "
+                "structured data to file.\n\n"
+                "Apify is your best tool for any specific website — structured "
+                "data, fast, cheap. If an actor exists for the target site, use it. "
+                "Once you have the schema, call apify_run with your best guess. "
+                "Don't research URL formats — try it and adjust.\n"
             )
 
         if not sections:
@@ -477,13 +557,18 @@ class OrchestratorV13:
         local_path.parent.mkdir(parents=True, exist_ok=True)
         local_path.write_text(content, encoding="utf-8")
 
+        # Track candidates harvested (count non-empty lines)
+        self._candidates_harvested += sum(
+            1 for line in content.splitlines() if line.strip()
+        )
+
         return workspace_path
 
     # ── Tool registration ─────────────────────────────────────────────
 
     def _register_tools(self, registry: ToolRegistry) -> None:
         self._register_code_exec(registry)
-        self._register_web_research(registry)
+        self._register_web_harvest(registry)
         self._register_bu_extract(registry)
         self._register_submit_candidates(registry)
         self._register_continue_processing(registry)
@@ -614,21 +699,21 @@ class OrchestratorV13:
             handler=lambda args: synced_code_exec(args.get("script", ""), args.get("description", "")),
         )
 
-    # --- web_research ---
+    # --- web_harvest ---
 
-    def _register_web_research(self, registry: ToolRegistry) -> None:
+    def _register_web_harvest(self, registry: ToolRegistry) -> None:
 
-        async def web_research(args: Dict) -> Tuple[str, float]:
+        async def web_harvest(args: Dict) -> Tuple[str, float]:
             query = args.get("query", "")
             candidate_description = args.get("candidate_description", "")
 
             if not query:
                 return "Error: query is required.", 0.0
 
-            idx = self._web_research_counter
-            self._web_research_counter += 1
+            idx = self._web_harvest_counter
+            self._web_harvest_counter += 1
             timestamp = int(time.time())
-            filename = f"web_research_{idx}_{timestamp}.jsonl"
+            filename = f"web_harvest_{idx}_{timestamp}.jsonl"
 
             total_cost = 0.0
             candidates_found = 0
@@ -637,7 +722,7 @@ class OrchestratorV13:
             try:
                 # Build the subagent
                 sub_registry = ToolRegistry()
-                sub_system_prompt = self._build_web_research_prompt(
+                sub_system_prompt = self._build_web_harvest_prompt(
                     query, candidate_description, f"/workspace/candidates/{filename}",
                 )
 
@@ -688,7 +773,7 @@ class OrchestratorV13:
                     max_turns=30,
                     soft_turn_limit=20,
                     reasoning={"effort": "low", "summary": "concise"},
-                    label=f"web_research:{idx}",
+                    label=f"web_harvest:{idx}",
                     continue_on_text=False,
                     on_cost=self.on_cost,
                     extra_tools=[web_search_tool],
@@ -703,9 +788,9 @@ class OrchestratorV13:
                 total_cost = subagent.total_cost
 
             except asyncio.CancelledError:
-                logger.info(f"[web_research:{idx}] cancelled")
+                logger.info(f"[web_harvest:{idx}] cancelled")
             except Exception as e:
-                logger.error(f"[web_research:{idx}] error: {e}", exc_info=True)
+                logger.error(f"[web_harvest:{idx}] error: {e}", exc_info=True)
                 return f"Web research failed: {e}", total_cost
 
             if candidates_found == 0:
@@ -742,15 +827,17 @@ class OrchestratorV13:
             return (
                 f"Web research complete: {candidates_found} candidates found.\n"
                 f"File: {output_path}\n"
-                f"Cost: ${total_cost:.4f}{sample_str}"
+                f"Cost: ${total_cost:.4f}{sample_str}\n\n"
+                f"Next: call submit_candidates with this file to start "
+                f"producing rows."
             ), total_cost
 
         registry.add(
-            name="web_research",
+            name="web_harvest",
             description=(
-                "Spawn a research agent that searches the web for a query, "
-                "opens pages, and yields candidates to a file. Returns "
-                "summary + file path. ~30s, moderate cost."
+                "Harvest candidates from the web. Spawns an agent that googles "
+                "the query, visits pages, and extracts entities to a JSONL file. "
+                "~$0.10-0.20/call. For harvesting entities only — not for research."
             ),
             parameters={
                 "type": "object",
@@ -769,10 +856,10 @@ class OrchestratorV13:
                 },
                 "required": ["query", "candidate_description"],
             },
-            handler=web_research,
+            handler=web_harvest,
         )
 
-    def _build_web_research_prompt(
+    def _build_web_harvest_prompt(
         self, query: str, candidate_description: str, output_file: str,
     ) -> str:
         return (
@@ -888,7 +975,7 @@ class OrchestratorV13:
 
         async def submit_candidates(args: Dict) -> Tuple[str, float]:
             file_path = args.get("file", "")
-            note = args.get("note", "")
+            note = args.get("instructions", "") or args.get("note", "")
             preset_fields = args.get("preset_fields", {})
             checkin_after = args.get("checkin_after", 10)
 
@@ -934,6 +1021,8 @@ class OrchestratorV13:
             if total_lines == 0:
                 return "Error: file is empty.", 0.0
 
+            self._candidates_submitted += total_lines
+
             # Set up file processing state
             self._current_file = _FileProcessingState(
                 file_path=str(local_path),
@@ -948,43 +1037,43 @@ class OrchestratorV13:
         registry.add(
             name="submit_candidates",
             description=(
-                "Submit a JSONL file for row generation. Each line is a candidate. "
-                "Blocks until checkin_after candidates are processed, then returns "
-                "a feedback report with outcomes."
+                "Send candidates to row generators. Each follows your instructions "
+                "to process the candidate into a row. This is how you produce rows "
+                "— nothing happens until you call this."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "file": {
                         "type": "string",
-                        "description": "Path to JSONL file in /workspace/candidates/.",
+                        "description": (
+                            "Path to JSONL file (e.g. the file returned by "
+                            "apify_run or web_harvest)."
+                        ),
                     },
-                    "note": {
+                    "instructions": {
                         "type": "string",
                         "description": (
-                            "Handoff note for the row generator: where the data "
-                            "came from, what's trustworthy, what to look for, "
-                            "any heads up."
+                            "Instructions for row generators: what the data looks "
+                            "like, which fields map to schema columns, what to "
+                            "research for gaps, what makes a valid row vs skip, "
+                            "and any tips to save cost."
                         ),
+                    },
+                    "checkin_after": {
+                        "type": "integer",
+                        "description": "How many candidates to process before returning feedback.",
                     },
                     "preset_fields": {
                         "type": "object",
                         "description": (
-                            "Mapping of {schema_column: candidate_field} to pre-fill "
-                            "row columns from candidate data. E.g. "
-                            '{"Company Name": "company_name", "Website": "website"}'
+                            "Optional. Map schema columns to candidate field names "
+                            "to pre-fill. Supports dot-notation for nested fields."
                         ),
                         "additionalProperties": {"type": "string"},
                     },
-                    "checkin_after": {
-                        "type": "integer",
-                        "description": (
-                            "How many processed candidates before returning a "
-                            "feedback report. Start with 5-10 for test batches."
-                        ),
-                    },
                 },
-                "required": ["file", "note"],
+                "required": ["file", "instructions"],
             },
             handler=submit_candidates,
         )
@@ -1149,7 +1238,8 @@ class OrchestratorV13:
             return (
                 f"Apollo people search: {len(people)} results, {pagination}.\n"
                 f"File: {output_path}\n"
-                f"For more pages: apollo_search(..., page={page + 1}){sample_str}"
+                f"For more pages: apollo_search(..., page={page + 1}){sample_str}\n\n"
+                f"Next: submit_candidates with this file, or harvest more first."
             ), 0.0
 
         registry.add(
@@ -1316,7 +1406,8 @@ class OrchestratorV13:
                 f"Apollo company search: {len(orgs)} companies, {pagination}.\n"
                 f"File: {output_path}\n"
                 f"For more pages: apollo_search_companies(..., page={page + 1})"
-                f"{sample_str}"
+                f"{sample_str}\n\n"
+                f"Next: submit_candidates with this file, or harvest more first."
             ), 0.0
 
         registry.add(
@@ -1402,7 +1493,8 @@ class OrchestratorV13:
 
             return (
                 f"Google Maps: {len(places)} businesses found.\n"
-                f"File: {output_path}{keys_str}{sample_str}{pagination_str}"
+                f"File: {output_path}{keys_str}{sample_str}{pagination_str}\n\n"
+                f"Next: submit_candidates with this file, or harvest more first."
             ), 0.0
 
         async def google_maps_details(args: Dict) -> Tuple[str, float]:
@@ -1466,6 +1558,31 @@ class OrchestratorV13:
 
     # --- Apify tools ---
 
+    @staticmethod
+    def _format_schema_property(
+        name: str, prop: Dict[str, Any], required: bool
+    ) -> str:
+        """Format a single JSON Schema property for LLM consumption."""
+        ptype = prop.get("type", "any")
+        req = "REQUIRED" if required else "optional"
+        desc = prop.get("description", "")
+        if prop.get("editor") and not desc:
+            desc = f"({prop['editor']} editor)"
+        line = f"- **{name}** ({ptype}, {req})"
+        if desc:
+            line += f": {desc[:300]}"
+        default = prop.get("default")
+        prefill = prop.get("prefill")
+        enum = prop.get("enum")
+        if default is not None:
+            line += f"  [default: {json.dumps(default, default=str)[:150]}]"
+        if prefill is not None and prefill != default:
+            line += f"  [example: {json.dumps(prefill, default=str)[:150]}]"
+        if enum:
+            vals = ", ".join(str(e) for e in enum[:15])
+            line += f"  [values: {vals}]"
+        return line
+
     def _register_apify_tools(self, registry: ToolRegistry) -> None:
 
         async def apify_search(args: Dict) -> Tuple[str, float]:
@@ -1498,11 +1615,14 @@ class OrchestratorV13:
 
         async def apify_run(args: Dict) -> Tuple[str, float]:
             actor_id = args.get("actor_id", "")
-            run_input = args.get("input", {})
             max_items = args.get("max_items")
 
             if not actor_id:
                 return "Error: actor_id is required.", 0.0
+
+            # All non-meta keys are the actor's input params
+            known_keys = {"actor_id", "max_items"}
+            run_input = {k: v for k, v in args.items() if k not in known_keys}
 
             logger.info(f"[orchestrator] Running Apify actor: {actor_id}")
 
@@ -1517,9 +1637,27 @@ class OrchestratorV13:
                 return f"Apify run error: {e}", 0.0
 
             if result["status"] != "SUCCEEDED":
-                return (
-                    f"Apify actor {actor_id} failed: {result.get('error', result['status'])}"
-                ), 0.0
+                error_msg = (
+                    f"Apify actor {actor_id} failed: "
+                    f"{result.get('error', result['status'])}"
+                )
+                # Fetch input schema so LLM can self-correct
+                try:
+                    details = await self.apify_client.get_actor_details(actor_id)
+                    schema = (details or {}).get("input_schema")
+                    if schema and schema.get("properties"):
+                        req = set(schema.get("required", []))
+                        lines_schema = [
+                            self._format_schema_property(n, p, n in req)
+                            for n, p in schema["properties"].items()
+                        ]
+                        error_msg += (
+                            "\n\nExpected input schema:\n"
+                            + "\n".join(lines_schema)
+                        )
+                except Exception:
+                    pass
+                return error_msg, 0.0
 
             items = result["items"]
             cost = result.get("cost_usd", 0.0)
@@ -1528,8 +1666,9 @@ class OrchestratorV13:
                 return f"Apify actor {actor_id} returned 0 items.", cost
 
             # Write raw results to file
-            timestamp = int(time.time())
-            filename = f"apify_{actor_id.replace('/', '_')}_{timestamp}.jsonl"
+            idx = self._apify_run_counter
+            self._apify_run_counter += 1
+            filename = f"apify_{idx}_{actor_id.replace('/', '_')}.jsonl"
             lines = [json.dumps(item, ensure_ascii=False, default=str) for item in items]
             output_path = await self._write_candidates_file(
                 filename, "\n".join(lines) + "\n"
@@ -1548,7 +1687,9 @@ class OrchestratorV13:
                 f"Apify {actor_id}: {len(items)} items returned.\n"
                 f"File: {output_path}\n"
                 f"Fields: {keys_str}\n"
-                f"Cost: ${cost:.4f}{sample_str}"
+                f"Cost: ${cost:.4f}{sample_str}\n\n"
+                f"Next: inspect briefly with code_exec if needed, then call "
+                f"submit_candidates with this file to start producing rows."
             ), cost
 
         registry.add(
@@ -1584,16 +1725,53 @@ class OrchestratorV13:
             if not details:
                 return f"Actor not found: {actor_id}", 0.0
 
+            pricing = details.get("pricing")
+            stats = details.get("stats")
             parts = [
                 f"**{details['title']}**",
                 f"URL: {details['url']}",
-                "",
-                details["description"],
             ]
+            if pricing:
+                parts.append(f"Pricing: {pricing}")
+            if stats:
+                parts.append(f"Stats: {stats}")
+            parts.append("")
+            parts.append(details["description"])
             if details.get("readme_summary"):
                 parts.append("")
-                parts.append(details["readme_summary"][:1000])
-            if details.get("example_input"):
+                parts.append(details["readme_summary"])
+
+            # Format the input schema so the LLM knows exactly what to pass
+            input_schema = details.get("input_schema")
+            if input_schema and input_schema.get("properties"):
+                required_set = set(input_schema.get("required", []))
+                req_props = {k: v for k, v in input_schema["properties"].items()
+                             if k in required_set}
+                opt_props = {k: v for k, v in input_schema["properties"].items()
+                             if k not in required_set}
+
+                parts.append("")
+                parts.append("## INPUT SCHEMA")
+                parts.append(
+                    "Pass these as top-level params to apify_run alongside actor_id."
+                )
+                if req_props:
+                    parts.append("")
+                    parts.append("Required:")
+                    for prop_name, prop_def in req_props.items():
+                        parts.append(
+                            self._format_schema_property(prop_name, prop_def, True)
+                        )
+                if opt_props:
+                    parts.append("")
+                    parts.append(
+                        "Optional (only pass if you need to override defaults):"
+                    )
+                    for prop_name, prop_def in opt_props.items():
+                        parts.append(
+                            self._format_schema_property(prop_name, prop_def, False)
+                        )
+            elif details.get("example_input"):
                 parts.append("")
                 parts.append(f"Example input: {details['example_input']}")
 
@@ -1622,32 +1800,25 @@ class OrchestratorV13:
         registry.add(
             name="apify_run",
             description=(
-                "Run an Apify scraper. Find the right actor first with "
-                "apify_search. Returns structured data written to file. "
-                "Faster and cheaper than BU for sites with a pre-built scraper."
+                "Run an Apify scraper. Pass the actor's input parameters "
+                "directly (e.g. startUrls, maxItems — whatever the actor "
+                "schema requires). Use apify_actor_details first to see "
+                "the schema."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "actor_id": {
                         "type": "string",
-                        "description": "Actor ID from apify_search (e.g. 'neatrat/upwork-job-scraper')",
-                    },
-                    "input": {
-                        "type": "object",
-                        "description": (
-                            "Input JSON for the actor. Use apify_actor_details to "
-                            "find what parameters the actor expects. Common patterns: "
-                            "search URL scrapers take {\"searchUrl\": \"...\"}, "
-                            "keyword scrapers take {\"searchQuery\": \"...\", \"maxItems\": N}."
-                        ),
+                        "description": "Actor ID from apify_search",
                     },
                     "max_items": {
                         "type": "integer",
                         "description": "Max items to return (optional).",
                     },
                 },
-                "required": ["actor_id", "input"],
+                "required": ["actor_id"],
+                "additionalProperties": True,
             },
             handler=apify_run,
         )
@@ -2018,8 +2189,9 @@ class OrchestratorV13:
                 "total_turns": self._conversation.total_turns,
             },
             "generation_stats": dict(self._generation_stats),
-            "web_research_counter": self._web_research_counter,
+            "web_research_counter": self._web_harvest_counter,
             "bu_extract_counter": self._bu_extract_counter,
+            "apify_run_counter": self._apify_run_counter,
             "current_file": file_state,
         }
 
@@ -2035,8 +2207,9 @@ class OrchestratorV13:
                 f"{len(conv['messages'])} messages"
             )
 
-        self._web_research_counter = state.get("web_research_counter", 0)
+        self._web_harvest_counter = state.get("web_research_counter", 0)
         self._bu_extract_counter = state.get("bu_extract_counter", 0)
+        self._apify_run_counter = state.get("apify_run_counter", 0)
 
         saved_stats = state.get("generation_stats", {})
         for key in ("skipped", "errors", "total_cost"):

@@ -30,6 +30,144 @@ class ApifyClient:
             "Content-Type": "application/json",
         }
 
+    async def get_actor_details(self, actor_id: str) -> Optional[Dict[str, Any]]:
+        """Get full details for an actor including description, readme, and input schema.
+
+        Returns dict with: title, description, readme_summary, example_input,
+        input_schema, url.
+
+        The input_schema is fetched from the actor's latest build definition —
+        this is the full JSON Schema with properties, types, descriptions,
+        enums, defaults, and required flags.  Without it, LLMs cannot figure
+        out what input to pass to apify_run.
+        """
+        actor_path = actor_id.replace("/", "~")
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                f"{BASE_URL}/acts/{actor_path}",
+                headers=self._headers,
+            )
+        if resp.status_code != 200:
+            return None
+
+        d = resp.json().get("data", {})
+
+        # Fetch the input schema from the actor's latest build.
+        # The build definition contains actorDefinition.input — the full
+        # JSON Schema that the Apify MCP server also uses.
+        input_schema = await self._fetch_input_schema(d)
+        pricing = self._extract_pricing(d.get("pricingInfos", []))
+        stats = self._extract_stats(d.get("stats", {}))
+
+        return {
+            "actor_id": actor_id,
+            "title": d.get("title", ""),
+            "description": d.get("description", ""),
+            "readme_summary": d.get("readmeSummary", ""),
+            "example_input": d.get("exampleRunInput", {}).get("body", ""),
+            "input_schema": input_schema,
+            "pricing": pricing,
+            "stats": stats,
+            "url": f"https://apify.com/{actor_id}",
+        }
+
+    @staticmethod
+    def _extract_stats(stats: Dict[str, Any]) -> Optional[str]:
+        """Extract human-readable stats summary."""
+        if not stats:
+            return None
+        parts = []
+        total_runs = stats.get("totalRuns", 0)
+        total_users = stats.get("totalUsers", 0)
+        rating = stats.get("actorReviewRating", 0)
+        reviews = stats.get("actorReviewCount", 0)
+        if total_runs:
+            parts.append(f"{total_runs:,} runs")
+        if total_users:
+            parts.append(f"{total_users:,} users")
+        if rating and reviews:
+            parts.append(f"{rating:.1f}/5 ({reviews} reviews)")
+        run_stats = stats.get("publicActorRunStats30Days", {})
+        succeeded = run_stats.get("SUCCEEDED", 0)
+        total_30d = run_stats.get("TOTAL", 0)
+        if total_30d > 0:
+            parts.append(f"{succeeded}/{total_30d} succeeded last 30d")
+        return ", ".join(parts) if parts else None
+
+    @staticmethod
+    def _extract_pricing(pricing_infos: List[Dict[str, Any]]) -> Optional[str]:
+        """Extract human-readable pricing from the latest pricing entry."""
+        if not pricing_infos:
+            return None
+        latest = pricing_infos[-1]
+        model = latest.get("pricingModel", "")
+        if model == "PAY_PER_EVENT":
+            events = (
+                latest.get("pricingPerEvent", {})
+                .get("actorChargeEvents", {})
+            )
+            parts = []
+            for event_info in events.values():
+                title = event_info.get("eventTitle", "")
+                price = event_info.get("eventPriceUsd", 0)
+                if price:
+                    parts.append(f"${price}/{ title}")
+            return ", ".join(parts) if parts else None
+        elif model == "FLAT_PRICE_PER_MONTH":
+            price = latest.get("pricePerUnitUsd", 0)
+            return f"${price}/month subscription"
+        elif model == "PRICE_PER_DATASET_ITEM":
+            price = latest.get("pricePerUnitUsd", 0)
+            return f"${price}/result"
+        return None
+
+    async def _fetch_input_schema(
+        self, actor_data: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch the input JSON Schema from the actor's latest build.
+
+        Tries taggedBuilds.latest first, then falls back to the most recent
+        version's build.
+        """
+        # Strategy 1: taggedBuilds.latest → buildId → build details
+        build_id = (
+            actor_data.get("taggedBuilds", {})
+            .get("latest", {})
+            .get("buildId")
+        )
+        if build_id:
+            schema = await self._get_build_input_schema(build_id)
+            if schema:
+                return schema
+
+        # Strategy 2: walk versions to find one with a buildId
+        for version in actor_data.get("versions", {}).get("items", []):
+            vid = version.get("buildId")
+            if vid:
+                schema = await self._get_build_input_schema(vid)
+                if schema:
+                    return schema
+
+        return None
+
+    async def _get_build_input_schema(
+        self, build_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch a build by ID and extract its actorDefinition.input schema."""
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    f"{BASE_URL}/actor-builds/{build_id}",
+                    headers=self._headers,
+                )
+            if resp.status_code != 200:
+                return None
+            build_data = resp.json().get("data", {})
+            return build_data.get("actorDefinition", {}).get("input")
+        except Exception:
+            logger.debug(f"[Apify] Failed to fetch build {build_id}")
+            return None
+
     async def search_actors(
         self,
         query: str,
@@ -55,7 +193,7 @@ class ApifyClient:
             results.append({
                 "actor_id": f"{item.get('username')}/{item.get('name')}",
                 "title": item.get("title", ""),
-                "description": (item.get("description") or "")[:200],
+                "description": (item.get("description") or "")[:2000],
                 "total_runs": stats.get("totalRuns", 0),
                 "total_users": stats.get("totalUsers", 0),
                 "url": f"https://apify.com/{item.get('username')}/{item.get('name')}",

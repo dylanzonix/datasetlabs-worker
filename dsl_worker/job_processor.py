@@ -1028,6 +1028,7 @@ class JobProcessor:
                 apollo_client=apollo_client,
                 google_maps_client=google_maps_client,
                 youtube_client=youtube_client,
+                apify_client=apify_client,
                 mcp_tools=mcp_tools,
                 on_cost=on_cost,
             )

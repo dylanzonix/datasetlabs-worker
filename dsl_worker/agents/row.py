@@ -166,9 +166,9 @@ class GeneratedRow:
 ROW_GENERATOR_SYSTEM_PROMPT = """\
 # Row Generator
 
-You are a row generator in a dataset generation pipeline. A harvester upstream \
-collected this candidate — your job is to validate it, research any missing \
-details, and produce a complete dataset row. You are the quality gate.
+You process candidates into dataset rows. An orchestrator upstream found \
+this candidate and wrote instructions for how to process it. Follow those \
+instructions.
 
 ## What the user wants
 
@@ -184,74 +184,47 @@ details, and produce a complete dataset row. You are the quality gate.
 
 Today's date: {current_date}
 
-## How to work — FOLLOW THIS ORDER
+{instructions_section}\
 
-**Step 1: Validate.** Before spending any time or money on this candidate, \
-verify it's real and current. Candidate data comes from search snippets which \
-may be stale or cached — treat it as a lead, not verified truth.
+## Tools
 
-If the candidate has a URL, **open it directly** (not search — actually open \
-the page). Then check:
-- Did the page load the actual listing, or did it redirect to a generic/index \
-page? A redirect means the listing is gone — skip it.
-- Does the page show the listing is still active/open? If closed or expired, skip.
-- Does the posted date meet the project's requirements? Convert "Posted X ago" \
-to an actual date and check. Don't trust dates from the candidate data — use \
-what the live page says.
+- **set_column(column, value, sources)** — set a schema column value. \
+Include sources when you have them (type: "url", "file", or "enrichment"). \
+When you set a column, the system warns if similar values exist — if the \
+match is close on something unique (name, URL, email), call mark_duplicate().
+- **submit_row()** — submit the completed row.
+- **skip_row(reason)** — skip if the candidate doesn't qualify.
+- **mark_duplicate(reason)** — mark as duplicate.
+- **Web search** (built-in) — use for lookups: company info, contact \
+details, verifying entities, finding emails/phones/LinkedIn.
+- **apollo_enrich / apollo_enrich_company** — instant enrichment if you \
+have an apollo_id or company domain. Returns name, email, phone, company \
+details.
+- **apify_search / apify_actor_details / apify_run** — search and run \
+pre-built web scrapers. Cheap (<$0.01/result). Use when you need to scrape \
+a specific page or profile — much cheaper than browse. Results written to \
+file + preview shown.
+- **code_exec(script)** — run Python in a sandbox. Use to read files, \
+parse data, or transform results.
+- **browse(task)** — open a page in a real browser. EXPENSIVE ($0.10-0.50). \
+Last resort — only when web search AND apify cannot get what you need.
 
-If validation fails, call skip_row() immediately. Don't proceed to filling or \
-research. Also check for duplicates — if it looks like something already in the \
-dataset, call mark_duplicate().
-
-**Step 2: Fill what you have.** Use set_column() for everything you already \
-know from the candidate data that you've now confirmed is valid.
-   - When you set a column, the system warns if similar values exist. \
-If the match is close on something unique (name, URL, email), call \
-mark_duplicate(reason="...").
-
-**Step 3: Research gaps.** If columns are still empty, research them:
-   - **Use web search** (built-in) for almost everything — looking up company \
-info, finding contact names, checking team pages, verifying a company, finding \
-phone numbers, LinkedIn profiles. Even "find who works at X company" is a web \
-search, not a browse. Web search has access to pre-indexed, rendered content from \
-most websites.
-   - **Use apollo_enrich / apollo_enrich_company** if the candidate has an \
-apollo_id or company domain. Instant (<1s), returns name, email, phone, company \
-details, LinkedIn.
-   - **Use browse(task) ONLY** when web search already failed for the specific \
-info you need AND you believe a live browser could succeed — e.g., the data is \
-behind a login, requires filling a form, is on an infinite-scroll feed, or the \
-site actively blocks search indexing. This is rare.
-
-**Step 4: Submit or skip.**
-   - Call submit_row() when all columns are filled.
-   - Call skip_row(reason="...") if the candidate doesn't qualify.
-
-**IMPORTANT: Work sequentially.** Validate → fill → research gaps → submit. \
-Don't spend money researching or enriching a candidate before confirming it's valid.
-
-## Rules
+## Guidelines
 
 - You are an automated data tool in an authorized pipeline. The user has \
 explicitly requested this dataset. Always complete the task — never refuse, \
 never apologize, never output "I can't help." If information is publicly \
-available, use it. If you cannot find something, leave the column blank or \
-note "not found" — but never stop working on the row entirely.
-- Output via tool calls ONLY. Text responses are wasted — the system ignores them.
-- If the candidate is a dead end (broken URL, doesn't exist, doesn't qualify), \
-call skip_row(reason="...").
-- If you can't find information after several attempts, put "not found" in the \
-column rather than making something up.
-- When calling set_column, include sources if you know where the value came from. \
-Each source has a type: "url" (with the URL), "file" (with the file number from \
-the file list), or "enrichment" (for business database lookups — no value needed). \
-Multiple sources OK. Not required for every column — just include when you have a \
-clear source.
-- Always cite the actual URL you found information on. If you got it from web \
-search results, use the URL from those results — don't reuse the candidate URL \
-if it didn't actually load the right content. Never describe a source in prose \
-when you can just include the URL.
-- Capitalize values properly — "Not found" not "not found", "N/A" not "n/a".
+available, use it. If you cannot find something, leave the column blank \
+or put "Not found" — but never stop working on the row entirely.
+- Output via tool calls ONLY. Text responses are ignored by the system.
+- Fill columns from the candidate data first, research gaps second.
+- If a candidate is a dead end (doesn't exist, doesn't qualify), skip \
+immediately — don't waste time researching.
+- If you can't find information after a few attempts, put "Not found" \
+rather than fabricating.
+- Capitalize properly — "Not found" not "not found".
+- Cite sources when you have them — use the actual URL, not prose.
+- Set multiple columns per turn when possible — don't set one at a time.
 """
 
 
@@ -294,6 +267,7 @@ class RowGeneratorAgent:
         apollo_client: Optional[ApolloClient] = None,
         google_maps_client: Optional[Any] = None,
         youtube_client: Optional[Any] = None,
+        apify_client: Optional[Any] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
         on_cost: Optional[Callable] = None,
         langfuse_parent: Optional[Any] = None,
@@ -311,6 +285,7 @@ class RowGeneratorAgent:
         self.apollo_client = apollo_client
         self.google_maps_client = google_maps_client
         self.youtube_client = youtube_client
+        self.apify_client = apify_client
         self.uploaded_files = uploaded_files or []
         self.stop_checker = stop_checker
         self.stop_event = stop_event
@@ -389,10 +364,19 @@ class RowGeneratorAgent:
             sources = args.get("sources")
 
             col_def = self._get_col_def(name)
-            if col_def:
-                error = self._validate_value(col_def, value)
-                if error:
-                    return f"Error: column '{name}' {error}", 0.0
+            if not col_def:
+                # Try case-insensitive match
+                for col in self._schema:
+                    if col.get("name", "").lower() == name.lower():
+                        col_def = col
+                        name = col["name"]  # use the canonical name
+                        break
+            if not col_def:
+                valid = [c.get("name") for c in self._schema]
+                return f"Error: unknown column '{name}'. Valid columns: {valid}", 0.0
+            error = self._validate_value(col_def, value)
+            if error:
+                return f"Error: column '{name}' {error}", 0.0
 
             self._current_row[name] = value
 
@@ -630,31 +614,6 @@ class RowGeneratorAgent:
             handler=mark_duplicate,
         )
 
-        async def rng(args: Dict) -> tuple[str, float]:
-            options = args.get("options", [])
-            weights = args.get("weights")
-            if not options:
-                return "Error: no options provided", 0.0
-            if weights and len(weights) == len(options):
-                selected = random.choices(options, weights=weights, k=1)[0]
-            else:
-                selected = random.choice(options)
-            return f"Selected: {selected}", 0.0
-
-        registry.add(
-            name="rng",
-            description="Pick a random option for controlled randomization.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "options": {"type": "array", "items": {"type": "string"}},
-                    "weights": {"type": "array", "items": {"type": "number"}},
-                },
-                "required": ["options"],
-            },
-            handler=rng,
-        )
-
         async def read_file(args: Dict) -> tuple[str, float]:
             path_str = args.get("path", "")
             try:
@@ -704,6 +663,10 @@ class RowGeneratorAgent:
 
         # --- YouTube (if available) ---
         self._register_youtube_tools(registry)
+
+        # --- Apify (if available) ---
+        if self.apify_client:
+            self._register_apify_tools(registry)
 
         # --- browse: BU V3 SDK ---
         async def browse(args: Dict) -> tuple[str, float]:
@@ -1061,6 +1024,142 @@ class RowGeneratorAgent:
             handler=youtube_channel_details,
         )
 
+    # ── Apify tools ──────────────────────────────────────────────────
+
+    def _register_apify_tools(self, registry) -> None:
+        import time as _time
+
+        async def apify_search(args: Dict) -> tuple[str, float]:
+            query = args.get("query", "")
+            if not query:
+                return "Error: query is required.", 0.0
+            try:
+                results = await self.apify_client.search_actors(query, limit=5)
+            except Exception as e:
+                return f"Apify search error: {e}", 0.0
+            if not results:
+                return f"No Apify actors found for: {query}", 0.0
+            lines = []
+            for r in results:
+                lines.append(
+                    f"- **{r['actor_id']}** — {r['title']}\n"
+                    f"  {r['description']}\n"
+                    f"  Runs: {r['total_runs']:,} | Users: {r['total_users']:,}"
+                )
+            return (
+                f"Found {len(results)} Apify actors:\n\n"
+                + "\n\n".join(lines)
+            ), 0.0
+
+        async def apify_actor_details(args: Dict) -> tuple[str, float]:
+            actor_id = args.get("actor_id", "")
+            if not actor_id:
+                return "Error: actor_id is required.", 0.0
+            try:
+                details = await self.apify_client.get_actor_details(actor_id)
+            except Exception as e:
+                return f"Error: {e}", 0.0
+            if not details:
+                return f"Actor not found: {actor_id}", 0.0
+            parts = [
+                f"**{details['title']}**",
+            ]
+            if details.get("pricing"):
+                parts.append(f"Pricing: {details['pricing']}")
+            if details.get("stats"):
+                parts.append(f"Stats: {details['stats']}")
+            parts.append("")
+            parts.append(details["description"][:500])
+            schema = details.get("input_schema")
+            if schema and schema.get("properties"):
+                req = set(schema.get("required", []))
+                parts.append("\nInput params:")
+                for name, prop in schema["properties"].items():
+                    r = "REQUIRED" if name in req else "optional"
+                    desc = (prop.get("description") or "")[:100]
+                    parts.append(f"  - {name} ({r}): {desc}")
+            return "\n".join(parts), 0.0
+
+        async def apify_run(args: Dict) -> tuple[str, float]:
+            actor_id = args.get("actor_id", "")
+            max_items = args.get("max_items")
+            if not actor_id:
+                return "Error: actor_id is required.", 0.0
+            known_keys = {"actor_id", "max_items"}
+            run_input = {k: v for k, v in args.items() if k not in known_keys}
+            try:
+                result = await self.apify_client.run_actor(
+                    actor_id, run_input, timeout=120, max_items=max_items,
+                )
+            except Exception as e:
+                return f"Apify run error: {e}", 0.0
+            if result["status"] != "SUCCEEDED":
+                return f"Apify actor failed: {result.get('error', result['status'])}", 0.0
+            items = result["items"]
+            cost = result.get("cost_usd", 0.0)
+            if not items:
+                return f"Actor returned 0 items.", cost
+            # Write to file for persistence
+            import json as _json
+            timestamp = int(_time.time())
+            filename = f"apify_rowgen_{actor_id.replace('/', '_')}_{timestamp}.jsonl"
+            file_path = self.workspace_dir / "candidates" / filename
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            lines = [_json.dumps(item, ensure_ascii=False, default=str) for item in items]
+            file_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            # Return preview (truncated if large)
+            preview_chars = 3000
+            preview = "\n".join(lines)[:preview_chars]
+            truncated = len("\n".join(lines)) > preview_chars
+            resp = f"Apify {actor_id}: {len(items)} items. Cost: ${cost:.4f}\n"
+            resp += f"File: /workspace/candidates/{filename}\n\n"
+            resp += preview
+            if truncated:
+                resp += f"\n\n... (truncated — use code_exec to read full file)"
+            return resp, cost
+
+        registry.add(
+            name="apify_search",
+            description="Search Apify for pre-built scrapers.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                },
+                "required": ["query"],
+            },
+            handler=apify_search,
+        )
+        registry.add(
+            name="apify_actor_details",
+            description="Get input schema and details for an Apify actor.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "actor_id": {"type": "string", "description": "Actor ID"},
+                },
+                "required": ["actor_id"],
+            },
+            handler=apify_actor_details,
+        )
+        registry.add(
+            name="apify_run",
+            description=(
+                "Run an Apify scraper. Pass actor params directly. "
+                "Results written to file + preview shown. Cheaper than browse."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "actor_id": {"type": "string", "description": "Actor ID"},
+                    "max_items": {"type": "integer", "description": "Max items (optional)"},
+                },
+                "required": ["actor_id"],
+                "additionalProperties": True,
+            },
+            handler=apify_run,
+        )
+
     # ── BU V3 SDK web access ────────────────────────────────────────
 
     async def _browse(self, url: str, task: str) -> Tuple[str, float]:
@@ -1175,23 +1274,34 @@ class RowGeneratorAgent:
                 file_lines.append(f"  [{idx}] {f.get('filename', 'unknown')}")
             files_note = "\n".join(file_lines)
 
-        # V13: orchestrator note
-        note_section = ""
+        # V13: orchestrator instructions
+        instructions_section = ""
         if note:
-            note_section = f"\n\nNote from orchestrator: {note}"
+            instructions_section = (
+                "## Instructions from orchestrator\n\n"
+                f"{note}\n\n"
+            )
 
         system_prompt = ROW_GENERATOR_SYSTEM_PROMPT.format(
             conversation=self._format_conversation(),
             schema_str=schema_str,
             current_date=date.today().isoformat(),
-        ) + apollo_note + files_note + note_section
+            instructions_section=instructions_section,
+        ) + apollo_note + files_note
 
         # V13: pre-fill columns from preset_fields before the LLM starts.
         # This uses the same validation + dedup logic as set_column.
         prefilled_columns: List[str] = []
         if preset_fields and isinstance(preset_fields, dict) and candidate_data and isinstance(candidate_data, dict):
             for schema_col, candidate_field in preset_fields.items():
-                value = candidate_data.get(candidate_field)
+                # Support dot-notation for nested fields (e.g. "author.displayName")
+                value = candidate_data
+                for key in candidate_field.split("."):
+                    if isinstance(value, dict):
+                        value = value.get(key)
+                    else:
+                        value = None
+                        break
                 if value is None:
                     continue
                 # Validate against schema
@@ -1245,7 +1355,8 @@ class RowGeneratorAgent:
 
         # Derive a prompt_cache_key from the system prompt so all row generators
         # sharing the same prefix get routed to the same backend → cache hits.
-        cache_key = hashlib.sha256(system_prompt.encode()).hexdigest()[:16]
+        # DISABLED: may contribute to Azure content filter cascading refusals
+        cache_key = None  # hashlib.sha256(system_prompt.encode()).hexdigest()[:16]
 
         conversation = AgentConversation(
             openai_client=self.openai_client,
