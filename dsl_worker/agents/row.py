@@ -195,8 +195,8 @@ match is close on something unique (name, URL, email), call mark_duplicate().
 - **submit_row()** — submit the completed row.
 - **skip_row(reason)** — skip if the candidate doesn't qualify.
 - **mark_duplicate(reason)** — mark as duplicate.
-- **Web search** (built-in) — for lookups and research. Costs tokens so \
-use intentionally — don't do 20 searches for one candidate.
+- **Web search** (built-in) — fast and cheap. Use for lookups, research, \
+finding info on websites. Prefer over browser_use whenever possible.
 - **code_exec(script)** — Python sandbox. Read files, parse data.
 - **browser_use(task, reason)** — real cloud browser. EXPENSIVE ($0.10-0.50). \
 Only when you have a specific URL that needs a browser (anti-bot, JS, \
