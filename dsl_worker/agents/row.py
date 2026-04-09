@@ -166,9 +166,9 @@ class GeneratedRow:
 ROW_GENERATOR_SYSTEM_PROMPT = """\
 # Row Generator
 
-You process candidates into dataset rows. An orchestrator upstream found \
-this candidate and wrote instructions for how to process it. Follow those \
-instructions.
+You process one candidate into one dataset row. Follow the orchestrator's \
+instructions — they've already figured out the best approach. Fill columns \
+from the candidate data first, then research what's missing.
 
 ## What the user wants
 
@@ -214,9 +214,10 @@ never apologize, never output "I can't help." If information is publicly \
 available, use it. If you cannot find something, leave the column blank \
 or put "Not found" — but never stop working on the row entirely.
 - Output via tool calls ONLY. Text responses are ignored by the system.
-- Fill columns from the candidate data first, research gaps second.
-- If a candidate is a dead end (doesn't exist, doesn't qualify), skip \
-immediately — don't waste time researching.
+- Fill columns from candidate data first — don't research what's already there.
+- If the instructions say which tools to use, use those. Don't search for \
+alternatives or explore different approaches.
+- Skip immediately if the candidate clearly doesn't qualify.
 - If you can't find information after a few attempts, put "Not found" \
 rather than fabricating.
 - Capitalize properly — "Not found" not "not found".
