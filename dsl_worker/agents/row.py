@@ -199,10 +199,10 @@ match is close on something unique (name, URL, email), call mark_duplicate().
 details, verifying entities, finding emails/phones/LinkedIn.
 - **code_exec(script)** — run Python in a sandbox. Read files, parse data.
 - **browse(task)** — real browser. EXPENSIVE ($0.10-0.50). Last resort.
-- Additional tools available via tool_search: **apify** (web scrapers), \
-**fullenrich** (people/company search + email/phone enrichment), \
-**apollo** (B2B company/people enrichment), **google_maps** (local \
-business search + details).
+- Additional tools available: **apify** (web scrapers), **fullenrich** \
+(people/company search + email/phone enrichment), **apollo** (B2B \
+company/people enrichment), **google_maps** (local business search + \
+details).
 
 ## Guidelines
 
@@ -651,7 +651,7 @@ class RowGeneratorAgent:
                 include_builtins=False,
             )
 
-        # Enable deferred tool discovery
+        # Enable deferred tool discovery (row gen uses gpt-5.4)
         registry.add_builtin({"type": "tool_search"})
 
         # Integration namespaces (deferred)

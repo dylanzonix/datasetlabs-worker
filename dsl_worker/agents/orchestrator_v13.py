@@ -508,7 +508,7 @@ class OrchestratorV13:
         if not sections:
             return ""
         return (
-            "Available integrations (use tool_search to load):\n"
+            "Available integrations:\n"
             + "\n".join(f"- {s}" for s in sections)
             + "\n"
         )
@@ -579,10 +579,11 @@ class OrchestratorV13:
         self._register_continue_processing(registry)
         self._register_finish(registry)
 
-        # Enable deferred tool discovery
-        registry.add_builtin({"type": "tool_search"})
+        # Note: tool_search requires gpt-5.4+. Orchestrator uses gpt-5.2,
+        # so namespace tools load upfront (no deferral). When upgrading to
+        # gpt-5.4, uncomment: registry.add_builtin({"type": "tool_search"})
 
-        # Integration namespaces (deferred — loaded on demand via tool_search)
+        # Integration namespaces
         if self.apify_client:
             from dsl_worker.agents.integrations.apify import register_apify_namespace
             from dsl_worker.config import settings

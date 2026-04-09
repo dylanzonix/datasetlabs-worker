@@ -47,7 +47,7 @@ class WorkerSettings(BaseSettings):
     brave_search_rps: float = 0.5  # requests per second
 
     research_model: str = "gpt-5.4"
-    generation_model: str = "gpt-5.2"  # 5.4 has persistent refusal issues on Azure
+    generation_model: str = "gpt-5.4"
 
     # V10 pipeline settings
     research_subagent_model: str = "gpt-5.4"           # model for research subagents
