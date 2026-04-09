@@ -654,7 +654,8 @@ class RowGeneratorAgent:
                 include_builtins=False,
             )
 
-        # tool_search not supported on Azure OpenAI. Namespace tools load upfront.
+        # Enable deferred tool discovery — namespace tools only load when needed
+        registry.add_builtin({"type": "tool_search"})
 
         # Integration namespaces (deferred)
         if self.apify_client:
