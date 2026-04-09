@@ -272,6 +272,7 @@ class OrchestratorV13:
         google_maps_client: Optional[Any] = None,
         youtube_client: Optional[Any] = None,
         apify_client: Optional[Any] = None,
+        fullenrich_client: Optional[Any] = None,
         feedback_context: Optional[Dict[str, Any]] = None,
         resume_context: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -296,6 +297,7 @@ class OrchestratorV13:
         self.apollo_client = apollo_client
         self.google_maps_client = google_maps_client
         self.apify_client = apify_client
+        self.fullenrich_client = fullenrich_client
         self.youtube_client = youtube_client
         self.feedback_context = feedback_context
         self.resume_context = resume_context
@@ -471,43 +473,45 @@ class OrchestratorV13:
         return "\n".join(lines)
 
     def _format_integration_tools(self) -> str:
-        """Build the integration tools section of the system prompt."""
+        """Build the integration tools section of the system prompt.
+
+        Describes available namespaces — individual tools are deferred
+        and discovered via tool_search when needed.
+        """
         sections = []
+
+        if self.apify_client:
+            sections.append(
+                "**apify** — 22,000+ pre-built web scrapers. Best for any specific "
+                "website. Search for actors, check schemas, run scrapers. Cheap and fast."
+            )
+
+        if hasattr(self, 'fullenrich_client') and self.fullenrich_client:
+            sections.append(
+                "**fullenrich** — Search for people (by title, location, company, "
+                "seniority, skills) and companies (by industry, location, size). "
+                "Enrich contacts with verified emails and phones via 20+ providers."
+            )
 
         if self.apollo_client:
             sections.append(
-                "**apollo_search(...)** — Search Apollo.io's 210M+ contact database. "
-                "FREE — no credits. Returns summary + file path. Great for B2B "
-                "contacts and company discovery.\n\n"
-                "**apollo_search_companies(...)** — Search Apollo.io's 30M+ company "
-                "database. Returns summary + file path.\n"
+                "**apollo** — B2B company search and enrichment. Search companies "
+                "by industry, location, size, tech stack. Enrich people and companies."
             )
 
         if self.google_maps_client:
             sections.append(
-                "**google_maps_search(query, page_token)** — Search Google Maps for "
-                "local businesses. Returns summary + file path. Fast and cheap "
-                "(~$0.003/search). Better than web research for local business data.\n\n"
-                "**google_maps_details(place_id)** — Full details for a place (phone, "
-                "website, hours). Use after google_maps_search to enrich.\n"
-            )
-
-        if self.apify_client:
-            sections.append(
-                "**apify_search(query)** — Find scrapers for a specific site.\n"
-                "**apify_actor_details(actor_id)** — Get input schema and pricing.\n"
-                "**apify_run(actor_id, ...)** — Run the scraper with the actor's "
-                "params passed directly (e.g. startUrls, maxItems). Returns "
-                "structured data to file.\n\n"
-                "Apify is your best tool for any specific website — structured "
-                "data, fast, cheap. If an actor exists for the target site, use it. "
-                "Once you have the schema, call apify_run with your best guess. "
-                "Don't research URL formats — try it and adjust.\n"
+                "**google_maps** — Local business search, place details (phone, "
+                "website, hours, reviews), geocoding, directions, distance matrix."
             )
 
         if not sections:
             return ""
-        return "\n".join(sections) + "\n"
+        return (
+            "Available integrations (use tool_search to load):\n"
+            + "\n".join(f"- {s}" for s in sections)
+            + "\n"
+        )
 
     def _format_resume_section(self) -> str:
         """Format resume context if this is a resumed job."""
@@ -567,6 +571,7 @@ class OrchestratorV13:
     # ── Tool registration ─────────────────────────────────────────────
 
     def _register_tools(self, registry: ToolRegistry) -> None:
+        # Core tools (always loaded)
         self._register_code_exec(registry)
         self._register_web_harvest(registry)
         self._register_bu_extract(registry)
@@ -574,12 +579,33 @@ class OrchestratorV13:
         self._register_continue_processing(registry)
         self._register_finish(registry)
 
-        if self.apollo_client:
-            self._register_apollo_tools(registry)
-        if self.google_maps_client:
-            self._register_google_maps(registry)
+        # Enable deferred tool discovery
+        registry.add_builtin({"type": "tool_search"})
+
+        # Integration namespaces (deferred — loaded on demand via tool_search)
         if self.apify_client:
-            self._register_apify_tools(registry)
+            from dsl_worker.agents.integrations.apify import register_apify_namespace
+            from dsl_worker.config import settings
+            register_apify_namespace(
+                registry, self.apify_client, settings.apify_api_key,
+                self.workspace_dir,
+            )
+        if self.apollo_client:
+            from dsl_worker.agents.integrations.apollo import register_apollo_namespace
+            register_apollo_namespace(
+                registry, self.apollo_client, self.workspace_dir,
+            )
+        if self.google_maps_client:
+            from dsl_worker.agents.integrations.google_maps import register_google_maps_namespace
+            from dsl_worker.config import settings as _settings
+            register_google_maps_namespace(
+                registry, _settings.google_api_key, self.workspace_dir,
+            )
+        if hasattr(self, 'fullenrich_client') and self.fullenrich_client:
+            from dsl_worker.agents.integrations.fullenrich import register_fullenrich_namespace
+            register_fullenrich_namespace(
+                registry, self.fullenrich_client, self.workspace_dir,
+            )
 
     # --- code_exec ---
 

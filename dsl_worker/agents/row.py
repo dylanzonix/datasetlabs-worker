@@ -197,17 +197,12 @@ match is close on something unique (name, URL, email), call mark_duplicate().
 - **mark_duplicate(reason)** — mark as duplicate.
 - **Web search** (built-in) — use for lookups: company info, contact \
 details, verifying entities, finding emails/phones/LinkedIn.
-- **apollo_enrich / apollo_enrich_company** — instant enrichment if you \
-have an apollo_id or company domain. Returns name, email, phone, company \
-details.
-- **apify_search / apify_actor_details / apify_run** — search and run \
-pre-built web scrapers. Cheap (<$0.01/result). Use when you need to scrape \
-a specific page or profile — much cheaper than browse. Results written to \
-file + preview shown.
-- **code_exec(script)** — run Python in a sandbox. Use to read files, \
-parse data, or transform results.
-- **browse(task)** — open a page in a real browser. EXPENSIVE ($0.10-0.50). \
-Last resort — only when web search AND apify cannot get what you need.
+- **code_exec(script)** — run Python in a sandbox. Read files, parse data.
+- **browse(task)** — real browser. EXPENSIVE ($0.10-0.50). Last resort.
+- Additional tools available via tool_search: **apify** (web scrapers), \
+**fullenrich** (people/company search + email/phone enrichment), \
+**apollo** (B2B company/people enrichment), **google_maps** (local \
+business search + details).
 
 ## Guidelines
 
@@ -268,6 +263,7 @@ class RowGeneratorAgent:
         google_maps_client: Optional[Any] = None,
         youtube_client: Optional[Any] = None,
         apify_client: Optional[Any] = None,
+        fullenrich_client: Optional[Any] = None,
         mcp_tools: Optional[List[Dict[str, Any]]] = None,
         on_cost: Optional[Callable] = None,
         langfuse_parent: Optional[Any] = None,
@@ -286,6 +282,7 @@ class RowGeneratorAgent:
         self.google_maps_client = google_maps_client
         self.youtube_client = youtube_client
         self.apify_client = apify_client
+        self.fullenrich_client = fullenrich_client
         self.uploaded_files = uploaded_files or []
         self.stop_checker = stop_checker
         self.stop_event = stop_event
@@ -654,19 +651,35 @@ class RowGeneratorAgent:
                 include_builtins=False,
             )
 
-        # --- Apollo enrichment (if available) ---
-        if self.apollo_client:
-            self._register_apollo_tools(registry)
+        # Enable deferred tool discovery
+        registry.add_builtin({"type": "tool_search"})
 
-        # --- Google Maps (if available) ---
-        self._register_google_maps_tools(registry)
-
-        # --- YouTube (if available) ---
-        self._register_youtube_tools(registry)
-
-        # --- Apify (if available) ---
+        # Integration namespaces (deferred)
         if self.apify_client:
-            self._register_apify_tools(registry)
+            from dsl_worker.agents.integrations.apify import register_apify_namespace
+            from dsl_worker.config import settings as _apify_settings
+            register_apify_namespace(
+                registry, self.apify_client, _apify_settings.apify_api_key,
+                self.workspace_dir,
+            )
+        if self.apollo_client:
+            from dsl_worker.agents.integrations.apollo import register_apollo_namespace
+            register_apollo_namespace(
+                registry, self.apollo_client, self.workspace_dir,
+            )
+        if self.google_maps_client:
+            from dsl_worker.agents.integrations.google_maps import register_google_maps_namespace
+            from dsl_worker.config import settings as _gm_settings
+            register_google_maps_namespace(
+                registry, _gm_settings.google_api_key, self.workspace_dir,
+            )
+        if self.apify_client:  # fullenrich uses same check pattern
+            pass  # fullenrich registered below if client exists
+        if hasattr(self, 'fullenrich_client') and self.fullenrich_client:
+            from dsl_worker.agents.integrations.fullenrich import register_fullenrich_namespace
+            register_fullenrich_namespace(
+                registry, self.fullenrich_client, self.workspace_dir,
+            )
 
         # --- browse: BU V3 SDK ---
         async def browse(args: Dict) -> tuple[str, float]:

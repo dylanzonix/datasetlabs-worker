@@ -954,6 +954,12 @@ class JobProcessor:
             apify_client = ApifyClient(api_key=settings.apify_api_key)
             logger.info("[Pipeline] Apify client initialized")
 
+        fullenrich_client = None
+        if settings.fullenrich_api_key:
+            from dsl_worker.infra.fullenrich_client import FullEnrichClient
+            fullenrich_client = FullEnrichClient(api_key=settings.fullenrich_api_key)
+            logger.info("[Pipeline] FullEnrich client initialized")
+
         # Row saver
         row_saver = GenerationWorkerPool(
             workspace_dir=workspace_dir,
@@ -1029,6 +1035,7 @@ class JobProcessor:
                 google_maps_client=google_maps_client,
                 youtube_client=youtube_client,
                 apify_client=apify_client,
+                fullenrich_client=fullenrich_client,
                 mcp_tools=mcp_tools,
                 on_cost=on_cost,
             )
@@ -1106,6 +1113,7 @@ class JobProcessor:
             google_maps_client=google_maps_client,
             youtube_client=youtube_client,
             apify_client=apify_client,
+            fullenrich_client=fullenrich_client,
             feedback_context=feedback_context,
             resume_context=resume_context,
         )
