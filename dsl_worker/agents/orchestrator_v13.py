@@ -579,9 +579,8 @@ class OrchestratorV13:
         self._register_continue_processing(registry)
         self._register_finish(registry)
 
-        # Note: tool_search requires gpt-5.4+. Orchestrator uses gpt-5.2,
-        # so namespace tools load upfront (no deferral). When upgrading to
-        # gpt-5.4, uncomment: registry.add_builtin({"type": "tool_search"})
+        # tool_search not supported on Azure OpenAI (returns 400 even with gpt-5.4).
+        # Namespace tools load upfront instead of deferred.
 
         # Integration namespaces
         if self.apify_client:

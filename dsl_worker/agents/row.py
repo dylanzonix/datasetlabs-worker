@@ -651,8 +651,7 @@ class RowGeneratorAgent:
                 include_builtins=False,
             )
 
-        # Enable deferred tool discovery (row gen uses gpt-5.4)
-        registry.add_builtin({"type": "tool_search"})
+        # tool_search not supported on Azure OpenAI. Namespace tools load upfront.
 
         # Integration namespaces (deferred)
         if self.apify_client:
