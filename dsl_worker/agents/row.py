@@ -726,7 +726,7 @@ class RowGeneratorAgent:
                 },
                 "required": ["task"],
             },
-            handler=browse,
+            handler=browser_use,
         )
 
     # ── Apollo enrichment ──────────────────────────────────────────
