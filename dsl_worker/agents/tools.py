@@ -114,7 +114,8 @@ class ToolRegistry:
                 "name": tool["name"],
                 "description": tool["description"],
                 "parameters": tool.get("parameters", {"type": "object", "properties": {}}),
-                "defer_loading": True,
+                # Note: defer_loading requires tool_search which Azure OpenAI
+                # doesn't support. Tools load upfront within their namespace.
             }
             if tool.get("additionalProperties"):
                 tool_def["parameters"]["additionalProperties"] = True
