@@ -87,6 +87,7 @@ def register_apollo_namespace(
     client: ApolloClient,
     workspace_dir: Path,
     file_counter: Optional[List[int]] = None,
+    cost_per_credit: float = 0.024,
 ) -> None:
     """Register the apollo namespace on a ToolRegistry."""
     if file_counter is None:
@@ -180,7 +181,8 @@ def register_apollo_namespace(
             f"Industry: {s.get('company_industry', 'N/A')}",
             f"Company Size: {s.get('company_size', 'N/A')}",
         ]
-        return "\n".join(parts), 0.0
+        # Person enrichment costs 1 Apollo credit
+        return "\n".join(parts), cost_per_credit
 
     # ── enrich_company ───────────────────────────────────────────────
 
@@ -282,10 +284,13 @@ def register_apollo_namespace(
         matched = sum(1 for r in results if "name" in r)
         workspace_path = f"/workspace/candidates/{output_path.name}"
 
+        # 1 credit per matched person
+        bulk_cost = matched * cost_per_credit
         return (
             f"Bulk enriched {matched}/{len(people)} people.\n"
-            f"File: {workspace_path}"
-        ), 0.0
+            f"File: {workspace_path}\n"
+            f"Cost: ${bulk_cost:.4f} ({matched} credits)"
+        ), bulk_cost
 
     # ── org_job_postings ─────────────────────────────────────────────
 

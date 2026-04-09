@@ -45,6 +45,7 @@ def register_fullenrich_namespace(
     client: FullEnrichClient,
     workspace_dir: Path,
     file_counter: Optional[List[int]] = None,
+    cost_per_credit: float = 0.055,
 ) -> None:
     """Register the fullenrich namespace on a ToolRegistry.
 
@@ -125,12 +126,16 @@ def register_fullenrich_namespace(
 
         workspace_path = f"/workspace/candidates/{output_path.name}"
 
+        credits_used = result.get("credits_used", 0)
+        cost_usd = credits_used * cost_per_credit
+
         return (
             f"Found {result['total']:,} people matching filters.\n"
             f"File: {workspace_path} ({result['item_count']} saved)\n"
-            f"Fields: {', '.join(result.get('fields', []))}\n\n"
+            f"Fields: {', '.join(result.get('fields', []))}\n"
+            f"Cost: ${cost_usd:.4f} ({credits_used:.1f} credits)\n\n"
             f"Next: submit_candidates with this file, or inspect with code_exec."
-        ), 0.0
+        ), cost_usd
 
     # ── search_companies handler ─────────────────────────────────────
 
@@ -179,13 +184,16 @@ def register_fullenrich_namespace(
             return f"No companies found matching filters. Total in database: {result.get('total', 0)}. Try broader filters.", 0.0
 
         workspace_path = f"/workspace/candidates/{output_path.name}"
+        credits_used = result.get("credits_used", 0) if "credits_used" in result else 0
+        cost_usd = credits_used * cost_per_credit
 
         return (
             f"Found {result['total']:,} companies matching filters.\n"
             f"File: {workspace_path} ({result['item_count']} saved)\n"
-            f"Fields: {', '.join(result.get('fields', []))}\n\n"
+            f"Fields: {', '.join(result.get('fields', []))}\n"
+            f"Cost: ${cost_usd:.4f} ({credits_used:.1f} credits)\n\n"
             f"Next: submit_candidates with this file, or inspect with code_exec."
-        ), 0.0
+        ), cost_usd
 
     # ── enrich_contacts handler ──────────────────────────────────────
 
@@ -221,7 +229,8 @@ def register_fullenrich_namespace(
             data = result.get("data", [])
             credits = result.get("cost", {}).get("credits", 0)
 
-            parts = [f"Enriched {len(data)} contacts. Credits used: {credits}.\n"]
+            cost_usd = credits * cost_per_credit
+            parts = [f"Enriched {len(data)} contacts. Cost: ${cost_usd:.4f} ({credits} credits).\n"]
             for entry in data:
                 inp = entry.get("input", {})
                 name = inp.get("full_name") or f"{inp.get('first_name', '')} {inp.get('last_name', '')}".strip()
@@ -256,7 +265,7 @@ def register_fullenrich_namespace(
                     if others:
                         parts.append(f"  Other phones: {', '.join(others)}")
 
-            return "\n".join(parts), 0.0
+            return "\n".join(parts), cost_usd
 
         else:
             # Bulk — write to file
@@ -272,11 +281,13 @@ def register_fullenrich_namespace(
                 return f"Enrichment error: {result['error']}", 0.0
 
             workspace_path = f"/workspace/candidates/{output_path.name}"
+            credits_used = result.get("credits_used", 0)
+            cost_usd = credits_used * cost_per_credit
             return (
                 f"Enriched {result.get('item_count', 0)} contacts.\n"
                 f"File: {workspace_path}\n"
-                f"Credits used: {result.get('credits_used', 0)}"
-            ), 0.0
+                f"Cost: ${cost_usd:.4f} ({credits_used} credits)"
+            ), cost_usd
 
     # ── Register namespace ───────────────────────────────────────────
 

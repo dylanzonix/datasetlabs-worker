@@ -663,8 +663,10 @@ class RowGeneratorAgent:
             )
         if self.apollo_client:
             from dsl_worker.agents.integrations.apollo import register_apollo_namespace
+            from dsl_worker.config import settings as _apollo_s
             register_apollo_namespace(
                 registry, self.apollo_client, self.workspace_dir,
+                cost_per_credit=_apollo_s.apollo_cost_per_credit,
             )
         if self.google_maps_client:
             from dsl_worker.agents.integrations.google_maps import register_google_maps_namespace
@@ -672,12 +674,12 @@ class RowGeneratorAgent:
             register_google_maps_namespace(
                 registry, _gm_settings.google_api_key, self.workspace_dir,
             )
-        if self.apify_client:  # fullenrich uses same check pattern
-            pass  # fullenrich registered below if client exists
         if hasattr(self, 'fullenrich_client') and self.fullenrich_client:
             from dsl_worker.agents.integrations.fullenrich import register_fullenrich_namespace
+            from dsl_worker.config import settings as _fe_s
             register_fullenrich_namespace(
                 registry, self.fullenrich_client, self.workspace_dir,
+                cost_per_credit=_fe_s.fullenrich_cost_per_credit,
             )
 
         # --- browse: BU V3 SDK ---

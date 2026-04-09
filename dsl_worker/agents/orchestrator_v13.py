@@ -592,8 +592,10 @@ class OrchestratorV13:
             )
         if self.apollo_client:
             from dsl_worker.agents.integrations.apollo import register_apollo_namespace
+            from dsl_worker.config import settings as _apollo_settings
             register_apollo_namespace(
                 registry, self.apollo_client, self.workspace_dir,
+                cost_per_credit=_apollo_settings.apollo_cost_per_credit,
             )
         if self.google_maps_client:
             from dsl_worker.agents.integrations.google_maps import register_google_maps_namespace
@@ -603,8 +605,10 @@ class OrchestratorV13:
             )
         if hasattr(self, 'fullenrich_client') and self.fullenrich_client:
             from dsl_worker.agents.integrations.fullenrich import register_fullenrich_namespace
+            from dsl_worker.config import settings as _fe_settings
             register_fullenrich_namespace(
                 registry, self.fullenrich_client, self.workspace_dir,
+                cost_per_credit=_fe_settings.fullenrich_cost_per_credit,
             )
 
     # --- code_exec ---
