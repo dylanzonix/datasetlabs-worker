@@ -195,14 +195,16 @@ match is close on something unique (name, URL, email), call mark_duplicate().
 - **submit_row()** — submit the completed row.
 - **skip_row(reason)** — skip if the candidate doesn't qualify.
 - **mark_duplicate(reason)** — mark as duplicate.
-- **Web search** (built-in) — use for lookups: company info, contact \
-details, verifying entities, finding emails/phones/LinkedIn.
-- **code_exec(script)** — run Python in a sandbox. Read files, parse data.
-- **browse(task)** — real browser. EXPENSIVE ($0.10-0.50). Last resort.
-- Additional tools available: **apify** (web scrapers), **fullenrich** \
-(people/company search + email/phone enrichment), **apollo** (B2B \
-company/people enrichment), **google_maps** (local business search + \
-details).
+- **Web search** (built-in) — for lookups and research. Costs tokens so \
+use intentionally — don't do 20 searches for one candidate.
+- **code_exec(script)** — Python sandbox. Read files, parse data.
+- **browser_use(task, reason)** — real cloud browser. EXPENSIVE ($0.10-0.50). \
+Only when you have a specific URL that needs a browser (anti-bot, JS, \
+interactive) and web_search + apify couldn't get it.
+- Additional tools: **apify** (22K+ web scrapers — check before using \
+browser_use), **fullenrich** (verified email ~$0.05, phone ~$0.55), \
+**apollo** (B2B company/people enrichment), **google_maps** (local \
+business data).
 
 ## Guidelines
 
@@ -682,20 +684,26 @@ class RowGeneratorAgent:
                 cost_per_credit=_fe_s.fullenrich_cost_per_credit,
             )
 
-        # --- browse: BU V3 SDK ---
-        async def browse(args: Dict) -> tuple[str, float]:
+        # --- browser_use: BU V3 SDK ---
+        async def browser_use(args: Dict) -> tuple[str, float]:
             task = args.get("task", "")
             if not task:
                 return "Error: task is required", 0.0
+            # Log the reason for debugging/optimization
+            reason = args.get("reason", "")
+            if reason:
+                logger.info(f"[row_generator] browser_use reason: {reason}")
             return await self._browse("", task)
 
         registry.add(
-            name="browse",
+            name="browser_use",
             description=(
-                "Launch a full cloud browser for tasks that need live interaction, "
-                "anti-bot bypass, JS rendering, captcha solving, or accessing content "
-                "that wouldn't be indexed. Slow and expensive — prefer web search for "
-                "simple lookups. Cannot process video or audio — don't use on YouTube, TikTok, etc."
+                "Open a real cloud browser to visit a specific URL. EXPENSIVE "
+                "($0.10-0.50 per session). Use ONLY when: (1) you have a specific "
+                "URL that needs a real browser — anti-bot protection, JS rendering, "
+                "or interactive elements, AND (2) web_search couldn't get the data, "
+                "AND (3) no Apify actor exists for this site. If the data could be "
+                "found from a different source without a browser, do that instead."
             ),
             parameters={
                 "type": "object",
@@ -703,8 +711,16 @@ class RowGeneratorAgent:
                     "task": {
                         "type": "string",
                         "description": (
-                            "What to do. E.g.: 'Go to coastmgt.com/about and find "
-                            "the leadership team names and contact info.'"
+                            "What to do. Include the specific URL. E.g.: 'Go to "
+                            "coastmgt.com/about and find the leadership team names.'"
+                        ),
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": (
+                            "Why browser_use is needed — what you tried that didn't "
+                            "work (e.g. 'web_search returned no results for this "
+                            "company contact page, site appears to block indexing')"
                         ),
                     },
                 },
