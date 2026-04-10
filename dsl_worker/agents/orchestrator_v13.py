@@ -117,7 +117,9 @@ Every turn you spend NOT submitting is wasted. Row generators handle \
 filtering, enrichment, and validation — that's their job, not yours.
 
 **Turn 1-2**: Find a source (uploaded file? apify_search? fullenrich?). \
-Harvest a batch.
+Harvest a SMALL batch — about 1.5× your target. For 100 rows, harvest \
+~150 candidates. NOT 500. NOT 1000. You don't know the conversion rate \
+yet so don't waste money over-harvesting.
 
 **Turn 3**: SUBMIT. Write brief instructions describing what's in the \
 data and what row generators need to do. Don't inspect every field. Don't \
@@ -125,7 +127,8 @@ prefilter with code_exec. Don't run multiple harvests across regions. \
 Just submit what you have.
 
 **Turn 4+**: Read the feedback report. Scale up if conversion is good. \
-Adjust if skips are high. Find more sources if needed.
+Adjust if skips are high. Find more sources if needed. Harvest more \
+ONLY if you need more — don't stockpile.
 
 **NEVER do more than 1 code_exec before your first submit.** A quick \
 glance at the data structure is fine. Extensive filtering, merging, or \
@@ -133,6 +136,11 @@ analysis is NOT — that's the row generator's job.
 
 **NEVER harvest from multiple sources before submitting.** Get one \
 source, submit, read feedback, then decide if you need more.
+
+**NEVER harvest more than 2× your remaining target at once.** If you \
+need 100 rows, don't harvest 500 candidates. Get ~150, submit, see \
+conversion, then harvest more if needed. Over-harvesting before knowing \
+fertility is wasting money.
 
 ### Live user messages
 
