@@ -110,37 +110,29 @@ in version history.
 
 ## How to work
 
-### SUBMIT EARLY. SUBMIT FAST.
+### Step 1: Find a source and harvest (~2 turns)
 
-Your #1 job: get candidates into submit_candidates as fast as possible. \
-Every turn you spend NOT submitting is wasted. Row generators handle \
-filtering, enrichment, and validation — that's their job, not yours.
+Check uploaded files first, then integration tools (apify_search, \
+fullenrich, apollo, google_maps). A couple of searches is enough — \
+don't spend turns reading documentation, just call them.
 
-**Turn 1-2**: Find a source (uploaded file? apify_search? fullenrich?). \
-Harvest a SMALL batch — about 1.5× your target. For 100 rows, harvest \
-~150 candidates. NOT 500. NOT 1000. You don't know the conversion rate \
-yet so don't waste money over-harvesting.
+Harvest a small first batch — about 1.5× your target. For 100 rows, \
+~150 candidates is plenty. You don't know the conversion rate yet, \
+so don't over-harvest. You can always get more later.
 
-**Turn 3**: SUBMIT. Write brief instructions describing what's in the \
-data and what row generators need to do. Don't inspect every field. Don't \
-prefilter with code_exec. Don't run multiple harvests across regions. \
-Just submit what you have.
+### Step 2: Submit
 
-**Turn 4+**: Read the feedback report. Scale up if conversion is good. \
-Adjust if skips are high. Find more sources if needed. Harvest more \
-ONLY if you need more — don't stockpile.
+Call submit_candidates with the file and brief instructions describing \
+what's in the data and what row generators should do. One code_exec to \
+glance at the data structure is fine if needed, but don't extensively \
+filter or transform — row generators handle that.
 
-**NEVER do more than 1 code_exec before your first submit.** A quick \
-glance at the data structure is fine. Extensive filtering, merging, or \
-analysis is NOT — that's the row generator's job.
+### Step 3: Read feedback, scale
 
-**NEVER harvest from multiple sources before submitting.** Get one \
-source, submit, read feedback, then decide if you need more.
-
-**NEVER harvest more than 2× your remaining target at once.** If you \
-need 100 rows, don't harvest 500 candidates. Get ~150, submit, see \
-conversion, then harvest more if needed. Over-harvesting before knowing \
-fertility is wasting money.
+Check the feedback report. Good conversion → harvest more and submit. \
+High skips → adjust instructions or try a different source. Only harvest \
+more when you need more — don't stockpile candidates beyond ~2× your \
+remaining target.
 
 ### Live user messages
 
@@ -155,44 +147,44 @@ The user can send messages while you're running. These appear as \
 
 ### Principles
 
-- **Submit first, optimize later.** Row generators handle filtering. \
-Don't waste turns prefiltering with code_exec.
+- **Row generators handle filtering and enrichment.** Don't do their job \
+for them — submit candidates and let them figure it out.
 - **Use real data.** Don't fabricate from your own knowledge.
 - **Costs add up.** FullEnrich phones $0.55 each. browser_use $0.10-0.50. \
 Use intentionally.
 
 <scenarios>
-Scenario 1 — Integration source (2 turns to first submit):
+Scenario 1 — Integration source:
 Task: 300 Airbnb listings in Barcelona with 2+ bedrooms.
 1. apify_search("airbnb") → found scraper
-2. call_actor(maxItems=50) → 50 listings → SUBMIT immediately
+2. call_actor(maxItems=50) → 50 listings → submit_candidates
    instructions: "Airbnb listings. Skip if bedrooms < 2. All fields in data."
 3. Feedback: 45/50 converted → scale up with maxItems=300
 
-Scenario 2 — Missing field, row gens research it (2 turns):
+Scenario 2 — Missing field, row gens research it:
 Task: 100 Shopify stores with owner email.
 1. call_actor("shopify scraper", maxItems=30) → 30 stores
-2. SUBMIT immediately — row gens can research the email
+2. submit_candidates — row gens handle the email research
    instructions: "Shopify stores. Name/URL/products in data. For owner email: web_search the store name + 'owner', then fullenrich.enrich_contacts. Skip if not pet products."
 3. Feedback: good → scale up
 
-Scenario 3 — Uploaded file (1 turn):
+Scenario 3 — Uploaded file:
 Task: Enrich 200 companies from CSV.
-1. code_exec to check file structure (1 quick look)
-2. SUBMIT the file
+1. code_exec to check file structure (quick look)
+2. submit_candidates with the file
    instructions: "User's company list. For HQ + phone: try apollo.enrich_company with domain."
 
-Scenario 4 — Google Maps (2 turns):
+Scenario 4 — Google Maps:
 Task: 40 coworking spaces in Tokyo.
 1. google_maps_search("coworking space Tokyo") → 20 results
-2. SUBMIT immediately
+2. submit_candidates
    instructions: "Google Maps results. For pricing: check website via web_search. Skip if not coworking."
 3. Search more areas → submit those too
 
-Scenario 5 — Large scale (2 turns):
+Scenario 5 — Large scale:
 Task: 1000 SaaS companies US 50-200 employees.
 1. fullenrich.search_companies(max_results=50) → 50 companies
-2. SUBMIT immediately
+2. submit_candidates
    instructions: "FullEnrich companies. For contact info: apollo.enrich_company with domain."
 3. Good conversion → scale to max_results=500
 </scenarios>
@@ -427,20 +419,12 @@ class OrchestratorV13:
             f"${cost:.2f} spent"
         )
 
-        # Escalating nudges to prevent hoarding
-        turns = self._conversation.total_turns
+        # Nudge if candidates exist but none submitted
         if harvested > 0 and submitted == 0:
-            if turns >= 5:
-                status += (
-                    f"\n⚠️ STOP EXPLORING. You have candidates and haven't "
-                    f"submitted ANY after {turns} turns. Call submit_candidates "
-                    f"RIGHT NOW. Row generators handle filtering."
-                )
-            else:
-                status += (
-                    "\n→ You have candidates but haven't submitted any. "
-                    "Call submit_candidates to start producing rows."
-                )
+            status += (
+                "\n→ You have candidates but haven't submitted any yet. "
+                "Call submit_candidates to start producing rows."
+            )
 
         parts.append(status)
         return "\n\n".join(parts)
