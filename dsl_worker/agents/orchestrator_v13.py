@@ -621,18 +621,26 @@ class OrchestratorV13:
         local_path.parent.mkdir(parents=True, exist_ok=True)
         local_path.write_text(content, encoding="utf-8")
 
-        # Track candidates harvested (count non-empty lines)
-        self._candidates_harvested += sum(
-            1 for line in content.splitlines() if line.strip()
-        )
-
-        # Persist to blob for pause/resume
+        # Persist to blob for pause/resume (also counts candidates)
         self._upload_candidate_to_blob(local_path)
 
         return workspace_path
 
     def _upload_candidate_to_blob(self, local_path: Path) -> None:
-        """Upload a candidate file to blob storage for pause/resume durability."""
+        """Upload a candidate file to blob storage for pause/resume durability.
+
+        Also counts lines to track _candidates_harvested — this is how
+        integration tools (apify, fullenrich, etc.) report their output
+        since they bypass _write_candidates_file().
+        """
+        # Count candidates in the file
+        try:
+            with open(local_path, "r", encoding="utf-8", errors="replace") as f:
+                line_count = sum(1 for line in f if line.strip())
+            self._candidates_harvested += line_count
+        except Exception:
+            pass
+
         if not self.blob_service_client:
             return
         blob_path = f"projects/{self.project_id}/candidates/{local_path.name}"
