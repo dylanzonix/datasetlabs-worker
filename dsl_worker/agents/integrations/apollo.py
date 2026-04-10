@@ -88,6 +88,7 @@ def register_apollo_namespace(
     workspace_dir: Path,
     file_counter: Optional[List[int]] = None,
     cost_per_credit: float = 0.024,
+    on_file_written: Optional[Callable] = None,
 ) -> None:
     """Register the apollo namespace on a ToolRegistry."""
     if file_counter is None:
@@ -131,6 +132,9 @@ def register_apollo_namespace(
         with open(output_path, "w") as f:
             for c in simplified:
                 f.write(json.dumps(c, ensure_ascii=False, default=str) + "\n")
+
+        if on_file_written:
+            on_file_written(output_path)
 
         workspace_path = f"/workspace/candidates/{output_path.name}"
         total_pages = (total + per_page - 1) // per_page if total else "?"
@@ -280,6 +284,9 @@ def register_apollo_namespace(
         with open(output_path, "w") as f:
             for r in results:
                 f.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
+
+        if on_file_written:
+            on_file_written(output_path)
 
         matched = sum(1 for r in results if "name" in r)
         workspace_path = f"/workspace/candidates/{output_path.name}"

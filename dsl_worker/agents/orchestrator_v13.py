@@ -98,6 +98,14 @@ file to row generators. Returns a feedback report.
 
 **continue_processing(checkin_after)** — Resume the current file.
 
+**reprocess_rows(instructions)** — Re-evaluate ALL existing rows. Use when \
+user asks to add/fill a column, filter rows, or modify existing data. \
+Automatically creates a version snapshot (old rows preserved in history). \
+Each row goes through a row generator that can update or filter it.
+
+**clear_rows(reason)** — Remove all rows and start fresh. Old rows preserved \
+in version history.
+
 **finish(reason)** — Only for genuinely impossible tasks.
 
 ## How to work
@@ -127,6 +135,17 @@ Read feedback. Good conversion → scale up. High skips → adjust source \
 or filtering. Source runs dry → pivot.
 
 **You produce rows by submitting candidates.** Don't over-explore.
+
+### Live user messages
+
+The user can send messages while you're running. These appear as \
+[User message] in the status updates. When you see one:
+- **Behavioral change** ("focus on X", "also include Y"): adapt your \
+  strategy going forward. No need to touch existing rows.
+- **Schema change** ("add Email column"): the schema is already updated. \
+  Call reprocess_rows to fill the new column on existing rows.
+- **Filtering** ("only 500+ karma"): call reprocess_rows with filter criteria.
+- **Start over** ("completely different approach"): call clear_rows.
 
 ### Principles
 
@@ -249,6 +268,13 @@ class OrchestratorV13:
         fullenrich_client: Optional[Any] = None,
         feedback_context: Optional[Dict[str, Any]] = None,
         resume_context: Optional[Dict[str, Any]] = None,
+        check_messages: Optional[Callable] = None,
+        state: Optional[Any] = None,
+        # Phase 2: sample CRUD for row reprocessing
+        read_samples: Optional[Callable] = None,
+        update_sample: Optional[Callable] = None,
+        delete_sample: Optional[Callable] = None,
+        create_version_snapshot: Optional[Callable] = None,
     ) -> None:
         self.chat_history = chat_history
         self.columns = columns
@@ -275,6 +301,12 @@ class OrchestratorV13:
         self.youtube_client = youtube_client
         self.feedback_context = feedback_context
         self.resume_context = resume_context
+        self._check_messages = check_messages
+        self._state = state
+        self._read_samples = read_samples
+        self._update_sample = update_sample
+        self._delete_sample = delete_sample
+        self._create_version_snapshot = create_version_snapshot
 
         self._generation_stats = generation_stats
         self._save_row = save_row
@@ -330,13 +362,59 @@ class OrchestratorV13:
         self._conversation.after_turn = self._build_status_line
 
     def _build_status_line(self) -> Optional[str]:
-        """Build a status line injected after every orchestrator turn."""
+        """Build a status line injected after every orchestrator turn.
+
+        Also checks for live user messages and injects them before the
+        status line so the orchestrator sees them on its next turn.
+        """
+        parts = []
+
+        # Check for new user messages from the chat
+        if self._check_messages:
+            try:
+                new_messages = self._check_messages()
+                for msg in new_messages:
+                    content = msg.get("content", "")
+                    changes = msg.get("applied_changes") or {}
+                    change_details = changes.get("changes", {})
+
+                    msg_parts = [f"[User message]: {content}"]
+
+                    # Summarize schema changes if any
+                    if "columns" in change_details:
+                        new_cols = change_details["columns"]
+                        col_names = [c.get("name", "?") for c in new_cols if isinstance(c, dict)]
+                        msg_parts.append(f"[Schema updated: columns are now {', '.join(col_names)}]")
+                        # Update our local schema
+                        self.columns = new_cols
+                    if "num_samples" in change_details:
+                        new_target = change_details["num_samples"]
+                        msg_parts.append(f"[Target updated: now {new_target} rows]")
+                        self.num_samples = new_target
+
+                    parts.append("\n".join(msg_parts))
+                    logger.info(f"[orchestrator] Injected live user message: {content[:100]}")
+            except Exception as e:
+                logger.warning(f"[orchestrator] check_messages error: {e}")
+
+        # Also sync schema from state if available (catches changes we missed)
+        if self._state:
+            try:
+                self._state.refresh()
+                if self._state.columns and self._state.columns != self.columns:
+                    self.columns = self._state.columns
+                if self._state.num_samples and self._state.num_samples != self.num_samples:
+                    self.num_samples = self._state.num_samples
+            except Exception:
+                pass
+
+        # Build status line
         rows = self._generation_stats.get("rows_generated", 0)
         cost = self._generation_stats.get("total_cost", 0.0)
         harvested = self._candidates_harvested
         submitted = self._candidates_submitted
 
-        line = (
+        status = (
             f"[Status] {rows}/{self.num_samples} rows | "
             f"{harvested} candidates harvested | "
             f"{submitted} submitted | "
@@ -344,12 +422,13 @@ class OrchestratorV13:
         )
 
         if harvested > 0 and submitted == 0 and rows == 0:
-            line += (
+            status += (
                 "\n→ You have candidates but haven't submitted any. "
                 "Call submit_candidates to start producing rows."
             )
 
-        return line
+        parts.append(status)
+        return "\n\n".join(parts)
 
     # ── System prompt construction ────────────────────────────────────
 
@@ -540,7 +619,27 @@ class OrchestratorV13:
             1 for line in content.splitlines() if line.strip()
         )
 
+        # Persist to blob for pause/resume
+        self._upload_candidate_to_blob(local_path)
+
         return workspace_path
+
+    def _upload_candidate_to_blob(self, local_path: Path) -> None:
+        """Upload a candidate file to blob storage for pause/resume durability."""
+        if not self.blob_service_client:
+            return
+        blob_path = f"projects/{self.project_id}/candidates/{local_path.name}"
+        try:
+            from dsl_worker.config import settings
+            blob = self.blob_service_client.get_blob_client(
+                container=settings.azure_storage_container_name,
+                blob=blob_path,
+            )
+            with open(local_path, "rb") as f:
+                blob.upload_blob(f, overwrite=True)
+            logger.info(f"[orchestrator] Uploaded candidate file to blob: {local_path.name}")
+        except Exception as e:
+            logger.warning(f"[orchestrator] Failed to upload candidate to blob: {e}")
 
     # ── Tool registration ─────────────────────────────────────────────
 
@@ -551,10 +650,18 @@ class OrchestratorV13:
         self._register_bu_extract(registry)
         self._register_submit_candidates(registry)
         self._register_continue_processing(registry)
+        self._register_reprocess_rows(registry)
+        self._register_clear_rows(registry)
         self._register_finish(registry)
 
         # Enable deferred tool discovery — namespace tools only load when needed
         registry.add_builtin({"type": "tool_search"})
+
+        # Shared file counter for integrations — start from existing file count
+        # so resume doesn't collide with files from before pause
+        candidates_dir = self.workspace_dir / "candidates"
+        existing_files = len(list(candidates_dir.glob("*"))) if candidates_dir.exists() else 0
+        file_counter = [existing_files]
 
         # Integration namespaces
         if self.apify_client:
@@ -563,26 +670,34 @@ class OrchestratorV13:
             register_apify_namespace(
                 registry, self.apify_client, settings.apify_api_key,
                 self.workspace_dir,
+                file_counter=file_counter,
+                on_file_written=self._upload_candidate_to_blob,
             )
         if self.apollo_client:
             from dsl_worker.agents.integrations.apollo import register_apollo_namespace
             from dsl_worker.config import settings as _apollo_settings
             register_apollo_namespace(
                 registry, self.apollo_client, self.workspace_dir,
+                file_counter=file_counter,
                 cost_per_credit=_apollo_settings.apollo_cost_per_credit,
+                on_file_written=self._upload_candidate_to_blob,
             )
         if self.google_maps_client:
             from dsl_worker.agents.integrations.google_maps import register_google_maps_namespace
             from dsl_worker.config import settings as _settings
             register_google_maps_namespace(
                 registry, _settings.google_api_key, self.workspace_dir,
+                file_counter=file_counter,
+                on_file_written=self._upload_candidate_to_blob,
             )
         if hasattr(self, 'fullenrich_client') and self.fullenrich_client:
             from dsl_worker.agents.integrations.fullenrich import register_fullenrich_namespace
             from dsl_worker.config import settings as _fe_settings
             register_fullenrich_namespace(
                 registry, self.fullenrich_client, self.workspace_dir,
+                file_counter=file_counter,
                 cost_per_credit=_fe_settings.fullenrich_cost_per_credit,
+                on_file_written=self._upload_candidate_to_blob,
             )
 
     # --- code_exec ---
@@ -671,7 +786,10 @@ class OrchestratorV13:
                                     continue
                                 try:
                                     content = await session.read_file(f"candidates/{fname}")
-                                    (candidates_dir / fname).write_text(content, encoding="utf-8")
+                                    local_file = candidates_dir / fname
+                                    local_file.write_text(content, encoding="utf-8")
+                                    # Persist to blob for pause/resume
+                                    self._upload_candidate_to_blob(local_file)
                                 except Exception:
                                     pass
                     except Exception:
@@ -1125,6 +1243,166 @@ class OrchestratorV13:
             handler=continue_processing,
         )
 
+    # --- reprocess_rows ---
+
+    def _register_reprocess_rows(self, registry: ToolRegistry) -> None:
+        if not self._read_samples or not self._create_version_snapshot:
+            return  # No DB callbacks — skip registration
+
+        async def reprocess_rows(args: Dict) -> Tuple[str, float]:
+            instructions = args.get("instructions", "")
+            if not instructions:
+                return "Error: instructions are required.", 0.0
+
+            # Read current rows
+            samples = await self._read_samples()
+            if not samples:
+                return "No rows to reprocess.", 0.0
+
+            # Auto-version: snapshot before modifying
+            try:
+                snapshot_info = await self._create_version_snapshot()
+                logger.info(
+                    f"[orchestrator] Auto-versioned to v{snapshot_info['version_number']} "
+                    f"before reprocessing {len(samples)} rows"
+                )
+            except Exception as e:
+                return f"Error creating version snapshot: {e}", 0.0
+
+            # Re-read samples (now on new version)
+            samples = await self._read_samples()
+            total = len(samples)
+            updated = 0
+            skipped = 0
+            errors = 0
+            total_cost = 0.0
+
+            for sample in samples:
+                if self.stop_checker and self.stop_checker():
+                    break
+
+                try:
+                    # Create a candidate from the existing row
+                    candidate = type("Candidate", (), {
+                        "values": json.dumps(sample["row"], ensure_ascii=False),
+                        "source_id": "reprocess",
+                        "source_context": instructions,
+                        "metadata": {
+                            "preset_fields": {},
+                            "candidate_data": sample["row"],
+                            "reprocess_sample_id": sample["id"],
+                        },
+                    })()
+
+                    result, cost, saved = await self._generate_row_fn(
+                        candidate, "reprocess"
+                    )
+                    total_cost += cost
+
+                    if result.success and result.row:
+                        # Update existing sample with new data
+                        await self._update_sample(sample["id"], result.row)
+                        updated += 1
+                    elif result.skipped:
+                        # Filter out — delete the sample
+                        await self._delete_sample(sample["id"])
+                        skipped += 1
+                    else:
+                        errors += 1
+
+                except Exception as e:
+                    logger.error(f"[orchestrator] Reprocess error: {e}", exc_info=True)
+                    errors += 1
+
+            report = (
+                f"Reprocessed {total} rows:\n"
+                f"  Updated: {updated}\n"
+                f"  Filtered out: {skipped}\n"
+                f"  Errors: {errors}\n"
+                f"  Cost: ${total_cost:.4f}\n"
+                f"  Version: v{snapshot_info['version_number']} "
+                f"(previous version preserved in history)"
+            )
+            return report, total_cost
+
+        registry.add(
+            name="reprocess_rows",
+            description=(
+                "Re-evaluate ALL existing rows through row generators. Use when "
+                "user asks to: add/fill a column, filter rows, modify existing data, "
+                "or apply new criteria. Automatically creates a version snapshot "
+                "so old rows are preserved. Row generators will process each "
+                "existing row and can update, modify, or filter it out."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "instructions": {
+                        "type": "string",
+                        "description": (
+                            "Instructions for row generators on what to do with each row. "
+                            "Examples: 'Fill in the Email column using web search', "
+                            "'Skip rows where karma < 500', "
+                            "'Add a Website column by searching for each company'."
+                        ),
+                    },
+                },
+                "required": ["instructions"],
+            },
+            handler=reprocess_rows,
+        )
+
+    # --- clear_rows ---
+
+    def _register_clear_rows(self, registry: ToolRegistry) -> None:
+        if not self._create_version_snapshot:
+            return
+
+        async def clear_rows(args: Dict) -> Tuple[str, float]:
+            reason = args.get("reason", "User requested fresh start")
+
+            # Check if there are rows to preserve
+            rows_done = self._generation_stats.get("rows_generated", 0)
+            if rows_done == 0:
+                return "No rows to clear.", 0.0
+
+            # Auto-version: snapshot current rows, then start fresh
+            try:
+                snapshot_info = await self._create_version_snapshot()
+                # Delete all samples on the new version
+                samples = await self._read_samples()
+                for s in samples:
+                    await self._delete_sample(s["id"])
+                self._generation_stats["rows_generated"] = 0
+
+                return (
+                    f"Cleared all {rows_done} rows. Previous rows preserved in "
+                    f"v{snapshot_info['version_number'] - 1} (visible in version history). "
+                    f"Starting fresh on v{snapshot_info['version_number']}."
+                ), 0.0
+            except Exception as e:
+                return f"Error clearing rows: {e}", 0.0
+
+        registry.add(
+            name="clear_rows",
+            description=(
+                "Remove ALL existing rows and start fresh. Use only when the user "
+                "wants a completely different approach. Previous rows are preserved "
+                "in version history."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Why rows are being cleared.",
+                    },
+                },
+                "required": ["reason"],
+            },
+            handler=clear_rows,
+        )
+
     # --- finish ---
 
     def _register_finish(self, registry: ToolRegistry) -> None:
@@ -1418,10 +1696,20 @@ class OrchestratorV13:
                 f"[orchestrator] Resuming: {len(self._conversation.messages)} messages, "
                 f"{rows_done}/{self.num_samples} rows"
             )
-            initial_msg = (
-                f"Resumed. {rows_done}/{self.num_samples} rows done so far. "
-                f"Continue where you left off."
-            )
+            resume_parts = [
+                f"Resumed. {rows_done}/{self.num_samples} rows done so far."
+            ]
+            if self._current_file:
+                fs = self._current_file
+                remaining = fs.total_lines - fs.next_line
+                resume_parts.append(
+                    f"You were processing {Path(fs.file_path).name}: "
+                    f"{fs.processed}/{fs.total_lines} done, "
+                    f"{remaining} remaining. Call continue_processing to resume."
+                )
+            else:
+                resume_parts.append("Continue where you left off.")
+            initial_msg = " ".join(resume_parts)
         elif self.feedback_context:
             initial_msg = (
                 "Begin. The user reviewed previous results and gave feedback "
@@ -1495,16 +1783,23 @@ class OrchestratorV13:
         return self._conversation.total_cost
 
     def export_state(self) -> Dict[str, Any]:
-        """Export full state for checkpointing."""
+        """Export full state for checkpointing.
+
+        For file processing: rolls next_line back by in_flight count so
+        candidates that were mid-generation get re-dispatched on resume.
+        Dedup catches any that actually completed before the kill.
+        """
         file_state = None
         if self._current_file:
             fs = self._current_file
+            # Roll back next_line so in-flight candidates are re-processed
+            safe_next_line = max(0, fs.next_line - fs.in_flight)
             file_state = {
                 "file_path": fs.file_path,
                 "note": fs.note,
                 "preset_fields": fs.preset_fields,
                 "total_lines": fs.total_lines,
-                "next_line": fs.next_line,
+                "next_line": safe_next_line,
                 "processed": fs.processed,
                 "rows": fs.rows,
                 "skipped": fs.skipped,
@@ -1524,6 +1819,8 @@ class OrchestratorV13:
             "web_research_counter": self._web_harvest_counter,
             "bu_extract_counter": self._bu_extract_counter,
             "apify_run_counter": self._apify_run_counter,
+            "candidates_harvested": self._candidates_harvested,
+            "candidates_submitted": self._candidates_submitted,
             "current_file": file_state,
         }
 
@@ -1542,6 +1839,8 @@ class OrchestratorV13:
         self._web_harvest_counter = state.get("web_research_counter", 0)
         self._bu_extract_counter = state.get("bu_extract_counter", 0)
         self._apify_run_counter = state.get("apify_run_counter", 0)
+        self._candidates_harvested = state.get("candidates_harvested", 0)
+        self._candidates_submitted = state.get("candidates_submitted", 0)
 
         saved_stats = state.get("generation_stats", {})
         for key in ("skipped", "errors", "total_cost"):

@@ -783,6 +783,9 @@ class JobProcessor:
         # Restore browser downloads from blob (survives pause/resume)
         self._restore_downloads_from_blob(project.id, workspace_dir)
 
+        # Restore candidate files from blob (survives pause/resume)
+        restored_candidate_count = self._restore_candidates_from_blob(project.id, workspace_dir)
+
         # Generate SAS URLs for uploaded files
         uploaded_file_urls = self._generate_file_urls(db, project.id)
 
@@ -999,6 +1002,12 @@ class JobProcessor:
                     harvester_counter=0,
                     apollo_counter=0,
                     research_counter=state_data.get("web_research_counter", 0),
+                    # V13-specific state
+                    bu_extract_counter=state_data.get("bu_extract_counter", 0),
+                    apify_run_counter=state_data.get("apify_run_counter", 0),
+                    candidates_harvested=state_data.get("candidates_harvested", 0),
+                    candidates_submitted=state_data.get("candidates_submitted", 0),
+                    current_file=state_data.get("current_file"),
                 ))
             except Exception as e:
                 logger.warning(f"[Pipeline] Checkpoint callback error: {e}")
@@ -1085,6 +1094,167 @@ class JobProcessor:
                 except Exception:
                     pass
 
+        # Live message checker — orchestrator polls this to detect new user messages
+        _last_seen_message_id = [None]
+
+        def check_messages():
+            """Check for new user chat messages since last check.
+
+            Returns list of (content, applied_changes) tuples, or empty list.
+            """
+            try:
+                query = (
+                    db.query(ChatMessage)
+                    .filter(
+                        ChatMessage.project_id == project.id,
+                        ChatMessage.role == "user",
+                    )
+                )
+                if _last_seen_message_id[0]:
+                    query = query.filter(ChatMessage.id > _last_seen_message_id[0])
+                else:
+                    # First check: only messages after version started
+                    query = query.filter(ChatMessage.created_at > version.started_at)
+
+                new_messages = query.order_by(ChatMessage.created_at.asc()).all()
+
+                if not new_messages:
+                    return []
+
+                _last_seen_message_id[0] = new_messages[-1].id
+                result = []
+                for msg in new_messages:
+                    # Skip messages that are part of the initial chat history
+                    if msg.content and msg.content not in [m.get("content") for m in chat_history if m.get("role") == "user"]:
+                        result.append({
+                            "content": msg.content,
+                            "applied_changes": msg.applied_changes,
+                        })
+                return result
+            except Exception as e:
+                logger.warning(f"[Pipeline] check_messages error: {e}")
+                return []
+
+        # --- Sample CRUD callbacks for row reprocessing ---
+        # version_holder allows version_id to change after snapshot
+        version_holder = [version]
+
+        def _get_version():
+            return version_holder[0]
+
+        async def read_samples() -> List[Dict]:
+            """Read all samples for current version."""
+            v = _get_version()
+            samples = (
+                db.query(Sample)
+                .filter(Sample.version_id == v.id)
+                .order_by(Sample.seq.asc())
+                .all()
+            )
+            return [
+                {"id": str(s.id), "seq": s.seq, "row": s.row, "tags": s.tags}
+                for s in samples
+            ]
+
+        async def update_sample(sample_id: str, row: Dict) -> None:
+            """Update a sample's row data in place."""
+            sample = db.query(Sample).filter(Sample.id == UUID(sample_id)).first()
+            if sample:
+                sample.row = row
+                db.commit()
+
+        async def delete_sample(sample_id: str) -> None:
+            """Delete a sample and decrement generated_count."""
+            db.query(Sample).filter(Sample.id == UUID(sample_id)).delete()
+            v = _get_version()
+            v.generated_count = max(0, (v.generated_count or 0) - 1)
+            db.commit()
+            generation_stats["rows_generated"] = max(0, generation_stats.get("rows_generated", 0) - 1)
+
+        async def create_version_snapshot() -> Dict[str, Any]:
+            """Create a new version with copies of current samples.
+
+            Old version is frozen (succeeded). New version becomes current.
+            Returns {"version_id": str, "version_number": int}.
+            """
+            from sqlalchemy import func as sql_func
+            old_version = _get_version()
+
+            # Freeze old version
+            old_version.status = "succeeded"
+            old_version.finished_at = datetime.now(timezone.utc)
+
+            # Create new version
+            max_num = (
+                db.query(sql_func.max(ProjectVersion.version_number))
+                .filter(ProjectVersion.project_id == project.id)
+                .scalar()
+                or 0
+            )
+            new_version = ProjectVersion(
+                project_id=project.id,
+                version_number=max_num + 1,
+                num_samples=old_version.num_samples,
+                generation_prompt=old_version.generation_prompt,
+                columns=state.columns,  # Use latest columns (may have changed)
+                files_snapshot=old_version.files_snapshot,
+                examples_snapshot=old_version.examples_snapshot or [],
+                status="running",
+                started_at=datetime.now(timezone.utc),
+                generated_count=old_version.generated_count or 0,
+            )
+            db.add(new_version)
+            db.flush()
+
+            # Bulk-copy samples to new version
+            import uuid as _uuid
+            old_samples = (
+                db.query(Sample)
+                .filter(Sample.version_id == old_version.id)
+                .all()
+            )
+            for s in old_samples:
+                new_sample = Sample(
+                    id=_uuid.uuid4(),
+                    project_id=project.id,
+                    version_id=new_version.id,
+                    seq=s.seq,
+                    row=dict(s.row) if s.row else {},
+                    tags=dict(s.tags) if s.tags else None,
+                )
+                db.add(new_sample)
+            db.flush()
+
+            # Update project to point to new version
+            project.current_version_id = new_version.id
+            db.commit()
+
+            # Update local references
+            version_holder[0] = new_version
+            # Re-seed dedup store with copied samples
+            dedup_store._submitted.clear()
+            dedup_store._token_cache.clear()
+            from dsl_worker.agents.row import _tokenize
+            for s in old_samples:
+                row_data = s.row or {}
+                row_id = str(s.id)  # Use original ID for dedup
+                dedup_store._submitted[row_id] = row_data
+                for col_name, value in row_data.items():
+                    dedup_store._token_cache[(row_id, col_name)] = _tokenize(value)
+
+            # Update checkpoint manager to save under new version
+            checkpoint_mgr.update_version(new_version.id)
+
+            logger.info(
+                f"[Pipeline] Version snapshot: v{old_version.version_number} → v{new_version.version_number} "
+                f"({len(old_samples)} samples copied)"
+            )
+
+            return {
+                "version_id": str(new_version.id),
+                "version_number": new_version.version_number,
+            }
+
         # Build the V13 orchestrator
         orchestrator = OrchestratorV13(
             chat_history=chat_history,
@@ -1116,6 +1286,13 @@ class JobProcessor:
             fullenrich_client=fullenrich_client,
             feedback_context=feedback_context,
             resume_context=resume_context,
+            check_messages=check_messages,
+            state=state,
+            # Phase 2: sample CRUD for row reprocessing
+            read_samples=read_samples,
+            update_sample=update_sample,
+            delete_sample=delete_sample,
+            create_version_snapshot=create_version_snapshot,
         )
 
         # Restore state from checkpoint if resuming
@@ -1124,8 +1301,11 @@ class JobProcessor:
                 "orchestrator_conversation": checkpoint.orchestrator_conversation,
                 "generation_stats": checkpoint.generation_stats,
                 "web_research_counter": checkpoint.research_counter or 0,
-                "bu_extract_counter": 0,
-                "current_file": None,
+                "bu_extract_counter": checkpoint.bu_extract_counter,
+                "apify_run_counter": checkpoint.apify_run_counter,
+                "candidates_harvested": checkpoint.candidates_harvested,
+                "candidates_submitted": checkpoint.candidates_submitted,
+                "current_file": checkpoint.current_file,
             })
 
         try:
@@ -1146,6 +1326,12 @@ class JobProcessor:
                     harvester_counter=0,
                     apollo_counter=0,
                     research_counter=state_data.get("web_research_counter", 0),
+                    # V13-specific state
+                    bu_extract_counter=state_data.get("bu_extract_counter", 0),
+                    apify_run_counter=state_data.get("apify_run_counter", 0),
+                    candidates_harvested=state_data.get("candidates_harvested", 0),
+                    candidates_submitted=state_data.get("candidates_submitted", 0),
+                    current_file=state_data.get("current_file"),
                 )
                 await checkpoint_mgr.force_save()
             except Exception as e:
@@ -1420,6 +1606,42 @@ print(json.dumps(results))
             logger.info(f"[Pipeline] Restored {len(blobs)} browser downloads from blob")
         except Exception as e:
             logger.debug(f"[Pipeline] No downloads to restore: {e}")
+
+    def _restore_candidates_from_blob(self, project_id, workspace_dir: Path) -> int:
+        """Restore candidate files from blob into workspace/candidates/.
+
+        Returns the number of files restored (used to initialize file_counter).
+        """
+        prefix = f"projects/{project_id}/candidates/"
+        candidates_dir = workspace_dir / "candidates"
+        candidates_dir.mkdir(parents=True, exist_ok=True)
+        restored = 0
+        try:
+            container_client = self.blob_service_client.get_container_client(
+                settings.azure_storage_container_name
+            )
+            blobs = list(container_client.list_blobs(name_starts_with=prefix))
+            if not blobs:
+                return 0
+
+            for blob in blobs:
+                filename = blob.name[len(prefix):]
+                if not filename:
+                    continue
+                local_path = candidates_dir / filename
+                try:
+                    blob_client = container_client.get_blob_client(blob.name)
+                    data = blob_client.download_blob().readall()
+                    local_path.write_bytes(data)
+                    restored += 1
+                    logger.info(f"[Pipeline] Restored candidate file: {filename} ({len(data)} bytes)")
+                except Exception as e:
+                    logger.warning(f"[Pipeline] Failed to restore candidate {filename}: {e}")
+
+            logger.info(f"[Pipeline] Restored {restored} candidate files from blob")
+        except Exception as e:
+            logger.debug(f"[Pipeline] No candidate files to restore: {e}")
+        return restored
 
     def _generate_file_urls(self, db: Session, project_id) -> Dict[str, str]:
         """Generate short-lived SAS URLs for uploaded files (no local download needed).

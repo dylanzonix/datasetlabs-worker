@@ -35,6 +35,7 @@ def register_apify_namespace(
     api_key: str,
     workspace_dir: Path,
     file_counter: Optional[List[int]] = None,
+    on_file_written: Optional[Callable] = None,
 ) -> None:
     """Register the apify namespace on a ToolRegistry."""
     if file_counter is None:
@@ -216,6 +217,9 @@ def register_apify_namespace(
 
         if item_count == 0:
             return f"Apify actor {actor_id} returned 0 items.", cost
+
+        if on_file_written:
+            on_file_written(output_path)
 
         workspace_path = f"/workspace/candidates/{output_path.name}"
         fields_str = ", ".join(result.get("fields", []))

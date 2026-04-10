@@ -67,6 +67,17 @@ class PipelineCheckpoint:
     apollo_counter: int = 0
     research_counter: int = 0
 
+    # --- V13 state ---
+
+    # V13 orchestrator counters (file naming, status line)
+    bu_extract_counter: int = 0
+    apify_run_counter: int = 0
+    candidates_harvested: int = 0
+    candidates_submitted: int = 0
+
+    # V13 file processing state (mid-file resume)
+    current_file: Optional[Dict[str, Any]] = None
+
     # --- Legacy fields (kept for backward compat on load) ---
     current_phase: str = "orchestrator"
     work_items: List[Dict] = field(default_factory=list)
@@ -263,8 +274,15 @@ class CheckpointManager:
         harvester_counter: int,
         apollo_counter: int,
         research_counter: int,
+        *,
+        # V13-specific fields (keyword-only so V12 callers don't break)
+        bu_extract_counter: int = 0,
+        apify_run_counter: int = 0,
+        candidates_harvested: int = 0,
+        candidates_submitted: int = 0,
+        current_file: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Save the full V11 pipeline state. Called after every orchestrator tool call."""
+        """Save the full pipeline state. Called after every orchestrator tool call."""
         async with self._lock:
             cp = self._checkpoint
             cp.orchestrator_conversation = {
@@ -277,6 +295,12 @@ class CheckpointManager:
             cp.harvester_counter = harvester_counter
             cp.apollo_counter = apollo_counter
             cp.research_counter = research_counter
+            # V13 fields
+            cp.bu_extract_counter = bu_extract_counter
+            cp.apify_run_counter = apify_run_counter
+            cp.candidates_harvested = candidates_harvested
+            cp.candidates_submitted = candidates_submitted
+            cp.current_file = current_file
             self._pending_updates += 1
 
         await self.save()
@@ -320,6 +344,17 @@ class CheckpointManager:
                     pass
         except Exception:
             pass
+
+    def update_version(self, new_version_id: UUID) -> None:
+        """Update version_id after a version snapshot.
+
+        Changes the blob path so checkpoints are saved under the new version.
+        """
+        self.version_id = new_version_id
+        self._checkpoint_path = f"checkpoints/{self.project_id}/{new_version_id}/state.json"
+        if self._checkpoint:
+            self._checkpoint.version_id = str(new_version_id)
+        logger.info(f"[Checkpoint] Updated version to {new_version_id}")
 
     async def force_save(self) -> None:
         """Force immediate save."""

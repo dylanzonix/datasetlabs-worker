@@ -35,6 +35,7 @@ def register_google_maps_namespace(
     api_key: str,
     workspace_dir: Path,
     file_counter: Optional[List[int]] = None,
+    on_file_written: Optional[Callable] = None,
 ) -> None:
     """Register the google_maps namespace on a ToolRegistry."""
     if file_counter is None:
@@ -138,6 +139,9 @@ def register_google_maps_namespace(
             for p in places:
                 f.write(json.dumps(p, ensure_ascii=False) + "\n")
 
+        if on_file_written:
+            on_file_written(output_path)
+
         workspace_path = f"/workspace/candidates/{output_path.name}"
         lines = [f"Found {len(places)} places.\nFile: {workspace_path}\n"]
         for p in places[:5]:
@@ -188,6 +192,9 @@ def register_google_maps_namespace(
         with open(output_path, "w") as f:
             for p in places:
                 f.write(json.dumps(p, ensure_ascii=False) + "\n")
+
+        if on_file_written:
+            on_file_written(output_path)
 
         workspace_path = f"/workspace/candidates/{output_path.name}"
         lines = [f"Found {len(places)} places nearby.\nFile: {workspace_path}\n"]
@@ -322,6 +329,9 @@ def register_google_maps_namespace(
         with open(output_path, "w") as f:
             for r in results:
                 f.write(json.dumps(r) + "\n")
+
+        if on_file_written:
+            on_file_written(output_path)
 
         workspace_path = f"/workspace/candidates/{output_path.name}"
         return (
@@ -465,6 +475,9 @@ def register_google_maps_namespace(
         with open(output_path, "w") as f:
             for r in results:
                 f.write(json.dumps(r) + "\n")
+
+        if on_file_written:
+            on_file_written(output_path)
 
         workspace_path = f"/workspace/candidates/{output_path.name}"
         return (

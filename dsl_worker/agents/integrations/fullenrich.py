@@ -46,6 +46,7 @@ def register_fullenrich_namespace(
     workspace_dir: Path,
     file_counter: Optional[List[int]] = None,
     cost_per_credit: float = 0.055,
+    on_file_written: Optional[Callable] = None,
 ) -> None:
     """Register the fullenrich namespace on a ToolRegistry.
 
@@ -54,6 +55,7 @@ def register_fullenrich_namespace(
         client: FullEnrichClient
         workspace_dir: For writing result files
         file_counter: Mutable [int] for unique filenames (shared across calls)
+        on_file_written: Callback(Path) called after each candidate file is written
     """
     if file_counter is None:
         file_counter = [0]
@@ -124,6 +126,9 @@ def register_fullenrich_namespace(
         if result.get("item_count", 0) == 0:
             return f"No people found matching filters. Total in database: {result.get('total', 0)}. Try broader filters.", 0.0
 
+        if on_file_written:
+            on_file_written(output_path)
+
         workspace_path = f"/workspace/candidates/{output_path.name}"
 
         credits_used = result.get("credits_used", 0)
@@ -182,6 +187,9 @@ def register_fullenrich_namespace(
 
         if result.get("item_count", 0) == 0:
             return f"No companies found matching filters. Total in database: {result.get('total', 0)}. Try broader filters.", 0.0
+
+        if on_file_written:
+            on_file_written(output_path)
 
         workspace_path = f"/workspace/candidates/{output_path.name}"
         credits_used = result.get("credits_used", 0) if "credits_used" in result else 0
@@ -279,6 +287,9 @@ def register_fullenrich_namespace(
 
             if "error" in result:
                 return f"Enrichment error: {result['error']}", 0.0
+
+            if on_file_written:
+                on_file_written(output_path)
 
             workspace_path = f"/workspace/candidates/{output_path.name}"
             credits_used = result.get("credits_used", 0)
