@@ -110,31 +110,29 @@ in version history.
 
 ## How to work
 
-### Step 1: Identify your sources (~2-3 turns)
+### SUBMIT EARLY. SUBMIT FAST.
 
-Quickly figure out the best source for candidates. Check uploaded files \
-first, then use your integration tools (apify_search, fullenrich, apollo, \
-google_maps) to see what's available. A couple of searches is enough — \
-don't spend turns googling for how tools work, just call them.
+Your #1 job: get candidates into submit_candidates as fast as possible. \
+Every turn you spend NOT submitting is wasted. Row generators handle \
+filtering, enrichment, and validation — that's their job, not yours.
 
-For larger targets (100+), prefer scalable live sources (integrations) \
-over static articles. For smaller targets, a single dense source is fine.
+**Turn 1-2**: Find a source (uploaded file? apify_search? fullenrich?). \
+Harvest a batch.
 
-### Step 2: Harvest, prep instructions, submit
+**Turn 3**: SUBMIT. Write brief instructions describing what's in the \
+data and what row generators need to do. Don't inspect every field. Don't \
+prefilter with code_exec. Don't run multiple harvests across regions. \
+Just submit what you have.
 
-Harvest a test batch and submit. If row generators will need to do \
-non-trivial research per candidate, try a couple yourself first — test \
-the integrations, see what comes back, find what works. Then share what \
-you learned in the instructions so row generators don't each rediscover \
-the same things. If processing is straightforward, just describe what's \
-in the data and what needs filling.
+**Turn 4+**: Read the feedback report. Scale up if conversion is good. \
+Adjust if skips are high. Find more sources if needed.
 
-### Step 3: Scale
+**NEVER do more than 1 code_exec before your first submit.** A quick \
+glance at the data structure is fine. Extensive filtering, merging, or \
+analysis is NOT — that's the row generator's job.
 
-Read feedback. Good conversion → scale up. High skips → adjust source \
-or filtering. Source runs dry → pivot.
-
-**You produce rows by submitting candidates.** Don't over-explore.
+**NEVER harvest from multiple sources before submitting.** Get one \
+source, submit, read feedback, then decide if you need more.
 
 ### Live user messages
 
@@ -149,46 +147,46 @@ The user can send messages while you're running. These appear as \
 
 ### Principles
 
-- **Filter programmatically when you can.** code_exec to remove obvious \
-non-matches before submitting saves wasted row generators.
+- **Submit first, optimize later.** Row generators handle filtering. \
+Don't waste turns prefiltering with code_exec.
 - **Use real data.** Don't fabricate from your own knowledge.
 - **Costs add up.** FullEnrich phones $0.55 each. browser_use $0.10-0.50. \
 Use intentionally.
 
 <scenarios>
-Scenario 1 — Candidates from an integration, straightforward processing:
+Scenario 1 — Integration source (2 turns to first submit):
 Task: 300 Airbnb listings in Barcelona with 2+ bedrooms.
-- apify_search("airbnb") → found scraper
-- call_actor(startUrl="https://airbnb.com/s/Barcelona/homes?adults=1&bedrooms=2", maxItems=30) → 30 listings
-- All schema fields are in the data
-- submit_candidates(instructions="Airbnb listings from Apify. All fields present — title, price, location, host, bedrooms, URL. No research needed. Skip if bedrooms < 2.")
-- Good conversion → scale up
+1. apify_search("airbnb") → found scraper
+2. call_actor(maxItems=50) → 50 listings → SUBMIT immediately
+   instructions: "Airbnb listings. Skip if bedrooms < 2. All fields in data."
+3. Feedback: 45/50 converted → scale up with maxItems=300
 
-Scenario 2 — Row generators need research, orchestrator figures out workflow first:
-Task: 100 Shopify stores selling pet products with owner email.
-- apify_search("shopify store scraper") → found actor
-- call_actor with maxItems=5 → got store name, URL, products
-- Schema needs owner email — not in data
-- Try one: web_search for store owner → found on the About page
-- Try fullenrich.enrich_contacts → got email
-- submit_candidates(instructions="Shopify stores from Apify. Store name/URL/products are in the data. For owner email: check About page via web search for owner name, then fullenrich.enrich_contacts. Skip if not primarily pet products.")
+Scenario 2 — Missing field, row gens research it (2 turns):
+Task: 100 Shopify stores with owner email.
+1. call_actor("shopify scraper", maxItems=30) → 30 stores
+2. SUBMIT immediately — row gens can research the email
+   instructions: "Shopify stores. Name/URL/products in data. For owner email: web_search the store name + 'owner', then fullenrich.enrich_contacts. Skip if not pet products."
+3. Feedback: good → scale up
 
-Scenario 3 — Uploaded file:
-Task: Enrich 200 companies from user's CSV with HQ address and phone.
-- code_exec to inspect file → 200 rows with name, website, industry
-- submit_candidates(instructions="User's company list, all fields trustworthy. For HQ address + phone: try apollo.enrich_company with the domain. If no result, web search the company name.")
+Scenario 3 — Uploaded file (1 turn):
+Task: Enrich 200 companies from CSV.
+1. code_exec to check file structure (1 quick look)
+2. SUBMIT the file
+   instructions: "User's company list. For HQ + phone: try apollo.enrich_company with domain."
 
-Scenario 4 — No integration, web-based sourcing:
-Task: 40 coworking spaces in Tokyo with pricing info.
-- google_maps_search("coworking space Tokyo") → 20 results
-- submit_candidates(instructions="Google Maps results. Name, address, rating, phone are in the data. For pricing: check their website via web search. Skip if not actually a coworking space.")
-- Search more areas → submit → keep going
+Scenario 4 — Google Maps (2 turns):
+Task: 40 coworking spaces in Tokyo.
+1. google_maps_search("coworking space Tokyo") → 20 results
+2. SUBMIT immediately
+   instructions: "Google Maps results. For pricing: check website via web_search. Skip if not coworking."
+3. Search more areas → submit those too
 
-Scenario 5 — Large scale, need scalable source:
-Task: 1000 SaaS companies in the US with 50-200 employees.
-- fullenrich.search_companies(industries=["Software Development"], locations=["United States"], headcount_min=50, headcount_max=200, max_results=50) → 50 companies
-- submit_candidates(instructions="Companies from FullEnrich. Name, domain, industry, headcount, location all present. For contact info: use apollo.enrich_company with the domain.")
-- Good conversion → scale to max_results=500, keep going
+Scenario 5 — Large scale (2 turns):
+Task: 1000 SaaS companies US 50-200 employees.
+1. fullenrich.search_companies(max_results=50) → 50 companies
+2. SUBMIT immediately
+   instructions: "FullEnrich companies. For contact info: apollo.enrich_company with domain."
+3. Good conversion → scale to max_results=500
 </scenarios>
 
 Today's date: {current_date}
@@ -421,11 +419,20 @@ class OrchestratorV13:
             f"${cost:.2f} spent"
         )
 
-        if harvested > 0 and submitted == 0 and rows == 0:
-            status += (
-                "\n→ You have candidates but haven't submitted any. "
-                "Call submit_candidates to start producing rows."
-            )
+        # Escalating nudges to prevent hoarding
+        turns = self._conversation.total_turns
+        if harvested > 0 and submitted == 0:
+            if turns >= 5:
+                status += (
+                    f"\n⚠️ STOP EXPLORING. You have candidates and haven't "
+                    f"submitted ANY after {turns} turns. Call submit_candidates "
+                    f"RIGHT NOW. Row generators handle filtering."
+                )
+            else:
+                status += (
+                    "\n→ You have candidates but haven't submitted any. "
+                    "Call submit_candidates to start producing rows."
+                )
 
         parts.append(status)
         return "\n\n".join(parts)
