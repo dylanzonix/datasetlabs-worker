@@ -90,8 +90,11 @@ googles, visits pages, extracts candidates to a file. ~$0.10-0.20/call.
 only when a specific URL needs JS rendering or anti-bot bypass AND no \
 Apify actor exists for that site.
 
-**reprocess_rows(instructions)** / **clear_rows(reason)** — For live \
-user messages requesting changes to existing rows.
+**reprocess_rows(instructions)** — Modify existing rows in place (add \
+column, filter, update). Preferred — salvage rows when possible.
+
+**clear_rows(reason)** — Delete all rows and start over. Last resort \
+only — when rows are genuinely unsalvageable.
 
 **finish(reason)** — Only for genuinely impossible tasks.
 
@@ -287,11 +290,10 @@ class OrchestratorV13:
         resume_context: Optional[Dict[str, Any]] = None,
         check_messages: Optional[Callable] = None,
         state: Optional[Any] = None,
-        # Phase 2: sample CRUD for row reprocessing
+        # Sample CRUD for row reprocessing
         read_samples: Optional[Callable] = None,
         update_sample: Optional[Callable] = None,
         delete_sample: Optional[Callable] = None,
-        create_version_snapshot: Optional[Callable] = None,
     ) -> None:
         self.chat_history = chat_history
         self.columns = columns
@@ -323,7 +325,6 @@ class OrchestratorV13:
         self._read_samples = read_samples
         self._update_sample = update_sample
         self._delete_sample = delete_sample
-        self._create_version_snapshot = create_version_snapshot
 
         self._activity_log: List[Dict[str, Any]] = []
 
@@ -1479,43 +1480,31 @@ class OrchestratorV13:
     # --- reprocess_rows ---
 
     def _register_reprocess_rows(self, registry: ToolRegistry) -> None:
-        if not self._read_samples or not self._create_version_snapshot:
-            return  # No DB callbacks — skip registration
+        if not self._read_samples:
+            return
 
         async def reprocess_rows(args: Dict) -> Tuple[str, float]:
             instructions = args.get("instructions", "")
             if not instructions:
                 return "Error: instructions are required.", 0.0
 
-            # Read current rows
             samples = await self._read_samples()
             if not samples:
                 return "No rows to reprocess.", 0.0
 
-            # Auto-version: snapshot before modifying
-            try:
-                snapshot_info = await self._create_version_snapshot()
-                logger.info(
-                    f"[orchestrator] Auto-versioned to v{snapshot_info['version_number']} "
-                    f"before reprocessing {len(samples)} rows"
-                )
-            except Exception as e:
-                return f"Error creating version snapshot: {e}", 0.0
-
-            # Re-read samples (now on new version)
-            samples = await self._read_samples()
             total = len(samples)
             updated = 0
             skipped = 0
             errors = 0
             total_cost = 0.0
 
+            self._log_activity(f"Reprocessing {total} rows")
+
             for sample in samples:
                 if self.stop_checker and self.stop_checker():
                     break
 
                 try:
-                    # Create a candidate from the existing row
                     candidate = type("Candidate", (), {
                         "values": json.dumps(sample["row"], ensure_ascii=False),
                         "source_id": "reprocess",
@@ -1533,11 +1522,9 @@ class OrchestratorV13:
                     total_cost += cost
 
                     if result.success and result.row:
-                        # Update existing sample with new data
                         await self._update_sample(sample["id"], result.row)
                         updated += 1
                     elif result.skipped:
-                        # Filter out — delete the sample
                         await self._delete_sample(sample["id"])
                         skipped += 1
                     else:
@@ -1547,25 +1534,23 @@ class OrchestratorV13:
                     logger.error(f"[orchestrator] Reprocess error: {e}", exc_info=True)
                     errors += 1
 
-            report = (
+            self._log_activity(f"Reprocessed: {updated} updated, {skipped} removed")
+
+            return (
                 f"Reprocessed {total} rows:\n"
                 f"  Updated: {updated}\n"
                 f"  Filtered out: {skipped}\n"
                 f"  Errors: {errors}\n"
-                f"  Cost: ${total_cost:.4f}\n"
-                f"  Version: v{snapshot_info['version_number']} "
-                f"(previous version preserved in history)"
-            )
-            return report, total_cost
+                f"  Cost: ${total_cost:.4f}"
+            ), total_cost
 
         registry.add(
             name="reprocess_rows",
             description=(
                 "Re-evaluate ALL existing rows through row generators. Use when "
-                "user asks to: add/fill a column, filter rows, modify existing data, "
-                "or apply new criteria. Automatically creates a version snapshot "
-                "so old rows are preserved. Row generators will process each "
-                "existing row and can update, modify, or filter it out."
+                "user asks to: add/fill a column, filter rows, or modify existing "
+                "data. Rows are modified in place. Prefer this over clear_rows — "
+                "most rows can be updated rather than discarded."
             ),
             parameters={
                 "type": "object",
@@ -1588,47 +1573,37 @@ class OrchestratorV13:
     # --- clear_rows ---
 
     def _register_clear_rows(self, registry: ToolRegistry) -> None:
-        if not self._create_version_snapshot:
+        if not self._read_samples:
             return
 
         async def clear_rows(args: Dict) -> Tuple[str, float]:
             reason = args.get("reason", "User requested fresh start")
 
-            # Check if there are rows to preserve
             rows_done = self._generation_stats.get("rows_generated", 0)
             if rows_done == 0:
                 return "No rows to clear.", 0.0
 
-            # Auto-version: snapshot current rows, then start fresh
-            try:
-                snapshot_info = await self._create_version_snapshot()
-                # Delete all samples on the new version
-                samples = await self._read_samples()
-                for s in samples:
-                    await self._delete_sample(s["id"])
-                self._generation_stats["rows_generated"] = 0
+            samples = await self._read_samples()
+            for s in samples:
+                await self._delete_sample(s["id"])
+            self._generation_stats["rows_generated"] = 0
+            self._log_activity(f"Cleared {rows_done} rows: {reason}")
 
-                return (
-                    f"Cleared all {rows_done} rows. Previous rows preserved in "
-                    f"v{snapshot_info['version_number'] - 1} (visible in version history). "
-                    f"Starting fresh on v{snapshot_info['version_number']}."
-                ), 0.0
-            except Exception as e:
-                return f"Error clearing rows: {e}", 0.0
+            return f"Cleared {rows_done} rows. Starting fresh.", 0.0
 
         registry.add(
             name="clear_rows",
             description=(
-                "Remove ALL existing rows and start fresh. Use only when the user "
-                "wants a completely different approach. Previous rows are preserved "
-                "in version history."
+                "Delete ALL existing rows and start over. Last resort — only when "
+                "existing rows are genuinely unsalvageable and a completely different "
+                "approach is needed. Prefer reprocess_rows when possible."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "reason": {
                         "type": "string",
-                        "description": "Why rows are being cleared.",
+                        "description": "Why rows can't be salvaged.",
                     },
                 },
                 "required": ["reason"],

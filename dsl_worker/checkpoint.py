@@ -345,17 +345,6 @@ class CheckpointManager:
         except Exception:
             pass
 
-    def update_version(self, new_version_id: UUID) -> None:
-        """Update version_id after a version snapshot.
-
-        Changes the blob path so checkpoints are saved under the new version.
-        """
-        self.version_id = new_version_id
-        self._checkpoint_path = f"checkpoints/{self.project_id}/{new_version_id}/state.json"
-        if self._checkpoint:
-            self._checkpoint.version_id = str(new_version_id)
-        logger.info(f"[Checkpoint] Updated version to {new_version_id}")
-
     async def force_save(self) -> None:
         """Force immediate save."""
         await self.save(force=True)
