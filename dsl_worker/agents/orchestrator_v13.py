@@ -187,7 +187,7 @@ Task: 100 Shopify stores with owner email.
    set_column("Owner Email", ...) → submit_row()
 3. Process 3 more — web_search works ~80% for email
 4. submit_candidates("Stores from Apify. For email: web_search \
-   '{store_name} owner email'. Skip if not pet products.")
+   '{{store_name}} owner email'. Skip if not pet products.")
 
 Scenario 3 — Uploaded file:
 Task: Enrich 200 companies from CSV.
