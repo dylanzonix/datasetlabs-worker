@@ -1327,6 +1327,53 @@ class OrchestratorV13:
 
     # --- submit_candidates ---
 
+    def _extract_workshop_transcript(self) -> str:
+        """Extract workshop tool calls from conversation as a readable transcript.
+
+        Returns a condensed view of process_candidate/set_column/submit_row/skip_row
+        calls so row generators can see exactly what the orchestrator did.
+        """
+        workshop_tools = {"process_candidate", "set_column", "submit_row", "skip_row"}
+        lines = []
+        in_workshop = False
+
+        for msg in self._conversation.messages:
+            if not isinstance(msg, dict):
+                continue
+
+            if msg.get("type") == "function_call":
+                name = msg.get("name", "")
+                if name in workshop_tools:
+                    in_workshop = True
+                    args = msg.get("arguments", "")
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    if name == "process_candidate":
+                        idx = args.get("index", "?") if isinstance(args, dict) else "?"
+                        lines.append(f"\n--- Candidate {idx} ---")
+                    elif name == "set_column":
+                        col = args.get("name", "?") if isinstance(args, dict) else "?"
+                        val = args.get("value", "") if isinstance(args, dict) else ""
+                        val_str = str(val)[:100]
+                        lines.append(f"  {col} = {val_str}")
+                    elif name == "submit_row":
+                        lines.append(f"  → submitted")
+                    elif name == "skip_row":
+                        reason = args.get("reason", "") if isinstance(args, dict) else ""
+                        lines.append(f"  → skipped: {reason[:100]}")
+
+                # Also capture web_search calls during workshop
+                elif in_workshop and name == "web_search":
+                    lines.append(f"  [web_search]")
+
+        if not lines:
+            return ""
+
+        return "## Workshop — what I did for sample rows\n\n" + "\n".join(lines) + "\n\n"
+
     def _register_submit_candidates(self, registry: ToolRegistry) -> None:
 
         async def submit_candidates(args: Dict) -> Tuple[str, float]:
@@ -1334,6 +1381,11 @@ class OrchestratorV13:
             note = args.get("instructions", "") or args.get("note", "")
             preset_fields = args.get("preset_fields", {})
             checkin_after = args.get("checkin_after", 10)
+
+            # Prepend workshop transcript so row gens see what the orchestrator did
+            workshop = self._extract_workshop_transcript()
+            if workshop:
+                note = workshop + note
 
             if not file_path:
                 return "Error: file is required.", 0.0
