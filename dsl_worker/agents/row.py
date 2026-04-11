@@ -329,32 +329,51 @@ class RowGeneratorAgent:
                 return col
         return None
 
-    def _validate_value(self, col_def: Dict, value: Any) -> Optional[str]:
+    def _coerce_value(self, col_def: Dict, value: Any) -> Tuple[Any, Optional[str]]:
+        """Coerce value to the column type. Returns (coerced_value, warning_or_None)."""
         col_type = col_def.get("type", "string")
+
+        # Handle None — use type-appropriate default
+        if value is None:
+            defaults = {"string": "", "int": 0, "float": 0.0, "bool": False}
+            if col_type in defaults:
+                return defaults[col_type], f"was null, defaulted to {defaults[col_type]!r}"
+            return value, None
+
         if col_type == "string":
             if not isinstance(value, str):
-                return f"expects string, got {type(value).__name__}"
+                return str(value), None
         elif col_type == "int":
-            if not isinstance(value, int) or isinstance(value, bool):
-                return f"expects int, got {type(value).__name__}"
+            if isinstance(value, bool):
+                return int(value), None
+            if not isinstance(value, int):
+                try:
+                    return int(value), None
+                except (ValueError, TypeError):
+                    return 0, f"couldn't convert {type(value).__name__} to int, defaulted to 0"
         elif col_type == "float":
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                return f"expects float, got {type(value).__name__}"
+            if isinstance(value, bool):
+                return float(value), None
+            if not isinstance(value, (int, float)):
+                try:
+                    return float(value), None
+                except (ValueError, TypeError):
+                    return 0.0, f"couldn't convert {type(value).__name__} to float, defaulted to 0.0"
         elif col_type == "bool":
             if not isinstance(value, bool):
-                return f"expects bool, got {type(value).__name__}"
+                return bool(value), None
         elif col_type == "enum":
             allowed = col_def.get("enum_values", [])
             if value not in allowed:
-                return f"expects one of {allowed}, got {value!r}"
+                return value, f"not in allowed values {allowed}"
         elif col_type == "json":
             schema = col_def.get("json_schema")
             if schema:
                 try:
                     jsonschema.validate(value, schema)
                 except jsonschema.ValidationError as e:
-                    return f"json_schema validation failed: {e.message}"
-        return None
+                    return value, f"json_schema: {e.message}"
+        return value, None
 
     def _register_tools(self, registry: ToolRegistry) -> None:
 
@@ -374,9 +393,7 @@ class RowGeneratorAgent:
             if not col_def:
                 valid = [c.get("name") for c in self._schema]
                 return f"Error: unknown column '{name}'. Valid columns: {valid}", 0.0
-            error = self._validate_value(col_def, value)
-            if error:
-                return f"Error: column '{name}' {error}", 0.0
+            value, warning = self._coerce_value(col_def, value)
 
             self._current_row[name] = value
 
@@ -420,7 +437,10 @@ class RowGeneratorAgent:
                     f"If any of these is the same entity, call mark_duplicate(reason=\"...\")."
                 ), 0.0
 
-            return f"Set {name}", 0.0
+            result_msg = f"Set {name}"
+            if warning:
+                result_msg += f" (note: {warning})"
+            return result_msg, 0.0
 
         registry.add(
             name="set_column",
@@ -529,9 +549,8 @@ class RowGeneratorAgent:
             for col in self._schema:
                 col_name = col.get("name", "")
                 if col_name in self._current_row:
-                    error = self._validate_value(col, self._current_row[col_name])
-                    if error:
-                        return f"Error: column '{col_name}' {error}.", 0.0
+                    coerced, _ = self._coerce_value(col, self._current_row[col_name])
+                    self._current_row[col_name] = coerced
 
             # Final dedup check — holistic comparison against submitted rows.
             # Catches the race condition where a concurrent generator submitted

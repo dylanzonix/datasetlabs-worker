@@ -129,7 +129,9 @@ actor is producing results, keep using it with adjusted parameters.
 
 Call process_candidate to load a candidate, then fill schema columns \
 using set_column. Research missing fields with web_search or \
-integrations. Submit or skip.
+integrations. Submit or skip. You MUST submit or skip at least one \
+candidate yourself before delegating — loading a candidate without \
+completing it teaches you nothing.
 
 This is where you learn:
 - Which fields are already in the candidate data (don't research those)
@@ -141,7 +143,8 @@ If you see a pattern in skips (e.g. most candidates have wrong size), \
 use code_exec to filter remaining candidates before processing more.
 
 For small projects (≤20 rows), you might just do them all yourself. \
-For larger ones, process enough to know the strategy (usually 3-8 rows).
+For larger ones, 3-5 completed rows is enough to know the pattern. \
+Don't over-workshop — once the pattern is clear, delegate.
 
 ### 3. Delegate
 
