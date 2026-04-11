@@ -1009,6 +1009,14 @@ class JobProcessor:
                     candidates_submitted=state_data.get("candidates_submitted", 0),
                     current_file=state_data.get("current_file"),
                 ))
+
+                # Update progress_detail for frontend polling
+                version.progress_detail = {
+                    "phase": "generating" if state_data["generation_stats"].get("rows_generated", 0) > 0 else "orchestrating",
+                    **state_data["generation_stats"],
+                    "activity": state_data.get("activity_log", []),
+                }
+                db.commit()
             except Exception as e:
                 logger.warning(f"[Pipeline] Checkpoint callback error: {e}")
 

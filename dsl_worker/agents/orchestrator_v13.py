@@ -306,6 +306,8 @@ class OrchestratorV13:
         self._delete_sample = delete_sample
         self._create_version_snapshot = create_version_snapshot
 
+        self._activity_log: List[Dict[str, Any]] = []
+
         self._generation_stats = generation_stats
         self._save_row = save_row
         self._generate_row_fn = generate_row_fn
@@ -588,6 +590,21 @@ class OrchestratorV13:
 
         return ""
 
+    # ── Activity log ──────────────────────────────────────────────────
+
+    def _log_activity(self, text: str) -> None:
+        """Append an entry to the activity log (surfaced to frontend)."""
+        self._activity_log.append({
+            "ts": time.time(),
+            "text": text,
+        })
+        # Keep last 50 entries
+        if len(self._activity_log) > 50:
+            self._activity_log = self._activity_log[-50:]
+
+    def get_activity_log(self) -> List[Dict[str, Any]]:
+        return list(self._activity_log)
+
     # ── File helpers ───────────────────────────────────────────────────
 
     def _to_workspace_path(self, local_path) -> str:
@@ -626,12 +643,27 @@ class OrchestratorV13:
         since they bypass _write_candidates_file().
         """
         # Count candidates in the file
+        line_count = 0
         try:
             with open(local_path, "r", encoding="utf-8", errors="replace") as f:
                 line_count = sum(1 for line in f if line.strip())
             self._candidates_harvested += line_count
         except Exception:
             pass
+
+        # Log activity — infer source from filename
+        if line_count > 0:
+            name = local_path.stem
+            if "apify" in name:
+                self._log_activity(f"Harvested {line_count} candidates from Apify")
+            elif "fullenrich" in name:
+                self._log_activity(f"Found {line_count} results from FullEnrich")
+            elif "apollo" in name:
+                self._log_activity(f"Found {line_count} results from Apollo")
+            elif "gmaps" in name:
+                self._log_activity(f"Found {line_count} places from Google Maps")
+            else:
+                self._log_activity(f"Harvested {line_count} candidates")
 
         if not self.blob_service_client:
             return
@@ -953,6 +985,8 @@ class OrchestratorV13:
                     )
                 )
 
+            self._log_activity(f"Web search: {candidates_found} candidates found")
+
             return (
                 f"Web research complete: {candidates_found} candidates found.\n"
                 f"File: {output_path}\n"
@@ -1152,6 +1186,7 @@ class OrchestratorV13:
                 return "Error: file is empty.", 0.0
 
             self._candidates_submitted += total_lines
+            self._log_activity(f"Submitted {total_lines} candidates for processing")
 
             # Set up file processing state
             self._current_file = _FileProcessingState(
@@ -1625,6 +1660,12 @@ class OrchestratorV13:
         note: str = "",
     ) -> str:
         """Build a feedback report for the orchestrator."""
+        # Log activity for the batch
+        self._log_activity(
+            f"{state.rows} rows generated, {state.skipped} skipped"
+            + (f", {state.duplicates} duplicates" if state.duplicates else "")
+        )
+
         rows_done = self._generation_stats.get("rows_generated", 0)
         total_cost = self._generation_stats.get("total_cost", 0.0)
         total_cost += self._conversation.total_cost
@@ -1829,6 +1870,7 @@ class OrchestratorV13:
             "candidates_harvested": self._candidates_harvested,
             "candidates_submitted": self._candidates_submitted,
             "current_file": file_state,
+            "activity_log": self._activity_log[-50:],
         }
 
     def restore_state(self, state: Dict[str, Any]) -> None:
@@ -1848,6 +1890,7 @@ class OrchestratorV13:
         self._apify_run_counter = state.get("apify_run_counter", 0)
         self._candidates_harvested = state.get("candidates_harvested", 0)
         self._candidates_submitted = state.get("candidates_submitted", 0)
+        self._activity_log = state.get("activity_log", [])
 
         saved_stats = state.get("generation_stats", {})
         for key in ("skipped", "errors", "total_cost"):
