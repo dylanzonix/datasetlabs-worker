@@ -42,156 +42,170 @@ logger = logging.getLogger(__name__)
 SYSTEM_PROMPT = """\
 # Dataset Builder — {num_samples} rows
 
-## Your role
+## Objective
 
-You are the **orchestrator**. You find the best sources of candidates, \
-harvest them, and submit them for processing by row generators.
+Produce the dataset at the lowest cost per row. Every tool call costs \
+money — yours and every row generator you spawn. Optimize ruthlessly.
 
-When you call submit_candidates, each candidate goes to a separate AI \
-agent (row generator) that inspects it, researches missing info, fills \
-schema columns, and decides row or skip. You get a feedback report back.
+## How it works
 
-Row generators have: **web_search**, **apify**, **fullenrich** (people/ \
-company search + verified email/phone), **apollo** (B2B enrichment), \
-**google_maps**, **code_exec**, and **browser_use** (expensive last \
-resort). Your instructions guide what they do — share what you've \
-learned so they don't each independently rediscover the same things.
+You have two modes:
+
+**Workshop mode** — Process candidates yourself using process_candidate, \
+set_column, submit_row, skip_row, and your research tools. This is how \
+you learn what works: which fields are in the data, which need research, \
+what gets skipped, what each row costs. Start here.
+
+**Delegate mode** — Hand off remaining candidates to row generators via \
+submit_candidates. They see your full conversation history including \
+your workshop, so they know what works. Only delegate once you've \
+figured out the optimal strategy.
 
 ## Tools
 
 {integration_tools_section}\
-**web_harvest(query, candidate_description)** — Spawns an agent that \
-googles, visits pages, extracts candidates to a file. ~$0.10-0.20/call. \
-For harvesting entities only — use your built-in web_search for lookups.
+**process_candidate(file, index)** — Load a candidate from a JSONL \
+file to process yourself. Then use set_column/submit_row/skip_row.
 
-**browser_use(task)** — Full cloud browser with anti-bot bypass, JS \
-rendering, captcha solving. $0.10-0.50/call. Use ONLY when you have a \
-specific URL that requires a real browser — the site blocks scraping, \
-needs JS interaction, or has anti-bot protection, AND no Apify actor \
-exists for it. If the data could be found from a different source that \
-doesn't need a browser, use that instead.
+**set_column(name, value)** — Set a column value on the loaded candidate.
+
+**submit_row()** — Submit the completed row.
+
+**skip_row(reason)** — Skip the current candidate.
+
+**submit_candidates(file, instructions, checkin_after)** — Delegate \
+remaining candidates to row generators. Include a brief note about \
+what you learned: what works, what to skip, target cost per row.
+
+**continue_processing(checkin_after)** — Resume delegated processing.
 
 **code_exec(script)** — Python sandbox. /workspace/uploads/ (read-only), \
-/workspace/candidates/ (your output). pandas, json, csv available.
+/workspace/candidates/ (your output). pandas, json, csv available. \
+Use for filtering candidates, extracting fields, data manipulation.
 
-### Source priority
-1. Uploaded files — free, inspect with code_exec
-2. Integrations (Apify, FullEnrich, Apollo, Google Maps) — cheap, structured
-3. web_search — cheap but not free (uses tokens), good for lookups
-4. web_harvest — $0.10-0.20/call, for scraping when no integration exists
-5. browser_use — $0.10-0.50/call, last resort for anti-bot/JS-heavy sites
+**web_harvest(query, candidate_description)** — Spawns an agent that \
+googles, visits pages, extracts candidates to a file. ~$0.10-0.20/call.
 
-Apify has 22,000+ scrapers covering social media, e-commerce, real estate, \
-job boards, news, and more. Always check apify_search before resorting to \
-web_harvest or browser_use.
+**browser_use(task)** — Cloud browser. $0.10-0.50/call. Last resort — \
+only when a specific URL needs JS rendering or anti-bot bypass AND no \
+Apify actor exists for that site.
 
-### Cost awareness
-- FullEnrich emails: ~$0.05 each (worth it — high find rate)
-- FullEnrich phones: ~$0.55 each (expensive — try web_search first)
-- Apify actors: usually <$0.01/result
-- browser_use: $0.10-0.50/session (avoid unless truly necessary)
-
-## Submission
-
-**submit_candidates(file, instructions, checkin_after)** — Send a JSONL \
-file to row generators. Returns a feedback report.
-
-**continue_processing(checkin_after)** — Resume the current file.
-
-**reprocess_rows(instructions)** — Re-evaluate ALL existing rows. Use when \
-user asks to add/fill a column, filter rows, or modify existing data. \
-Automatically creates a version snapshot (old rows preserved in history). \
-Each row goes through a row generator that can update or filter it.
-
-**clear_rows(reason)** — Remove all rows and start fresh. Old rows preserved \
-in version history.
+**reprocess_rows(instructions)** / **clear_rows(reason)** — For live \
+user messages requesting changes to existing rows.
 
 **finish(reason)** — Only for genuinely impossible tasks.
 
+### Source hierarchy
+1. Uploaded files — free
+2. Integrations (Apify, FullEnrich, Apollo, Google Maps) — cheap, structured
+3. web_search — cheap, good for per-row lookups
+4. web_harvest — ~$0.15/call, only when no integration exists
+5. browser_use — $0.10-0.50/call, absolute last resort
+
+Apify has scrapers for most sites. Always check apify_search first.
+
+### Cost reference
+- Apify actors: <$0.01/result
+- FullEnrich emails: ~$0.05 each
+- FullEnrich phones: ~$0.55 each (try web_search first)
+- browser_use: $0.10-0.50/session
+
 ## How to work
 
-### Step 1: Find a source and harvest (~2 turns)
+### 1. Find candidates
 
-Check uploaded files first, then integration tools (apify_search, \
-fullenrich, apollo, google_maps). A couple of searches is enough — \
-don't spend turns reading documentation, just call them.
+Pick the most obvious source. Don't overthink it — for most projects \
+the source is clear. A quick web_search to understand the landscape is \
+fine. Keep total harvesting cost under ~$1.
 
-Harvest a small first batch — about 1.5× your target. For 100 rows, \
-~150 candidates is plenty. You don't know the conversion rate yet, \
-so don't over-harvest. You can always get more later.
+For cheap sources (Apify <$0.01/result), harvest generously. For \
+expensive sources, start small. Stick with what works — if an Apify \
+actor is producing results, keep using it with adjusted parameters.
 
-### Step 2: Submit
+### 2. Workshop — process candidates yourself
 
-Call submit_candidates with the file and brief instructions describing \
-what's in the data and what row generators should do. One code_exec to \
-glance at the data structure is fine if needed, but don't extensively \
-filter or transform — row generators handle that.
+Call process_candidate to load a candidate, then fill schema columns \
+using set_column. Research missing fields with web_search or \
+integrations. Submit or skip.
 
-### Step 3: Read feedback, scale
+This is where you learn:
+- Which fields are already in the candidate data (don't research those)
+- Which tools work for missing fields
+- What patterns cause skips (wrong category, out of range, etc.)
+- What a row costs
 
-Check the feedback report. Good conversion → harvest more and submit. \
-High skips → adjust the source parameters (e.g. different URL filters, \
-tighter query) or adjust your instructions. Only harvest more when you \
-need more — don't stockpile candidates beyond ~2× your remaining target.
+If you see a pattern in skips (e.g. most candidates have wrong size), \
+use code_exec to filter remaining candidates before processing more.
 
-**Stick with what works.** If you found a working Apify actor, keep \
-using it with adjusted parameters — don't fall back to web_harvest for \
-the same site. web_harvest is for when no integration exists, not as an \
-alternative to an Apify actor you already have.
+For small projects (≤20 rows), you might just do them all yourself. \
+For larger ones, process enough to know the strategy (usually 3-8 rows).
+
+### 3. Delegate
+
+Once you know the pattern, call submit_candidates with a note \
+summarizing what you learned. Row generators see your full conversation \
+so they already know what worked — the note is just a quick summary.
+
+If the feedback report shows problems (high skips, high cost), adjust \
+your approach: filter candidates, change instructions, or try a \
+different source parameter.
 
 ### Live user messages
 
-The user can send messages while you're running. These appear as \
-[User message] in the status updates. When you see one:
-- **Behavioral change** ("focus on X", "also include Y"): adapt your \
-  strategy going forward. No need to touch existing rows.
-- **Schema change** ("add Email column"): the schema is already updated. \
-  Call reprocess_rows to fill the new column on existing rows.
-- **Filtering** ("only 500+ karma"): call reprocess_rows with filter criteria.
-- **Start over** ("completely different approach"): call clear_rows.
+User messages appear as [User message] in status updates:
+- **Behavioral change**: adapt going forward
+- **Schema change**: call reprocess_rows to update existing rows
+- **Filtering**: call reprocess_rows with filter criteria
+- **Start over**: call clear_rows
 
 ### Principles
 
-- **Row generators handle filtering and enrichment.** Don't do their job \
-for them — submit candidates and let them figure it out.
-- **Use real data.** Don't fabricate from your own knowledge.
-- **Costs add up.** FullEnrich phones $0.55 each. browser_use $0.10-0.50. \
-Use intentionally.
+- **Optimize cost per produced row.** That's the metric.
+- **Use real data.** Don't fabricate.
+- **Filter obvious non-matches programmatically.** If a JSON field \
+clearly disqualifies a candidate (wrong size, wrong category), filter \
+with code_exec. Don't send obvious skips to row generators.
+- **Stick with what works.** Don't switch sources unless exhausted or \
+clearly wrong.
 
 <scenarios>
-Scenario 1 — Integration source:
-Task: 300 Airbnb listings in Barcelona with 2+ bedrooms.
+Scenario 1 — Structured integration data:
+Task: 100 Airbnb listings in Barcelona, 2+ bedrooms.
 1. apify_search("airbnb") → found scraper
-2. call_actor(maxItems=50) → 50 listings → submit_candidates
-   instructions: "Airbnb listings. Skip if bedrooms < 2. All fields in data."
-3. Feedback: 45/50 converted → scale up with maxItems=300
+2. call_actor(maxItems=20) → 20 listings
+3. process_candidate(file, 0) → inspect data, all fields present
+   set_column("Title", ...), set_column("Price", ...), submit_row()
+4. Process 2 more — pattern clear, all columns from data, no research
+5. submit_candidates(file, "All fields in data. Skip if bedrooms < 2.")
+6. Good conversion → call_actor(maxItems=200), submit_candidates
 
-Scenario 2 — Missing field, row gens research it:
+Scenario 2 — Need per-row research:
 Task: 100 Shopify stores with owner email.
-1. call_actor("shopify scraper", maxItems=30) → 30 stores
-2. submit_candidates — row gens handle the email research
-   instructions: "Shopify stores. Name/URL/products in data. For owner email: web_search the store name + 'owner', then fullenrich.enrich_contacts. Skip if not pet products."
-3. Feedback: good → scale up
+1. call_actor("shopify scraper", maxItems=20) → 20 stores
+2. process_candidate(0) — name/URL in data, need owner email
+   web_search("store name owner email") → found on About page
+   set_column("Owner Email", ...) → submit_row()
+3. Process 3 more — web_search works ~80% for email
+4. submit_candidates("Stores from Apify. For email: web_search \
+   '{store_name} owner email'. Skip if not pet products.")
 
 Scenario 3 — Uploaded file:
 Task: Enrich 200 companies from CSV.
-1. code_exec to check file structure (quick look)
-2. submit_candidates with the file
-   instructions: "User's company list. For HQ + phone: try apollo.enrich_company with domain."
+1. code_exec to check structure → name, website, industry columns
+2. process_candidate(0) — need HQ address + phone
+   apollo.enrich_company(domain) → got both
+3. Process 2 more — apollo works consistently
+4. submit_candidates("For HQ + phone: apollo.enrich_company with domain.")
 
-Scenario 4 — Google Maps:
-Task: 40 coworking spaces in Tokyo.
-1. google_maps_search("coworking space Tokyo") → 20 results
-2. submit_candidates
-   instructions: "Google Maps results. For pricing: check website via web_search. Skip if not coworking."
-3. Search more areas → submit those too
-
-Scenario 5 — Large scale:
-Task: 1000 SaaS companies US 50-200 employees.
-1. fullenrich.search_companies(max_results=50) → 50 companies
-2. submit_candidates
-   instructions: "FullEnrich companies. For contact info: apollo.enrich_company with domain."
-3. Good conversion → scale to max_results=500
+Scenario 4 — Low fertility, needs filtering:
+Task: 100 industrial land listings, 2000-15000 sqm.
+1. call_actor("immobiliare scraper", maxItems=50) → 50 listings
+2. process_candidate(0) → residential land, 500 sqm → skip
+3. process_candidate(1) → agricultural, 64000 sqm → skip
+4. process_candidate(2) → industrial, 3200 sqm → submit_row()
+5. Pattern: most candidates are wrong type/size. Surface area is in JSON.
+   code_exec to filter: keep only 2000-15000 sqm → 8 out of 50 remain
+6. Process remaining 7, then harvest more with adjusted query
 </scenarios>
 
 Today's date: {current_date}
@@ -331,6 +345,10 @@ class OrchestratorV13:
         self._web_harvest_counter: int = 0
         self._bu_extract_counter: int = 0
         self._apify_run_counter: int = 0
+
+        # Workshop mode — orchestrator processes rows directly
+        self._workshop_row: Dict[str, Any] = {}
+        self._workshop_candidate: Optional[str] = None
 
         # Candidate tracking for status line
         self._candidates_harvested: int = 0
@@ -692,6 +710,7 @@ class OrchestratorV13:
         self._register_code_exec(registry)
         self._register_web_harvest(registry)
         self._register_bu_extract(registry)
+        self._register_workshop_tools(registry)
         self._register_submit_candidates(registry)
         self._register_continue_processing(registry)
         self._register_reprocess_rows(registry)
@@ -1136,6 +1155,173 @@ class OrchestratorV13:
                 "required": ["task"],
             },
             handler=bu_extract,
+        )
+
+    # --- workshop tools (process rows directly) ---
+
+    def _register_workshop_tools(self, registry: ToolRegistry) -> None:
+
+        async def process_candidate(args: Dict) -> Tuple[str, float]:
+            """Load a candidate from a file for the orchestrator to process directly."""
+            file_path = args.get("file", "")
+            index = args.get("index", 0)
+
+            if not file_path:
+                return "Error: file is required.", 0.0
+
+            # Resolve workspace path
+            if file_path.startswith("/workspace/"):
+                local_path = self.workspace_dir / file_path[len("/workspace/"):]
+            else:
+                local_path = Path(file_path)
+                if not local_path.is_absolute():
+                    local_path = self.workspace_dir / file_path
+
+            if not local_path.exists():
+                return f"Error: file not found: {file_path}", 0.0
+
+            # Read the specific line
+            try:
+                with open(local_path, "r", encoding="utf-8") as f:
+                    for i, line in enumerate(f):
+                        if i == index:
+                            line = line.strip()
+                            if not line:
+                                return f"Error: line {index} is empty.", 0.0
+                            candidate_data = json.loads(line)
+                            self._workshop_row = {}
+                            self._workshop_candidate = json.dumps(
+                                candidate_data, indent=2, ensure_ascii=False
+                            )
+                            return (
+                                f"Candidate {index} loaded. Data:\n\n"
+                                f"```json\n{self._workshop_candidate[:3000]}\n```\n\n"
+                                f"Now fill the schema columns with set_column, "
+                                f"then call submit_row or skip_row."
+                            ), 0.0
+                    return f"Error: file has fewer than {index + 1} lines.", 0.0
+            except json.JSONDecodeError:
+                return f"Error: invalid JSON at line {index}.", 0.0
+            except Exception as e:
+                return f"Error reading file: {e}", 0.0
+
+        registry.add(
+            name="process_candidate",
+            description=(
+                "Load a candidate from a JSONL file to process directly. "
+                "Use this in workshop mode — process a few candidates yourself "
+                "before delegating to row generators."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "file": {
+                        "type": "string",
+                        "description": "Path to JSONL file.",
+                    },
+                    "index": {
+                        "type": "integer",
+                        "description": "Line index (0-based) of the candidate to load.",
+                    },
+                },
+                "required": ["file", "index"],
+            },
+            handler=process_candidate,
+        )
+
+        async def set_column(args: Dict) -> Tuple[str, float]:
+            name = args.get("name", "")
+            value = args.get("value")
+
+            if self._workshop_candidate is None:
+                return "Error: no candidate loaded. Call process_candidate first.", 0.0
+
+            # Case-insensitive column match
+            matched_name = None
+            for col in self.columns:
+                if col.get("name", "").lower() == name.lower():
+                    matched_name = col["name"]
+                    break
+            if not matched_name:
+                valid = [c.get("name") for c in self.columns]
+                return f"Error: unknown column '{name}'. Valid: {valid}", 0.0
+
+            self._workshop_row[matched_name] = value
+            return f"Set {matched_name}", 0.0
+
+        registry.add(
+            name="set_column",
+            description="Set a column value on the current candidate.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Column name"},
+                    "value": {"description": "Column value"},
+                },
+                "required": ["name", "value"],
+            },
+            handler=set_column,
+        )
+
+        async def submit_row(args: Dict) -> Tuple[str, float]:
+            if self._workshop_candidate is None:
+                return "Error: no candidate loaded.", 0.0
+
+            missing = [
+                col.get("name") for col in self.columns
+                if col.get("name") and col.get("name") not in self._workshop_row
+            ]
+            if missing:
+                return f"Error: missing columns {missing}. Set them before submitting.", 0.0
+
+            # Save to DB
+            row_id = await self._save_row(self._workshop_row)
+            if row_id:
+                self._generation_stats["rows_generated"] = (
+                    self._generation_stats.get("rows_generated", 0) + 1
+                )
+                rows_done = self._generation_stats["rows_generated"]
+                self._log_activity(f"Row {rows_done} submitted (workshop)")
+                self._workshop_row = {}
+                self._workshop_candidate = None
+                return f"Row submitted ({rows_done}/{self.num_samples} done).", 0.0
+            else:
+                self._workshop_row = {}
+                self._workshop_candidate = None
+                return "Target reached — row discarded.", 0.0
+
+        registry.add(
+            name="submit_row",
+            description="Submit the current row. Call when all columns are filled.",
+            parameters={"type": "object", "properties": {}},
+            handler=submit_row,
+        )
+
+        async def skip_row(args: Dict) -> Tuple[str, float]:
+            reason = args.get("reason", "")
+            if self._workshop_candidate is None:
+                return "Error: no candidate loaded.", 0.0
+
+            self._generation_stats["skipped"] = (
+                self._generation_stats.get("skipped", 0) + 1
+            )
+            self._workshop_row = {}
+            self._workshop_candidate = None
+            return f"Skipped: {reason}", 0.0
+
+        registry.add(
+            name="skip_row",
+            description=(
+                "Skip this candidate — wrong category, doesn't match criteria, etc."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string", "description": "Why"},
+                },
+                "required": ["reason"],
+            },
+            handler=skip_row,
         )
 
     # --- submit_candidates ---

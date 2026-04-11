@@ -144,10 +144,11 @@ def register_apify_namespace(
         if not actor_id:
             return "Error: actor_id is required.", 0.0
 
-        # Everything except actor_id and max_items is actor input
-        known_keys = {"actor_id", "max_items"}
+        # Everything except known keys is actor input
+        known_keys = {"actor_id", "max_items", "max_cost"}
         run_input = {k: v for k, v in args.items() if k not in known_keys}
         max_items = args.get("max_items")
+        max_cost = args.get("max_cost")
 
         logger.info(f"[apify] Running actor: {actor_id}")
 
@@ -159,12 +160,15 @@ def register_apify_namespace(
                 "Content-Type": "application/json",
             }
             actor_path = actor_id.replace("/", "~")
+            run_params: Dict[str, Any] = {"timeout": 0}  # async start
+            if max_cost is not None:
+                run_params["maxTotalChargeUsd"] = max_cost
             async with httpx.AsyncClient(timeout=30.0) as http:
                 resp = await http.post(
                     f"https://api.apify.com/v2/acts/{actor_path}/runs",
                     headers=headers,
                     json=run_input,
-                    params={"timeout": 0},  # async start
+                    params=run_params,
                 )
 
             if resp.status_code not in (200, 201):
@@ -298,6 +302,10 @@ def register_apify_namespace(
                     "max_items": {
                         "type": "integer",
                         "description": "Limit items downloaded from the dataset (optional)",
+                    },
+                    "max_cost": {
+                        "type": "number",
+                        "description": "Max USD cost for this run (optional). Apify stops the actor if cost exceeds this.",
                     },
                 },
                 "required": ["actor_id"],
