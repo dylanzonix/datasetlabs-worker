@@ -130,9 +130,14 @@ filter or transform — row generators handle that.
 ### Step 3: Read feedback, scale
 
 Check the feedback report. Good conversion → harvest more and submit. \
-High skips → adjust instructions or try a different source. Only harvest \
-more when you need more — don't stockpile candidates beyond ~2× your \
-remaining target.
+High skips → adjust the source parameters (e.g. different URL filters, \
+tighter query) or adjust your instructions. Only harvest more when you \
+need more — don't stockpile candidates beyond ~2× your remaining target.
+
+**Stick with what works.** If you found a working Apify actor, keep \
+using it with adjusted parameters — don't fall back to web_harvest for \
+the same site. web_harvest is for when no integration exists, not as an \
+alternative to an Apify actor you already have.
 
 ### Live user messages
 
