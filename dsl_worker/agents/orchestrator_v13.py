@@ -1957,28 +1957,76 @@ class OrchestratorV13:
         candidates_dir = self.workspace_dir / "candidates"
         candidates_dir.mkdir(parents=True, exist_ok=True)
 
+        def _exit_condition() -> bool:
+            if self._finish_requested:
+                return True
+            rows_done = self._generation_stats.get("rows_generated", 0)
+            if rows_done >= self.num_samples:
+                return True
+            return False
+
         # Determine initial message
         if self._conversation.messages:
-            # Resuming from checkpoint — pick up where we left off
+            # Resuming from checkpoint
             rows_done = self._generation_stats.get("rows_generated", 0)
             logger.info(
                 f"[orchestrator] Resuming: {len(self._conversation.messages)} messages, "
                 f"{rows_done}/{self.num_samples} rows"
             )
-            resume_parts = [
-                f"Resumed. {rows_done}/{self.num_samples} rows done so far."
-            ]
+
+            # If we were mid-file, just keep processing — no LLM needed
             if self._current_file:
                 fs = self._current_file
                 remaining = fs.total_lines - fs.next_line
-                resume_parts.append(
-                    f"You were processing {Path(fs.file_path).name}: "
-                    f"{fs.processed}/{fs.total_lines} done, "
-                    f"{remaining} remaining. Call continue_processing to resume."
+                logger.info(
+                    f"[orchestrator] Resuming file processing: "
+                    f"{fs.processed}/{fs.total_lines} done, {remaining} remaining"
+                )
+                while remaining > 0 and not _exit_condition():
+                    if self.stop_checker and self.stop_checker():
+                        break
+                    result_text, cost = await self._process_batch(20)
+                    self._conversation.total_cost += cost
+                    if self.on_cost and cost > 0:
+                        await self.on_cost(cost, "orchestrator")
+                    if self._on_checkpoint:
+                        self._on_checkpoint(self)
+                    remaining = fs.total_lines - fs.next_line
+                    # Check for new user messages between batches
+                    if self._check_messages:
+                        new_msgs = self._check_messages()
+                        if new_msgs:
+                            # User sent a message — hand back to LLM
+                            for msg in new_msgs:
+                                self._conversation.inject_message(
+                                    "user",
+                                    f"[User message]: {msg.get('content', '')}"
+                                )
+                            break
+
+                # If file is done and target not reached, let LLM decide next steps
+                if _exit_condition():
+                    return AgentResult(
+                        text="Target reached.",
+                        cost_usd=self._conversation.total_cost,
+                    )
+                if self.stop_checker and self.stop_checker():
+                    return AgentResult(
+                        text="Stopped.",
+                        cost_usd=self._conversation.total_cost,
+                        stopped=True,
+                    )
+
+                # File done or user message — continue with LLM
+                initial_msg = (
+                    f"Resumed. {self._generation_stats.get('rows_generated', 0)}/{self.num_samples} rows. "
+                    f"Continue."
                 )
             else:
-                resume_parts.append("Continue where you left off.")
-            initial_msg = " ".join(resume_parts)
+                initial_msg = (
+                    f"Resumed. {rows_done}/{self.num_samples} rows done so far. "
+                    f"Continue where you left off."
+                )
         elif self.feedback_context:
             initial_msg = (
                 "Begin. The user reviewed previous results and gave feedback "
@@ -1995,14 +2043,6 @@ class OrchestratorV13:
                 "Begin. Read the conversation and schema, figure out what the "
                 "user wants, then find and submit candidates."
             )
-
-        def _exit_condition() -> bool:
-            if self._finish_requested:
-                return True
-            rows_done = self._generation_stats.get("rows_generated", 0)
-            if rows_done >= self.num_samples:
-                return True
-            return False
 
         try:
             result = await self._conversation.send(
