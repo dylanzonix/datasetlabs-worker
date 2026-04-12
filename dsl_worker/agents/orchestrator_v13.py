@@ -1937,6 +1937,31 @@ class OrchestratorV13:
         except Exception as e:
             logger.warning(f"[orchestrator] checkpoint callback error: {e}")
 
+    def _cleanup_orphaned_tool_calls(self) -> None:
+        """Remove trailing function_calls with no matching output.
+
+        When paused mid-tool-execution, the conversation has a function_call
+        at the end but no function_call_output. The API requires outputs for
+        all calls. Strip these so the LLM can continue cleanly.
+        """
+        msgs = self._conversation.messages
+        while msgs:
+            last = msgs[-1]
+            if isinstance(last, dict) and last.get("type") == "function_call":
+                logger.info(
+                    f"[orchestrator] Removing orphaned function_call: {last.get('name', '?')}"
+                )
+                msgs.pop()
+                # Also remove preceding reasoning item if it's now dangling
+                if msgs and isinstance(msgs[-1], dict) and msgs[-1].get("type") == "reasoning":
+                    msgs.pop()
+            elif isinstance(last, dict) and last.get("role") == "user":
+                # Dangling user message (e.g. status line injected after tools)
+                # that was never answered — remove so LLM doesn't see a stale prompt
+                msgs.pop()
+            else:
+                break
+
     # ── Run ───────────────────────────────────────────────────────────
 
     async def run(self) -> AgentResult:
@@ -2011,16 +2036,13 @@ class OrchestratorV13:
                         stopped=True,
                     )
 
-                # File done or user message — continue with LLM
-                initial_msg = (
-                    f"Resumed. {self._generation_stats.get('rows_generated', 0)}/{self.num_samples} rows. "
-                    f"Continue."
-                )
+                # File done or user message — clean up orphans and continue
+                self._cleanup_orphaned_tool_calls()
+                initial_msg = None  # Use step() instead of send()
             else:
-                initial_msg = (
-                    f"Resumed. {rows_done}/{self.num_samples} rows done so far. "
-                    f"Continue where you left off."
-                )
+                # Not mid-file — clean up and let LLM continue naturally
+                self._cleanup_orphaned_tool_calls()
+                initial_msg = None  # Use step() instead of send()
         elif self.feedback_context:
             initial_msg = (
                 "Begin. The user reviewed previous results and gave feedback "
@@ -2039,10 +2061,16 @@ class OrchestratorV13:
             )
 
         try:
-            result = await self._conversation.send(
-                initial_msg,
-                exit_condition=_exit_condition,
-            )
+            if initial_msg is not None:
+                result = await self._conversation.send(
+                    initial_msg,
+                    exit_condition=_exit_condition,
+                )
+            else:
+                # Resume — no new message, just continue the conversation
+                result = await self._conversation.step(
+                    exit_condition=_exit_condition,
+                )
             logger.info(
                 f"[orchestrator] Finished: "
                 f"{self._generation_stats.get('rows_generated', 0)}/{self.num_samples} rows, "
