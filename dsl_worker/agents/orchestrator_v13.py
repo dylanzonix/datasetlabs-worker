@@ -658,18 +658,16 @@ class OrchestratorV13:
         local_path.write_text(content, encoding="utf-8")
 
         # Persist to blob for pause/resume (also counts candidates)
-        self._upload_candidate_to_blob(local_path)
+        self._on_candidate_file_written(local_path)
 
         return workspace_path
 
-    def _upload_candidate_to_blob(self, local_path: Path) -> None:
-        """Upload a candidate file to blob storage for pause/resume durability.
+    def _on_candidate_file_written(self, local_path: Path) -> None:
+        """Track candidate count and log activity when a file is written.
 
-        Also counts lines to track _candidates_harvested — this is how
-        integration tools (apify, fullenrich, etc.) report their output
-        since they bypass _write_candidates_file().
+        Blob persistence is handled by the checkpoint callback which syncs
+        ALL candidate files every checkpoint cycle.
         """
-        # Count candidates in the file
         line_count = 0
         try:
             with open(local_path, "r", encoding="utf-8", errors="replace") as f:
@@ -678,7 +676,6 @@ class OrchestratorV13:
         except Exception:
             pass
 
-        # Log activity — infer source from filename
         if line_count > 0:
             name = local_path.stem
             if "apify" in name:
@@ -691,21 +688,6 @@ class OrchestratorV13:
                 self._log_activity(f"Found {line_count} places from Google Maps")
             else:
                 self._log_activity(f"Harvested {line_count} candidates")
-
-        if not self.blob_service_client:
-            return
-        blob_path = f"projects/{self.project_id}/candidates/{local_path.name}"
-        try:
-            from dsl_worker.config import settings
-            blob = self.blob_service_client.get_blob_client(
-                container=settings.azure_storage_container_name,
-                blob=blob_path,
-            )
-            with open(local_path, "rb") as f:
-                blob.upload_blob(f, overwrite=True)
-            logger.info(f"[orchestrator] Uploaded candidate file to blob: {local_path.name}")
-        except Exception as e:
-            logger.warning(f"[orchestrator] Failed to upload candidate to blob: {e}")
 
     # ── Tool registration ─────────────────────────────────────────────
 
@@ -829,9 +811,8 @@ class OrchestratorV13:
 
             result = await original_code_exec(script, description)
 
-            # After code_exec: sync ALL candidate files from sandbox to local + blob.
-            # This ensures every file survives pause/resume. Idempotent — re-uploading
-            # an unchanged file is fine (overwrite=True in blob upload).
+            # After code_exec: sync candidate files from sandbox to local.
+            # Blob persistence is handled by the checkpoint callback.
             try:
                 if self._sandbox_impl and self._sandbox_impl._sandbox_session:
                     session = self._sandbox_impl._sandbox_session
@@ -840,19 +821,20 @@ class OrchestratorV13:
                             "ls -1 /workspace/candidates/ 2>/dev/null || true", timeout=5
                         )
                         if listing.success and listing.stdout.strip():
-                            sandbox_files = listing.stdout.strip().split("\n")
-                            for fname in sandbox_files:
+                            local_files = set(
+                                f.name for f in candidates_dir.iterdir() if f.is_file()
+                            ) if candidates_dir.exists() else set()
+                            for fname in listing.stdout.strip().split("\n"):
                                 if fname.startswith(".") or not fname.strip():
                                     continue
-                                try:
-                                    local_file = candidates_dir / fname
-                                    # Always download from sandbox (source of truth after code_exec)
-                                    content = await session.read_file(f"candidates/{fname}")
-                                    local_file.write_text(content, encoding="utf-8")
-                                    # Always upload to blob for pause/resume
-                                    self._upload_candidate_to_blob(local_file)
-                                except Exception as e:
-                                    logger.warning(f"[orchestrator] Failed to sync {fname}: {e}")
+                                if fname not in local_files:
+                                    try:
+                                        content = await session.read_file(f"candidates/{fname}")
+                                        local_file = candidates_dir / fname
+                                        local_file.write_text(content, encoding="utf-8")
+                                        self._on_candidate_file_written(local_file)
+                                    except Exception as e:
+                                        logger.warning(f"[orchestrator] Failed to sync {fname}: {e}")
                     except Exception as e:
                         logger.warning(f"[orchestrator] Post-exec listing failed: {e}")
             except Exception as e:

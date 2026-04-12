@@ -1012,6 +1012,24 @@ class JobProcessor:
                     current_file=state_data.get("current_file"),
                 ))
 
+                # Sync ALL candidate files to blob on every checkpoint.
+                # This is the only reliable way to ensure every file survives
+                # pause/resume — no matter how it was created (code_exec,
+                # integration, _write_candidates_file, etc).
+                candidates_dir = workspace_dir / "candidates"
+                if candidates_dir.exists():
+                    container = settings.azure_storage_container_name
+                    for f in candidates_dir.iterdir():
+                        if f.is_file() and not f.name.startswith("."):
+                            blob_path = f"projects/{project.id}/candidates/{f.name}"
+                            try:
+                                blob = self.blob_service_client.get_blob_client(
+                                    container=container, blob=blob_path,
+                                )
+                                blob.upload_blob(f.read_bytes(), overwrite=True)
+                            except Exception:
+                                pass  # Best effort — checkpoint itself is more important
+
                 # Update progress_detail for frontend polling
                 version.progress_detail = {
                     "phase": "generating" if state_data["generation_stats"].get("rows_generated", 0) > 0 else "orchestrating",
