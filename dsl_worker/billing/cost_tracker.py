@@ -142,13 +142,16 @@ class CostTracker:
         self.charge_if_needed()
 
     def _query_charged_since_start(self) -> int:
-        """Query cents already charged for this project since tracker start."""
+        """Query cents already charged for this project (all time, not just this run).
+
+        On resume, we need to know what was ALREADY charged across all runs
+        so we don't double-charge. Using project_id scopes it correctly.
+        """
         result = (
             self.db.query(sql_func.sum(sql_func.abs(BalanceLedger.amount)))
             .filter(
                 BalanceLedger.project_id == self.project_id,
                 BalanceLedger.amount < 0,
-                BalanceLedger.created_at >= self._start_time,
             )
             .scalar()
         )
