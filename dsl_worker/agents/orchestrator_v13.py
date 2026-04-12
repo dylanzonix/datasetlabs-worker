@@ -829,38 +829,32 @@ class OrchestratorV13:
 
             result = await original_code_exec(script, description)
 
-            # After code_exec: sync any new/modified files FROM sandbox back to local.
-            # This ensures local is always the source of truth — sandbox can die
-            # and we lose nothing.
+            # After code_exec: sync ALL candidate files from sandbox to local + blob.
+            # This ensures every file survives pause/resume. Idempotent — re-uploading
+            # an unchanged file is fine (overwrite=True in blob upload).
             try:
                 if self._sandbox_impl and self._sandbox_impl._sandbox_session:
                     session = self._sandbox_impl._sandbox_session
-                    # List files in sandbox candidates/ and download any we don't have locally
                     try:
                         listing = await session.exec_shell(
                             "ls -1 /workspace/candidates/ 2>/dev/null || true", timeout=5
                         )
                         if listing.success and listing.stdout.strip():
-                            sandbox_files = set(listing.stdout.strip().split("\n"))
-                            local_files = set(
-                                f.name for f in candidates_dir.iterdir()
-                                if f.is_file()
-                            ) if candidates_dir.exists() else set()
-
-                            new_files = sandbox_files - local_files
-                            for fname in new_files:
-                                if fname.startswith("."):
+                            sandbox_files = listing.stdout.strip().split("\n")
+                            for fname in sandbox_files:
+                                if fname.startswith(".") or not fname.strip():
                                     continue
                                 try:
-                                    content = await session.read_file(f"candidates/{fname}")
                                     local_file = candidates_dir / fname
+                                    # Always download from sandbox (source of truth after code_exec)
+                                    content = await session.read_file(f"candidates/{fname}")
                                     local_file.write_text(content, encoding="utf-8")
-                                    # Persist to blob for pause/resume
+                                    # Always upload to blob for pause/resume
                                     self._upload_candidate_to_blob(local_file)
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
+                                except Exception as e:
+                                    logger.warning(f"[orchestrator] Failed to sync {fname}: {e}")
+                    except Exception as e:
+                        logger.warning(f"[orchestrator] Post-exec listing failed: {e}")
             except Exception as e:
                 logger.warning(f"[orchestrator] Post-exec sync error: {e}")
 
