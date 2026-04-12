@@ -720,7 +720,7 @@ class OrchestratorV13:
                 registry, self.apify_client, settings.apify_api_key,
                 self.workspace_dir,
                 file_counter=file_counter,
-                on_file_written=self._upload_candidate_to_blob,
+                on_file_written=self._on_candidate_file_written,
             )
         if self.apollo_client:
             from dsl_worker.agents.integrations.apollo import register_apollo_namespace
@@ -729,7 +729,7 @@ class OrchestratorV13:
                 registry, self.apollo_client, self.workspace_dir,
                 file_counter=file_counter,
                 cost_per_credit=_apollo_settings.apollo_cost_per_credit,
-                on_file_written=self._upload_candidate_to_blob,
+                on_file_written=self._on_candidate_file_written,
             )
         if self.google_maps_client:
             from dsl_worker.agents.integrations.google_maps import register_google_maps_namespace
@@ -737,7 +737,7 @@ class OrchestratorV13:
             register_google_maps_namespace(
                 registry, _settings.google_api_key, self.workspace_dir,
                 file_counter=file_counter,
-                on_file_written=self._upload_candidate_to_blob,
+                on_file_written=self._on_candidate_file_written,
             )
         if hasattr(self, 'fullenrich_client') and self.fullenrich_client:
             from dsl_worker.agents.integrations.fullenrich import register_fullenrich_namespace
@@ -746,7 +746,7 @@ class OrchestratorV13:
                 registry, self.fullenrich_client, self.workspace_dir,
                 file_counter=file_counter,
                 cost_per_credit=_fe_settings.fullenrich_cost_per_credit,
-                on_file_written=self._upload_candidate_to_blob,
+                on_file_written=self._on_candidate_file_written,
             )
 
     # --- code_exec ---
