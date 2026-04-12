@@ -1975,7 +1975,7 @@ class OrchestratorV13:
             )
 
             # If we were mid-file, just keep processing — no LLM needed
-            if self._current_file:
+            if self._current_file and Path(self._current_file.file_path).exists():
                 fs = self._current_file
                 remaining = fs.total_lines - fs.next_line
                 logger.info(
