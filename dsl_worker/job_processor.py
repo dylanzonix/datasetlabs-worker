@@ -1122,46 +1122,8 @@ class JobProcessor:
                 except Exception:
                     pass
 
-        # Live message checker — orchestrator polls this to detect new user messages
-        _last_seen_message_id = [None]
-
-        def check_messages():
-            """Check for new user chat messages since last check.
-
-            Returns list of (content, applied_changes) tuples, or empty list.
-            """
-            try:
-                query = (
-                    db.query(ChatMessage)
-                    .filter(
-                        ChatMessage.project_id == project.id,
-                        ChatMessage.role == "user",
-                    )
-                )
-                if _last_seen_message_id[0]:
-                    query = query.filter(ChatMessage.id > _last_seen_message_id[0])
-                else:
-                    # First check: only messages after version started
-                    query = query.filter(ChatMessage.created_at > version.started_at)
-
-                new_messages = query.order_by(ChatMessage.created_at.asc()).all()
-
-                if not new_messages:
-                    return []
-
-                _last_seen_message_id[0] = new_messages[-1].id
-                result = []
-                for msg in new_messages:
-                    # Skip messages that are part of the initial chat history
-                    if msg.content and msg.content not in [m.get("content") for m in chat_history if m.get("role") == "user"]:
-                        result.append({
-                            "content": msg.content,
-                            "applied_changes": msg.applied_changes,
-                        })
-                return result
-            except Exception as e:
-                logger.warning(f"[Pipeline] check_messages error: {e}")
-                return []
+        # TODO: Re-enable live message checking when mid-generation updates are reliable
+        check_messages = None
 
         # --- Sample CRUD callbacks for row reprocessing ---
 

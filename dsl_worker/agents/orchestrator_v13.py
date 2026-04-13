@@ -471,51 +471,8 @@ class OrchestratorV13:
         self._conversation.after_turn = self._build_status_line
 
     def _build_status_line(self) -> Optional[str]:
-        """Build a status line injected after every orchestrator turn.
-
-        Also checks for live user messages and injects them before the
-        status line so the orchestrator sees them on its next turn.
-        """
+        """Build a status line injected after every orchestrator turn."""
         parts = []
-
-        # Check for new user messages from the chat
-        if self._check_messages:
-            try:
-                new_messages = self._check_messages()
-                for msg in new_messages:
-                    content = msg.get("content", "")
-                    changes = msg.get("applied_changes") or {}
-                    change_details = changes.get("changes", {})
-
-                    msg_parts = [f"[User message]: {content}"]
-
-                    # Summarize schema changes if any
-                    if "columns" in change_details:
-                        new_cols = change_details["columns"]
-                        col_names = [c.get("name", "?") for c in new_cols if isinstance(c, dict)]
-                        msg_parts.append(f"[Schema updated: columns are now {', '.join(col_names)}]")
-                        # Update our local schema
-                        self.columns = new_cols
-                    if "num_samples" in change_details:
-                        new_target = change_details["num_samples"]
-                        msg_parts.append(f"[Target updated: now {new_target} rows]")
-                        self.num_samples = new_target
-
-                    parts.append("\n".join(msg_parts))
-                    logger.info(f"[orchestrator] Injected live user message: {content[:100]}")
-            except Exception as e:
-                logger.warning(f"[orchestrator] check_messages error: {e}")
-
-        # Also sync schema from state if available (catches changes we missed)
-        if self._state:
-            try:
-                self._state.refresh()
-                if self._state.columns and self._state.columns != self.columns:
-                    self.columns = self._state.columns
-                if self._state.num_samples and self._state.num_samples != self.num_samples:
-                    self.num_samples = self._state.num_samples
-            except Exception:
-                pass
 
         # Build status line
         rows = self._generation_stats.get("rows_generated", 0)
@@ -2070,17 +2027,6 @@ class OrchestratorV13:
                     if self._on_checkpoint:
                         self._on_checkpoint(self)
                     remaining = fs.total_lines - fs.next_line
-                    # Check for new user messages between batches
-                    if self._check_messages:
-                        new_msgs = self._check_messages()
-                        if new_msgs:
-                            # User sent a message — hand back to LLM
-                            for msg in new_msgs:
-                                self._conversation.inject_message(
-                                    "user",
-                                    f"[User message]: {msg.get('content', '')}"
-                                )
-                            break
 
                 # If file is done and target not reached, let LLM decide next steps
                 if _exit_condition():
