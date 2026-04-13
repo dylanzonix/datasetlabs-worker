@@ -295,6 +295,8 @@ class JobProcessor:
                 cost_tracker.add_cost(phase=label, cost_usd=cost_usd)
                 cost_tracker.charge_if_needed()
                 await checkpoint_mgr.add_cost(cost_usd)
+                # Keep generation_stats in sync so progress_detail shows live cost
+                generation_stats["total_cost"] = generation_stats.get("total_cost", 0.0) + cost_usd
 
                 # Stop the pipeline if credits are exhausted
                 if not credit_exhausted and not cost_tracker.has_sufficient_balance():
