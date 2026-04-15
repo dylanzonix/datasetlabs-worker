@@ -421,7 +421,7 @@ class OrchestratorV13:
 
         # Processing state
         self._current_file: Optional[_FileProcessingState] = None
-        self._processing_semaphore = asyncio.Semaphore(10)
+        self._processing_semaphore = asyncio.Semaphore(5)
         self._active_tasks: set = set()
         self._finish_requested: bool = False
         self._start_time: float = time.time()
