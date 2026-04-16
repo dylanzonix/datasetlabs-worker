@@ -65,3 +65,19 @@ models:
   gpt-5-nano:
     input: 0.00000005    # $0.05 / 1M tokens
     output: 0.0000004    # $0.40 / 1M tokens
+
+  # Anthropic Claude models
+  claude-opus-4-7:
+    input: 0.000005      # $5.00 / 1M tokens
+    cached_input: 0.0000005  # $0.50 / 1M tokens (cache read ~10% of input)
+    output: 0.000025     # $25.00 / 1M tokens
+
+  claude-sonnet-4-6:
+    input: 0.000003      # $3.00 / 1M tokens
+    cached_input: 0.0000003  # $0.30 / 1M tokens
+    output: 0.000015     # $15.00 / 1M tokens
+
+  claude-haiku-4-5:
+    input: 0.000001      # $1.00 / 1M tokens
+    cached_input: 0.0000001  # $0.10 / 1M tokens
+    output: 0.000005     # $5.00 / 1M tokens

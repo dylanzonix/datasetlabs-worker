@@ -8,6 +8,9 @@ from .pricing import (
 from .tracked_client import (
     TrackedOpenAIClient,
 )
+from .tracked_anthropic_client import (
+    TrackedAnthropicClient,
+)
 from .cost_tracker import (
     CostTracker,
 )
@@ -15,5 +18,6 @@ from .cost_tracker import (
 __all__ = [
     "UsageCost",
     "TrackedOpenAIClient",
+    "TrackedAnthropicClient",
     "CostTracker",
 ]

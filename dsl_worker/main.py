@@ -23,7 +23,8 @@ from dsl_worker.config import settings
 from dsl_worker.job_processor import JobProcessor
 from dsl_worker.logging_setup import setup_logging
 
-from openai import AsyncAzureOpenAI
+from openai import AsyncAzureOpenAI, AsyncOpenAI
+from anthropic import AsyncAnthropic
 
 logger = logging.getLogger(__name__)
 
@@ -41,11 +42,26 @@ class Worker:
             settings.azure_service_bus_connection_string
         )
 
-        self.openai_client = AsyncAzureOpenAI(
-            api_key=settings.azure_openai_api_key,
-            azure_endpoint=settings.azure_openai_endpoint,
-            api_version=settings.azure_openai_api_version,
-        )
+        if settings.llm_provider == "anthropic":
+            if not settings.anthropic_api_key:
+                raise RuntimeError(
+                    "llm_provider=anthropic but anthropic_api_key is not set"
+                )
+            logger.info(
+                f"Using Anthropic client (model default: {settings.anthropic_model})"
+            )
+            self.openai_client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+        elif settings.use_direct_openai and settings.openai_api_key:
+            logger.info("Using direct OpenAI client (bypassing Azure)")
+            self.openai_client = AsyncOpenAI(
+                api_key=settings.openai_api_key,
+            )
+        else:
+            self.openai_client = AsyncAzureOpenAI(
+                api_key=settings.azure_openai_api_key,
+                azure_endpoint=settings.azure_openai_endpoint,
+                api_version=settings.azure_openai_api_version,
+            )
 
         self.blob_service_client = BlobServiceClient(
             account_url=f"https://{settings.azure_storage_account_name}.blob.core.windows.net",

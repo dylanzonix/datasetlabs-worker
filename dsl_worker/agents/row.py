@@ -30,7 +30,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import jsonschema
 
-from dsl_worker.agents.base import AgentConversation
+from dsl_worker.agents.factory import make_conversation
 from dsl_worker.agents.tools import ToolRegistry
 from dsl_worker.billing.tracked_client import TrackedOpenAIClient
 from dsl_worker.infra.bu_client import BUClient
@@ -156,6 +156,7 @@ class GeneratedRow:
     success: bool
     row: Optional[Dict[str, Any]] = None
     sources: Optional[Dict[str, str]] = None  # column_name → source/citation
+    enrichment_params: Optional[Dict[str, Any]] = None  # FE params for deferred enrichment
     error: Optional[str] = None
     cost_usd: float = 0.0
     skipped: bool = False
@@ -198,12 +199,19 @@ match is close on something unique (name, URL, email), call mark_duplicate().
 - **submit_row()** — submit the completed row.
 - **skip_row(reason)** — skip if the candidate doesn't qualify.
 - **mark_duplicate(reason)** — mark as duplicate.
-- **web_search** — fast and cheap. Use for lookups and research.
+- **enrich_email** — verified email lookup via 20+ data providers. \
+Cheap (~$0.055) and reliable. Use as FIRST option for finding emails. \
+If it fails, try web_search as fallback.
+- **web_search** — fast and cheap. Use for general lookups and research, \
+and as fallback for emails if enrich_email fails.
+- **set_column** with **enrichment_params** — for phone columns, always \
+include enrichment_params (contact details) so the user can trigger \
+verified phone lookup after generation. You can also set a value if \
+you found a phone number — include enrichment_params either way.
 - **code_exec(script)** — Python sandbox. Read files, parse data.
 - **browser_use(task, reason)** — EXPENSIVE ($0.10-0.50). Only when \
 web_search cannot access the content.
-- Additional tools: **apify** (web scrapers), **fullenrich** (verified \
-email ~$0.05, phone ~$0.55), **apollo** (B2B enrichment), \
+- Additional tools: **apify** (web scrapers), **apollo** (B2B enrichment), \
 **google_maps** (local business data).
 
 ## How to work
@@ -310,6 +318,7 @@ class RowGeneratorAgent:
         self._is_duplicate: bool = False
         self._skip_reason: str = ""
         self._schema: List[Dict] = []
+        self._enrichment_params: Dict[str, Any] = {}  # FE params for deferred enrichment
 
         # Sandbox for code_exec only (minimal ResearchTools)
         self._sandbox_impl: Optional[Any] = None
@@ -390,6 +399,7 @@ class RowGeneratorAgent:
             name = args.get("name", "")
             value = args.get("value")
             sources = args.get("sources")
+            enrichment_params = args.get("enrichment_params")
 
             col_def = self._get_col_def(name)
             if not col_def:
@@ -402,6 +412,17 @@ class RowGeneratorAgent:
             if not col_def:
                 valid = [c.get("name") for c in self._schema]
                 return f"Error: unknown column '{name}'. Valid columns: {valid}", 0.0
+
+            # Handle enrichment params — only for phone columns (email is always fetched live)
+            if enrichment_params and isinstance(enrichment_params, dict):
+                enrich_type = col_def.get("enrichment")
+                if enrich_type == "phone":
+                    self._enrichment_params["phone"] = enrichment_params
+
+            # Allow value to be None/empty for phone columns with enrichment_params
+            if value is None and enrichment_params and col_def.get("enrichment") == "phone":
+                value = ""  # empty string passes validation, user enriches later
+
             value, warning = self._coerce_value(col_def, value)
 
             self._current_row[name] = value
@@ -454,13 +475,20 @@ class RowGeneratorAgent:
         registry.add(
             name="set_column",
             description=(
-                "Set a column value. Optionally include sources for citation."
+                "Set a column value. Optionally include sources for citation.\n\n"
+                "For phone columns ONLY: include enrichment_params with the contact's "
+                "details (first_name, last_name, company_name, domain, linkedin_url). "
+                "These are used to look up verified phone numbers after generation. "
+                "You can set a value too if you found one, or omit value and just pass "
+                "enrichment_params.\n\n"
+                "For email columns: always use enrich_email or web_search to find the "
+                "actual email. Do NOT use enrichment_params for email — fetch it directly."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Column name"},
-                    "value": {"description": "Column value"},
+                    "value": {"description": "Column value. Can be omitted for enrichable columns if enrichment_params is set."},
                     "sources": {
                         "type": "array",
                         "description": "Where this value came from. Each source has a type.",
@@ -486,8 +514,24 @@ class RowGeneratorAgent:
                             "required": ["type"],
                         },
                     },
+                    "enrichment_params": {
+                        "type": "object",
+                        "description": (
+                            "Contact details for deferred enrichment (phone columns). "
+                            "These params are sent to a waterfall enrichment API (20+ providers) "
+                            "when the user triggers phone lookup after generation. "
+                            "Needs either linkedin_url OR first_name + last_name + company/domain."
+                        ),
+                        "properties": {
+                            "first_name": {"type": "string"},
+                            "last_name": {"type": "string"},
+                            "company_name": {"type": "string", "description": "Company name"},
+                            "domain": {"type": "string", "description": "Company domain (e.g. acme.com)"},
+                            "linkedin_url": {"type": "string", "description": "LinkedIn profile URL (best accuracy)"},
+                        },
+                    },
                 },
-                "required": ["name", "value"],
+                "required": ["name"],
             },
             handler=set_column,
         )
@@ -706,12 +750,83 @@ class RowGeneratorAgent:
             register_google_maps_namespace(
                 registry, _gm_settings.google_api_key, self.workspace_dir,
             )
+        # ── Email enrichment (calls FE live, emails only — $0.055/email) ──
         if hasattr(self, 'fullenrich_client') and self.fullenrich_client:
-            from dsl_worker.agents.integrations.fullenrich import register_fullenrich_namespace
             from dsl_worker.config import settings as _fe_s
-            register_fullenrich_namespace(
-                registry, self.fullenrich_client, self.workspace_dir,
-                cost_per_credit=_fe_s.fullenrich_cost_per_credit,
+            _fe_client = self.fullenrich_client
+            _fe_cost_per_credit = _fe_s.fullenrich_cost_per_credit
+
+            async def enrich_email(args: Dict) -> tuple[str, float]:
+                contact = {
+                    k: v for k, v in {
+                        "first_name": args.get("first_name", ""),
+                        "last_name": args.get("last_name", ""),
+                        "company_name": args.get("company_name", ""),
+                        "domain": args.get("domain", ""),
+                        "linkedin_url": args.get("linkedin_url", ""),
+                    }.items() if v
+                }
+                if not contact.get("linkedin_url") and not (contact.get("first_name") and contact.get("last_name")):
+                    return "Error: provide linkedin_url OR first_name + last_name (plus company_name or domain).", 0.0
+
+                result = await _fe_client.enrich_contacts(
+                    contacts=[contact],
+                    name=f"email_{int(__import__('time').time())}",
+                    enrich_fields=["contact.emails"],
+                )
+                if "error" in result:
+                    return f"Email enrichment error: {result['error']}", 0.0
+
+                data = result.get("data", [])
+                credits = result.get("cost", {}).get("credits", 0)
+                cost_usd = credits * _fe_cost_per_credit
+
+                if not data:
+                    return "No email found.", cost_usd
+
+                entry = data[0]
+                contact_info = entry.get("contact_info", {})
+                email_obj = contact_info.get("most_probable_work_email", {})
+                email = email_obj.get("email") if email_obj else None
+                status = email_obj.get("status", "") if email_obj else ""
+
+                if not email:
+                    return f"No verified email found. Cost: ${cost_usd:.4f} ({credits} credits).", cost_usd
+
+                # Collect all emails found for metadata
+                all_emails = contact_info.get("work_emails", [])
+                extra = [e.get("email") for e in all_emails if e.get("email") and e.get("email") != email]
+
+                result_parts = [f"Email: {email} [{status}]"]
+                if extra:
+                    result_parts.append(f"Also found: {', '.join(extra)}")
+                result_parts.append(f"Cost: ${cost_usd:.4f} ({credits} credits)")
+
+                return "\n".join(result_parts), cost_usd
+
+            registry.add(
+                name="enrich_email",
+                description=(
+                    "Find a verified work email via waterfall enrichment across 20+ data "
+                    "providers. Reliable and cheap (~1 credit / ~$0.055). Use this as your "
+                    "FIRST option for finding emails — it's more reliable than web_search "
+                    "for emails. If this fails, try web_search as fallback.\n\n"
+                    "Returns email with verification status: DELIVERABLE (confirmed), "
+                    "HIGH_PROBABILITY, CATCH_ALL (domain accepts all), INVALID.\n\n"
+                    "Needs either: linkedin_url (best accuracy), OR first_name + last_name + "
+                    "company_name or domain."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "first_name": {"type": "string"},
+                        "last_name": {"type": "string"},
+                        "company_name": {"type": "string", "description": "Company name"},
+                        "domain": {"type": "string", "description": "Company domain (e.g. acme.com)"},
+                        "linkedin_url": {"type": "string", "description": "LinkedIn profile URL (best accuracy)"},
+                    },
+                },
+                handler=enrich_email,
             )
 
         # --- browser_use: BU V3 SDK ---
@@ -842,15 +957,6 @@ class RowGeneratorAgent:
                     candidate_data = None
 
         from datetime import date
-        apollo_note = ""
-        if self.apollo_client:
-            apollo_note = (
-                "\n\n## Apollo.io Enrichment\n\n"
-                "You have apollo_enrich and apollo_enrich_company tools. Use them to get "
-                "email addresses, phone numbers, and detailed company info. "
-                "If the candidate has an apollo_id, use that for the most reliable match. "
-                "Otherwise, use name + organization_name or linkedin_url.\n"
-            )
         # Format schema as readable lines instead of raw JSON
         schema_lines = []
         for col in schema:
@@ -887,7 +993,7 @@ class RowGeneratorAgent:
             schema_str=schema_str,
             current_date=date.today().isoformat(),
             instructions_section=instructions_section,
-        ) + apollo_note + files_note
+        ) + files_note
 
         # V13: pre-fill columns from preset_fields before the LLM starts.
         # This uses the same validation + dedup logic as set_column.
@@ -911,10 +1017,10 @@ class RowGeneratorAgent:
                         col_def = col
                         break
                 if col_def:
-                    error = self._validate_value(col_def, value)
-                    if error:
+                    value, warning = self._coerce_value(col_def, value)
+                    if warning:
                         logger.debug(
-                            f"[row_gen] preset_fields: skipping {schema_col} — {error}"
+                            f"[row_gen] preset_fields: {schema_col} — {warning}"
                         )
                         continue
 
@@ -958,7 +1064,8 @@ class RowGeneratorAgent:
         # DISABLED: may contribute to Azure content filter cascading refusals
         cache_key = None  # hashlib.sha256(system_prompt.encode()).hexdigest()[:16]
 
-        conversation = AgentConversation(
+        conversation = make_conversation(
+            self.openai_client,
             openai_client=self.openai_client,
             model=self.model,
             system_prompt=system_prompt,
@@ -1009,6 +1116,7 @@ class RowGeneratorAgent:
                 success=True,
                 row=self._current_row,
                 sources=self._current_sources if self._current_sources else None,
+                enrichment_params=self._enrichment_params if self._enrichment_params else None,
                 cost_usd=cost,
             )
 

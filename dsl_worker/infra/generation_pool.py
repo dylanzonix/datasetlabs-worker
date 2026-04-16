@@ -53,7 +53,7 @@ class GenerationWorkerPool:
         self.version_id = version_id
         self.chat_history = chat_history or []
         self.dedup_store = dedup_store or DedupStore()
-        self.model = model or settings.generation_model
+        self.model = model or settings.get_model("generation")
         self.brave_api_key = brave_api_key
         self.sandbox = sandbox
         self.num_workers = num_workers
@@ -235,7 +235,10 @@ class GenerationWorkerPool:
         )
         return success_count, error_count
 
-    async def _save_row(self, row: Dict, tags: Optional[Dict] = None) -> Optional[str]:
+    async def _save_row(
+        self, row: Dict, tags: Optional[Dict] = None,
+        enrichment_data: Optional[Dict] = None,
+    ) -> Optional[str]:
         """Save generated row to database. Returns row ID."""
         from sqlalchemy import func as sql_func
         from dsl_api.models.project_version import ProjectVersion
@@ -265,6 +268,7 @@ class GenerationWorkerPool:
                 seq=max_seq + 1,
                 row=clean_row,
                 tags=tags or {},
+                enrichment_data=enrichment_data,
             )
             self.db.add(sample)
 

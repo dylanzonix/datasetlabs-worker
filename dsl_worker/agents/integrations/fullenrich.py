@@ -47,6 +47,7 @@ def register_fullenrich_namespace(
     file_counter: Optional[List[int]] = None,
     cost_per_credit: float = 0.055,
     on_file_written: Optional[Callable] = None,
+    exclude: Optional[List[str]] = None,
 ) -> None:
     """Register the fullenrich namespace on a ToolRegistry.
 
@@ -412,6 +413,12 @@ def register_fullenrich_namespace(
         "search_companies": search_companies,
         "enrich_contacts": enrich_contacts,
     }
+
+    # Filter out excluded tools
+    excluded = set(exclude or [])
+    if excluded:
+        tools = [t for t in tools if t["name"] not in excluded]
+        handlers = {k: v for k, v in handlers.items() if k not in excluded}
 
     registry.add_namespace(
         name="fullenrich",

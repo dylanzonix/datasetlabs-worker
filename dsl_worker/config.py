@@ -30,6 +30,17 @@ class WorkerSettings(BaseSettings):
     azure_openai_endpoint: str  # e.g. "https://found-mlr2zdw9-eastus2.cognitiveservices.azure.com"
     azure_openai_api_version: str = "2025-04-01-preview"
 
+    # Direct OpenAI (used when use_direct_openai=true to bypass Azure content filters)
+    openai_api_key: str = ""
+    use_direct_openai: bool = False
+
+    # LLM provider: "openai" (default) or "anthropic". When "anthropic",
+    # all agent calls are routed through TrackedAnthropicClient using
+    # anthropic_model. Pricing and cost tracking flow through unchanged.
+    llm_provider: str = "openai"
+    anthropic_api_key: str = ""
+    anthropic_model: str = "claude-opus-4-7"
+
     # Worker settings
     max_concurrent_jobs: int = 1
     heartbeat_interval_seconds: int = 30
@@ -64,9 +75,6 @@ class WorkerSettings(BaseSettings):
     browser_use_api_key: str = ""                  # API key from cloud.browser-use.com/settings
     browser_use_proxy_country: str = "us"          # Residential proxy country code (us, gb, de, etc.)
 
-    # Credential pool service URL (serves authenticated cookies per session)
-    credential_pool_url: str = ""
-
     # Apollo.io (optional — leave blank to disable)
     apollo_api_key: str = ""
     apollo_cost_per_credit: float = 0.0238  # $60 / 2520 credits
@@ -81,13 +89,28 @@ class WorkerSettings(BaseSettings):
     fullenrich_api_key: str = ""
     fullenrich_cost_per_credit: float = 0.055  # ~$55/1000 credits (Pro plan)
 
-    # Pipeline version (v12 = default, v13 = new blocking orchestrator)
-    pipeline_version: str = "v12"
+    pipeline_version: str = "v13"
 
     # Langfuse observability (optional — leave blank to disable)
     langfuse_secret_key: str = ""
     langfuse_public_key: str = ""
     langfuse_base_url: str = "https://cloud.langfuse.com"
+
+    def get_model(self, role: str) -> str:
+        """Resolve the model for a role, respecting llm_provider.
+
+        When llm_provider == "anthropic", every role maps to anthropic_model.
+        Otherwise returns the role-specific OpenAI model.
+        """
+        if self.llm_provider == "anthropic":
+            return self.anthropic_model
+        role_map = {
+            "generation": self.generation_model,
+            "research": self.research_model,
+            "seed_yielder": self.seed_yielder_model,
+            "subagent": self.research_subagent_model,
+        }
+        return role_map.get(role, self.generation_model)
 
 
 settings = WorkerSettings()

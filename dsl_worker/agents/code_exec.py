@@ -15,7 +15,8 @@ import logging
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from dsl_worker.agents.base import AgentConversation, AgentResult
+from dsl_worker.agents.base import AgentResult
+from dsl_worker.agents.factory import make_conversation
 from dsl_worker.agents.tools import ToolRegistry
 from dsl_worker.billing.tracked_client import TrackedOpenAIClient
 
@@ -103,7 +104,8 @@ class CodeExecAgent:
 
         soft_limit = max(max_turns, 5)
         hard_cap = soft_limit + 3
-        self._conversation = AgentConversation(
+        self._conversation = make_conversation(
+            openai_client,
             openai_client=openai_client,
             model=model,
             system_prompt=CODE_EXEC_SYSTEM_PROMPT,

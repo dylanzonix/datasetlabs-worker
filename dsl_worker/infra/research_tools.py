@@ -334,13 +334,6 @@ class ResearchTools:
                 )
                 self._browser_context = browser.contexts[0]
 
-                # Inject authenticated cookies from credential pool
-                if settings.credential_pool_url:
-                    from dsl_worker.infra.credential_pool import load_pool_cookies
-                    pool_cookies = await load_pool_cookies(settings.credential_pool_url)
-                    if pool_cookies:
-                        await self._browser_context.add_cookies(pool_cookies)
-
         return self._browser_context
     
     # =========================================================================

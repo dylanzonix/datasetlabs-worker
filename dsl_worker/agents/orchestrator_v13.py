@@ -29,7 +29,8 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
-from dsl_worker.agents.base import AgentConversation, AgentResult
+from dsl_worker.agents.base import AgentResult
+from dsl_worker.agents.factory import make_conversation
 from dsl_worker.agents.tools import ToolRegistry
 from dsl_worker.billing.tracked_client import TrackedOpenAIClient
 from dsl_worker.infra.candidate_pool import Candidate
@@ -42,259 +43,110 @@ logger = logging.getLogger(__name__)
 SYSTEM_PROMPT = """\
 # Dataset Builder — {num_samples} rows
 
-## Objective
+You produce dataset rows. You have tools to find candidates, research \
+data, and fill columns. Every tool call costs money.
 
-Produce the dataset at the lowest cost per row while maintaining quality. \
-Every tool call costs money — yours and every row generator you spawn.
+## The flow
 
-## How it works
+1. **plan()** — call this first. 3-5 sentences: what source, what shape \
+(filter+enrich / just enrich / just filter), what tools.
+2. **Get candidates** — one search or harvest call. Don't overthink the \
+source — pick the obvious one.
+3. **process_candidate → set_column → submit_row** — immediately start \
+doing rows. Don't inspect the file with code_exec first. Just load \
+candidate 0 and try to fill the schema. You learn by doing, not by \
+analyzing. These rows count as real output.
+4. **Keep doing rows.** Each submit_row shows the cost. As you go you'll \
+figure out: which columns are in the data (free), which need research \
+(and what tool works), what makes a bad candidate (filter criteria).
+5. **Optimize.** After a few rows, if candidates are failing for reasons \
+visible in the JSON, use code_exec to pre-filter the file. If a tool \
+is expensive, try a cheaper one.
+6. **Delegate when the process is repeatable.** Once you're not learning \
+anything new from doing more rows yourself, call submit_candidates. \
+Row generators are separate LLMs that can't see your conversation — \
+they only know what you pass them. If the process varies across \
+candidates, do more rows yourself first so your instructions reflect \
+the real variety. See "Delegating to row generators" below for format.
 
-You find candidates, then **master the row processing yourself** before \
-delegating to row generators at scale. The instructions you write for \
-row generators are the most important thing you produce — they determine \
-the cost and quality of every row.
+**Do NOT spend multiple turns analyzing data before processing your \
+first candidate.** The fastest way to understand the data is to try \
+filling the schema with it.
 
-Row generators are separate LLMs. They only know what you tell them. \
-They cannot see your conversation. They have the same tools you do, \
-but no strategy unless you give them one. If your instructions are \
-vague, each row generator will independently spend turns figuring out \
-what you already know — multiplied across hundreds of candidates.
+**If a criterion can be measured cheaply, measure it.** For example, \
+counting product team members at a company is one free search_people \
+call — do it, don't guess from headcount. But if measuring something \
+would require expensive research (browser_use, multiple API calls per \
+candidate), use a reasonable proxy and move on.
 
 ## Tools
 
 {integration_tools_section}\
-**process_candidate(file, index)** — Load a candidate from a JSONL \
-file to process yourself. Then use set_column/submit_row/skip_row.
+**plan(plan)** — Strategy. Call first. Keep it short.
 
-**set_column(name, value)** — Set a column value on the loaded candidate.
+**process_candidate(file, index)** — Load a candidate. Then set_column \
+/ submit_row / skip_row.
+
+**set_column(name, value)** — Set a column. For phone columns: include \
+enrichment_params (first_name, last_name, company_name, domain, \
+linkedin_url) for verified phone lookup after generation.
 
 **submit_row()** — Submit the completed row.
 
-**skip_row(reason)** — Skip the current candidate.
+**skip_row(reason)** — Skip if candidate doesn't qualify.
 
-**submit_candidates(file, instructions, checkin_after)** — Delegate \
-candidates to row generators with your instructions.
+**submit_candidates(file, instructions)** — Delegate to row generators.
 
-**continue_processing(checkin_after)** — Resume delegated processing.
+**continue_processing()** — Resume delegated processing.
 
-**code_exec(script)** — Python sandbox. /workspace/uploads/ (read-only), \
-/workspace/candidates/ (your output). pandas, json, csv available. \
-Use for filtering candidates, extracting fields, data manipulation.
+**code_exec(script)** — Python sandbox. Free. Use for filtering \
+candidate files AFTER you know what to filter on (from doing rows).
 
-**web_harvest(query, candidate_description)** — Spawns an agent that \
-googles, visits pages, extracts candidates to a file. ~$0.10-0.20/call.
+**web_harvest(query, candidate_description)** — Web research agent. \
+~$0.10-0.20/call.
 
-**browser_use(task)** — Cloud browser. $0.10-0.50/call. Last resort — \
-only when a specific URL needs JS rendering or anti-bot bypass AND no \
-Apify actor exists for that site.
+**browser_use(task)** — Cloud browser. $0.10-0.50/call. Last resort.
 
-**reprocess_rows(instructions)** — Modify existing rows in place (add \
-column, filter, update). Preferred — salvage rows when possible.
+**reprocess_rows(instructions)** — Modify existing rows.
 
-**clear_rows(reason)** — Delete all rows and start over. Last resort \
-only — when rows are genuinely unsalvageable.
+**clear_rows(reason)** — Delete all rows. Last resort.
 
-**finish(reason)** — Only for genuinely impossible tasks.
+**finish(reason)** — Only for impossible tasks.
 
-### Source hierarchy
+### Sources (cheapest first)
 1. Uploaded files — free
-2. Integrations (Apify, FullEnrich, Apollo, Google Maps) — cheap, structured
-3. web_search — cheap, good for per-row lookups
-4. web_harvest — ~$0.15/call, only when no integration exists
-5. browser_use — $0.10-0.50/call, absolute last resort
-
-Apify has scrapers for most sites. Always check apify_search first.
+2. Integrations (Apify, FullEnrich, Apollo, Google Maps) — cheap
+3. web_search — ~$0.005/call
+4. web_harvest — ~$0.15/call
+5. browser_use — $0.10-0.50/call
 
 ### Cost reference
-- Apify actors: <$0.01/result typical
-- web_search: ~$0.005/call
-- FullEnrich emails: ~$0.05/email
-- FullEnrich phones: ~$0.55/phone (try web_search first)
+- Apify: <$0.01/result
+- enrich_email: ~$0.055/email (cheap, reliable)
+- Phone: user-triggered after generation. Just set enrichment_params.
 - Apollo enrichment: ~$0.01/lookup
-- browser_use: $0.10-0.50/session (avoid unless necessary)
-- Row generator spawn: ~$0.01-0.03 base + tool costs
+- Row generator: ~$0.01-0.03/turn + tool costs
 
-## How to work
+## Instructions for row generators
 
-### Step 1: Find candidates
+When you delegate, your instructions must cover:
+- **Column mapping**: which columns come from candidate data, field paths
+- **Research steps**: which columns need tools, which tool, how
+- **Filter criteria**: what to skip, how to detect quickly (check first)
+- **Phone columns**: set_column with enrichment_params, don't search
 
-Pick the most obvious source. Don't overthink it — for most projects \
-the source is clear. A quick web_search to understand the landscape is \
-fine. Keep total harvesting cost under ~$1.
+## Principles
 
-For cheap sources (Apify <$0.01/result), harvest generously — 1.5-2x \
-target. For expensive sources, start small. Stick with what works — \
-if an Apify actor is producing results, keep using it.
-
-### Step 2: Master the row processing
-
-Process candidates yourself using process_candidate → set_column → \
-submit_row / skip_row. These rows count as real output. Your goal is \
-to figure out the optimal process so you can write great instructions.
-
-You need to learn:
-1. **What's free** — which schema columns are directly in the candidate \
-data (JSON field names, nested paths). These cost nothing to fill.
-2. **What needs research** — which columns require web_search, \
-enrichment, or other tools. For each, what's the cheapest method that \
-works? (e.g. web_search "{{name}} email" vs FullEnrich at $0.05)
-3. **What to filter** — which candidates don't qualify and how to \
-detect it. Can the filter be applied programmatically on a JSON field \
-(free), or does it require LLM judgment (costs a row gen spawn)?
-4. **What it costs** — roughly how many tool calls per row, what the \
-typical cost per row is.
-
-Process a **varied sample** — not just the first 2-3 candidates. You \
-need to see different shapes: ones that pass, ones that should be \
-skipped, ones missing different fields. Straightforward projects \
-(reformatting data, simple extraction) need fewer samples. Complex \
-projects (multi-step enrichment, high skip rates) need more.
-
-**Programmatic filtering**: If candidates have a JSON field that can \
-disqualify them (size, category, location, date), use code_exec to \
-create a filtered file BEFORE delegating. This is free and saves \
-the cost of spawning row generators just to skip. Be careful not to \
-over-filter — only filter on fields you're confident about. Don't \
-filter on fuzzy criteria that need LLM judgment (e.g. "is this company \
-relevant" when relevance is nuanced).
-
-**Don't over-optimize**: You don't need to perfect the process. A few \
-rows showing different patterns is enough. Don't spend many turns \
-planning without producing rows — produce rows AND learn simultaneously. \
-For small projects (≤20 rows), you might just do them all yourself.
-
-### Step 3: Write instructions and delegate
-
-This is the most important step. Call submit_candidates with clear, \
-specific instructions. Think of it like writing a recipe — the row \
-generator should be able to follow it mechanically without guessing.
-
-**Your instructions MUST cover:**
-
-1. **Column mapping** — which columns come from the candidate data \
-and what the field path is. Example: "Agency Name → candidate.agency.name, \
-Land Size → candidate.surface (integer sqm), Listing URL → candidate.url"
-
-2. **Research steps** — for columns NOT in the data, exactly what tool \
-to use and how. Example: "For Agency Email: web_search '{{agency_name}} \
-email contact'. For Agency Website: web_search '{{agency_name}} official \
-website'." Don't just say "research missing fields" — say which fields \
-and which tool.
-
-3. **Filter criteria** — what makes a candidate invalid and how to \
-detect it quickly. Example: "Skip if the listing is residential (check \
-category field). Skip if you can tell from the description it's not \
-commercial/industrial." Put filter checks FIRST so bad candidates are \
-rejected before spending on enrichment.
-
-4. **Cost guidance** — which tools are expensive and when to use \
-alternatives. Example: "Do NOT use FullEnrich for phone ($0.55) — try \
-web_search first. Only use browser_use if web_search can't access the \
-site."
-
-**Bad instructions** (vague, row gen has to figure it out):
-"Process the candidates and fill in the schema."
-
-**Good instructions** (specific, row gen can follow mechanically):
-"Columns from data: Agency Name (agency.name), Phone (agency.phones[0]), \
-Listing Title (title), URL (shareUrl), Location (location.name), \
-Land Size (surfaceValue as integer), Description (description). \
-Research needed: Agency Email — web_search '{{agency name}} email', \
-Agency Website — web_search '{{agency name}} website'. Skip if: \
-category is not commercial/industrial."
-
-### Step 4: Monitor and adjust
-
-After delegating, the feedback report shows results. If you see \
-problems (high skip rate, high error rate, missing columns), adjust:
-- Tighten filter criteria or pre-filter with code_exec
-- Clarify instructions for the next batch
-- Try a different source if candidates are drying up
+- **Use real data.** Never fabricate.
+- **Approximate hard criteria.** Don't burn API calls for precision on \
+things that can be reasonably estimated from existing data.
+- **Filter programmatically** with code_exec after you know the patterns.
+- **Phone columns** marked enrichment: "phone" — set enrichment_params, \
+leave value empty. Not a quality failure.
 
 ### Live user messages
 
-User messages appear as [User message] in status updates:
-- **Behavioral change**: adapt going forward
-- **Schema change**: call reprocess_rows to update existing rows
-- **Filtering**: call reprocess_rows with filter criteria
-- **Start over**: call clear_rows
-
-### Principles
-
-- **Cost per produced row is the metric.** Minimize it without cutting \
-corners on quality.
-- **Use real data.** Never fabricate or generate content from knowledge. \
-All data must come from real sources — web searches, APIs, files.
-- **Don't over-harvest.** Get 1.5-2x the target from a source that \
-works. Don't keep launching more harvests when you have enough \
-candidates. If you have 150 candidates for a 100-row project, that's \
-plenty — start processing.
-- **Don't switch sources unless necessary.** If one source is working, \
-exhaust it before trying another. Don't harvest from 5 places for \
-variety — that's wasted orchestrator cost.
-- **Filter programmatically when possible.** code_exec to filter a \
-JSONL file is free. A row generator spawned just to skip is not.
-- **Quality means filling every column.** If the schema asks for \
-email and website, the instructions must tell row generators how to \
-find them. Leaving columns blank because you didn't instruct research \
-is a quality failure.
-
-<scenarios>
-Scenario 1 — Mostly extraction, light filtering:
-Task: 100 Airbnb listings in Barcelona, 2+ bedrooms.
-Source: Apify "airbnb scraper" → 200 listings
-Mastering: Process 3 candidates. All schema columns are in the JSON \
-(title, price, bedrooms, location, rating, url). Some have < 2 bedrooms.
-Filtering: code_exec to filter bedrooms >= 2 → 140 remain.
-Instructions: "All columns from data: Title (name), Price (price.total), \
-Bedrooms (bedrooms), Location (location.city), Rating (rating), \
-URL (url). No research needed — just extract and submit. Skip only \
-if data is clearly malformed."
-
-Scenario 2 — Extraction + enrichment:
-Task: 100 agencies from real estate site with email/website.
-Source: Apify scraper → 300 listings
-Mastering: Process 5 candidates. 7/9 columns from JSON. Agency Email \
-and Website are NOT in the data for most listings. web_search works \
-for ~70% of agencies. One candidate has wrong category → skip.
-Filtering: code_exec to filter by land size range → 180 remain.
-Instructions: "Columns from data: Agency Name (agency.name), Phone \
-(agency.phones[0]), Listing Title (title), URL (shareUrl), \
-Location (location.name), Land Size (surfaceValue integer sqm), \
-Description (description). RESEARCH NEEDED: Agency Email — web_search \
-'{{agency_name}} email contact site:{{agency_domain}}' or just \
-'{{agency_name}} email'. Agency Website — web_search '{{agency_name}} \
-official website'. These are critical columns, always attempt them. \
-Skip if listing is residential/agricultural (check type/category)."
-
-Scenario 3 — Uploaded file enrichment:
-Task: Find 2-3 decision-makers per org from CSV.
-Source: Uploaded hud_agencies.csv (25 orgs)
-Mastering: Process 3 orgs. Organization fields from CSV. Contacts \
-need web_search or Apollo. web_search "{{org_name}} director" works \
-well. Apollo search_people with company domain fills 2-3 contacts.
-Instructions: "Org columns from CSV: organization_name, \
-organization_website, organization_address. For contacts: \
-1) web_search '{{org_name}} director OR manager contact' for contact_1. \
-2) If org has a website, try web_search 'site:{{website}} staff OR team'. \
-3) For additional contacts, apollo.search_people with company name. \
-Fill name, title, email, phone for each contact found. Put blank if \
-not found — don't fabricate."
-
-Scenario 4 — Knowledge/content from web sources:
-Task: 50 DayZ pro tips.
-Source: web_harvest on Reddit, wikis, forums → 60 tip candidates
-Mastering: Process 3 tips. Each candidate is raw text from a source. \
-Need to classify (Category), determine scope (Applies To), and \
-rewrite concisely (Tip). All from the source text — no additional \
-research needed.
-Instructions: "Each candidate is a tip from web sources. Set Category \
-(Combat/Survival/Inventory/Stealth/Medical/Cold Weather), Applies To \
-(All Servers / Cold Maps / blank), Tip (rewrite in 1-3 short sentences, \
-friendly plain English). No research needed — everything comes from \
-the candidate text. Skip if: generic/obvious (e.g. 'drink water'), \
-duplicate of a common tip, or not actually a late-game tip."
-</scenarios>
+[User message] in status updates: adapt, reprocess_rows, or clear_rows.
 
 Today's date: {current_date}
 
@@ -435,6 +287,13 @@ class OrchestratorV13:
         # Workshop mode — orchestrator processes rows directly
         self._workshop_row: Dict[str, Any] = {}
         self._workshop_candidate: Optional[str] = None
+        self._workshop_enrichment_params: Dict[str, Any] = {}
+        self._plan: Optional[str] = None
+
+        # Per-candidate cost tracking for cost breakdown display
+        self._candidate_tool_costs: List[Dict[str, Any]] = []
+        self._candidate_turn_count: int = 0
+        self._candidate_cost_snapshot: float = 0.0
 
         # Candidate tracking for status line
         self._candidates_harvested: int = 0
@@ -452,7 +311,8 @@ class OrchestratorV13:
         web_search_tool = {"type": "web_search"}
         all_extra_tools = [web_search_tool] + self.mcp_tools
 
-        self._conversation = AgentConversation(
+        self._conversation = make_conversation(
+            openai_client,
             openai_client=openai_client,
             model=model,
             system_prompt=system_prompt,
@@ -610,7 +470,8 @@ class OrchestratorV13:
             sections.append(
                 "**fullenrich** — Search for people (by title, location, company, "
                 "seniority, skills) and companies (by industry, location, size). "
-                "Enrich contacts with verified emails and phones via 20+ providers."
+                "Row generators use enrich_email for verified emails (~$0.05). "
+                "Phone enrichment is user-triggered after generation (not automatic)."
             )
 
         if self.apollo_client:
@@ -731,6 +592,36 @@ class OrchestratorV13:
     # ── Tool registration ─────────────────────────────────────────────
 
     def _register_tools(self, registry: ToolRegistry) -> None:
+        # Plan tool — called first, forces strategy articulation
+        async def plan_tool(args: Dict) -> Tuple[str, float]:
+            plan_text = args.get("plan", "")
+            if not plan_text:
+                return "Error: plan text is required.", 0.0
+            self._plan = plan_text
+            self._log_activity(f"Plan: {plan_text[:200]}")
+            return "Plan set. Now execute it.", 0.0
+
+        registry.add(
+            name="plan",
+            description=(
+                "Write your strategy for building this dataset. "
+                "Call this FIRST before any other tool. "
+                "Describe your approach, candidate source, and the "
+                "general process per row."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "plan": {
+                        "type": "string",
+                        "description": "Your strategy in plain text.",
+                    },
+                },
+                "required": ["plan"],
+            },
+            handler=plan_tool,
+        )
+
         # Core tools (always loaded)
         self._register_code_exec(registry)
         self._register_web_harvest(registry)
@@ -786,6 +677,7 @@ class OrchestratorV13:
                 file_counter=file_counter,
                 cost_per_credit=_fe_settings.fullenrich_cost_per_credit,
                 on_file_written=self._on_candidate_file_written,
+                exclude=["enrich_contacts"],
             )
 
     # --- code_exec ---
@@ -967,7 +859,8 @@ class OrchestratorV13:
                 # Web search is built-in via extra_tools
                 web_search_tool = {"type": "web_search"}
 
-                subagent = AgentConversation(
+                subagent = make_conversation(
+                    self.openai_client,
                     openai_client=self.openai_client,
                     model=self.model,
                     system_prompt=sub_system_prompt,
@@ -1209,6 +1102,9 @@ class OrchestratorV13:
                                 return f"Error: line {index} is empty.", 0.0
                             candidate_data = json.loads(line)
                             self._workshop_row = {}
+                            self._candidate_tool_costs = []
+                            self._candidate_turn_count = 0
+                            self._candidate_cost_snapshot = self._generation_stats.get("total_cost", 0.0)
                             self._workshop_candidate = json.dumps(
                                 candidate_data, indent=2, ensure_ascii=False
                             )
@@ -1251,33 +1147,65 @@ class OrchestratorV13:
         async def set_column(args: Dict) -> Tuple[str, float]:
             name = args.get("name", "")
             value = args.get("value")
+            enrichment_params = args.get("enrichment_params")
 
             if self._workshop_candidate is None:
                 return "Error: no candidate loaded. Call process_candidate first.", 0.0
 
             # Case-insensitive column match
             matched_name = None
+            matched_col = None
             for col in self.columns:
                 if col.get("name", "").lower() == name.lower():
                     matched_name = col["name"]
+                    matched_col = col
                     break
             if not matched_name:
                 valid = [c.get("name") for c in self.columns]
                 return f"Error: unknown column '{name}'. Valid: {valid}", 0.0
+
+            # Handle enrichment params
+            # Enrichment params — phone only (email is always fetched live)
+            if enrichment_params and isinstance(enrichment_params, dict):
+                enrich_type = matched_col.get("enrichment") if matched_col else None
+                if enrich_type == "phone":
+                    if not hasattr(self, '_workshop_enrichment_params'):
+                        self._workshop_enrichment_params = {}
+                    self._workshop_enrichment_params["phone"] = enrichment_params
+
+            # Allow empty value for phone columns with enrichment_params
+            if value is None and enrichment_params and matched_col and matched_col.get("enrichment") == "phone":
+                value = ""
 
             self._workshop_row[matched_name] = value
             return f"Set {matched_name}", 0.0
 
         registry.add(
             name="set_column",
-            description="Set a column value on the current candidate.",
+            description=(
+                "Set a column value on the current candidate. "
+                "For phone columns: include enrichment_params with contact details "
+                "(first_name, last_name, company_name, domain, linkedin_url) for "
+                "verified phone lookup after generation."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Column name"},
-                    "value": {"description": "Column value"},
+                    "value": {"description": "Column value. Can be omitted for enrichable columns."},
+                    "enrichment_params": {
+                        "type": "object",
+                        "description": "Contact details for deferred enrichment (phone columns).",
+                        "properties": {
+                            "first_name": {"type": "string"},
+                            "last_name": {"type": "string"},
+                            "company_name": {"type": "string"},
+                            "domain": {"type": "string"},
+                            "linkedin_url": {"type": "string"},
+                        },
+                    },
                 },
-                "required": ["name", "value"],
+                "required": ["name"],
             },
             handler=set_column,
         )
@@ -1293,20 +1221,39 @@ class OrchestratorV13:
             if missing:
                 return f"Error: missing columns {missing}. Set them before submitting.", 0.0
 
+            # Build enrichment data from workshop params
+            enrich_data = None
+            if hasattr(self, '_workshop_enrichment_params') and self._workshop_enrichment_params:
+                enrich_data = {"params": self._workshop_enrichment_params}
+
             # Save to DB
-            row_id = await self._save_row(self._workshop_row)
+            row_id = await self._save_row(
+                self._workshop_row, enrichment_data=enrich_data,
+            )
+
+            # Calculate cost breakdown
+            current_cost = self._generation_stats.get("total_cost", 0.0)
+            row_cost = current_cost - self._candidate_cost_snapshot
+
             if row_id:
                 self._generation_stats["rows_generated"] = (
                     self._generation_stats.get("rows_generated", 0) + 1
                 )
                 rows_done = self._generation_stats["rows_generated"]
-                self._log_activity(f"Row {rows_done} submitted (workshop)")
+                self._log_activity(f"Row {rows_done} submitted (${row_cost:.3f})")
                 self._workshop_row = {}
                 self._workshop_candidate = None
-                return f"Row submitted ({rows_done}/{self.num_samples} done).", 0.0
+                self._workshop_enrichment_params = {}
+
+                # Cost breakdown for the orchestrator to learn from
+                return (
+                    f"Row submitted ({rows_done}/{self.num_samples} done). "
+                    f"This row cost ~${row_cost:.3f}."
+                ), 0.0
             else:
                 self._workshop_row = {}
                 self._workshop_candidate = None
+                self._workshop_enrichment_params = {}
                 return "Target reached — row discarded.", 0.0
 
         registry.add(
@@ -1321,12 +1268,16 @@ class OrchestratorV13:
             if self._workshop_candidate is None:
                 return "Error: no candidate loaded.", 0.0
 
+            current_cost = self._generation_stats.get("total_cost", 0.0)
+            skip_cost = current_cost - self._candidate_cost_snapshot
+
             self._generation_stats["skipped"] = (
                 self._generation_stats.get("skipped", 0) + 1
             )
             self._workshop_row = {}
             self._workshop_candidate = None
-            return f"Skipped: {reason}", 0.0
+            self._workshop_enrichment_params = {}
+            return f"Skipped: {reason} (cost: ${skip_cost:.3f})", 0.0
 
         registry.add(
             name="skip_row",
@@ -1399,6 +1350,19 @@ class OrchestratorV13:
             note = args.get("instructions", "") or args.get("note", "")
             preset_fields = args.get("preset_fields", {})
             checkin_after = args.get("checkin_after", 10)
+
+            # Gate: must have submitted at least one row yourself before delegating.
+            # This forces the orchestrator to actually execute the process once
+            # rather than writing instructions for a pattern it hasn't verified.
+            rows_done = self._generation_stats.get("rows_generated", 0)
+            if rows_done == 0:
+                return (
+                    "Error: you haven't submitted any rows yet. "
+                    "Do at least one row yourself first via process_candidate → "
+                    "set_column → submit_row. Row generators follow your "
+                    "instructions blindly — if you haven't verified the process "
+                    "works on a real candidate, you can't tell them how to do it."
+                ), 0.0
 
             if not file_path:
                 return "Error: file is required.", 0.0
