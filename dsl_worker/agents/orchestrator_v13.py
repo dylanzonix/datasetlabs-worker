@@ -1236,6 +1236,7 @@ class OrchestratorV13:
             row_cost = current_cost - self._candidate_cost_snapshot
 
             if row_id:
+                await self._dedup_store.promote_to_submitted(str(row_id), self._workshop_row)
                 self._generation_stats["rows_generated"] = (
                     self._generation_stats.get("rows_generated", 0) + 1
                 )
