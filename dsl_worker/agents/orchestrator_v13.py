@@ -141,8 +141,8 @@ When you delegate, your instructions must cover:
 - **Approximate hard criteria.** Don't burn API calls for precision on \
 things that can be reasonably estimated from existing data.
 - **Filter programmatically** with code_exec after you know the patterns.
-- **Phone columns** marked enrichment: "phone" — set enrichment_params, \
-leave value empty. Not a quality failure.
+- **Phone columns** marked `contact_type: "phone"` — set \
+enrichment_params, leave value empty. Not a quality failure.
 
 ### Live user messages
 
@@ -1167,14 +1167,14 @@ class OrchestratorV13:
             # Handle enrichment params
             # Enrichment params — phone only (email is always fetched live)
             if enrichment_params and isinstance(enrichment_params, dict):
-                enrich_type = matched_col.get("enrichment") if matched_col else None
-                if enrich_type == "phone":
+                contact_type = matched_col.get("contact_type") if matched_col else None
+                if contact_type == "phone":
                     if not hasattr(self, '_workshop_enrichment_params'):
                         self._workshop_enrichment_params = {}
                     self._workshop_enrichment_params["phone"] = enrichment_params
 
             # Allow empty value for phone columns with enrichment_params
-            if value is None and enrichment_params and matched_col and matched_col.get("enrichment") == "phone":
+            if value is None and enrichment_params and matched_col and matched_col.get("contact_type") == "phone":
                 value = ""
 
             self._workshop_row[matched_name] = value

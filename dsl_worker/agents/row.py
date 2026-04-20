@@ -204,10 +204,11 @@ Cheap (~$0.055) and reliable. Use as FIRST option for finding emails. \
 If it fails, try web_search as fallback.
 - **web_search** — fast and cheap. Use for general lookups and research, \
 and as fallback for emails if enrich_email fails.
-- **set_column** with **enrichment_params** — for phone columns, always \
-include enrichment_params (contact details) so the user can trigger \
-verified phone lookup after generation. You can also set a value if \
-you found a phone number — include enrichment_params either way.
+- **set_column** with **enrichment_params** — for columns marked \
+`contact_type: "phone"`, always include enrichment_params (contact \
+details) so the user can trigger verified phone lookup after \
+generation. You can also set a value if you found a phone number — \
+include enrichment_params either way.
 - **code_exec(script)** — Python sandbox. Read files, parse data.
 - **browser_use(task, reason)** — EXPENSIVE ($0.10-0.50). Only when \
 web_search cannot access the content.
@@ -415,12 +416,12 @@ class RowGeneratorAgent:
 
             # Handle enrichment params — only for phone columns (email is always fetched live)
             if enrichment_params and isinstance(enrichment_params, dict):
-                enrich_type = col_def.get("enrichment")
-                if enrich_type == "phone":
+                contact_type = col_def.get("contact_type")
+                if contact_type == "phone":
                     self._enrichment_params["phone"] = enrichment_params
 
             # Allow value to be None/empty for phone columns with enrichment_params
-            if value is None and enrichment_params and col_def.get("enrichment") == "phone":
+            if value is None and enrichment_params and col_def.get("contact_type") == "phone":
                 value = ""  # empty string passes validation, user enriches later
 
             value, warning = self._coerce_value(col_def, value)
