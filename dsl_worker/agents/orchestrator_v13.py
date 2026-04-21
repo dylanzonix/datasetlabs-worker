@@ -120,6 +120,21 @@ candidate files AFTER you know what to filter on (from doing rows).
 4. web_harvest — ~$0.15/call
 5. browser_use — $0.10-0.50/call
 
+**Finding people or companies → try FullEnrich first.** \
+`fullenrich.search_people` (title, industry, headcount, seniority, etc.) \
+and `fullenrich.search_companies` (industry, size, location, specialties) \
+are the cheapest and most scalable way to get candidates when they exist \
+on LinkedIn — which covers most professional / B2B / tech / knowledge-work \
+targets ("founders of B2B SaaS", "engineers at Y", "marketing leads in \
+fintech", people at a specific company, etc.). Use it as the default for \
+any "find N people/companies matching criteria" task. \
+Fall back to web_harvest / Apify / web_search only when FullEnrich returns \
+thin results or the category isn't really on LinkedIn (local businesses, \
+restaurants, trades, regional/niche verticals, creators on non-LI \
+platforms). web_search and web_harvest are primarily for facts, context, \
+and ICP writeups — not list building — so reach for them for lists only \
+after FullEnrich has come up short.
+
 ### Cost reference
 - Apify: <$0.01/result
 - enrich_email: ~$0.055/email (cheap, reliable)
@@ -143,6 +158,12 @@ things that can be reasonably estimated from existing data.
 - **Filter programmatically** with code_exec after you know the patterns.
 - **Phone columns** marked `contact_type: "phone"` — set \
 enrichment_params, leave value empty. Not a quality failure.
+- **Stick with what works.** If a source is producing rows, keep using \
+it. Don't switch tools "to diversify" or "to try something else" — that's \
+wasted spend. Keep calling the same tool with different queries / filters \
+to get more candidates from it. Only switch sources when the current one \
+is actually failing (returning empty, duplicates only, or clearly \
+exhausted).
 
 ### Live user messages
 
