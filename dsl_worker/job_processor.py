@@ -748,14 +748,25 @@ class JobProcessor:
 
         db.refresh(version)
         generated = version.generated_count or 0
-        if generated > 0:
-            if generated < state.num_samples:
-                logger.warning(
-                    f"[Pipeline] Completed with {generated}/{state.num_samples} rows"
-                )
+        if generated >= state.num_samples:
             await checkpoint_mgr.force_save()
             self._handle_completion(db, project, version, cost_tracker)
             return True
+
+        if generated > 0:
+            # Pipeline exited early without hitting quota — keep the version
+            # resumable so the user can top up credits / edit the plan / retry.
+            # Re-check balance since uncharged cost may have pushed it over.
+            cost_tracker.charge_remaining()
+            can_continue, balance_reason = cost_tracker.check_balance_and_charge()
+            stop_reason = balance_reason if not can_continue else "quota_not_met"
+            logger.warning(
+                f"[Pipeline] Early exit at {generated}/{state.num_samples} "
+                f"rows (reason={stop_reason})"
+            )
+            await checkpoint_mgr.force_save()
+            self._handle_force_stop(db, project, version, cost_tracker, stop_reason)
+            return False
 
         await checkpoint_mgr.force_save()
         finish_reason = getattr(orchestrator, "_finish_reason", None)
@@ -1247,11 +1258,15 @@ print(json.dumps(results))
 
         cost_tracker.charge_remaining()
 
-        is_credit_stop = reason in ("insufficient_balance", "credit_exhausted")
+        resumable_reasons = {
+            "insufficient_balance", "credit_exhausted", "quota_not_met",
+        }
+        is_resumable = reason in resumable_reasons
         generated = version.generated_count or 0
 
-        if is_credit_stop and generated > 0:
-            # Credit exhaustion with partial progress → paused (user can buy credits & resume)
+        if is_resumable and generated > 0:
+            # Stopped with partial progress → paused so the user can top up,
+            # edit the plan, or just resume.
             version.status = "paused"
             version.error = reason
             self._emit_event(

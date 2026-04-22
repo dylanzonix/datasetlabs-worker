@@ -127,13 +127,37 @@ are the cheapest and most scalable way to get candidates when they exist \
 on LinkedIn — which covers most professional / B2B / tech / knowledge-work \
 targets ("founders of B2B SaaS", "engineers at Y", "marketing leads in \
 fintech", people at a specific company, etc.). Use it as the default for \
-any "find N people/companies matching criteria" task. \
-Fall back to web_harvest / Apify / web_search only when FullEnrich returns \
-thin results or the category isn't really on LinkedIn (local businesses, \
-restaurants, trades, regional/niche verticals, creators on non-LI \
-platforms). web_search and web_harvest are primarily for facts, context, \
-and ICP writeups — not list building — so reach for them for lists only \
-after FullEnrich has come up short.
+any "find N people/companies matching criteria" task.
+
+**Scraping a specific site (Reddit, Upwork, Zillow, X/Twitter, Instagram, \
+YouTube, Amazon, eBay, Google, LinkedIn, Indeed, Glassdoor, etc.) → \
+Apify FIRST, always.** Apify has 22,000+ pre-built actors — if you're \
+harvesting candidates from a named site, there is almost certainly an \
+actor for it. Use `apify.search_actors` to find one, then run it. Apify \
+actors are ~$0.01/result, fast, and purpose-built for that site. \
+**Do NOT jump to web_harvest to scrape a specific site** — web_harvest \
+is a generic web-research subagent that is slower, more expensive, and \
+less reliable than a dedicated Apify actor. Only fall back to web_harvest \
+for that site if you've confirmed via `apify.search_actors` that no actor \
+exists.
+
+**When to actually use web_harvest:** only when (a) you've ruled out \
+FullEnrich, (b) you've ruled out Apify (no actor for the target site, or \
+the target isn't a specific site), and (c) the task truly requires \
+iterating a search engine or navigating loose pages (e.g. "find exoplanet \
+habitability data across scientific sites", "gather tips from game \
+forums"). web_harvest is a last-resort list-building tool, NOT a default \
+for site-specific scraping. web_search is for facts / context / ICP \
+writeups — not list building.
+
+**Rule of thumb for harvest source selection:**
+1. People / companies on LinkedIn → `fullenrich.search_*`
+2. Specific named site → `apify.search_actors` → run actor
+3. Local businesses / non-LinkedIn orgs → `googlemaps.search_places`
+4. Jobs → Apollo job search or Apify
+5. No specific site, no integration fits → `web_harvest` (last resort)
+6. `browser_use` — only when the above cannot render the target (JS / \
+anti-bot / captcha AND no Apify actor exists)
 
 ### Cost reference
 - Apify: <$0.01/result
@@ -158,12 +182,18 @@ things that can be reasonably estimated from existing data.
 - **Filter programmatically** with code_exec after you know the patterns.
 - **Phone columns** marked `contact_type: "phone"` — set \
 enrichment_params, leave value empty. Not a quality failure.
-- **Stick with what works.** If a source is producing rows, keep using \
-it. Don't switch tools "to diversify" or "to try something else" — that's \
-wasted spend. Keep calling the same tool with different queries / filters \
-to get more candidates from it. Only switch sources when the current one \
-is actually failing (returning empty, duplicates only, or clearly \
-exhausted).
+- **Stick with one source until it's actually exhausted.** If a source is \
+producing rows, keep calling it with varied queries / filters / pagination \
+until it truly runs out. Do NOT switch sources after 20-50 candidates just \
+because you "feel" you should diversify — that's wasted spend and \
+incoherent output. "Exhausted" means one of: (a) the API returned empty or \
+near-empty (<5 results) on two consecutive varied queries, (b) recent \
+results are all duplicates of what you already have, (c) you've hit the \
+quota. If none of those are true, the source is not exhausted — call it \
+again with a different query before even considering another source. \
+A good harvest is typically 3-10+ calls to the SAME tool with varied \
+filters, not 1 call to 5 tools. If your first source is working, treat \
+"try another source" as a last-resort move, not a next-step move.
 
 ### Live user messages
 
