@@ -297,6 +297,7 @@ class OrchestratorV13:
         self._processing_semaphore = asyncio.Semaphore(5)
         self._active_tasks: set = set()
         self._finish_requested: bool = False
+        self._finish_reason: Optional[str] = None
         self._start_time: float = time.time()
         self._last_checkpoint_time: float = 0.0
 
@@ -1669,6 +1670,7 @@ class OrchestratorV13:
         async def finish(args: Dict) -> Tuple[str, float]:
             reason = args.get("reason", "No reason provided")
             self._finish_requested = True
+            self._finish_reason = reason
             logger.info(f"[orchestrator] finish() called: {reason}")
             return f"Job aborted: {reason}", 0.0
 
@@ -2145,6 +2147,7 @@ class OrchestratorV13:
             "candidates_submitted": self._candidates_submitted,
             "current_file": file_state,
             "activity_log": self._activity_log[-50:],
+            "finish_reason": self._finish_reason,
         }
 
     def restore_state(self, state: Dict[str, Any]) -> None:

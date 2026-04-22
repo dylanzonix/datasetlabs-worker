@@ -758,7 +758,13 @@ class JobProcessor:
             return True
 
         await checkpoint_mgr.force_save()
-        self._handle_force_stop(db, project, version, cost_tracker, "No rows generated")
+        finish_reason = getattr(orchestrator, "_finish_reason", None)
+        if finish_reason:
+            self._emit_finish_chat_message(db, project, finish_reason)
+            stop_reason = f"Task infeasible: {finish_reason}"
+        else:
+            stop_reason = "No rows generated"
+        self._handle_force_stop(db, project, version, cost_tracker, stop_reason)
         return False
 
     def _load_chat_history(self, db: Session, project_id: UUID) -> List[Dict[str, str]]:
@@ -1146,6 +1152,30 @@ print(json.dumps(results))
         )
         db.add(event)
         db.commit()
+
+    def _emit_finish_chat_message(
+        self,
+        db: Session,
+        project: Project,
+        finish_reason: str,
+    ) -> None:
+        """Post an assistant chat message explaining why the orchestrator aborted."""
+        content = f"{finish_reason}\n\nPlease adjust the prompt and retry."
+        msg = ChatMessage(
+            project_id=project.id,
+            role="assistant",
+            content=content,
+            applied_changes={
+                "type": "finish_notification",
+                "finish_reason": finish_reason,
+            },
+        )
+        db.add(msg)
+        db.commit()
+        logger.info(
+            f"[Pipeline] Posted finish notification to chat "
+            f"(project={project.id}): {finish_reason[:120]}"
+        )
 
     def _handle_pause(
         self,
