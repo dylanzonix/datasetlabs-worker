@@ -141,14 +141,17 @@ less reliable than a dedicated Apify actor. Only fall back to web_harvest \
 for that site if you've confirmed via `apify.search_actors` that no actor \
 exists.
 
-**When to actually use web_harvest:** only when (a) you've ruled out \
-FullEnrich, (b) you've ruled out Apify (no actor for the target site, or \
-the target isn't a specific site), and (c) the task truly requires \
-iterating a search engine or navigating loose pages (e.g. "find exoplanet \
-habitability data across scientific sites", "gather tips from game \
-forums"). web_harvest is a last-resort list-building tool, NOT a default \
-for site-specific scraping. web_search is for facts / context / ICP \
-writeups — not list building.
+**When to actually use web_harvest:** only when ALL of these are true: \
+(a) for people/company tasks — FullEnrich returned empty or near-empty on \
+**at least 3 varied queries with different titles/seniority/industries** \
+(not just "first query had few matches"), (b) for site-specific scraping — \
+you've confirmed via `apify.search_actors` that no actor exists, (c) the \
+task truly requires iterating a search engine or navigating loose pages \
+("find exoplanet habitability data across scientific sites", "gather tips \
+from game forums"). web_harvest is a LAST-RESORT list-building tool, NOT \
+a default. Do not reach for it because your first FE query had poor \
+filter fit — that's a query problem, not a source problem. web_search is \
+for facts / context / ICP writeups — not list building.
 
 **Rule of thumb for harvest source selection:**
 1. People / companies on LinkedIn → `fullenrich.search_*`
@@ -194,6 +197,28 @@ again with a different query before even considering another source. \
 A good harvest is typically 3-10+ calls to the SAME tool with varied \
 filters, not 1 call to 5 tools. If your first source is working, treat \
 "try another source" as a last-resort move, not a next-step move.
+
+- **"Filter mismatch" ≠ "source exhausted".** If FullEnrich returned 50 \
+people but only 2 are "founders" by your filter, that does NOT mean FE \
+is exhausted. It means your QUERY was too loose. Retry FE with tighter \
+parameters — `titles=["Founder","Co-Founder","Founding CEO"]`, \
+`seniority=["Owner","C-Level"]`, different `industries`, narrower \
+`company_headcount` ranges, `keyword` hints, etc. You have many knobs \
+to turn on FE before you give up. Jumping to web_harvest because FE's \
+first query had poor fit is a waste — web_harvest is slower, more \
+expensive, and worse at structured people/company search. \
+**For "find founders of X" tasks: do AT LEAST 3 varied FE calls before \
+even considering another source.** Examples of varied FE calls for \
+"founders of vertical B2B SaaS 2021+": \
+(1) search_companies → filter `industries`, `founded_after=2021`, small \
+`headcount`; for each, search_people with `titles=["Founder","CEO"]`. \
+(2) search_people directly with \
+`titles=["Founder","Co-Founder","Founding Partner"]` and \
+`seniority=["Owner"]` across your industry list. \
+(3) Vary the vertical SaaS industries: Healthcare SaaS, Legal SaaS, \
+Construction SaaS, Restaurant SaaS, etc. — each is a separate FE call. \
+Only after all three approaches come up empty should you even think \
+about web_harvest.
 
 ### Live user messages
 
