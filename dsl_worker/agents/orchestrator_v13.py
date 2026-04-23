@@ -116,15 +116,9 @@ candidate files AFTER you know what to filter on (from doing rows).
 ### Sources (cheapest first)
 1. Uploaded files — free
 2. Integrations (Apify, FullEnrich, Apollo, Google Maps) — cheap
-3. web_harvest — ~$0.15/call (last resort, see below)
-4. browser_use — $0.10-0.50/call (last resort, only when JS/captcha)
-
-You do NOT have a general web_search tool. For per-candidate research or \
-factual lookups you don't do that work yourself — either use a structured \
-integration (FE/Apollo can look up people by company+title in one call) \
-or delegate to row generators who have their own research tools. \
-Spending 3 minutes and $0.20 on 20 Google queries to verify one candidate \
-is never correct for the orchestrator.
+3. web_search — ~$0.005/call
+4. web_harvest — ~$0.15/call
+5. browser_use — $0.10-0.50/call
 
 **Finding people or companies → try FullEnrich first.** \
 `fullenrich.search_people` (title, industry, headcount, seniority, etc.) \
@@ -156,7 +150,8 @@ task truly requires iterating a search engine or navigating loose pages \
 ("find exoplanet habitability data across scientific sites", "gather tips \
 from game forums"). web_harvest is a LAST-RESORT list-building tool, NOT \
 a default. Do not reach for it because your first FE query had poor \
-filter fit — that's a query problem, not a source problem.
+filter fit — that's a query problem, not a source problem. web_search is \
+for facts / context / ICP writeups — not list building.
 
 **Rule of thumb for harvest source selection:**
 1. People / companies on LinkedIn → `fullenrich.search_*`
@@ -390,13 +385,8 @@ class OrchestratorV13:
         from dsl_worker.config import settings
         max_turns = getattr(settings, 'orchestrator_max_turns', 40)
 
-        # web_search is a built-in OpenAI tool with no per-turn limit — the
-        # LLM was firing 15-20 searches per turn for per-candidate detective
-        # work, burning ~3 min of wall time and ~$0.20 per verification run.
-        # The orchestrator has structured tools (FE, Apollo, Apify, Google
-        # Maps) for harvesting, and web_harvest for real multi-page research.
-        # Row generators still get web_search for their own per-row needs.
-        all_extra_tools = list(self.mcp_tools)
+        web_search_tool = {"type": "web_search"}
+        all_extra_tools = [web_search_tool] + self.mcp_tools
 
         self._conversation = make_conversation(
             openai_client,
