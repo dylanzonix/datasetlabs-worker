@@ -27,6 +27,7 @@ from dsl_api.models.project_version import ProjectVersion
 from dsl_api.models.sample import Sample
 from dsl_api.schemas.chat import AppliedChange
 
+from dsl_worker.chat_api import candidates
 from dsl_worker.chat_api import sources
 from dsl_worker.chat_api import fill
 
@@ -104,8 +105,9 @@ Filters are dicts: `{col: v}` for equality, `{col__lt: n}` / `__gt` / `__lte`
   named site (Reddit, Upwork, LinkedIn, Zillow, etc.) is covered.
 - `apify_actor_details(actor_id)` — see an actor's input schema before
   invoking.
-- `apify_call_actor(actor_id, input, max_results)` — run the actor and get
-  results inline.
+- `apify_call_actor(actor_id, input, max_items?)` — run the actor.
+  Results land in a candidates file (NOT inline). `max_items` caps the
+  Apify dataset paging; omit for unbounded.
 
 **Google Maps** (local businesses, anything with a physical address):
 - `google_maps_search_places(query)` — text search. Bake the location into
@@ -123,10 +125,41 @@ Filters are dicts: `{col: v}` for equality, `{col__lt: n}` / `__gt` / `__lte`
 | Anything from a specific named site (Reddit, Upwork, etc.) | `apify_search_actors` then `apify_call_actor` |
 | One person/company lookup by URL or domain | `apollo_enrich_person` / `apollo_enrich_company` |
 
-After a source call, **inspect the inline results, then `rows_add`** the
-ones you want with the column shapes the user expects. Don't try to
-commit the raw provider record — pick the fields that match the project's
-column schema.
+## How source results land: candidate files
+
+Source tools (apify_call_actor, fullenrich_*, apollo_search_*,
+google_maps_search_places, browser_use, web_harvest) do NOT inline their
+full results. Each call writes the fetch to a per-project candidate file
+and returns a small response:
+
+    {candidates_file, tool, items_count, fields, preview, cost_usd, ...}
+
+`preview` is a sample of ~5 items so you can see what the data looks like.
+`fields` is the list of all keys present in the file. The full dataset
+lives in the candidates file; you read or commit it via three tools:
+
+- **candidates_list()** — see all candidate files this project has.
+- **candidates_inspect(file, filter, fields, limit, offset)** — look at a
+  slice without holding the whole file in context. Server-side filter +
+  field projection.
+- **candidates_to_rows(file, column_map, filter, merge_key)** — bulk
+  commit a subset as rows. `column_map` is `{source_field: column_name}`.
+  Streams server-side; no LLM round-trip per row. This is how 1000
+  fetched candidates become 1000 rows in one call.
+
+For custom transforms (flatten nested JSON, derive columns, multi-source
+join), use **code_exec** with `files=['name.jsonl', ...]` — each file is
+staged into the sandbox so the snippet can `open(name)` like a local
+file.
+
+## You don't have to predefine columns
+
+If the user's ask is open-ended ("get me posts from this guy on X"), it's
+fine to fetch first and look at the candidate file's `fields` before
+deciding the schema. Then `columns_add` the ones that matter, and
+`candidates_to_rows` with the matching map. This avoids guessing field
+shapes upfront. It's also fine to predefine columns when the schema is
+obvious — use judgment.
 
 # Workflow
 
@@ -159,10 +192,12 @@ should never feel like work is happening behind their back.
 - **web_search** (OpenAI built-in) — quick factual lookups (recent news,
   public bios, "does this company still exist"). For context, NOT for
   list-fetching.
-- **code_exec(code)** — Python sandbox, stateless per call. Useful for
-  parsing nested data, mapping JSON to flat dicts, calculations. Stdlib
-  + httpx + json + re. No DB access; print results, then `rows_add`
-  separately.
+- **code_exec(code, files?)** — Python sandbox, stateless per call. Pass
+  `files=[...]` to stage candidate files into the workspace; inside the
+  snippet they're openable as local files. Use for parsing nested data,
+  mapping JSON to flat dicts, computing derived fields, joining across
+  files. Stdlib + httpx + json + re. No DB access; print to stdout, then
+  use `candidates_to_rows` or `rows_add`.
 - **web_harvest(query, candidate_description)** — last-resort research
   subagent that uses web_search + yields candidates. Use ONLY when
   there's no Apify actor for the target site and no structured source
@@ -187,12 +222,12 @@ Be concise. After a tool call, say what happened in one or two sentences
 and (when relevant) suggest the next obvious move. No headers, no lists
 unless they're genuinely shorter that way.
 
-# Worked example (illustrative)
+# Worked example A: schema known upfront
 
 User: "Find me women's gym apparel founders on LinkedIn"
 
-You: "Quick check — US only, or global? And do you want verified work
-emails added too, or just the founder + company?"
+You: "Quick check — US only, or global? And verified work emails too, or
+just founder + company?"
 
 User: "US, with emails"
 
@@ -201,17 +236,43 @@ You (one tool call): `fullenrich_search_people` with titles=["Founder",
 locations=["United States"], company_specialties=["women's apparel",
 "activewear","gym wear"], limit=10.
 
-You: "Got 10. Sample looks like founders of small (<50 person) athletic-
-apparel brands. Want me to commit these and pull more, or refine
-filters first?"
+Tool returns: candidates_file=fullenrich_search_people_<id>.jsonl,
+items_count=10, fields=[full_name, title, current_company_name, ...],
+preview=[...].
 
-(...user approves; you `rows_add` the 10, then continue paginated
-search; for each batch ask before the next; once they say "enough",
-move to enrichment phase via `fullenrich_enrich_contacts` in batches
-of ≤25.)
+You: "Got 10. Preview looks like founders of small (<50 person) athletic
+brands. Want me to commit these and pull more, or refine filters first?"
 
-The shape: tiny clarification, one fetch, show, ask, proceed. Never
-chain everything in one giant turn.
+(...user approves; you `candidates_to_rows` with column_map mapping
+full_name→Name, current_company_name→Company, etc.; then continue
+paginated search; for each batch ask before the next; once they say
+"enough", move to enrichment via `fullenrich_enrich_contacts` in
+batches of ≤25.)
+
+# Worked example B: schema discovered from candidates
+
+User: "Get me posts from this guy on X: @shannholmberg"
+
+You: pick `apify_search_actors` for "X tweets user", then
+`apify_actor_details` on the chosen actor, then `apify_call_actor`
+with the actor's expected input shape and the requested handle.
+
+Tool returns: candidates_file=apify_call_actor_<id>.jsonl,
+items_count=247, fields=[id, text, created_at, public_metrics, ...],
+preview=[...3 sample tweets...].
+
+You (looking at fields and preview): "I have 247 tweets in the
+candidates file. I'll set up columns: Tweet ID, Text, Posted At, Likes,
+Retweets, Replies, URL — does that look right? I'll commit all 247 if
+yes, or trim/sort/filter first if you want a different shape."
+
+(...user approves; you `columns_add` for each, then `candidates_to_rows`
+with column_map={id: 'Tweet ID', text: 'Text', ...}, merge_key='id'.
+The 247 tweets land as rows in one call — no LLM-context blowup.)
+
+The shape across both: tiny clarification, one fetch, look at fields +
+preview, decide schema if not known, commit a subset. Never chain
+everything in one giant turn.
 """
 
 
@@ -405,6 +466,82 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
             "required": ["columns"],
         },
     },
+    # ── Candidates: blob-backed staging files written by source tools ──
+    {
+        "type": "function",
+        "name": "candidates_list",
+        "description": (
+            "List all candidate files for this project. Candidate files are "
+            "JSONL fetches written by source tools (apify_call_actor, "
+            "fullenrich_*, apollo_*, google_maps_*, browser_use, web_harvest). "
+            "Each entry has the file name, source tool, item count, size, and "
+            "creation time. Use this to remember what's been fetched in past "
+            "turns or after a session reload."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "candidates_inspect",
+        "description": (
+            "Read a slice of items from a candidate file without holding the "
+            "whole dataset in context. Apply filters and project to a subset "
+            "of fields. Use this to look around before committing to rows. "
+            "Default limit 20, max 200."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file": {
+                    "type": "string",
+                    "description": "Candidate file name from candidates_list, e.g. 'apify_call_actor_3a91.jsonl'.",
+                },
+                "filter": {"type": "object", "description": _FILTER_DESC},
+                "fields": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Project to a subset of fields. Empty = all fields.",
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Default 20."},
+                "offset": {"type": "integer", "minimum": 0, "description": "Skip first N matched items. Default 0."},
+            },
+            "required": ["file"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "candidates_to_rows",
+        "description": (
+            "Bulk-commit items from a candidate file as rows. Stream the file "
+            "server-side, apply optional filter, map source fields to column "
+            "names, insert in batches. No LLM round-trip per row. Use this to "
+            "turn 1000 fetched candidates into 1000 rows in one call. The "
+            "column_map keys are source field names (from the candidate file), "
+            "values are project column names."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file": {"type": "string"},
+                "column_map": {
+                    "type": "object",
+                    "description": (
+                        "Dict like {'username': 'X Handle', 'text': 'Tweet', "
+                        "'likes': 'Likes'}. Keys = source-file fields, values = "
+                        "project column names. Source fields not in the map are "
+                        "dropped."
+                    ),
+                    "additionalProperties": {"type": "string"},
+                },
+                "filter": {"type": "object", "description": _FILTER_DESC},
+                "merge_key": {
+                    "type": "string",
+                    "description": "Column name to dedupe on (column-name in the project, post-mapping). If matching row exists, merge fields instead of inserting.",
+                },
+            },
+            "required": ["file", "column_map"],
+        },
+    },
     # Source tools (FullEnrich, Apollo, Apify, Google Maps, etc.) are
     # appended at module load so they're part of the same flat surface the
     # chat agent sees. Their handlers live in `sources`.
@@ -586,7 +723,7 @@ async def execute_tool(
     # and have their own cost reporting.
     if sources.is_source_tool(tool_name):
         result_text, cost_usd = await sources.execute_source_tool(
-            tool_name, args
+            tool_name, args, project_id=project.id
         )
         # Source tools don't make table changes themselves; the agent calls
         # rows_add / rows_update afterwards.
@@ -636,7 +773,156 @@ async def execute_tool(
         )
         return applied, result, cost
 
+    if tool_name == "candidates_list":
+        applied, result = _tool_candidates_list(project, args)
+        return applied, result, 0.0
+    if tool_name == "candidates_inspect":
+        applied, result = _tool_candidates_inspect(project, args)
+        return applied, result, 0.0
+    if tool_name == "candidates_to_rows":
+        applied, result = await _tool_candidates_to_rows(
+            db, project, version, args, progress_cb=progress_cb
+        )
+        return applied, result, 0.0
+
     return ({}, {"error": f"unknown tool: {tool_name}"}, 0.0)
+
+
+# --- Candidates tools (file-backed staging from source fetches) ---
+
+
+def _tool_candidates_list(
+    project: Project, args: Dict[str, Any]
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    try:
+        files = candidates.list_candidate_files(project.id)
+    except Exception as e:
+        return {}, {"error": f"{type(e).__name__}: {e}"}
+    return {}, {"files": files, "total": len(files)}
+
+
+def _tool_candidates_inspect(
+    project: Project, args: Dict[str, Any]
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    file_name = args.get("file")
+    if not file_name or not isinstance(file_name, str):
+        return {}, {"error": "file (string) is required"}
+    filt = args.get("filter") or {}
+    fields = args.get("fields") or None
+    limit = min(int(args.get("limit", 20) or 20), 200)
+    offset = max(int(args.get("offset", 0) or 0), 0)
+
+    matched = 0
+    skipped = 0
+    out: List[Dict[str, Any]] = []
+    try:
+        for item in candidates.stream_candidates(project.id, file_name):
+            if not candidates.apply_filter(item, filt):
+                continue
+            matched += 1
+            if matched <= offset:
+                skipped += 1
+                continue
+            if len(out) < limit:
+                out.append(candidates.project_fields(item, fields))
+            elif matched > offset + limit and not filt:
+                # Cheap exit when no filter and we already have our slice;
+                # we still need full count for `matched` though, so only
+                # break if caller didn't ask for that. Always count full.
+                pass
+    except FileNotFoundError as e:
+        return {}, {"error": str(e)}
+    except Exception as e:
+        return {}, {"error": f"{type(e).__name__}: {e}"}
+
+    return (
+        {},
+        {
+            "matched": matched,
+            "returned": len(out),
+            "offset": offset,
+            "items": out,
+        },
+    )
+
+
+async def _tool_candidates_to_rows(
+    db: Session,
+    project: Project,
+    version: ProjectVersion,
+    args: Dict[str, Any],
+    progress_cb: Optional[fill.ProgressCallback] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    file_name = args.get("file")
+    column_map = args.get("column_map")
+    if not file_name or not isinstance(file_name, str):
+        return {}, {"error": "file (string) is required"}
+    if not isinstance(column_map, dict) or not column_map:
+        return {}, {"error": "column_map must be a non-empty {source_field: column_name} dict"}
+    filt = args.get("filter") or {}
+    merge_key = args.get("merge_key")
+
+    BATCH = 100
+    total_inserted = 0
+    total_merged = 0
+    total_skipped_filter = 0
+
+    batch: List[Dict[str, Any]] = []
+
+    async def flush() -> None:
+        nonlocal total_inserted, total_merged
+        if not batch:
+            return
+        applied_batch, result_batch = await _tool_rows_add(
+            db,
+            project,
+            version,
+            {"items": list(batch), "merge_key": merge_key} if merge_key else {"items": list(batch)},
+            progress_cb=progress_cb,
+        )
+        if isinstance(result_batch, dict) and result_batch.get("ok"):
+            total_inserted += int(result_batch.get("inserted", 0) or 0)
+            total_merged += int(result_batch.get("merged", 0) or 0)
+        batch.clear()
+
+    try:
+        for item in candidates.stream_candidates(project.id, file_name):
+            if not candidates.apply_filter(item, filt):
+                total_skipped_filter += 1
+                continue
+            mapped = {
+                target: item.get(source)
+                for source, target in column_map.items()
+            }
+            # Drop rows where every mapped value is None — usually means
+            # the source field names don't match anything in this file.
+            if all(v is None for v in mapped.values()):
+                total_skipped_filter += 1
+                continue
+            batch.append(mapped)
+            if len(batch) >= BATCH:
+                await flush()
+        await flush()
+    except FileNotFoundError as e:
+        return {}, {"error": str(e)}
+    except Exception as e:
+        log.exception("candidates_to_rows failed")
+        return {}, {"error": f"{type(e).__name__}: {e}"}
+
+    total_rows = (
+        db.query(func.count(Sample.id)).filter(Sample.version_id == version.id).scalar()
+        or 0
+    )
+    return (
+        {"rows": {"inserted": total_inserted, "merged": total_merged}},
+        {
+            "ok": True,
+            "inserted": total_inserted,
+            "merged": total_merged,
+            "skipped": total_skipped_filter,
+            "total": total_rows,
+        },
+    )
 
 
 async def _tool_rows_fill(

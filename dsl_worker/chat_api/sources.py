@@ -28,6 +28,48 @@ from openai import AsyncAzureOpenAI
 
 from dsl_api.config import settings as _api_settings
 
+from dsl_worker.chat_api import candidates
+
+
+def _persist_candidates(
+    project_id: Optional[Any],
+    tool: str,
+    items: List[Dict[str, Any]],
+    *,
+    cost_usd: float = 0.0,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Write items to a candidates blob file (if project_id given) and
+    return the canonical tool-result dict (file path, count, fields,
+    preview). When project_id is None — only happens in tests/dev — we
+    fall back to a degenerate "preview-only" shape so the tool still
+    runs end-to-end without blob writes."""
+    if project_id is None:
+        fields = sorted({k for it in items if isinstance(it, dict) for k in it.keys()})
+        return {
+            "candidates_file": None,
+            "tool": tool,
+            "items_count": len(items),
+            "fields": fields,
+            "cost_usd": round(cost_usd, 4),
+            "preview": items[:candidates.PREVIEW_ITEMS],
+            "run_metadata": extra or {},
+        }
+    try:
+        meta = candidates.write_candidates(
+            project_id, tool, items, cost_usd=cost_usd, extra=extra
+        )
+    except Exception as e:
+        log.exception("write_candidates failed for %s", tool)
+        return {
+            "error": f"failed to persist candidates: {type(e).__name__}: {e}",
+            "items_count_attempted": len(items),
+            "preview": items[:candidates.PREVIEW_ITEMS],
+        }
+    return candidates.make_tool_result(
+        meta=meta, preview_items=items[:candidates.PREVIEW_ITEMS]
+    )
+
 
 log = logging.getLogger(__name__)
 
@@ -37,10 +79,6 @@ log = logging.getLogger(__name__)
 # COMPUTE_COST_PER_CREDIT downstream; this is the raw $ to us.
 _FE_COST_PER_CREDIT_USD = float(os.getenv("FULLENRICH_COST_PER_CREDIT", "0.055"))
 _APOLLO_COST_PER_CREDIT_USD = 0.024  # ~$24/1000 credits
-
-
-# Truncate inline tool results so we don't blow up the LLM context.
-_MAX_INLINE_RESULTS = 50
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +165,7 @@ def _build_range_filter(
 # ---------------------------------------------------------------------------
 
 
-async def _fe_search_people(args: Dict[str, Any]) -> Tuple[str, float]:
+async def _fe_search_people(args: Dict[str, Any], *, project_id: Optional[Any] = None) -> Tuple[str, float]:
     client = _fe()
     if client is None:
         return json.dumps({"error": "FULLENRICH_API_KEY not configured"}), 0.0
@@ -190,22 +228,21 @@ async def _fe_search_people(args: Dict[str, Any]) -> Tuple[str, float]:
     credits = float(metadata.get("credits_used", result.get("credits_used", 0)) or 0)
     cost_usd = credits * _FE_COST_PER_CREDIT_USD
 
-    return (
-        json.dumps(
-            {
-                "total_in_db": total,
-                "returned": len(items),
-                "credits_used": credits,
-                "results": items,
-                "next_offset": offset + len(items) if len(items) >= limit else None,
-            },
-            default=str,
-        ),
-        cost_usd,
+    persisted = _persist_candidates(
+        project_id,
+        "fullenrich_search_people",
+        items,
+        cost_usd=cost_usd,
+        extra={
+            "total_in_db": total,
+            "credits_used": credits,
+            "next_offset": offset + len(items) if len(items) >= limit else None,
+        },
     )
+    return json.dumps(persisted, default=str), cost_usd
 
 
-async def _fe_search_companies(args: Dict[str, Any]) -> Tuple[str, float]:
+async def _fe_search_companies(args: Dict[str, Any], *, project_id: Optional[Any] = None) -> Tuple[str, float]:
     client = _fe()
     if client is None:
         return json.dumps({"error": "FULLENRICH_API_KEY not configured"}), 0.0
@@ -257,22 +294,21 @@ async def _fe_search_companies(args: Dict[str, Any]) -> Tuple[str, float]:
     credits = float(metadata.get("credits_used", result.get("credits_used", 0)) or 0)
     cost_usd = credits * _FE_COST_PER_CREDIT_USD
 
-    return (
-        json.dumps(
-            {
-                "total_in_db": total,
-                "returned": len(items),
-                "credits_used": credits,
-                "results": items,
-                "next_offset": offset + len(items) if len(items) >= limit else None,
-            },
-            default=str,
-        ),
-        cost_usd,
+    persisted = _persist_candidates(
+        project_id,
+        "fullenrich_search_companies",
+        items,
+        cost_usd=cost_usd,
+        extra={
+            "total_in_db": total,
+            "credits_used": credits,
+            "next_offset": offset + len(items) if len(items) >= limit else None,
+        },
     )
+    return json.dumps(persisted, default=str), cost_usd
 
 
-async def _fe_enrich_contacts(args: Dict[str, Any]) -> Tuple[str, float]:
+async def _fe_enrich_contacts(args: Dict[str, Any], *, project_id: Optional[Any] = None) -> Tuple[str, float]:
     """Enrich a small batch of contacts (≤25 recommended) with verified
     work emails and/or phones via FullEnrich's waterfall enrichment.
 
@@ -318,13 +354,14 @@ async def _fe_enrich_contacts(args: Dict[str, Any]) -> Tuple[str, float]:
     credits = float(result.get("cost", {}).get("credits", 0) or 0)
     cost_usd = credits * _FE_COST_PER_CREDIT_USD
 
-    return (
-        json.dumps(
-            {"enriched": len(data), "credits_used": credits, "results": data},
-            default=str,
-        ),
-        cost_usd,
+    persisted = _persist_candidates(
+        project_id,
+        "fullenrich_enrich_contacts",
+        data,
+        cost_usd=cost_usd,
+        extra={"credits_used": credits, "enriched": len(data)},
     )
+    return json.dumps(persisted, default=str), cost_usd
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +369,7 @@ async def _fe_enrich_contacts(args: Dict[str, Any]) -> Tuple[str, float]:
 # ---------------------------------------------------------------------------
 
 
-async def _apollo_search_companies(args: Dict[str, Any]) -> Tuple[str, float]:
+async def _apollo_search_companies(args: Dict[str, Any], *, project_id: Optional[Any] = None) -> Tuple[str, float]:
     client = _apollo()
     if client is None:
         return json.dumps({"error": "APOLLO_API_KEY not configured"}), 0.0
@@ -356,24 +393,23 @@ async def _apollo_search_companies(args: Dict[str, Any]) -> Tuple[str, float]:
     except Exception as e:
         return json.dumps({"error": f"{type(e).__name__}: {e}"}), 0.0
 
-    simplified = [_simplify_company(o) for o in (orgs or [])][:_MAX_INLINE_RESULTS]
-    return (
-        json.dumps(
-            {
-                "total": total,
-                "page": page,
-                "per_page": per_page,
-                "returned": len(simplified),
-                "results": simplified,
-                "next_page": page + 1 if total and (page * per_page) < total else None,
-            },
-            default=str,
-        ),
-        0.0,  # Apollo company search has no per-result cost
+    simplified = [_simplify_company(o) for o in (orgs or [])]
+    persisted = _persist_candidates(
+        project_id,
+        "apollo_search_companies",
+        simplified,
+        cost_usd=0.0,
+        extra={
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "next_page": page + 1 if total and (page * per_page) < total else None,
+        },
     )
+    return json.dumps(persisted, default=str), 0.0  # Apollo company search has no per-result cost
 
 
-async def _apollo_enrich_person(args: Dict[str, Any]) -> Tuple[str, float]:
+async def _apollo_enrich_person(args: Dict[str, Any], *, project_id: Optional[Any] = None) -> Tuple[str, float]:
     client = _apollo()
     if client is None:
         return json.dumps({"error": "APOLLO_API_KEY not configured"}), 0.0
@@ -398,7 +434,7 @@ async def _apollo_enrich_person(args: Dict[str, Any]) -> Tuple[str, float]:
     )
 
 
-async def _apollo_enrich_company(args: Dict[str, Any]) -> Tuple[str, float]:
+async def _apollo_enrich_company(args: Dict[str, Any], *, project_id: Optional[Any] = None) -> Tuple[str, float]:
     client = _apollo()
     if client is None:
         return json.dumps({"error": "APOLLO_API_KEY not configured"}), 0.0
@@ -423,7 +459,7 @@ async def _apollo_enrich_company(args: Dict[str, Any]) -> Tuple[str, float]:
 # ---------------------------------------------------------------------------
 
 
-async def _apify_search_actors(args: Dict[str, Any]) -> Tuple[str, float]:
+async def _apify_search_actors(args: Dict[str, Any], *, project_id: Optional[Any] = None) -> Tuple[str, float]:
     client = _apify()
     if client is None:
         return json.dumps({"error": "APIFY_API_KEY not configured"}), 0.0
@@ -441,7 +477,7 @@ async def _apify_search_actors(args: Dict[str, Any]) -> Tuple[str, float]:
     )
 
 
-async def _apify_actor_details(args: Dict[str, Any]) -> Tuple[str, float]:
+async def _apify_actor_details(args: Dict[str, Any], *, project_id: Optional[Any] = None) -> Tuple[str, float]:
     client = _apify()
     if client is None:
         return json.dumps({"error": "APIFY_API_KEY not configured"}), 0.0
@@ -457,7 +493,7 @@ async def _apify_actor_details(args: Dict[str, Any]) -> Tuple[str, float]:
     return json.dumps(details, default=str), 0.0
 
 
-async def _apify_call_actor(args: Dict[str, Any]) -> Tuple[str, float]:
+async def _apify_call_actor(args: Dict[str, Any], *, project_id: Optional[Any] = None) -> Tuple[str, float]:
     client = _apify()
     if client is None:
         return json.dumps({"error": "APIFY_API_KEY not configured"}), 0.0
@@ -465,39 +501,38 @@ async def _apify_call_actor(args: Dict[str, Any]) -> Tuple[str, float]:
     if not actor_id:
         return json.dumps({"error": "actor_id is required"}), 0.0
     actor_input = args.get("input") or {}
-    max_results = int(args.get("max_results", 50))
+    # max_items applies a server-side cap when paging the Apify dataset.
+    # None = unbounded; the agent can pull large fetches without truncation
+    # because we land them in a candidates file, not the LLM context.
+    max_items = args.get("max_items")
+    if max_items is not None:
+        max_items = int(max_items)
     timeout_secs = int(args.get("timeout_secs", 300))
     try:
         run_info = await client.run_actor(
             actor_id=actor_id,
             run_input=actor_input,
             timeout=timeout_secs,
-            max_items=max_results,
+            max_items=max_items,
         )
         if not run_info or run_info.get("status") != "SUCCEEDED":
             return json.dumps({"ok": False, "run_info": run_info}, default=str), 0.0
         items = run_info.get("items", []) or []
     except Exception as e:
         return json.dumps({"error": f"{type(e).__name__}: {e}"}), 0.0
-    # Apify run cost is in run_info.usage / charges — surface to the agent
-    # but we don't bill it through here (Apify is invoiced separately on
-    # our account).
-    return (
-        json.dumps(
-            {
-                "returned": len(items[:_MAX_INLINE_RESULTS]),
-                "total_in_dataset": len(items),
-                "results": items[:_MAX_INLINE_RESULTS],
-                "run_info": {
-                    "status": run_info.get("status"),
-                    "stats": run_info.get("stats"),
-                    "usage": run_info.get("usage"),
-                },
-            },
-            default=str,
-        ),
-        0.0,
+
+    # Apify charges hit our account directly, not the user's credits, but
+    # we surface usage to the agent so it can be cost-aware.
+    extra = {
+        "actor_id": actor_id,
+        "status": run_info.get("status"),
+        "stats": run_info.get("stats"),
+        "usage": run_info.get("usage"),
+    }
+    result = _persist_candidates(
+        project_id, "apify_call_actor", items, cost_usd=0.0, extra=extra
     )
+    return json.dumps(result, default=str), 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -505,7 +540,7 @@ async def _apify_call_actor(args: Dict[str, Any]) -> Tuple[str, float]:
 # ---------------------------------------------------------------------------
 
 
-async def _gmaps_search_places(args: Dict[str, Any]) -> Tuple[str, float]:
+async def _gmaps_search_places(args: Dict[str, Any], *, project_id: Optional[Any] = None) -> Tuple[str, float]:
     client = _gmaps()
     if client is None:
         return json.dumps({"error": "GOOGLE_API_KEY not configured"}), 0.0
@@ -522,21 +557,21 @@ async def _gmaps_search_places(args: Dict[str, Any]) -> Tuple[str, float]:
     # GoogleMapsClient returns {"results": [...], "next_page_token": ...}
     items = places.get("results", []) or places.get("places", []) or []
     next_page_token = places.get("next_page_token") or places.get("nextPageToken")
+    persisted = _persist_candidates(
+        project_id,
+        "google_maps_search_places",
+        items,
+        cost_usd=0.032,
+        extra={"next_page_token": next_page_token, "query": query},
+    )
     return (
-        json.dumps(
-            {
-                "returned": len(items[:_MAX_INLINE_RESULTS]),
-                "results": items[:_MAX_INLINE_RESULTS],
-                "next_page_token": next_page_token,
-            },
-            default=str,
-        ),
+        json.dumps(persisted, default=str),
         # Google charges roughly $0.032 per text-search request
         0.032,
     )
 
 
-async def _gmaps_place_details(args: Dict[str, Any]) -> Tuple[str, float]:
+async def _gmaps_place_details(args: Dict[str, Any], *, project_id: Optional[Any] = None) -> Tuple[str, float]:
     client = _gmaps()
     if client is None:
         return json.dumps({"error": "GOOGLE_API_KEY not configured"}), 0.0
@@ -557,10 +592,18 @@ async def _gmaps_place_details(args: Dict[str, Any]) -> Tuple[str, float]:
 # ---------------------------------------------------------------------------
 
 
-async def _code_exec(args: Dict[str, Any]) -> Tuple[str, float]:
-    """Run a Python snippet in the remote sandbox. Stateless — fresh
-    session per call. Use for parsing/processing inline data the LLM
-    inlines into the snippet, NOT for stateful workflows.
+async def _code_exec(args: Dict[str, Any], *, project_id: Optional[Any] = None) -> Tuple[str, float]:
+    """Run a Python snippet in the remote sandbox.
+
+    Stateless — fresh session per call. Use for parsing/processing data
+    (inline in the snippet, OR loaded from candidate files via the
+    `files` arg).
+
+    When `files=[...]` is passed, each candidate file is fetched from
+    blob and uploaded into the sandbox before the snippet runs, so the
+    snippet can `open(filename)` or json-iter through it just like a
+    local file. Use this to filter / aggregate / transform large
+    candidate sets without holding them in LLM context.
     """
     code = args.get("code")
     if not code or not isinstance(code, str):
@@ -571,12 +614,30 @@ async def _code_exec(args: Dict[str, Any]) -> Tuple[str, float]:
         return json.dumps({"error": "SANDBOX_SERVICE_URL not configured"}), 0.0
 
     timeout = int(args.get("timeout_secs", 60))
+    file_names = args.get("files") or []
+    if not isinstance(file_names, list):
+        return json.dumps({"error": "files must be a list of candidate file names"}), 0.0
 
     try:
         async with SandboxClient(sandbox_url, timeout=timeout + 30) as pool:
             session = await pool.create_session()
             session_id = session.session_id
             try:
+                # Stage requested candidate files into the sandbox workspace.
+                for fn in file_names:
+                    if not isinstance(fn, str) or not fn:
+                        continue
+                    if project_id is None:
+                        return json.dumps({
+                            "error": "files= requires a project context "
+                                     "(set when called via the chat agent)"
+                        }), 0.0
+                    try:
+                        blob_bytes = candidates.read_candidates_bytes(project_id, fn)
+                    except FileNotFoundError as e:
+                        return json.dumps({"error": str(e)}), 0.0
+                    await session.upload_content(blob_bytes, fn)
+
                 result = await session.exec_python(code, timeout=timeout)
                 return (
                     json.dumps(
@@ -586,6 +647,9 @@ async def _code_exec(args: Dict[str, Any]) -> Tuple[str, float]:
                             "stdout": (result.stdout or "")[:8000],
                             "stderr": (result.stderr or "")[:4000],
                             "duration_ms": result.duration_ms,
+                            "staged_files": [
+                                fn for fn in file_names if isinstance(fn, str) and fn
+                            ],
                         },
                         default=str,
                     ),
@@ -623,7 +687,7 @@ def _bu():
     return _bu_client
 
 
-async def _browser_use(args: Dict[str, Any]) -> Tuple[str, float]:
+async def _browser_use(args: Dict[str, Any], *, project_id: Optional[Any] = None) -> Tuple[str, float]:
     """Run a Browser Use cloud session for a single tightly-scoped task.
 
     Last resort: only when (a) Apify has no actor for the site AND (b) the
@@ -644,18 +708,19 @@ async def _browser_use(args: Dict[str, Any]) -> Tuple[str, float]:
         )
     except Exception as e:
         return json.dumps({"error": f"{type(e).__name__}: {e}"}), 0.0
-    return (
-        json.dumps(
-            {
-                "count": len(items or []),
-                "items": (items or [])[:_MAX_INLINE_RESULTS],
-                "summary": (summary or "")[:1000],
-                "session_id": session_id,
-            },
-            default=str,
-        ),
-        float(cost or 0),
+    items = items or []
+    persisted = _persist_candidates(
+        project_id,
+        "browser_use",
+        items,
+        cost_usd=float(cost or 0),
+        extra={
+            "summary": (summary or "")[:1000],
+            "session_id": session_id,
+            "task": task[:200],
+        },
     )
+    return json.dumps(persisted, default=str), float(cost or 0)
 
 
 # ---------------------------------------------------------------------------
@@ -716,7 +781,7 @@ Rules:
 """
 
 
-async def _web_harvest(args: Dict[str, Any]) -> Tuple[str, float]:
+async def _web_harvest(args: Dict[str, Any], *, project_id: Optional[Any] = None) -> Tuple[str, float]:
     """Spawn a small bounded web-research agent. Returns yielded
     candidates inline.
 
@@ -736,7 +801,7 @@ async def _web_harvest(args: Dict[str, Any]) -> Tuple[str, float]:
 
     client = _get_subagent_client()
 
-    candidates: List[Dict[str, Any]] = []
+    harvested: List[Dict[str, Any]] = []
     total_cost = 0.0
     web_search_calls = 0
     previous_response_id: Optional[str] = None
@@ -782,7 +847,7 @@ async def _web_harvest(args: Dict[str, Any]) -> Tuple[str, float]:
             resp = await client.responses.create(**kwargs)
         except Exception as e:
             return (
-                json.dumps({"error": f"{type(e).__name__}: {e}", "candidates": candidates}),
+                json.dumps({"error": f"{type(e).__name__}: {e}", "candidates": harvested}),
                 total_cost,
             )
 
@@ -813,11 +878,11 @@ async def _web_harvest(args: Dict[str, Any]) -> Tuple[str, float]:
             if fc.name == "yield_candidate":
                 data = fc_args.get("data") or {}
                 if isinstance(data, dict) and data:
-                    candidates.append(data)
+                    harvested.append(data)
                     tool_outputs.append({
                         "type": "function_call_output",
                         "call_id": fc.call_id,
-                        "output": f"Saved #{len(candidates)}",
+                        "output": f"Saved #{len(harvested)}",
                     })
                 else:
                     tool_outputs.append({
@@ -832,25 +897,26 @@ async def _web_harvest(args: Dict[str, Any]) -> Tuple[str, float]:
                     "output": f"unknown tool: {fc.name}",
                 })
 
-        if len(candidates) >= max_candidates:
+        if len(harvested) >= max_candidates:
             break
 
         next_input = tool_outputs
 
     total_cost += web_search_calls * _WEB_SEARCH_USD_PER_CALL
 
-    return (
-        json.dumps(
-            {
-                "candidates": candidates,
-                "count": len(candidates),
-                "web_search_calls": web_search_calls,
-                "turns_used": turn_idx + 1,
-            },
-            default=str,
-        ),
-        total_cost,
+    persisted = _persist_candidates(
+        project_id,
+        "web_harvest",
+        harvested,
+        cost_usd=total_cost,
+        extra={
+            "query": query,
+            "candidate_description": description,
+            "web_search_calls": web_search_calls,
+            "turns_used": turn_idx + 1,
+        },
     )
+    return json.dumps(persisted, default=str), total_cost
 
 
 # ---------------------------------------------------------------------------
@@ -1058,17 +1124,19 @@ SOURCE_TOOLS: List[Dict[str, Any]] = [
         "type": "function",
         "name": "apify_call_actor",
         "description": (
-            "Run an Apify actor with the given input and return up to "
-            "max_results items from its dataset (default 50). Use "
-            "apify_actor_details first to understand the actor's input "
-            "schema. Apify run cost is billed separately on our account."
+            "Run an Apify actor and write results to a candidates file. "
+            "Use apify_actor_details first to understand the actor's input "
+            "schema. Returns the candidates_file path, items_count, fields, "
+            "and a small preview — NOT the full result set. To work with "
+            "items use candidates_inspect / candidates_to_rows / code_exec. "
+            "Apify run cost is billed separately on our account."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "actor_id": {"type": "string"},
                 "input": {"type": "object", "description": "Actor-specific input. Check apify_actor_details for the schema."},
-                "max_results": {"type": "integer", "minimum": 1},
+                "max_items": {"type": "integer", "minimum": 1, "description": "Cap items returned by the actor. Omit for unbounded."},
                 "timeout_secs": {"type": "integer", "description": "Default 300."},
             },
             "required": ["actor_id"],
@@ -1163,17 +1231,29 @@ SOURCE_TOOLS: List[Dict[str, Any]] = [
         "name": "code_exec",
         "description": (
             "Run a Python snippet in a remote sandbox. Stateless — each call "
-            "gets a fresh session. Use for parsing/processing data you inline "
-            "into the snippet (e.g. mapping nested JSON to flat dicts), pure "
-            "algorithmic Python, or quick calculations. The sandbox has the "
-            "Python stdlib + httpx + json + re. It does NOT have access to "
-            "the project DB; if you want to commit results, print them to "
-            "stdout, then call rows_add separately. Default timeout 60s."
+            "gets a fresh session. Use for parsing/processing data (inline "
+            "or loaded from candidate files), mapping nested JSON to flat "
+            "dicts, pure algorithmic Python, or quick calculations. The "
+            "sandbox has the Python stdlib + httpx + json + re. It does NOT "
+            "have access to the project DB; if you want to commit results, "
+            "print them to stdout, then call rows_add or candidates_to_rows "
+            "separately. Default timeout 60s.\n\n"
+            "Pass `files=['name.jsonl', ...]` to stage candidate files from "
+            "blob into the sandbox workspace before running. Inside the "
+            "snippet they appear as local files: `for line in open('name.jsonl')` "
+            "or `[json.loads(l) for l in open('name.jsonl')]`. Use this to "
+            "filter, transform, or aggregate large fetches without holding "
+            "them in LLM context."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "code": {"type": "string", "description": "Python source to execute."},
+                "files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Candidate file names (from candidates_list) to stage into the sandbox before running. Each becomes openable as a local file by that name.",
+                },
                 "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 300},
             },
             "required": ["code"],
@@ -1187,7 +1267,7 @@ SOURCE_TOOLS: List[Dict[str, Any]] = [
 # ---------------------------------------------------------------------------
 
 
-_HandlerType = Callable[[Dict[str, Any]], Awaitable[Tuple[str, float]]]
+_HandlerType = Callable[..., Awaitable[Tuple[str, float]]]
 
 _HANDLERS: Dict[str, _HandlerType] = {
     "fullenrich_search_people": _fe_search_people,
@@ -1211,17 +1291,25 @@ def is_source_tool(name: str) -> bool:
     return name in _HANDLERS
 
 
-async def execute_source_tool(name: str, args: Dict[str, Any]) -> Tuple[str, float]:
+async def execute_source_tool(
+    name: str,
+    args: Dict[str, Any],
+    *,
+    project_id: Optional[Any] = None,
+) -> Tuple[str, float]:
     """Run a source tool by name. Returns (result_json_text, cost_usd).
 
     Cost is in USD (raw provider cost to us). The chat handler converts
     to user-facing credits at COMPUTE_COST_PER_CREDIT.
+
+    project_id is threaded to handlers that write candidates files. Tools
+    that don't need it ignore the kwarg.
     """
     handler = _HANDLERS.get(name)
     if handler is None:
         return json.dumps({"error": f"unknown source tool: {name}"}), 0.0
     try:
-        return await handler(args)
+        return await handler(args, project_id=project_id)
     except Exception as e:
         log.exception("source tool %s failed", name)
         return json.dumps({"error": f"{type(e).__name__}: {e}"}), 0.0
