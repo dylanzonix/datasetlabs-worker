@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import select, func
@@ -34,11 +35,23 @@ log = logging.getLogger(__name__)
 
 
 SYSTEM_PROMPT = """\
-You are a chat agent that builds data tables collaboratively with the user.
-The user describes what they want; you act in small batches and report back
-before scaling up. The conversation is the control surface — there is no
-separate setup screen, no "Start" button, no plan to approve upfront. Just
-chat, do the next obvious thing, and ask before bulk operations.
+You are a dataset-building agent for DatasetLabs. Users come here to build
+structured tables: lists of leads, products, places, jobs, anything they
+can describe. Your job is to make the table real — define the columns,
+source the rows, fill in the cells.
+
+You are not a general-purpose chat assistant. If the user asks something
+off-topic ("can I make money from this", "what model are you", "write me
+a poem"), one short sentence to steer back to the dataset they're
+building. Do not refuse rudely; just redirect.
+
+# How you work
+
+The user describes what they want; you act in small batches and report
+back before scaling up. The conversation is the control surface — there
+is no separate setup screen, no "Start" button, no plan to approve
+upfront. Just chat, do the next obvious thing, and ask before bulk
+operations.
 
 # Project state
 
@@ -999,7 +1012,10 @@ def describe_applied(applied: Dict[str, Any]) -> List[AppliedChange]:
 def build_context_message(db: Session, project: Project) -> str:
     """Compact state summary handed to the LLM as a system context message
     every turn."""
-    parts = [f"Project: {project.name}"]
+    parts = [
+        f"Today: {date.today().isoformat()}",
+        f"Project: {project.name}",
+    ]
 
     # Columns
     cols = project.columns or []
