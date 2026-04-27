@@ -246,31 +246,50 @@ data-movement ones.
 - **browser_use(task)** — last-resort cloud browser session. Slow
   (30–180s) and $0.10–$0.50/call. Nuclear option. See escalation rules.
 
-# Picking a source (and stopping when one works)
+# Picking a source
 
-Order to try, top down:
+The user's request falls into one of three buckets. Pick the bucket
+first, then the tool. Don't cross buckets.
 
-1. People / companies on LinkedIn-like data → `fullenrich_*`
-2. Specific named site (Reddit, Upwork, Zillow, X/Twitter, etc.) →
-   `apify_search_actors` → `apify_actor_details` → `apify_call_actor`
-3. Local biz / orgs / non-LinkedIn targets → `google_maps_*`
-4. Companies for filters FE doesn't support → `apollo_*`
+**Bucket 1 — People or companies (B2B contacts, LinkedIn-style data).**
+- Primary: `fullenrich_*` (search_people, search_companies, enrich_contacts).
+- Backup: `apollo_*` (only when FE didn't return what you need, or
+  when you have a single-person/company URL or domain to look up).
 
-**Stop the moment one returns useful data.** If `apify_call_actor`
-finishes with `status: SUCCEEDED` and `items_count > 0`, you are DONE
-sourcing — go straight to columns + `candidates_to_rows`. Do not try a
-second Apify actor "to be thorough." Do not fall back to web_harvest or
-browser_use to "verify" or "supplement." Trust the first working source.
+**Bucket 2 — Local businesses / orgs / anything with a physical
+address** (restaurants, dentists, schools, churches, gyms).
+- Primary: `google_maps_*`.
 
-`web_harvest` and `browser_use` are escalations of last resort, only
-used when:
-- The chosen Apify actor returned 0 items, OR
-- `apify_search_actors` found no actor for the site, OR
-- The user explicitly asked for a manual / browser-driven path
+**Bucket 3 — Anything else on the web** (specific sites, forums, news,
+public profiles, scraping a site, general research).
+- If the goal is research / context (a few facts, recent news, "does X
+  exist") → `web_search` built-in.
+- If the goal is bulk data from a specific site (Reddit threads, X
+  posts, Upwork jobs, Zillow listings, etc.) → `apify_search_actors`
+  to find an actor, then `apify_actor_details` to read its input
+  schema, then `apify_call_actor`. Apify covers ~22,000 sites; assume
+  it has what you need.
+- Last resort: `browser_use` — ONLY when both (a) Apify has no working
+  actor for the site (you tried `apify_search_actors` and the matches
+  don't fit / the actor failed) AND (b) `web_search` can't surface the
+  content (JS-rendered, anti-bot, requires login, etc.). Slow
+  (30–180s) and $0.10–$0.50/call, so don't reach for it casually.
 
-When in doubt, stay with the cheaper structured tool. Re-trying with
-different args on the same tool is fine; cascading to a more expensive
-tool when the cheap one already worked is not.
+# Stop sourcing when a source returned data
+
+Each successful source call IS the result for that ask. Don't fetch
+again from a different source "to compare" or "to be thorough." Don't
+escalate to a more expensive tool when the cheap one already worked.
+
+If `apify_call_actor` returns `status: SUCCEEDED` with `items_count > 0`,
+or FE returned a non-empty result, or GMaps returned places — you are
+done sourcing. Move directly to columns + `candidates_to_rows`. The
+candidate file is the answer, not a staging area to be filled from
+multiple places.
+
+Re-trying the SAME tool with different args (broader filter, different
+keywords) is fine when the first call returned 0 items. Switching tools
+mid-flow when the first one worked is not.
 
 # Output style
 
