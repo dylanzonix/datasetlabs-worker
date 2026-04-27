@@ -521,8 +521,9 @@ async def _apify_call_actor(args: Dict[str, Any], *, project_id: Optional[Any] =
     except Exception as e:
         return json.dumps({"error": f"{type(e).__name__}: {e}"}), 0.0
 
-    # Apify charges hit our account directly, not the user's credits, but
-    # we surface usage to the agent so it can be cost-aware.
+    # Apify reports the run's billed-USD via usageTotalUsd. Pass it through
+    # so the chat handler bills the user's credits at COMPUTE_COST_PER_CREDIT.
+    cost_usd = float(run_info.get("cost_usd") or 0.0)
     extra = {
         "actor_id": actor_id,
         "status": run_info.get("status"),
@@ -530,9 +531,9 @@ async def _apify_call_actor(args: Dict[str, Any], *, project_id: Optional[Any] =
         "usage": run_info.get("usage"),
     }
     result = _persist_candidates(
-        project_id, "apify_call_actor", items, cost_usd=0.0, extra=extra
+        project_id, "apify_call_actor", items, cost_usd=cost_usd, extra=extra
     )
-    return json.dumps(result, default=str), 0.0
+    return json.dumps(result, default=str), cost_usd
 
 
 # ---------------------------------------------------------------------------
