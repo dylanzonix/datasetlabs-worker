@@ -598,7 +598,9 @@ async def execute_tool(
         applied, result = _tool_columns_delete(db, project, args)
         return applied, result, 0.0
     if tool_name == "rows_add":
-        applied, result = _tool_rows_add(db, project, version, args)
+        applied, result = await _tool_rows_add(
+            db, project, version, args, progress_cb=progress_cb
+        )
         return applied, result, 0.0
     if tool_name == "rows_count":
         applied, result = _tool_rows_count(db, project, version, args)
@@ -755,8 +757,12 @@ def _tool_columns_delete(db: Session, project: Project, args: Dict[str, Any]):
 # --- Row tools ---
 
 
-def _tool_rows_add(
-    db: Session, project: Project, version: ProjectVersion, args: Dict[str, Any]
+async def _tool_rows_add(
+    db: Session,
+    project: Project,
+    version: ProjectVersion,
+    args: Dict[str, Any],
+    progress_cb: Optional[fill.ProgressCallback] = None,
 ):
     items = args.get("items")
     if not isinstance(items, list):
@@ -790,6 +796,14 @@ def _tool_rows_add(
                         sample.row = data
                         merged += 1
                         merged_existing = True
+                        if progress_cb is not None:
+                            try:
+                                await progress_cb({
+                                    "type": "row_merged",
+                                    "row": _row_to_dict(sample),
+                                })
+                            except Exception:
+                                log.exception("row_merged progress_cb raised")
         if merged_existing:
             continue
 
@@ -805,6 +819,14 @@ def _tool_rows_add(
         db.flush()
         version.generated_count = (version.generated_count or 0) + 1
         inserted += 1
+        if progress_cb is not None:
+            try:
+                await progress_cb({
+                    "type": "row_added",
+                    "row": _row_to_dict(sample),
+                })
+            except Exception:
+                log.exception("row_added progress_cb raised")
 
     total = db.query(func.count(Sample.id)).filter(Sample.version_id == version.id).scalar() or 0
     return (
