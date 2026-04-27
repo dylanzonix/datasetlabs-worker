@@ -27,8 +27,9 @@ COPY api/dsl_api/ ./dsl_api/
 # Copy worker code
 COPY worker/dsl_worker/ ./dsl_worker/
 
-# Copy entrypoint
+# Copy entrypoints (V13 SB consumer + chat FastAPI; deploy script picks one)
 COPY worker/entrypoint.sh ./entrypoint.sh
-RUN chmod +x ./entrypoint.sh
+COPY worker/entrypoint_chat.sh ./entrypoint_chat.sh
+RUN chmod +x ./entrypoint.sh ./entrypoint_chat.sh
 
 CMD ["./entrypoint.sh"]

@@ -52,3 +52,8 @@ pdfplumber
 python-docx
 python-pptx
 openpyxl
+
+# Chat worker FastAPI service (chat_api/)
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-jose[cryptography]==3.3.0
