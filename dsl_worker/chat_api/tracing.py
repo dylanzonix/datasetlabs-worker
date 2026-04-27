@@ -56,30 +56,34 @@ def start_trace(
     md = dict(metadata or {})
     if project_id:
         md["project_id"] = project_id
+    # Set up the langfuse span. If setup fails, degrade to no-op tracing.
+    # See start_generation for the rationale (yielding twice is illegal).
     try:
-        with lf.start_as_current_observation(
+        cm = lf.start_as_current_observation(
             as_type="span",
             name=name,
             input=input_text,
             metadata=md,
-        ) as span:
-            try:
-                trace_kwargs: Dict[str, Any] = {
-                    "name": name,
-                    "input": input_text,
-                    "metadata": md,
-                }
-                if user_id:
-                    trace_kwargs["user_id"] = str(user_id)
-                if project_id:
-                    trace_kwargs["session_id"] = str(project_id)
-                span.update_trace(**trace_kwargs)
-            except Exception:
-                pass
-            yield span
+        )
     except Exception:
-        log.exception("langfuse trace failed; continuing without tracing")
+        log.exception("langfuse start_trace setup failed; continuing without tracing")
         yield None
+        return
+    with cm as span:
+        try:
+            trace_kwargs: Dict[str, Any] = {
+                "name": name,
+                "input": input_text,
+                "metadata": md,
+            }
+            if user_id:
+                trace_kwargs["user_id"] = str(user_id)
+            if project_id:
+                trace_kwargs["session_id"] = str(project_id)
+            span.update_trace(**trace_kwargs)
+        except Exception:
+            pass
+        yield span
 
 
 @contextlib.contextmanager
@@ -93,18 +97,26 @@ def start_generation(
     if lf is None:
         yield None
         return
+    # Set up the langfuse observation. If the SETUP fails (langfuse misconfig,
+    # transient API issue), degrade to no-op tracing — don't fail the user's
+    # request. If the user's `with` body raises, propagate it normally;
+    # contextmanager forbids yielding twice, so the prior version's
+    # `except: yield None` actually masked real errors with a misleading
+    # "generator didn't stop after throw()".
     try:
-        with lf.start_as_current_observation(
+        cm = lf.start_as_current_observation(
             as_type="generation",
             name=name,
             model=model,
             input=input_payload,
             metadata=metadata or {},
-        ) as gen:
-            yield gen
+        )
     except Exception:
-        log.exception("langfuse generation failed; continuing without tracing")
+        log.exception("langfuse start_generation setup failed; continuing without tracing")
         yield None
+        return
+    with cm as gen:
+        yield gen
 
 
 def update_generation(
@@ -144,16 +156,18 @@ def start_span(
         yield None
         return
     try:
-        with lf.start_as_current_observation(
+        cm = lf.start_as_current_observation(
             as_type="span",
             name=name,
             input=input_payload,
             metadata=metadata or {},
-        ) as span:
-            yield span
+        )
     except Exception:
-        log.exception("langfuse span failed; continuing without tracing")
+        log.exception("langfuse start_span setup failed; continuing without tracing")
         yield None
+        return
+    with cm as span:
+        yield span
 
 
 def update_span(

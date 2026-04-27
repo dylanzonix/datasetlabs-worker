@@ -364,7 +364,7 @@ async def stream_chat_response(
 
         # Immediate signal so the UI doesn't sit silent during prompt
         # assembly + the OpenAI Responses request's first-byte latency.
-        yield _sse({"type": "status", "content": "Reading project state…"})
+        yield _sse({"type": "status", "content": "Thinking…"})
 
         history = _get_chat_history(db, project_id)
         is_first_message = len(history) == 0
@@ -407,8 +407,16 @@ async def stream_chat_response(
             return entry
 
         try:
-            previous_response_id = None
+            # Manual conversation state — replayed in full each round.
+            # Mirrors dsl_worker/agents/base.py so we don't depend on
+            # `previous_response_id` (which fails with HTTP 400
+            # "No tool call found for function call output" when the prior
+            # response state is dropped/incomplete after long round 0 runs).
+            running_input: List[Dict[str, Any]] = list(input_items)
             stripper = _CitationStripper()
+            # Track web_search_call items we've already surfaced as synthetic
+            # tool calls, so we don't double-emit on retry/replay.
+            seen_web_search_ids: set = set()
 
             for round_num in range(MAX_TOOL_ROUNDS + 1):
                 if await request.is_disconnected():
@@ -418,23 +426,14 @@ async def stream_chat_response(
                 round_thinking_start = time.time()
                 got_output_this_round = False
 
-                if round_num == 0:
-                    stream_kwargs: Dict[str, Any] = {
-                        "model": settings.OPENAI_MODEL,
-                        "instructions": agent.SYSTEM_PROMPT,
-                        "input": input_items,
-                        "tools": agent.CHAT_TOOLS,
-                        "reasoning": {"effort": "medium", "summary": "auto"},
-                        "max_output_tokens": 8000,
-                    }
-                else:
-                    stream_kwargs = {
-                        "model": settings.OPENAI_MODEL,
-                        "previous_response_id": previous_response_id,
-                        "input": tool_result_items,
-                        "tools": agent.CHAT_TOOLS,
-                        "max_output_tokens": 8000,
-                    }
+                stream_kwargs: Dict[str, Any] = {
+                    "model": settings.OPENAI_MODEL,
+                    "instructions": agent.SYSTEM_PROMPT,
+                    "input": running_input,
+                    "tools": agent.CHAT_TOOLS,
+                    "reasoning": {"effort": "low", "summary": "auto"},
+                    "max_output_tokens": 8000,
+                }
 
                 round_text_collected = ""
                 with tracing.start_generation(
@@ -471,6 +470,68 @@ async def stream_chat_response(
                                             yield _sse({"type": "source_added", **added})
                                             await asyncio.sleep(0)
 
+                            elif event_type == "response.output_item.added":
+                                # Surface OpenAI's built-in web_search calls
+                                # as synthetic tool_call entries so the UI
+                                # doesn't go silent during searches (which
+                                # can each take 30-60s and chain).
+                                added_item = getattr(event, "item", None)
+                                if (
+                                    added_item is not None
+                                    and getattr(added_item, "type", None) == "web_search_call"
+                                ):
+                                    item_id = getattr(added_item, "id", None) or ""
+                                    if item_id and item_id not in seen_web_search_ids:
+                                        seen_web_search_ids.add(item_id)
+                                        action = getattr(added_item, "action", None)
+                                        a_type = getattr(action, "type", None) if action else None
+                                        if a_type == "search":
+                                            preview = (getattr(action, "query", None) or "")[:120]
+                                            args_preview = f'query="{preview}"'
+                                        elif a_type == "open_page":
+                                            preview = (getattr(action, "url", None) or "")[:120]
+                                            args_preview = f'url="{preview}"'
+                                        elif a_type == "find_in_page":
+                                            preview = (getattr(action, "query", None) or "")[:120]
+                                            args_preview = f'find="{preview}"'
+                                        else:
+                                            args_preview = ""
+                                        tool_log_index[item_id] = len(tool_log)
+                                        tool_log.append({
+                                            "id": item_id,
+                                            "name": "web_search",
+                                            "args_preview": args_preview,
+                                        })
+                                        yield _sse({
+                                            "type": "tool_call",
+                                            "id": item_id,
+                                            "name": "web_search",
+                                            "args_preview": args_preview,
+                                        })
+                                        await asyncio.sleep(0)
+
+                            elif event_type == "response.output_item.done":
+                                done_item = getattr(event, "item", None)
+                                if (
+                                    done_item is not None
+                                    and getattr(done_item, "type", None) == "web_search_call"
+                                ):
+                                    item_id = getattr(done_item, "id", None) or ""
+                                    if item_id:
+                                        status = getattr(done_item, "status", None) or "completed"
+                                        idx = tool_log_index.get(item_id)
+                                        summary = "done" if status == "completed" else status
+                                        if idx is not None:
+                                            tool_log[idx]["summary"] = summary
+                                        yield _sse({
+                                            "type": "tool_result",
+                                            "id": item_id,
+                                            "name": "web_search",
+                                            "summary": summary,
+                                            "cost": 0,
+                                        })
+                                        await asyncio.sleep(0)
+
                             elif event_type == "response.output_text.delta":
                                 if not got_output_this_round:
                                     got_output_this_round = True
@@ -493,7 +554,39 @@ async def stream_chat_response(
                                         yield _sse({"type": "token", "content": clean})
                                         await asyncio.sleep(0)
 
-                        final_response = await stream.get_final_response()
+                        # OpenAI's stream sometimes ends without sending a
+                        # `response.completed` event (network blip, Azure
+                        # mid-stream timeout, model truncation). The SDK
+                        # raises RuntimeError in that case. Don't crash —
+                        # treat as an incomplete round and break out
+                        # gracefully. The text the model already streamed
+                        # is on the client; we'll persist it as a stub
+                        # via the normal end-of-turn path.
+                        try:
+                            final_response = await stream.get_final_response()
+                        except RuntimeError as _rt:
+                            if "response.completed" in str(_rt):
+                                log.warning(
+                                    f"round {round_num}: stream ended without "
+                                    f"completion event — treating as incomplete"
+                                )
+                                final_response = None
+                            else:
+                                raise
+
+                    if final_response is None:
+                        # Incomplete round: skip post-stream processing and
+                        # exit the loop. full_content has whatever text we
+                        # streamed; the assistant message will persist with
+                        # that + a `stopped` flag.
+                        stopped = True
+                        remaining = stripper.flush()
+                        if remaining:
+                            full_content += remaining
+                            yield _sse({"type": "token", "content": remaining})
+                        if not got_output_this_round:
+                            thinking_total += time.time() - round_thinking_start
+                        break
 
                     # Fallback: walk the final response for any url_citation
                     # annotations the streaming event missed (depends on SDK
@@ -558,7 +651,25 @@ async def stream_chat_response(
                 if not got_output_this_round:
                     thinking_total += time.time() - round_thinking_start
 
-                previous_response_id = final_response.id
+                # Capture every output item into running_input so the next
+                # round sees the full conversation. Reasoning items get a
+                # manual dump because model_dump(exclude_none=True) drops
+                # the required `summary` field when the API returns null.
+                for out_item in final_response.output or []:
+                    if out_item.type == "reasoning":
+                        summary = []
+                        if out_item.summary:
+                            summary = [
+                                {"type": s.type, "text": s.text}
+                                for s in out_item.summary
+                            ]
+                        running_input.append({
+                            "type": "reasoning",
+                            "id": out_item.id,
+                            "summary": summary,
+                        })
+                    else:
+                        running_input.append(out_item.model_dump(exclude_none=True))
 
                 tool_calls = [
                     item for item in final_response.output
@@ -687,8 +798,24 @@ async def stream_chat_response(
                         "output": result_text,
                     })
 
+                # Carry tool outputs into the conversation state so the
+                # next round's input includes them (replaces the old
+                # previous_response_id-based chaining).
+                running_input.extend(tool_result_items)
+
                 if stopped:
                     break
+
+                # Quick-reply chips: surface as a dedicated SSE event so
+                # the frontend can render them directly (separate from the
+                # generic "change" feed which is for table mutations).
+                if isinstance(round_applied.get("suggestions"), dict):
+                    sg = round_applied["suggestions"]
+                    yield _sse({
+                        "type": "suggestions",
+                        "kind": sg.get("kind") or "choice",
+                        "items": sg.get("items") or [],
+                    })
 
                 for change in agent.describe_applied(round_applied):
                     if change.field == "questions":
@@ -703,12 +830,49 @@ async def stream_chat_response(
                             event_data["value"] = change.value
                         yield _sse(event_data)
 
-                if any(item.name == "ask_questions" for item in tool_calls):
+                # End the conversation after these tools — they're terminal:
+                # ask_questions waits for a structured answer; suggest_replies
+                # hands control to the user via clickable chips.
+                if any(
+                    item.name in ("ask_questions", "suggest_replies")
+                    for item in tool_calls
+                ):
                     break
 
         except Exception as e:
             log.exception("OpenAI streaming error")
             yield _sse({"type": "error", "message": f"AI service error: {str(e)}"})
+            # Best-effort: persist whatever we have so the user sees a trace
+            # on history reload instead of a silent disappearance. Without
+            # this, a mid-stream error leaves only the user message in DB
+            # and the UI shows nothing on reload.
+            try:
+                err_ac: Dict[str, Any] = {"error": str(e)[:500]}
+                if applied:
+                    err_ac["changes"] = applied
+                if tool_log:
+                    err_ac["tool_log"] = tool_log
+                if total_cost > 0:
+                    err_ac["total_cost_usd"] = round(total_cost, 4)
+                if sources:
+                    err_ac["sources"] = sources
+                if thinking_total >= 0.5:
+                    err_ac["thinking_duration"] = round(thinking_total, 1)
+                partial = ChatMessage(
+                    project_id=project_id,
+                    role="assistant",
+                    content=_clean_citations(full_content),
+                    applied_changes=err_ac,
+                )
+                db.add(partial)
+                _charge_credits(db, user_id, total_cost, project_id=project_id)
+                db.commit()
+            except Exception:
+                log.exception("Failed to persist error stub")
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
             return
 
         # Forced text wrap-up if we exited the tool loop with no text. Hits

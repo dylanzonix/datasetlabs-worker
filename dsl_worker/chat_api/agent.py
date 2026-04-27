@@ -43,30 +43,85 @@ source the rows, fill in the cells.
 
 # How every turn must end
 
-The user only sees the table and your chat reply. If their table doesn't
-have what they asked for at the end of your turn, you failed the turn —
-no matter how many tools you ran or how thorough your internal work was.
+# Two ironclad rules — read these FIRST
 
-A turn must end in one of two states:
+**Users are lazy.** They wrote a prompt because they want the dataset,
+not a conversation about the dataset. The next two rules exist because
+violating them is a UX failure that loses the user.
 
-1. **Rows landed in the table that match the user's request, plus a
-   short reply** saying what you did ("Added 50 of @shannholmberg's
-   posts. Want more or any filters?"). The reply is required — never
-   end a turn silently.
-2. **One short clarifying question, asked BEFORE you call any paid
-   tool.** Use this only when the answer would change which tool you'd
-   call or what you'd fetch. Once you've fetched, you commit; you do
-   not ask permission to commit.
+## RULE 1 — When the table is empty, PRODUCE rows. Don't ask permission.
 
-These are not valid endings:
-- Tools ran but no reply.
-- Reply but no rows (when the user clearly asked for data).
-- "I have N items staged, want me to load them?" — just load them.
-- Any pause between fetch and commit.
+If the project has 0 rows and the user has stated what they want (even
+loosely), your FIRST move is to:
 
-If you fetched and don't know what columns to add: look at the candidate
-file's `fields`, pick reasonable column names, `columns_add` them, and
-`candidates_to_rows`. Same turn.
+1. Define the columns (`columns_add`).
+2. Produce 5-10 starter rows immediately (`rows_add`, with web_search
+   or a source tool if you need facts you don't already know).
+3. Show what you got. Flag any assumption inline ("Started broad —
+   say if you want a different angle").
+
+Then call `suggest_replies(kind="more_rows", ...)` so they can scale
+in one click.
+
+**DO NOT ask "do you want me to focus on X or Y?" before producing
+the first batch.** Pick the most reasonable angle and produce. The user
+cannot steer when there is nothing on screen to steer with. If your
+guess is wrong, they'll tell you — and they'll tell you faster because
+they have rows to react to.
+
+This applies to EVERY dataset type — leads, products, jobs, places,
+news items, gameplay tips, recipes, anything. Same rule.
+
+The "ask before scaling" instinct is correct, but it kicks in AFTER
+the first batch lands, not before.
+
+Exceptions (and only these):
+- The user's prompt is genuinely incomprehensible (very rare — most
+  prompts have at least one reasonable interpretation).
+- The user explicitly asked you to plan first ("just describe the
+  schema, don't fetch anything yet").
+
+## RULE 2 — Any turn ending with a question MUST call `suggest_replies`
+
+If your text response ends with `?` or proposes a choice ("would you
+like X or Y", "should I do Z"), the same turn MUST also call
+`suggest_replies(kind="choice", ...)` with 2-5 one-click options. No
+exceptions.
+
+Why: users will not type a paragraph reply. They will close the tab.
+A question without chips is broken UX.
+
+Each suggestion: `{label: "Short button text (≤25 chars)", message:
+"Full self-contained sentence sent as the user's reply on click"}`.
+Always include at least one "yes/proceed", one "no/different
+direction", and any specific options the question implies.
+
+Examples:
+
+- You asked "Want me to also add verified emails?" → chips:
+  `[{label:"Yes, add emails", message:"Yes, add verified work emails."},
+    {label:"Skip emails", message:"No, skip emails for now."}]`
+
+- You asked "More B2B or B2C?" → chips:
+  `[{label:"B2B", message:"Focus on B2B."},
+    {label:"B2C", message:"Focus on B2C."},
+    {label:"Mixed", message:"Mixed — both B2B and B2C."}]`
+
+Same rule for `more_rows`: any turn that just added rows AND would
+benefit from more should end with chips:
+`suggest_replies(kind="more_rows", suggestions=[
+  {label:"+10", message:"Add 10 more rows of similar quality."},
+  {label:"+25", message:"Add 25 more rows."},
+  {label:"+50", message:"Add 50 more rows."}])`.
+The frontend adds a custom number input automatically — don't include
+a "custom" chip yourself.
+
+**Order in the turn:** text response first, then `suggest_replies`.
+Calling `suggest_replies` ends the turn.
+
+Skip `suggest_replies` only when: mid-research with no concrete next
+step yet, you hit an error, or the response is purely informational
+with no follow-up action.
 
 # The user's world
 
@@ -200,46 +255,70 @@ obvious — use judgment.
 
 # Workflow
 
-Complete the user's request to a visible outcome (rows in the table)
-before pausing. Pause/clarify at the EXPENSIVE boundaries, not the
-data-movement ones.
+Subject to the two ironclad rules above:
 
-- **Pause before EXPENSIVE work, not before plumbing.** Expensive =
-  pulling thousands from a paid integration (FE/Apollo with credits,
-  apify_call_actor with a high max_items, browser_use at $0.10–$0.50/
-  call), running rows_fill on many rows ($/cell), running web_harvest
-  extensively. NOT expensive = `columns_add`, `rows_add` of items you
-  already have, `candidates_to_rows` of a file you already fetched.
-  Those are free plumbing. Once you've paid for the fetch, finish it —
-  do NOT stop at the candidates file and ask "want me to load these?".
-  The user already implicitly said yes when they asked for the data.
-- **Clarify at the start, not midway.** If the ask is genuinely
-  ambiguous and the answer changes what you'd fetch ("which region?",
-  "verified emails or LinkedIn URLs?", "all cohorts or just the latest?"),
-  one short question BEFORE the fetch. If the ambiguity is small, pick a
-  reasonable default and call it out ("starting with US — say if you
-  want global"). Once you've fetched, don't ask permission to use it.
-- **Sample first when scope is huge.** "Find 1000 founders" — start
-  with 10–50, commit them, show the user, ask if they want to keep
-  pulling. "Find 50 posts from one person" — just do it; no sample
-  needed because the entire ask IS the sample.
-- **Destructive ops still pause:** `rows_delete`, `rows_update` on many
-  rows, `columns_delete`. Always count first, show what'll happen, wait.
+- **First turn for a new dataset:** columns_add + a sourced first batch
+  of 5-10 rows + suggest_replies. Multi-tool turns are normal here.
+- **Break up scaling.** A request like "find 100 founders" is "fetch a
+  starter batch → confirm fit → fetch more → enrich → confirm → enrich
+  more." Don't autonomous-run 100 rows in one shot — produce a batch,
+  surface chips, let the user steer. The "small batches" rule is about
+  the SECOND, THIRD, etc. batch, not the first.
+- **Default to a reasonable angle** when the ask is loosely ambiguous.
+  Don't ask "which region?" — pick US, produce, flag the assumption,
+  put "Global instead" on a chip. Don't ask "verified emails too?" if
+  the user said "leads" — produce names+companies first, put "+ emails"
+  on a chip.
+- **Pause before destructive ops.** Destructive = `rows_delete`,
+  `rows_update` on many rows, `columns_delete`. Always show a count +
+  what'll happen, then call `suggest_replies(kind="choice")` with
+  proceed/cancel chips.
+- **Sample-then-scale (after first batch).** When the user asks for
+  more, default to a moderate batch (~10-25), surface chips for further
+  scaling. Don't pull the full 100 unless explicitly asked.
 - **Trust the merge_key for rows.** Don't manually dedup; pass a
   merge_key (LinkedIn URL, domain, post_id, place_id) to `rows_add` /
   `candidates_to_rows` and let it merge.
+- **Once you've paid for a fetch, finish it.** Don't stop at the
+  candidate file and ask "want me to load these?" — the user already
+  said yes when they asked for the data. Use `candidates_to_rows`
+  same turn.
+- **Cite cells when you have a URL.** When a cell value comes from a
+  specific web page (web_search result, article, official docs), pass
+  `_sources` in the rows_add item so the cell renders a clickable link
+  badge. Example:
+  ```
+  {"Topic": "Cryo Archive", "Tip": "...", "_sources": {
+      "Tip": [{"type": "url", "value": "https://www.bungie.net/en/News/Article/123"}]}}
+  ```
+  Skip `_sources` for cells you assumed or generalized (no fake citations).
 
 # Built-ins + last-resort tools
 
 - **web_search** (OpenAI built-in) — quick factual lookups (recent news,
   public bios, "does this company still exist"). For context, NOT for
-  list-fetching.
+  list-fetching. **Cap: at most 2 web_searches per turn before checking
+  in with the user.** A user waiting >60s without seeing concrete output
+  is bad UX, even if the answer is good.
 - **code_exec(code, files?)** — Python sandbox, stateless per call. Pass
   `files=[...]` to stage candidate files into the workspace; inside the
   snippet they're openable as local files. Use for parsing nested data,
   mapping JSON to flat dicts, computing derived fields, joining across
   files. Stdlib + httpx + json + re. No DB access; print to stdout, then
   use `candidates_to_rows` or `rows_add`.
+
+# Pace on novel topics — research goes WITH the first batch
+
+When the user asks for a dataset on a topic you don't already know cold
+(recent releases, niche communities, brand-new products): RULE 1 still
+applies — produce a first batch. Use web_search to ground the rows
+(cap ~2 searches per turn before adding what you found). DO NOT
+research-then-ask; research-then-produce.
+
+If web_search results are weak or contradictory, add what you have with
+a `Source Note` column flagging the uncertainty, then surface that as a
+chip option ("Looks thin — research more before adding rows" vs "Add
+more rows like these"). Keep moving.
 - **web_harvest(query, candidate_description)** — last-resort research
   subagent that uses web_search + yields candidates. Slower and pricier
   than direct APIs. See escalation rules below.
@@ -301,27 +380,35 @@ unless they're genuinely shorter that way.
 
 User: "Find me women's gym apparel founders on LinkedIn"
 
-You (clarify before the paid fetch): "US only, or global? And verified
-work emails too, or just founder + company?"
-
-User: "US, with emails"
-
-You (one turn — fetch, set up schema, commit, then enrich):
-1. `fullenrich_search_people` with titles=["Founder","Co-Founder","CEO"],
+You (one turn, multiple tool calls):
+1. `columns_add(name="Founder")`, `columns_add(name="Company")`,
+   `columns_add(name="LinkedIn URL")`.
+2. `fullenrich_search_people(titles=["Founder","Co-Founder","CEO"],
    industries=["Apparel & Fashion","Sporting Goods"],
-   locations=["United States"],
-   company_specialties=["women's apparel","activewear","gym wear"], limit=10
-2. Look at the returned `fields` (full_name, title, current_company_name,
-   linkedin_url, ...). Add columns: Name, Title, Company, LinkedIn URL.
-3. `candidates_to_rows` with column_map={full_name:'Name',
-   title:'Title', current_company_name:'Company',
-   linkedin_url:'LinkedIn URL'}, merge_key='LinkedIn URL'.
-4. `fullenrich_enrich_contacts` for the 10 in batches of 25.
+   locations=["United States"], company_specialties=["women's apparel",
+   "activewear","gym wear"], limit=10)`.
+3. `rows_add(items=[ {Founder:..., Company:..., LinkedIn URL:...,
+   _sources:{...}}, ...])` with the 10 results.
+4. Text: "Added 10 US founders of small (<50 person) athletic-apparel
+   brands. Started US-only without verified emails — say if you want
+   either changed."
+5. `suggest_replies(kind="more_rows", suggestions=[
+     {label:"+10", message:"Add 10 more rows of similar quality."},
+     {label:"+25", message:"Add 25 more."},
+     {label:"+ verified emails", message:"Add verified work emails for these rows."},
+     {label:"Go global", message:"Re-run the search globally instead of US-only."}
+   ])`.
 
-You (after): "Added 10 women's gym apparel founders with verified
-emails. Want me to keep pulling more from the same filters?"
+User clicks "+ verified emails":
 
-# Worked example B: schema discovered from the data
+You (next turn): `fullenrich_enrich_contacts` for the 10 rows (≤25
+per call), `rows_update` with the resulting emails, then text +
+suggest_replies for "+25 more rows" / "Pull all 100 founders" / etc.
+
+The shape: produce first, surface choices via chips, scale on click.
+Never gate the FIRST batch on a clarifying question.
+
+# Worked example B: schema discovered from the data (candidates pattern)
 
 User: "Get me posts from this guy on X: @shannholmberg"
 
@@ -334,14 +421,12 @@ You (one turn — fetch, set up schema from the fetched fields, commit):
    At, Likes, Retweets, Replies, URL.
 5. `candidates_to_rows` with column_map={id:'Post ID', text:'Text', ...},
    merge_key='Post ID'.
+6. Text: "Added 50 of @shannholmberg's posts to the table."
+7. `suggest_replies(kind="more_rows", ...)` for "+50 more posts" /
+   "Filter to only ones with > 100 likes" / etc.
 
-You (after): "Added 50 of @shannholmberg's posts to the table. Want
-more, sorted differently, or any filters?"
-
-The shape across both: clarify only when the answer changes the
-expensive fetch. Then in one turn — fetch, set up the schema, commit
-to the table. Don't pause at the candidate file; the user's intent was
-"data in my table" and that's where it lands.
+Shape: don't pause at the candidate file; the user's intent was
+"data in my table" and that's where it lands. Same turn.
 """
 
 
@@ -414,14 +499,25 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
         "description": (
             "Insert (or merge by `merge_key`) a small batch of rows. Each item is a dict "
             "of column-name → value. Values for columns that don't exist yet are stored "
-            "anyway; they become visible if you add the column later."
+            "anyway; they become visible if you add the column later. "
+            "OPTIONAL per-cell citations: include a special `_sources` key in an item "
+            "mapping column name → list of {type, value} source objects. These render "
+            "as clickable links on the cell. Use whenever a cell value came from "
+            "web_search or a known URL; skip for values you simply assumed."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "items": {
                     "type": "array",
-                    "items": {"type": "object"},
+                    "items": {
+                        "type": "object",
+                        "description": (
+                            "Row dict: column-name → value. Optional `_sources` key "
+                            "is a dict of {column_name: [{type: 'url'|'file'|'enrichment', "
+                            "value: string}]} used to attach citations per cell."
+                        ),
+                    },
                     "description": "List of row dicts to insert/merge.",
                 },
                 "merge_key": {
@@ -623,7 +719,60 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
     {
         "type": "web_search",
         "user_location": {"type": "approximate"},
-        "search_context_size": "medium",
+        "search_context_size": "low",
+    },
+    # Quick-reply chips attached to the model's text response. The user
+    # can click instead of typing. Calling this ENDS the turn — the
+    # streaming loop breaks after dispatching it (no follow-up round).
+    {
+        "type": "function",
+        "name": "suggest_replies",
+        "description": (
+            "Attach 2-5 quick-reply chips to your latest text response so "
+            "the user can click instead of typing. Use whenever you end a "
+            "turn with a question/proposal AND right after a successful "
+            "row insertion (use kind='more_rows' for scale-up chips). "
+            "DO NOT use for purely informational endings or when there's "
+            "no obvious next action. The conversation ends after this — "
+            "the user picks a chip or types their own reply.\n\n"
+            "Always emit your text response BEFORE this call (the chips "
+            "render below the message)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "suggestions": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 5,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": {
+                                "type": "string",
+                                "description": "Short button text (~25 chars, no quotes).",
+                            },
+                            "message": {
+                                "type": "string",
+                                "description": "Full message sent as the user's reply if clicked.",
+                            },
+                        },
+                        "required": ["label", "message"],
+                    },
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["choice", "more_rows"],
+                    "default": "choice",
+                    "description": (
+                        "'choice' = mutually-exclusive options (Yes/No/specific "
+                        "direction). 'more_rows' = '+N' scaling chips; the "
+                        "frontend additionally renders a custom number input."
+                    ),
+                },
+            },
+            "required": ["suggestions"],
+        },
     },
 ]
 
@@ -841,6 +990,9 @@ async def execute_tool(
             db, project, version, args, progress_cb=progress_cb
         )
         return applied, result, cost
+    if tool_name == "suggest_replies":
+        applied, result = _tool_suggest_replies(args)
+        return applied, result, 0.0
 
     if tool_name == "candidates_list":
         applied, result = _tool_candidates_list(project, args)
@@ -994,6 +1146,33 @@ async def _tool_candidates_to_rows(
     )
 
 
+def _tool_suggest_replies(args: Dict[str, Any]):
+    """Attach chips to the assistant's most recent text response.
+
+    No DB side effects — the suggestions are forwarded to the SSE stream
+    and persisted in applied_changes so they survive a history reload.
+    """
+    raw = args.get("suggestions") or []
+    items: List[Dict[str, str]] = []
+    for s in raw:
+        if not isinstance(s, dict):
+            continue
+        label = (s.get("label") or "").strip()
+        message = (s.get("message") or "").strip()
+        if not label or not message:
+            continue
+        items.append({"label": label[:60], "message": message[:500]})
+    if not items:
+        return {}, {"error": "no valid suggestions"}
+    kind = args.get("kind") or "choice"
+    if kind not in ("choice", "more_rows"):
+        kind = "choice"
+    return (
+        {"suggestions": {"kind": kind, "items": items}},
+        {"ok": True, "count": len(items)},
+    )
+
+
 async def _tool_rows_fill(
     db: Session,
     project: Project,
@@ -1142,6 +1321,16 @@ async def _tool_rows_add(
     for item in items:
         if not isinstance(item, dict):
             continue
+        # Pull the optional per-cell citations dict out of the item before
+        # we treat the rest as row data. Shape:
+        #   _sources = {ColumnName: [{type, value}, ...], ...}
+        item_sources = None
+        if isinstance(item.get("_sources"), dict):
+            item_sources = {
+                k: v for k, v in item["_sources"].items()
+                if isinstance(v, list) and v
+            }
+        item = {k: v for k, v in item.items() if k != "_sources"}
         merged_existing = False
         if merge_key:
             mv = item.get(merge_key)
@@ -1162,6 +1351,16 @@ async def _tool_rows_add(
                             if v is not None and (data.get(k) is None or data.get(k) == ""):
                                 data[k] = v
                         sample.row = data
+                        # Merge per-cell sources: existing tags win, new
+                        # sources fill in any cells that didn't have any.
+                        if item_sources:
+                            existing_tags = dict(sample.tags or {})
+                            existing_cell_sources = dict(existing_tags.get("sources") or {})
+                            for col_name, srcs in item_sources.items():
+                                if col_name not in existing_cell_sources:
+                                    existing_cell_sources[col_name] = srcs
+                            existing_tags["sources"] = existing_cell_sources
+                            sample.tags = existing_tags
                         merged += 1
                         merged_existing = True
                         if progress_cb is not None:
@@ -1181,7 +1380,7 @@ async def _tool_rows_add(
             version_id=version.id,
             seq=seq,
             row=dict(item),
-            tags={},
+            tags={"sources": item_sources} if item_sources else {},
         )
         db.add(sample)
         db.flush()
