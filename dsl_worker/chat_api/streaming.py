@@ -56,7 +56,7 @@ _OUTPUT_COST = 0.000015          # $15.00 / 1M tokens
 # Counted separately because usage.input/output tokens don't include it.
 _WEB_SEARCH_USD_PER_CALL = 0.025
 
-MAX_TOOL_ROUNDS = 5
+MAX_TOOL_ROUNDS = 12
 
 
 def _response_cost_usd(response) -> float:
@@ -710,6 +710,50 @@ async def stream_chat_response(
             log.exception("OpenAI streaming error")
             yield _sse({"type": "error", "message": f"AI service error: {str(e)}"})
             return
+
+        # Forced text wrap-up if we exited the tool loop with no text. Hits
+        # when the agent burned all rounds on tools and never produced a
+        # final reply (e.g. round cap reached). Without this we save an
+        # empty assistant message — visually "nothing happened" to the user
+        # even though tools ran. One non-streaming call with tool_choice=
+        # "none" forces a short summary.
+        if (
+            not stopped
+            and previous_response_id
+            and len(tool_log) > 0
+            and not full_content.strip()
+        ):
+            try:
+                wrap = await client.responses.create(
+                    model=settings.OPENAI_MODEL,
+                    instructions=agent.SYSTEM_PROMPT,
+                    input=[{
+                        "role": "user",
+                        "content": (
+                            "(System note — not from the user.) You ran tools "
+                            "but produced no text reply, and the tool-round "
+                            "cap stopped the loop. Look at the project state "
+                            "in the prior context and write ONE short reply "
+                            "summarizing what you did this turn AND, if rows "
+                            "did not actually land in the table, finish the "
+                            "job: add columns + commit candidates_to_rows "
+                            "before replying. The user is staring at the "
+                            "table waiting."
+                        ),
+                    }],
+                    previous_response_id=previous_response_id,
+                    max_output_tokens=600,
+                )
+                total_cost += _response_cost_usd(wrap)
+                for item in wrap.output:
+                    if item.type == "message":
+                        for block in item.content:
+                            text = getattr(block, "text", None)
+                            if text:
+                                full_content += text
+                                yield _sse({"type": "token", "content": text})
+            except Exception:
+                log.exception("forced-text wrap-up failed")
 
         # Auto-name on first message
         if is_first_message and not stopped:
