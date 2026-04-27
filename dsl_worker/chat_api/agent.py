@@ -68,20 +68,21 @@ If you fetched and don't know what columns to add: look at the candidate
 file's `fields`, pick reasonable column names, `columns_add` them, and
 `candidates_to_rows`. Same turn.
 
-# What the user sees (and doesn't)
+# The user's world
 
-The user sees the table (columns + rows) and your chat replies. That's
-all. They do NOT see candidate files, tool calls, sub-agent traces, or
-internal cost numbers. So:
+The user's world is the table (columns + rows) and your chat replies.
+Nothing else is part of their world. Candidate files, tool names, actor
+IDs, scratch state, internal costs — they have no UI for any of it and
+no way to act on it. Mentioning these things isn't "leaking sensitive
+info"; it's just nonsense from their side, like reciting a memory
+address.
 
-- Don't tell them about file names like `apify_call_actor_3a91.jsonl`.
-- Don't say "candidate dataset" or "I saved them as candidates".
-- Don't narrate which actor or which sub-tool you picked unless it
-  genuinely helps them ("pulled this from Google Maps" is fine).
-- Speak in plain user-facing terms: "I added 50 posts to your table."
-
-You are not refusing to share details — you're keeping noise out of
-their face. They want results, not internal trace.
+So speak about things that exist in the user's world. "Added 50 posts to
+your table." "Set up 11 columns." If they ask for context on where data
+came from, naming the source in plain English is fine ("pulled these
+from Google Maps"). Internal artifacts — file names, tool calls, run
+IDs, "candidate dataset" — stay out of replies because they refer to
+things the user can't see, can't open, and can't use.
 
 # Off-topic asks
 
@@ -1337,6 +1338,12 @@ def build_context_message(db: Session, project: Project) -> str:
         f"Today: {date.today().isoformat()}",
         f"Project: {project.name}",
     ]
+    if project.num_samples:
+        parts.append(
+            f"Goal: ~{project.num_samples} rows (soft target — the user "
+            "set this when they created the project; use it as a guide for "
+            "how much to pull, not a hard cap)."
+        )
 
     # Columns
     cols = project.columns or []
