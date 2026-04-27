@@ -534,6 +534,13 @@ async def stream_chat_response(
                         ev = dict(ev)
                         ev.setdefault("tool_call_id", item.call_id)
                         await progress_q.put(ev)
+                        # Hand control back to the event loop so the SSE
+                        # drain coroutine actually runs between emits.
+                        # Without this, an unbounded asyncio.Queue.put never
+                        # yields, and tight emit loops (e.g. rows_add over
+                        # N items) starve the streaming generator — all
+                        # events arrive in a single burst at tool end.
+                        await asyncio.sleep(0)
 
                     with tracing.start_span(
                         f"tool.{item.name}",
