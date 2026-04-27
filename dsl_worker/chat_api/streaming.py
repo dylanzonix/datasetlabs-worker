@@ -879,33 +879,36 @@ async def stream_chat_response(
         # when the agent burned all rounds on tools and never produced a
         # final reply (e.g. round cap reached). Without this we save an
         # empty assistant message — visually "nothing happened" to the user
-        # even though tools ran. One non-streaming call with tool_choice=
-        # "none" forces a short summary.
+        # even though tools ran. One non-streaming call replays the full
+        # input and forces a short summary.
+        # NOTE: we don't use previous_response_id here — Azure's saved
+        # state can drop after long rounds, causing HTTP 400 "No tool
+        # call found for function call output". Pass running_input
+        # (the replayed conversation) directly instead.
         if (
             not stopped
-            and previous_response_id
             and len(tool_log) > 0
             and not full_content.strip()
         ):
             try:
+                wrap_input = list(running_input) + [{
+                    "role": "user",
+                    "content": (
+                        "(System note — not from the user.) You ran tools "
+                        "but produced no text reply, and the tool-round "
+                        "cap stopped the loop. Look at the project state "
+                        "in the prior context and write ONE short reply "
+                        "summarizing what you did this turn AND, if rows "
+                        "did not actually land in the table, finish the "
+                        "job: add columns + commit candidates_to_rows "
+                        "before replying. The user is staring at the "
+                        "table waiting."
+                    ),
+                }]
                 wrap = await client.responses.create(
                     model=settings.OPENAI_MODEL,
                     instructions=agent.SYSTEM_PROMPT,
-                    input=[{
-                        "role": "user",
-                        "content": (
-                            "(System note — not from the user.) You ran tools "
-                            "but produced no text reply, and the tool-round "
-                            "cap stopped the loop. Look at the project state "
-                            "in the prior context and write ONE short reply "
-                            "summarizing what you did this turn AND, if rows "
-                            "did not actually land in the table, finish the "
-                            "job: add columns + commit candidates_to_rows "
-                            "before replying. The user is staring at the "
-                            "table waiting."
-                        ),
-                    }],
-                    previous_response_id=previous_response_id,
+                    input=wrap_input,
                     max_output_tokens=600,
                 )
                 total_cost += _response_cost_usd(wrap)
