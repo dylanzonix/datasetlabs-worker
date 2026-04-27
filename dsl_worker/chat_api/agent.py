@@ -241,22 +241,36 @@ data-movement ones.
   files. Stdlib + httpx + json + re. No DB access; print to stdout, then
   use `candidates_to_rows` or `rows_add`.
 - **web_harvest(query, candidate_description)** — last-resort research
-  subagent that uses web_search + yields candidates. Use ONLY when
-  there's no Apify actor for the target site and no structured source
-  matches. Slower and pricier than direct APIs.
-- **browser_use(task)** — last-resort cloud browser session. ONLY for ONE
-  URL + ONE extraction task when Apify has no actor AND the page needs
-  JS rendering / anti-bot / interactive flow. Slow (30-180s),
-  $0.10-0.50/call.
+  subagent that uses web_search + yields candidates. Slower and pricier
+  than direct APIs. See escalation rules below.
+- **browser_use(task)** — last-resort cloud browser session. Slow
+  (30–180s) and $0.10–$0.50/call. Nuclear option. See escalation rules.
 
-# Strict rule of thumb for picking a source
+# Picking a source (and stopping when one works)
+
+Order to try, top down:
 
 1. People / companies on LinkedIn-like data → `fullenrich_*`
-2. Specific named site (Reddit, Upwork, Zillow, etc.) → `apify_*`
-3. Local biz / orgs / non-LI → `google_maps_*`
-4. Job listings → `apollo_*` (or Apify)
-5. No structured source fits → `web_harvest`
-6. JS-heavy / anti-bot / Apify-doesn't-cover → `browser_use`
+2. Specific named site (Reddit, Upwork, Zillow, X/Twitter, etc.) →
+   `apify_search_actors` → `apify_actor_details` → `apify_call_actor`
+3. Local biz / orgs / non-LinkedIn targets → `google_maps_*`
+4. Companies for filters FE doesn't support → `apollo_*`
+
+**Stop the moment one returns useful data.** If `apify_call_actor`
+finishes with `status: SUCCEEDED` and `items_count > 0`, you are DONE
+sourcing — go straight to columns + `candidates_to_rows`. Do not try a
+second Apify actor "to be thorough." Do not fall back to web_harvest or
+browser_use to "verify" or "supplement." Trust the first working source.
+
+`web_harvest` and `browser_use` are escalations of last resort, only
+used when:
+- The chosen Apify actor returned 0 items, OR
+- `apify_search_actors` found no actor for the site, OR
+- The user explicitly asked for a manual / browser-driven path
+
+When in doubt, stay with the cheaper structured tool. Re-trying with
+different args on the same tool is fine; cascading to a more expensive
+tool when the cheap one already worked is not.
 
 # Output style
 
