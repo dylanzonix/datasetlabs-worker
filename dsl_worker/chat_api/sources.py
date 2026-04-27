@@ -24,7 +24,7 @@ from dsl_worker.infra.apify_client import ApifyClient
 from dsl_worker.infra.google_maps_client import GoogleMapsClient
 from dsl_worker.agents.integrations.apollo import _simplify_person, _simplify_company, _select_companies
 from sandbox_service import SandboxClient
-from openai import AsyncAzureOpenAI
+from openai import AsyncOpenAI
 
 from dsl_api.config import settings as _api_settings
 
@@ -752,17 +752,13 @@ def _response_cost(resp: Any) -> float:
     return non_cached * _LLM_INPUT_USD + cached * _LLM_CACHED_INPUT_USD + outp * _LLM_OUTPUT_USD
 
 
-_subagent_client: Optional[AsyncAzureOpenAI] = None
+_subagent_client: Optional[AsyncOpenAI] = None
 
 
-def _get_subagent_client() -> AsyncAzureOpenAI:
+def _get_subagent_client() -> AsyncOpenAI:
     global _subagent_client
     if _subagent_client is None:
-        _subagent_client = AsyncAzureOpenAI(
-            api_key=_api_settings.AZURE_OPENAI_API_KEY,
-            azure_endpoint=_api_settings.AZURE_OPENAI_ENDPOINT,
-            api_version=_api_settings.AZURE_OPENAI_API_VERSION,
-        )
+        _subagent_client = AsyncOpenAI(api_key=_api_settings.OPENAI_API_KEY)
     return _subagent_client
 
 

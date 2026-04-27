@@ -20,7 +20,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 from uuid import UUID
 
 from fastapi import Request
-from openai import AsyncAzureOpenAI
+from openai import AsyncOpenAI
 from sqlalchemy.orm import Session
 
 from dsl_api.config import settings
@@ -34,17 +34,13 @@ log = logging.getLogger(__name__)
 
 
 # ---- OpenAI client (singleton) -------------------------------------------
-_client: Optional[AsyncAzureOpenAI] = None
+_client: Optional[AsyncOpenAI] = None
 
 
-def get_openai_client() -> AsyncAzureOpenAI:
+def get_openai_client() -> AsyncOpenAI:
     global _client
     if _client is None:
-        _client = AsyncAzureOpenAI(
-            api_key=settings.AZURE_OPENAI_API_KEY,
-            azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
-            api_version=settings.AZURE_OPENAI_API_VERSION,
-        )
+        _client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
     return _client
 
 
@@ -274,7 +270,7 @@ def _summarize_result(name: str, result_text: str) -> str:
 
 # ---- Auto-name on first message ------------------------------------------
 async def _auto_name_project(
-    client: AsyncAzureOpenAI, project: Project, user_message: str
+    client: AsyncOpenAI, project: Project, user_message: str
 ) -> float:
     if project.name != "New Dataset":
         return 0.0

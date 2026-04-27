@@ -19,8 +19,8 @@ load_dotenv(".env")
 
 # Silence noisy Pydantic discriminated-union warnings emitted by the OpenAI
 # SDK when serializing Response objects that contain `web_search_call`
-# items — the SDK's union variants don't perfectly match what Azure OpenAI
-# returns (e.g. action `find_in_page` arrives as `ActionSearch`-shaped
+# items — the SDK's union variants don't always match the live response
+# shape (e.g. action `find_in_page` arriving as `ActionSearch`-shaped
 # data), so pydantic warns once per non-matching variant on every response.
 # Suppressing keeps the request log readable; the responses themselves work.
 warnings.filterwarnings(

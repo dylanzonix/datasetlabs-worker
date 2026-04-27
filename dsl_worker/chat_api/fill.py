@@ -191,14 +191,10 @@ async def _run_cell_agent(
     max_turns: int,
 ) -> CellFillResult:
     """Spawn the bounded subagent for one row and return its CellFillResult."""
-    from openai import AsyncAzureOpenAI
+    from openai import AsyncOpenAI
 
     result = CellFillResult(row_id=row_id)
-    client = AsyncAzureOpenAI(
-        api_key=_api_settings.AZURE_OPENAI_API_KEY,
-        azure_endpoint=_api_settings.AZURE_OPENAI_ENDPOINT,
-        api_version=_api_settings.AZURE_OPENAI_API_VERSION,
-    )
+    client = AsyncOpenAI(api_key=_api_settings.OPENAI_API_KEY)
 
     user_msg = _row_context(row_data, target_columns, target_specs)
     cell_tools = _cell_tools_for_columns(target_columns)
