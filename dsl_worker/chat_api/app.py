@@ -10,11 +10,24 @@ from __future__ import annotations
 
 import logging
 import os
+import warnings
 
 from dotenv import load_dotenv
 
 # Load .env before importing anything that reads settings (dsl_api.config).
 load_dotenv(".env")
+
+# Silence noisy Pydantic discriminated-union warnings emitted by the OpenAI
+# SDK when serializing Response objects that contain `web_search_call`
+# items — the SDK's union variants don't perfectly match what Azure OpenAI
+# returns (e.g. action `find_in_page` arrives as `ActionSearch`-shaped
+# data), so pydantic warns once per non-matching variant on every response.
+# Suppressing keeps the request log readable; the responses themselves work.
+warnings.filterwarnings(
+    "ignore",
+    message=r"^Pydantic serializer warnings:",
+    category=UserWarning,
+)
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

@@ -90,9 +90,14 @@ def _charge_credits(db: Session, user_id, cost_usd: float, project_id=None) -> N
 # ---- Citation stripping (web_search marker cleanup) ----------------------
 # Two formats observed from OpenAI's web_search built-in:
 #   1. Bracketed:  【4:0†source title】
-#   2. Bare token: citeturn1search14turn8view2turn3search21
-# Both leak into output_text.delta and need to be removed before display
-# AND before persistence (DB content is the source of truth on refresh).
+#   2. Bare token: citeturn1search14turn8view2
+# OpenAI wraps the bare form in Private Use Area Unicode chars (U+E000-
+# U+F8FF) which render as garbage glyphs ("chinese symbols") in most fonts
+# AND prevent the bare regex from matching, since `cite` and `turn\d+...`
+# are separated by ``. We strip all PUA chars first so the bare
+# regex collapses to the visible `citeturnXsearchY` form, then strip both
+# forms. PUA has no legitimate use in chat output, so global strip is safe.
+_PUA_RE = re.compile(r'[-]')
 # Bracketed: 【4:0†source title】
 _BRACKETED_RE = re.compile(r'【[^】]*?†[^】]*?】')
 # Bare: citeturn0search24turn3view7... — anchor on the unmistakable
@@ -103,6 +108,7 @@ _BARE_CITE_RE = re.compile(r'citeturn\d+(?:[a-z]+\d+)*')
 
 
 def _clean_citations(text: str) -> str:
+    text = _PUA_RE.sub('', text)
     return _BARE_CITE_RE.sub('', _BRACKETED_RE.sub('', text))
 
 
@@ -122,6 +128,11 @@ class _CitationStripper:
         self._buf = ""
 
     def feed(self, token: str) -> str:
+        # Strip OpenAI's PUA control chars on entry so the bare regex can
+        # match `citeturn\d...`. Without this, ``cite``turn0search8`` ends up
+        # at the "treat as ordinary text" fallthrough below and `cite` leaks
+        # through followed by the rendered-glyph PUA chars.
+        token = _PUA_RE.sub('', token)
         self._buf += token
         out = ""
         while True:
