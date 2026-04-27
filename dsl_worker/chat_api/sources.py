@@ -470,17 +470,13 @@ async def _apify_call_actor(args: Dict[str, Any]) -> Tuple[str, float]:
     try:
         run_info = await client.run_actor(
             actor_id=actor_id,
-            actor_input=actor_input,
-            timeout_secs=timeout_secs,
+            run_input=actor_input,
+            timeout=timeout_secs,
+            max_items=max_results,
         )
         if not run_info or run_info.get("status") != "SUCCEEDED":
             return json.dumps({"ok": False, "run_info": run_info}, default=str), 0.0
-        dataset_id = run_info.get("defaultDatasetId")
-        items = (
-            await client.get_dataset_items(dataset_id, limit=max_results)
-            if dataset_id
-            else []
-        )
+        items = run_info.get("items", []) or []
     except Exception as e:
         return json.dumps({"error": f"{type(e).__name__}: {e}"}), 0.0
     # Apify run cost is in run_info.usage / charges — surface to the agent
