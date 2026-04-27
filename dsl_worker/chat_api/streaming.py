@@ -377,6 +377,20 @@ async def stream_chat_response(
         tool_log: List[Dict[str, Any]] = []
         # Map call_id -> index in tool_log so we can update on tool_result
         tool_log_index: Dict[str, int] = {}
+        # Web search citations the agent used. Stripped from the displayed
+        # text and rendered separately as a sources list. Deduped by URL.
+        sources: List[Dict[str, Any]] = []
+        sources_by_url: Dict[str, int] = {}
+
+        def _record_source(url: Optional[str], title: Optional[str]) -> Optional[Dict[str, Any]]:
+            if not url:
+                return None
+            if url in sources_by_url:
+                return None
+            entry = {"n": len(sources) + 1, "url": url, "title": title or url}
+            sources.append(entry)
+            sources_by_url[url] = entry["n"]
+            return entry
 
         try:
             previous_response_id = None
@@ -425,6 +439,24 @@ async def stream_chat_response(
                                     yield _sse({"type": "thinking", "content": delta})
                                     await asyncio.sleep(0)
 
+                            elif event_type == "response.output_text.annotation.added":
+                                ann = getattr(event, "annotation", None)
+                                if ann is not None:
+                                    a_type = getattr(ann, "type", None) or (
+                                        ann.get("type") if isinstance(ann, dict) else None
+                                    )
+                                    if a_type == "url_citation":
+                                        url = getattr(ann, "url", None) or (
+                                            ann.get("url") if isinstance(ann, dict) else None
+                                        )
+                                        title = getattr(ann, "title", None) or (
+                                            ann.get("title") if isinstance(ann, dict) else None
+                                        )
+                                        added = _record_source(url, title)
+                                        if added is not None:
+                                            yield _sse({"type": "source_added", **added})
+                                            await asyncio.sleep(0)
+
                             elif event_type == "response.output_text.delta":
                                 if not got_output_this_round:
                                     got_output_this_round = True
@@ -448,6 +480,30 @@ async def stream_chat_response(
                                         await asyncio.sleep(0)
 
                         final_response = await stream.get_final_response()
+
+                    # Fallback: walk the final response for any url_citation
+                    # annotations the streaming event missed (depends on SDK
+                    # / model version). De-duped by URL via _record_source.
+                    for out_item in getattr(final_response, "output", []) or []:
+                        content = getattr(out_item, "content", None) or []
+                        for block in content:
+                            anns = getattr(block, "annotations", None) or []
+                            for ann in anns:
+                                a_type = getattr(ann, "type", None) or (
+                                    ann.get("type") if isinstance(ann, dict) else None
+                                )
+                                if a_type != "url_citation":
+                                    continue
+                                url = getattr(ann, "url", None) or (
+                                    ann.get("url") if isinstance(ann, dict) else None
+                                )
+                                title = getattr(ann, "title", None) or (
+                                    ann.get("title") if isinstance(ann, dict) else None
+                                )
+                                added = _record_source(url, title)
+                                if added is not None:
+                                    yield _sse({"type": "source_added", **added})
+                                    await asyncio.sleep(0)
 
                     usage = getattr(final_response, "usage", None)
                     usage_dict: Dict[str, Any] = {}
@@ -650,6 +706,8 @@ async def stream_chat_response(
             ac_data["tool_log"] = tool_log
         if total_cost > 0:
             ac_data["total_cost_usd"] = round(total_cost, 4)
+        if sources:
+            ac_data["sources"] = sources
 
         assistant_msg = ChatMessage(
             project_id=project_id,
@@ -683,6 +741,8 @@ async def stream_chat_response(
             done_event["thinking_duration"] = round(thinking_total, 1)
         if stopped:
             done_event["stopped"] = True
+        if sources:
+            done_event["sources"] = sources
         yield _sse(done_event)
 
     except Exception as e:
