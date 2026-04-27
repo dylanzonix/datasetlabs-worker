@@ -734,7 +734,8 @@ _LLM_INPUT_USD = 0.0000025
 _LLM_CACHED_INPUT_USD = 0.00000025
 _LLM_OUTPUT_USD = 0.000015
 # Cost per OpenAI built-in web_search call (rough; updates over time).
-_WEB_SEARCH_USD_PER_CALL = 0.005
+# Mirrors streaming._WEB_SEARCH_USD_PER_CALL — keep in sync.
+_WEB_SEARCH_USD_PER_CALL = 0.025
 
 
 def _response_cost(resp: Any) -> float:

@@ -52,6 +52,9 @@ def get_openai_client() -> AsyncAzureOpenAI:
 _INPUT_COST = 0.0000025          # $2.50 / 1M tokens
 _CACHED_INPUT_COST = 0.00000025  # $0.25 / 1M tokens
 _OUTPUT_COST = 0.000015          # $15.00 / 1M tokens
+# OpenAI bills built-in web_search at ~$25 / 1K calls (varies by tier).
+# Counted separately because usage.input/output tokens don't include it.
+_WEB_SEARCH_USD_PER_CALL = 0.025
 
 MAX_TOOL_ROUNDS = 5
 
@@ -541,6 +544,16 @@ async def stream_chat_response(
                     yield _sse({"type": "token", "content": remaining})
 
                 total_cost += _response_cost_usd(final_response)
+
+                # Bill built-in web_search calls separately — they're not
+                # included in usage.input/output_tokens, only as
+                # web_search_call items in response.output.
+                web_search_count = sum(
+                    1 for item in final_response.output
+                    if item.type == "web_search_call"
+                )
+                if web_search_count:
+                    total_cost += web_search_count * _WEB_SEARCH_USD_PER_CALL
 
                 if not got_output_this_round:
                     thinking_total += time.time() - round_thinking_start
