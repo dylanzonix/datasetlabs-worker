@@ -41,12 +41,28 @@ log = logging.getLogger(__name__)
 # Concurrent cell agents. Same default as V13 row-gens.
 _CELL_CONCURRENCY = 5
 
-# Per-cell defaults. The first prod test (a16z Speedrun founders → Twitter
-# handles via web research) hit the $0.10 cap on 4/5 cells before finding a
-# match — bumping up so the agent has enough room to do a couple of web
-# searches per cell.
-_DEFAULT_MAX_COST = 0.20
-_DEFAULT_MAX_TURNS = 7
+# Per-cell budget tiers, keyed off the user's effort selection in the chat
+# input. The cell agent stops calling tools once cost_usd >= max_cost, so
+# this is purely a safety cap — most cells finish well under it.
+#
+# fast: cheap lookups (existing-fields-derive, one quick web_search)
+# balanced: typical, room for ~10 web_searches OR one Apollo enrichment
+# highest: covers FE phones (~$0.55) and other expensive single calls
+_TIER_MAX_COST = {
+    "auto": 0.30,
+    "fast": 0.10,
+    "balanced": 0.30,
+    "highest": 1.00,
+}
+
+# Hard ceiling on per-cell turns regardless of cost. The cost cap usually
+# fires first; this just prevents pathological infinite loops.
+_HARD_TURN_LIMIT = 10
+
+
+def tier_default_max_cost(effort: Optional[str]) -> float:
+    """Resolve the per-cell budget from the user's effort tier."""
+    return _TIER_MAX_COST.get(effort or "balanced", _TIER_MAX_COST["balanced"])
 
 # Subset of the chat-mode tool surface that the cell agent gets. All the
 # row/column management tools are excluded — a cell agent should NOT
@@ -86,6 +102,19 @@ Process:
    Apify for site-specific scraping, Google Maps for local biz, web
    research only as a last resort.)
 4. Once you have the value(s), call set_values to commit and stop.
+
+Helpful defaults for common cases:
+- **Person → Twitter/X handle.** Try the formal name first; if no
+  confident match, try common nickname variants (Andrew→Andy,
+  Robert→Rob/Bob, William→Will/Bill, Michael→Mike). Verify a candidate
+  by checking that the bio mentions the person's company or another
+  side fact from the row — don't commit a name match alone.
+- **Person → email/phone via FullEnrich.** Default to emails only;
+  include phones only if the column or user explicitly asks for them
+  (phones cost ~10× more than emails).
+- **Verifying a match.** When you find a candidate, glance at one
+  side-fact (company, role, location) to confirm before set_values.
+  A confident null beats a wrong value.
 
 Critical rules:
 - Real data only. If you can't find a real answer, call set_values with
@@ -188,7 +217,6 @@ async def _run_cell_agent(
     target_columns: List[str],
     target_specs: Dict[str, Dict[str, str]],
     max_cost: float,
-    max_turns: int,
 ) -> CellFillResult:
     """Spawn the bounded subagent for one row and return its CellFillResult."""
     from openai import AsyncOpenAI
@@ -201,7 +229,7 @@ async def _run_cell_agent(
     next_input: Any = [{"role": "user", "content": user_msg}]
     previous_response_id: Optional[str] = None
 
-    for turn_idx in range(max_turns):
+    for turn_idx in range(_HARD_TURN_LIMIT):
         result.turns = turn_idx + 1
 
         if result.cost_usd >= max_cost:
@@ -298,7 +326,7 @@ async def _run_cell_agent(
     if result.status == "filled":
         return result  # was set in the last turn
     result.status = "budget_exhausted"
-    result.reason = result.reason or f"reached max_turns={max_turns} without calling set_values"
+    result.reason = result.reason or f"reached turn ceiling without calling set_values"
     return result
 
 
@@ -309,8 +337,7 @@ async def fill_rows(
     where_sql: str,
     where_params: Dict[str, Any],
     limit: Optional[int],
-    max_cost: float = _DEFAULT_MAX_COST,
-    max_turns: int = _DEFAULT_MAX_TURNS,
+    max_cost: float = 0.30,
     concurrency: int = _CELL_CONCURRENCY,
     progress_cb: Optional[ProgressCallback] = None,
 ) -> Tuple[Dict[str, Any], float]:
@@ -391,7 +418,6 @@ async def fill_rows(
                 target_columns=target_columns,
                 target_specs=target_specs,
                 max_cost=max_cost,
-                max_turns=max_turns,
             )
             # Persist this cell's values immediately so:
             #  (a) the table updates live as cells fill, not in one

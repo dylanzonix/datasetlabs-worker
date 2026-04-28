@@ -987,6 +987,7 @@ async def stream_chat_response(
                             agent.execute_tool(
                                 db, project, item.name, args,
                                 progress_cb=_on_progress,
+                                effort=effective_effort,
                             )
                         )
 

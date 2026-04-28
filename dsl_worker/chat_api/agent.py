@@ -791,13 +791,13 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
         "name": "rows_fill",
         "description": (
             "Per-cell research+fill. For each row matching `where`, spawn a "
-            "small bounded subagent that uses the source tools (FE / Apollo "
-            "/ Apify / Google Maps / web_harvest / browser_use) to research "
-            "the listed columns and commit values. Each cell agent has a "
-            "tight budget cap and turn limit; up to 5 cells run in parallel. "
-            "Use this for 'fill emails for these rows', 'find LinkedIn URL "
-            "for each', etc. Always start with a small `limit` (5-10 rows) "
-            "to validate before running on the rest."
+            "small bounded subagent with access to the source tools (FE / "
+            "Apollo / Apify / Google Maps / web_harvest / browser_use / "
+            "web_search). Up to 5 cells run in parallel. Use this for "
+            "'fill emails for these rows', 'find LinkedIn URL for each', "
+            "etc. Default budget is set by the user's effort tier; you "
+            "can override `max_cost` when the work is known-expensive "
+            "(e.g. FullEnrich phones at ~$0.55/cell)."
         ),
         "parameters": {
             "type": "object",
@@ -814,9 +814,8 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
                         "{<column>: null} to target unfilled cells only."
                     ),
                 },
-                "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Max rows to fill in this call (default 20)."},
-                "max_cost": {"type": "number", "description": "Per-cell budget cap in USD (default 0.10)."},
-                "max_turns": {"type": "integer", "minimum": 1, "maximum": 10, "description": "Per-cell turn cap (default 5)."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Max rows to fill in this call. Omit to process all matching rows."},
+                "max_cost": {"type": "number", "description": "Per-cell budget cap in USD (safety net). Defaults from effort tier: fast ~$0.10, balanced ~$0.30, highest ~$1.00."},
             },
             "required": ["columns"],
         },
@@ -1219,6 +1218,7 @@ async def execute_tool(
     tool_name: str,
     args: Dict[str, Any],
     progress_cb: Optional[fill.ProgressCallback] = None,
+    effort: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], float]:
     """Run one tool. Returns (applied, result, cost_usd).
 
@@ -1283,7 +1283,9 @@ async def execute_tool(
         return applied, result, 0.0
     if tool_name == "rows_fill":
         applied, result, cost = await _tool_rows_fill(
-            db, project, version, args, progress_cb=progress_cb
+            db, project, version, args,
+            progress_cb=progress_cb,
+            effort=effort,
         )
         return applied, result, cost
     if tool_name == "suggest_replies":
@@ -1610,6 +1612,7 @@ async def _tool_rows_fill(
     version: ProjectVersion,
     args: Dict[str, Any],
     progress_cb: Optional[fill.ProgressCallback] = None,
+    effort: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], float]:
     columns = args.get("columns") or []
     if not isinstance(columns, list) or not columns:
@@ -1619,8 +1622,15 @@ async def _tool_rows_fill(
     limit = args.get("limit", 20)
     if limit is not None:
         limit = min(int(limit), 200)
-    max_cost = float(args.get("max_cost", 0.10))
-    max_turns = int(args.get("max_turns", 5))
+
+    # Per-cell budget. Defaults derive from the user-selected effort tier
+    # (no `max_cost` arg → fall back to tier default); the agent can still
+    # override explicitly when it knows the column is expensive (e.g.
+    # FullEnrich phones at ~$0.55).
+    if "max_cost" in args and args["max_cost"] is not None:
+        max_cost = float(args["max_cost"])
+    else:
+        max_cost = fill.tier_default_max_cost(effort)
 
     where_sql, where_params = _where_to_sql(where)
 
@@ -1639,7 +1649,6 @@ async def _tool_rows_fill(
         where_params=where_params,
         limit=limit,
         max_cost=max_cost,
-        max_turns=max_turns,
         progress_cb=progress_cb,
     )
     applied = {"rows_filled": summary.get("cells_filled", 0)}
