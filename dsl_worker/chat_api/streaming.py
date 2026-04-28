@@ -344,12 +344,46 @@ def _resolve_reasoning_effort(user_content: str) -> str:
     return "medium"
 
 
+# Frontend-tier (auto/fast/balanced/highest) → OpenAI reasoning_effort.
+# `auto` falls back to the dynamic per-message resolver above so the
+# default behavior is unchanged when the user hasn't picked a tier.
+_EFFORT_TO_REASONING = {
+    "fast": "low",
+    "balanced": "medium",
+    "highest": "high",
+}
+
+# Per-tier hint appended to the system context message so the agent
+# scales research breadth alongside the reasoning_effort. The numbers
+# are advisory — the agent already knows how to scope; this just sets
+# the dial. `auto` gets no hint (agent uses its own judgment).
+_EFFORT_HINT = {
+    "fast": (
+        "Effort: fast. Minimize research and tool depth: cap web_search "
+        "at 1-2 calls, prefer the cheapest source that fits, return a "
+        "small starter batch quickly. Skip optional verification."
+    ),
+    "balanced": (
+        "Effort: balanced. Normal research depth: ~3 web_searches max "
+        "before committing rows; use direct API sources when they fit; "
+        "reasonable batch size."
+    ),
+    "highest": (
+        "Effort: highest. The user wants thoroughness. Cast a wider net "
+        "(more searches/sources OK), pull a larger batch, double-check "
+        "ambiguous fields, but still commit rows promptly — don't "
+        "research forever."
+    ),
+}
+
+
 # ---- Main streaming generator --------------------------------------------
 async def stream_chat_response(
     project_id: UUID,
     user_id: UUID,
     user_content: str,
     request: Request,
+    effort: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
     """Run one send-message turn and stream SSE events.
 
@@ -417,8 +451,37 @@ async def stream_chat_response(
             "message_id": str(user_msg.id),
         })
 
+        # Server-side gate: free-tier users can't pick "highest" even if
+        # the client sends it (tampered request, lapsed paid plan still
+        # in localStorage). Silently downgrade to balanced; the UI also
+        # disables the option client-side.
+        effective_effort = effort
+        if effective_effort == "highest":
+            from dsl_api.models.subscription import Subscription
+            sub = (
+                db.query(Subscription)
+                .filter(Subscription.user_id == user_id)
+                .order_by(Subscription.created_at.desc())
+                .first()
+            )
+            is_paid = (
+                sub is not None
+                and sub.plan != "free"
+                and sub.status in ("active", "past_due")
+            )
+            if not is_paid:
+                effective_effort = "balanced"
+
+        # Append the effort-tier hint to the per-turn context message so
+        # the agent scales research breadth to match the user's pick. auto
+        # / unset → no hint (preserves the existing dynamic behavior).
+        context_msg = agent.build_context_message(db, project)
+        effort_hint = _EFFORT_HINT.get(effective_effort or "")
+        if effort_hint:
+            context_msg = f"{context_msg}\n\n{effort_hint}"
+
         input_items: List[Dict[str, str]] = [
-            {"role": "system", "content": agent.build_context_message(db, project)}
+            {"role": "system", "content": context_msg}
         ]
         input_items.extend(history)
         input_items.append({"role": "user", "content": user_content})
@@ -455,10 +518,13 @@ async def stream_chat_response(
             # "No tool call found for function call output" when the prior
             # response state is dropped/incomplete after long round 0 runs).
             running_input: List[Dict[str, Any]] = list(input_items)
-            # Reasoning effort scales with the user's message — default low
-            # for snap turns, escalates to medium/high when the user asks
-            # for deeper thinking or signals dissatisfaction.
-            _effort = _resolve_reasoning_effort(user_content)
+            # User-picked tier maps directly to OpenAI reasoning_effort.
+            # auto / unset → fall back to the per-message dynamic
+            # resolver (today: returns "medium" but kept as a hook for
+            # future signal-based escalation). effective_effort was
+            # already decided above (after the free-tier gate).
+            _effort = _EFFORT_TO_REASONING.get(effective_effort or "") \
+                or _resolve_reasoning_effort(user_content)
             stripper = _CitationStripper()
             # Track web_search_call items we've already surfaced as synthetic
             # tool calls, so we don't double-emit on retry/replay.
