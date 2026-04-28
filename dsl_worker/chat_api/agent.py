@@ -1238,6 +1238,14 @@ async def _tool_rows_fill(
 
     where_sql, where_params = _where_to_sql(where)
 
+    # Commit the main session before fill_rows opens its own SessionLocal.
+    # Otherwise rows just inserted by rows_add / candidates_to_rows in the
+    # same turn aren't visible to the new session and the query returns
+    # matched_rows=0 even though the rows exist (in the uncommitted main
+    # transaction). Targeted commit here only — committing per-tool in
+    # streaming.py caused event-loop stalls.
+    db.commit()
+
     summary, total_cost = await fill.fill_rows(
         project=project,
         target_columns=columns,
