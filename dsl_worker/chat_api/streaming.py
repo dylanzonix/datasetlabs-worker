@@ -101,11 +101,20 @@ _BRACKETED_RE = re.compile(r'【[^】]*?†[^】]*?】')
 # `citeturning` or other false positives. Requires at least one digit-ended
 # segment to avoid swallowing trailing prose.
 _BARE_CITE_RE = re.compile(r'citeturn\d+(?:[a-z]+\d+)*')
+# After the bracketed-pair regex strips well-formed citations, any
+# remaining lone 【 or 】 is an artifact of an incomplete citation
+# (e.g. the model emitted only the closing 】 at end-of-stream). No
+# legitimate user-facing prose contains these glyphs, so global strip
+# is safe.
+_LONELY_BRACKET_RE = re.compile(r'[【】]')
 
 
 def _clean_citations(text: str) -> str:
     text = _PUA_RE.sub('', text)
-    return _BARE_CITE_RE.sub('', _BRACKETED_RE.sub('', text))
+    text = _BRACKETED_RE.sub('', text)
+    text = _BARE_CITE_RE.sub('', text)
+    text = _LONELY_BRACKET_RE.sub('', text)
+    return text
 
 
 class _CitationStripper:
@@ -131,6 +140,14 @@ class _CitationStripper:
         token = _PUA_RE.sub('', token)
         self._buf += token
         out = ""
+
+        def _emit(chunk: str) -> str:
+            # Anything reaching emit-stage is no-longer-a-citation by
+            # construction (bracketed pairs are matched + dropped above).
+            # Lone 【 or 】 surviving here is a stray artifact — strip
+            # before flushing to the SSE stream.
+            return _LONELY_BRACKET_RE.sub('', chunk)
+
         while True:
             # Bracketed form takes priority — it's unambiguous once both
             # 【 and 】 are present.
@@ -144,7 +161,7 @@ class _CitationStripper:
                     if len(self._buf) > self._MAX_BUFFER:
                         out += self._buf
                         self._buf = ""
-                    return out
+                    return _emit(out)
                 candidate = self._buf[:br_end + 1]
                 if '†' in candidate:
                     self._buf = self._buf[br_end + 1:]
@@ -161,7 +178,7 @@ class _CitationStripper:
                 if len(self._buf) >= 4:
                     out += self._buf[:-3]
                     self._buf = self._buf[-3:]
-                return out
+                return _emit(out)
 
             out += self._buf[:bc_start]
             self._buf = self._buf[bc_start:]
@@ -175,7 +192,7 @@ class _CitationStripper:
                 tail = self._buf[m.end():]
                 could_extend = tail == "" or tail[0].isalnum()
                 if could_extend and len(self._buf) < self._MAX_BUFFER:
-                    return out
+                    return _emit(out)
                 self._buf = self._buf[m.end():]
                 continue
 
@@ -193,7 +210,7 @@ class _CitationStripper:
                 or tail.startswith("turn")
             )
             if looks_like_marker and len(self._buf) < self._MAX_BUFFER:
-                return out
+                return _emit(out)
             # Treat "cite" as ordinary text
             out += self._buf[:4]
             self._buf = self._buf[4:]
