@@ -764,6 +764,15 @@ async def stream_chat_response(
                         total_cost += tool_cost
                         round_applied.update(item_applied)
                         applied.update(item_applied)
+                        # Commit per-tool so writes from this tool are
+                        # visible to (a) any subsequent tool that opens its
+                        # own SessionLocal (rows_fill, candidates_*), and
+                        # (b) the frontend's mid-stream refetch when the
+                        # change event triggers it. Without this, columns
+                        # added by columns_add aren't visible until the
+                        # end-of-turn commit and the table renders empty.
+                        if item_applied:
+                            db.commit()
                         tracing.update_span(
                             tool_span,
                             output=result,
