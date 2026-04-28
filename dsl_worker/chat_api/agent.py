@@ -177,12 +177,13 @@ When your turn naturally leads to a follow-up choice or scaling
 decision, call ONE OR BOTH of these (they can fire in the same turn).
 Both tools terminate the turn — emit text response first, then call.
 
-**A. `suggest_replies(suggestions=[{label, message}, ...])`** — text
+**`suggest_replies(suggestions=[{label, message}, ...])`** — text
 reply suggestions, rendered as clickable text under your message. Use
-when ending a turn with a question or proposed choice. Each `label`
-reads as a complete sentence the user might say (~40 chars max);
-`message` is what gets sent on click (usually identical to label).
-Always include at least one yes/proceed, one no/different-direction.
+when ending a turn with a question, proposed choice, OR a scale-up
+prompt after harvesting rows. Each `label` reads as a complete
+sentence the user might say (~40 chars max); `message` is what gets
+sent on click (usually identical to label). Always include at least
+one yes/proceed, one no/different-direction when answering a question.
 
 Examples:
 
@@ -197,21 +198,16 @@ Examples:
     {label:"Focus on B2C", message:"Focus on B2C."},
     {label:"Mixed — both", message:"Mixed — both B2B and B2C."}])`
 
-**B. `suggest_more_rows(amounts=[10, 25, 50])`** — preset '+N' chips
-rendered above the text input. Call right after a successful
-`rows_add` / `candidates_to_rows` when scaling makes sense. Pick 2-4
-amounts based on current row count: with 5-10 rows suggest
-[10, 25, 50]; with 50 rows suggest [25, 50, 100]; with 100+ suggest
-[50, 100, 250]. The frontend adds a custom number input automatically
-— don't include a "custom" amount.
+- After adding starter rows, mix scale-up + off-axis next moves →
+  `suggest_replies(suggestions=[
+    {label:"Generate 25 more", message:"Generate 25 more rows of similar quality."},
+    {label:"Generate 50 more", message:"Generate 50 more rows of similar quality."},
+    {label:"Add verified emails", message:"Add verified work emails for these rows."}])`
+  Pick scale amounts based on current row count: 5-10 rows → 25/50/100;
+  50 rows → 50/100/250; 100+ → 100/250/500.
 
-Don't call `suggest_replies` for scaling — use `suggest_more_rows`.
-Don't call `suggest_more_rows` after just answering a question
-(unless rows were also added in the same turn) — it would feel
-disconnected.
-
-Skip both when: mid-flow with no clear next step, post-error, or
-purely informational with no follow-up.
+Skip when: mid-flow with no clear next step, post-error, or purely
+informational with no follow-up.
 
 # The user's world
 
@@ -347,8 +343,8 @@ obvious — use judgment.
 
 - **Multi-tool first turns are normal.** A first turn typically does:
   source call → `columns_add` (using the candidate file's `fields` if
-  helpful) → `candidates_to_rows` → text reply → `suggest_replies` /
-  `suggest_more_rows`. All in one turn. This is the harvest job.
+  helpful) → `candidates_to_rows` → text reply → `suggest_replies`.
+  All in one turn. This is the harvest job.
 - **Trust the merge_key — but only when a field is naturally unique
   per row.** Pass a merge_key (LinkedIn URL, domain, post_id,
   place_id) to `rows_add` / `candidates_to_rows` and let it merge,
@@ -487,11 +483,12 @@ You (one turn, multiple tool calls — HARVEST only):
 3. `candidates_to_rows` with that column_map, merge_key="LinkedIn URL".
 4. Text: "Added 20 US founders of small athletic-apparel brands.
    Started US-only — say if you want global. No verified emails yet."
-5. `suggest_more_rows(amounts=[25, 50, 100])` for scaling.
-6. `suggest_replies(suggestions=[
+5. `suggest_replies(suggestions=[
+     {label:"Generate 25 more", message:"Generate 25 more rows of similar quality."},
+     {label:"Generate 50 more", message:"Generate 50 more rows of similar quality."},
      {label:"Add verified work emails", message:"Add verified work emails for these rows."},
      {label:"Go global instead of US-only", message:"Re-run globally instead of US-only."}
-   ])` for off-axis next steps.
+   ])` — mix scale-up amounts with off-axis next moves.
 
 User clicks "+ verified emails" — that's an ENRICH job:
 
@@ -517,8 +514,10 @@ You (one turn):
    retweet_count, reply_count, url). `columns_add` for each.
 5. `candidates_to_rows` with column_map, merge_key="Post ID".
 6. Text: "Added 50 of @shannholmberg's posts."
-7. `suggest_more_rows(amounts=[50, 100, 250])` for scaling, and
-   optionally `suggest_replies` for filter follow-ups.
+7. `suggest_replies(suggestions=[
+     {label:"Generate 50 more", message:"Generate 50 more posts of similar quality."},
+     {label:"Generate 100 more", message:"Generate 100 more posts."},
+     {label:"Filter to last 30 days", message:"Filter to posts from the last 30 days."}])` — mix scaling + filter follow-ups.
 
 # Worked example C — closed set, harvest then enrich
 
@@ -551,7 +550,9 @@ You (turn 2 — enrich):
    web_search-driven Twitter discovery.
 2. Text: "Filled Twitter handles for 47 founders; 3 had no clear
    public match — left null."
-3. `suggest_replies(kind="more_rows", ...)`.
+3. `suggest_replies(suggestions=[
+     {label:"Generate 50 more", message:"Generate 50 more rows of similar quality."},
+     {label:"Generate 100 more", message:"Generate 100 more rows of similar quality."}])` for scaling.
 
 The shape: harvest one job, enrich another. Cost scales linearly per
 cell instead of exploding inside a single agent loop.
@@ -850,8 +851,9 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
         "search_context_size": "low",
     },
     # Text reply suggestions, rendered as clickable text under the
-    # assistant's message. Use when ending a turn with a question or
-    # proposal — gives the user 1-click answers without typing.
+    # assistant's message. Use when ending a turn with a question,
+    # proposal, OR scale-up prompt after harvesting rows. Gives the
+    # user 1-click answers without typing.
     # Calling this ENDS the turn (loop breaks after dispatch).
     {
         "type": "function",
@@ -860,15 +862,15 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
             "Attach 2-5 text reply suggestions to your latest message. "
             "These render as clickable text lines under the message — "
             "the user picks one with a click instead of typing. Use "
-            "whenever you end a turn with a question or proposal "
-            "('want me to do X or Y?', 'should I add emails too?'). "
-            "DO NOT use for purely informational endings or when no "
+            "whenever you end a turn with a question, proposal, OR "
+            "after rows are added (offer scale-up amounts as "
+            "suggestions: label 'Generate 25 more', message 'Generate "
+            "25 more rows of similar quality.'). Pick scale amounts "
+            "based on current row count: 5-10 rows → 25/50/100; 50 "
+            "rows → 50/100/250; 100+ → 100/250/500.\n\n"
+            "DO NOT use for purely informational endings when no "
             "concrete next-action choice exists.\n\n"
-            "For scale-up chips ('+10 rows', '+25 rows'), use "
-            "`suggest_more_rows` instead — that surfaces above the "
-            "input as universal scaling buttons.\n\n"
-            "Both tools can be called in the same turn when both apply. "
-            "Always emit your text response BEFORE these calls."
+            "Always emit your text response BEFORE this call."
         ),
         "parameters": {
             "type": "object",
@@ -894,48 +896,6 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
                 },
             },
             "required": ["suggestions"],
-        },
-    },
-    # Universal '+N more rows' chips, rendered above the input area.
-    # Use right after rows_add succeeds AND it makes sense to scale.
-    # Click sends a templated 'Add N more rows of similar quality.'
-    # The frontend ALWAYS adds a custom number input — don't include
-    # an explicit 'custom' option. Calling this ENDS the turn.
-    {
-        "type": "function",
-        "name": "suggest_more_rows",
-        "description": (
-            "Attach scaling '+N' chips above the user's input area, for "
-            "one-click 'add N more rows' actions. Call this RIGHT AFTER "
-            "a successful rows_add (or candidates_to_rows) when scaling "
-            "up makes sense — e.g. you added 8 starter rows and the "
-            "user might want 10/25/50 more.\n\n"
-            "Pick 2-4 amounts based on current row count. Rough guide: "
-            "with 5-10 rows, suggest [10, 25, 50]; with 50 rows, "
-            "suggest [25, 50, 100]; with 100+ rows, suggest [50, 100, "
-            "250]. The frontend adds a custom number input "
-            "automatically, so don't include an explicit 'custom' chip.\n\n"
-            "DO NOT call when no rows were just added, or when the "
-            "user's last message was a question that needs an answer "
-            "(use suggest_replies for that). Both tools can be called "
-            "in the same turn if both apply."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "amounts": {
-                    "type": "array",
-                    "minItems": 2,
-                    "maxItems": 4,
-                    "items": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 1000,
-                    },
-                    "description": "Preset row counts to offer (e.g. [10, 25, 50]).",
-                },
-            },
-            "required": ["amounts"],
         },
     },
 ]
@@ -1157,9 +1117,6 @@ async def execute_tool(
     if tool_name == "suggest_replies":
         applied, result = _tool_suggest_replies(args)
         return applied, result, 0.0
-    if tool_name == "suggest_more_rows":
-        applied, result = _tool_suggest_more_rows(args)
-        return applied, result, 0.0
 
     if tool_name == "candidates_list":
         applied, result = _tool_candidates_list(project, args)
@@ -1349,30 +1306,6 @@ def _tool_suggest_replies(args: Dict[str, Any]):
     return (
         {"suggestions": {"items": items}},
         {"ok": True, "count": len(items)},
-    )
-
-
-def _tool_suggest_more_rows(args: Dict[str, Any]):
-    """Attach scaling '+N' chips above the input area.
-
-    No DB side effects — the amounts are forwarded to the SSE stream
-    and persisted in applied_changes so they survive a history reload.
-    """
-    raw = args.get("amounts") or []
-    amounts: List[int] = []
-    for v in raw:
-        try:
-            n = int(v)
-        except (TypeError, ValueError):
-            continue
-        if 1 <= n <= 1000 and n not in amounts:
-            amounts.append(n)
-    if not amounts:
-        return {}, {"error": "no valid amounts"}
-    amounts.sort()
-    return (
-        {"more_rows": {"amounts": amounts}},
-        {"ok": True, "count": len(amounts)},
     )
 
 

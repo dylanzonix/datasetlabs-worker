@@ -839,22 +839,15 @@ async def stream_chat_response(
                 if stopped:
                     break
 
-                # Surface the two suggestion tools as dedicated SSE events
+                # Surface suggest_replies as a dedicated SSE event
                 # (separate from the generic "change" feed which is for
-                # table mutations). Frontend renders them in different UI
-                # locations: text replies under the message, more_rows
-                # chips above the input.
+                # table mutations). Frontend renders these as clickable
+                # text replies under the assistant's message.
                 if isinstance(round_applied.get("suggestions"), dict):
                     sg = round_applied["suggestions"]
                     yield _sse({
                         "type": "suggestions",
                         "items": sg.get("items") or [],
-                    })
-                if isinstance(round_applied.get("more_rows"), dict):
-                    mr = round_applied["more_rows"]
-                    yield _sse({
-                        "type": "more_rows",
-                        "amounts": mr.get("amounts") or [],
                     })
 
                 for change in agent.describe_applied(round_applied):
@@ -871,13 +864,13 @@ async def stream_chat_response(
                         yield _sse(event_data)
 
                 # End the conversation after these tools — they're terminal:
-                # ask_questions waits for a structured answer; suggest_*
-                # hands control to the user via clickable suggestions/chips.
+                # ask_questions waits for a structured answer;
+                # suggest_replies hands control to the user via clickable
+                # text suggestions.
                 if any(
                     item.name in (
                         "ask_questions",
                         "suggest_replies",
-                        "suggest_more_rows",
                     )
                     for item in tool_calls
                 ):
