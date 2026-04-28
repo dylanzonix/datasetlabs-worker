@@ -341,7 +341,7 @@ _MEDIUM_EFFORT_SIGNALS = (
 
 
 def _resolve_reasoning_effort(user_content: str) -> str:
-    return "high"
+    return "medium"
 
 
 # ---- Main streaming generator --------------------------------------------
