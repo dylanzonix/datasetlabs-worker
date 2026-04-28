@@ -344,6 +344,32 @@ def _resolve_reasoning_effort(user_content: str) -> str:
     return "medium"
 
 
+def _web_search_args_preview(item: Any) -> str:
+    """Format a web_search_call's action as `kind="value"` for the UI.
+
+    OpenAI's web_search built-in fires `output_item.added` and
+    `output_item.done` events with an `action` sub-object. The action
+    type is one of `search` (action.query), `open_page` (action.url),
+    or `find_in_page` (action.query). The query may be empty on the
+    initial added event and only populated by the time `done` fires —
+    callers re-run this on done to backfill.
+    """
+    action = getattr(item, "action", None)
+    if action is None:
+        return ""
+    a_type = getattr(action, "type", None)
+    if a_type == "search":
+        v = (getattr(action, "query", None) or "")[:120]
+        return f'query="{v}"' if v else ""
+    if a_type == "open_page":
+        v = (getattr(action, "url", None) or "")[:120]
+        return f'url="{v}"' if v else ""
+    if a_type == "find_in_page":
+        v = (getattr(action, "query", None) or "")[:120]
+        return f'find="{v}"' if v else ""
+    return ""
+
+
 # Frontend-tier (auto/fast/balanced/highest) → OpenAI reasoning_effort.
 # `auto` falls back to the dynamic per-message resolver above so the
 # default behavior is unchanged when the user hasn't picked a tier.
@@ -617,19 +643,7 @@ async def stream_chat_response(
                                         item_id = getattr(added_item, "id", None) or ""
                                         if item_id and item_id not in seen_web_search_ids:
                                             seen_web_search_ids.add(item_id)
-                                            action = getattr(added_item, "action", None)
-                                            a_type = getattr(action, "type", None) if action else None
-                                            if a_type == "search":
-                                                preview = (getattr(action, "query", None) or "")[:120]
-                                                args_preview = f'query="{preview}"'
-                                            elif a_type == "open_page":
-                                                preview = (getattr(action, "url", None) or "")[:120]
-                                                args_preview = f'url="{preview}"'
-                                            elif a_type == "find_in_page":
-                                                preview = (getattr(action, "query", None) or "")[:120]
-                                                args_preview = f'find="{preview}"'
-                                            else:
-                                                args_preview = ""
+                                            args_preview = _web_search_args_preview(added_item)
                                             tool_log_index[item_id] = len(tool_log)
                                             tool_log.append({
                                                 "id": item_id,
@@ -655,14 +669,24 @@ async def stream_chat_response(
                                             status = getattr(done_item, "status", None) or "completed"
                                             idx = tool_log_index.get(item_id)
                                             summary = "done" if status == "completed" else status
+                                            # Re-derive the args preview from the
+                                            # done payload — the initial added
+                                            # event sometimes fires before
+                                            # action.query is populated, so the
+                                            # done event is the reliable source
+                                            # for the final query string.
+                                            final_args = _web_search_args_preview(done_item)
                                             if idx is not None:
                                                 tool_log[idx]["summary"] = summary
+                                                if final_args:
+                                                    tool_log[idx]["args_preview"] = final_args
                                             yield _sse({
                                                 "type": "tool_result",
                                                 "id": item_id,
                                                 "name": "web_search",
                                                 "summary": summary,
                                                 "cost": 0,
+                                                "args_preview": final_args or None,
                                             })
                                             await asyncio.sleep(0)
 
