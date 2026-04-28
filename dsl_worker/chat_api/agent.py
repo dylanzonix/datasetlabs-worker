@@ -328,9 +328,14 @@ obvious — use judgment.
   mapping JSON to flat dicts, computing derived fields, joining across
   files. Stdlib + httpx + json + re. No DB access; print to stdout, then
   use `candidates_to_rows` or `rows_add`.
-- **web_harvest(query, candidate_description)** — research subagent
-  that uses web_search + yields candidates. Use only when there's no
-  Apify actor for the target site and no structured source matches.
+- **web_harvest(query, candidate_description)** — runs a bounded
+  sub-agent that performs MULTIPLE web searches and yields candidate
+  ROWS into a candidates file. ONLY for harvesting entities from
+  public web pages when there's no Apify actor for the target site
+  and no structured source matches. NOT for finding a single URL,
+  checking a fact, or scoping the source landscape — for those, use
+  `web_search` directly (one cheap call). Slow and pricey
+  ($0.20–$0.50 typical).
 - **browser_use(task)** — last-resort cloud browser session. Slow
   (30–180s) and $0.10–$0.50/call. Nuclear option — only when Apify has
   no working actor for the site AND `web_search` can't surface the
@@ -1232,6 +1237,13 @@ async def _tool_rows_fill(
     max_turns = int(args.get("max_turns", 5))
 
     where_sql, where_params = _where_to_sql(where)
+
+    # Commit the main session before fill_rows opens its own SessionLocal.
+    # Without this, rows just inserted by rows_add / candidates_to_rows
+    # earlier in the same turn aren't visible to the new session and the
+    # query returns matched_rows=0 even though the rows exist in the
+    # uncommitted transaction.
+    db.commit()
 
     summary, total_cost = await fill.fill_rows(
         project=project,
