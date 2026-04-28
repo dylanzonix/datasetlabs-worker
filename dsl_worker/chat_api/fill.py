@@ -392,6 +392,33 @@ async def fill_rows(
                 max_cost=max_cost,
                 max_turns=max_turns,
             )
+            # Persist this cell's values immediately so:
+            #  (a) the table updates live as cells fill, not in one
+            #      batch at the end, and
+            #  (b) if rows_fill is interrupted, partial progress is in
+            #      the DB — re-running with where={col: null} resumes
+            #      naturally.
+            updated_row: Optional[Dict[str, Any]] = None
+            if res.values:
+                write_db = SessionLocal()
+                try:
+                    sample = write_db.query(Sample).filter(Sample.id == res.row_id).first()
+                    if sample is not None:
+                        d = dict(sample.row or {})
+                        for k, v in res.values.items():
+                            d[k] = v
+                        sample.row = d
+                        write_db.commit()
+                        write_db.refresh(sample)
+                        updated_row = {"_id": str(sample.id), "_seq": sample.seq, **(sample.row or {})}
+                except Exception:
+                    log.exception("per-cell persist failed for row %s", res.row_id)
+                    try:
+                        write_db.rollback()
+                    except Exception:
+                        pass
+                finally:
+                    write_db.close()
             await _emit({
                 "type": "cell_done",
                 "row_id": str(row_id),
@@ -404,6 +431,10 @@ async def fill_rows(
                     if v is not None and v != ""
                 ],
             })
+            # Push a row_merged so the frontend updates the visible row
+            # in the table immediately, same channel as rows_add uses.
+            if updated_row is not None:
+                await _emit({"type": "row_merged", "row": updated_row})
             return res
 
     tasks = [
@@ -412,26 +443,12 @@ async def fill_rows(
     ]
     completed = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Persist values to the DB. Each result writes only its own cells.
-    write_db = SessionLocal()
-    try:
-        for r in completed:
-            if isinstance(r, Exception):
-                continue
-            results.append(r)
-            total_cost += r.cost_usd
-            if not r.values:
-                continue
-            sample = write_db.query(Sample).filter(Sample.id == r.row_id).first()
-            if sample is None:
-                continue
-            d = dict(sample.row or {})
-            for k, v in r.values.items():
-                d[k] = v
-            sample.row = d
-        write_db.commit()
-    finally:
-        write_db.close()
+    # Aggregate-only pass — DB writes already happened per-cell above.
+    for r in completed:
+        if isinstance(r, Exception):
+            continue
+        results.append(r)
+        total_cost += r.cost_usd
 
     # Aggregate summary
     by_status: Dict[str, int] = {}
