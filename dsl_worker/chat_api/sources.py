@@ -1296,6 +1296,67 @@ def is_source_tool(name: str) -> bool:
     return name in _HANDLERS
 
 
+def derive_default_source(
+    tool: str, item: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """Default cell-source citation for a candidate item from a source tool.
+
+    candidates_to_rows uses this to auto-attach `_sources` so rows committed
+    via bulk mapping carry the same provenance the agent would have added
+    via `_sources` on `rows_add`. Returns `{"type": "url", "value": ...}` or
+    None when no useful source URL can be derived.
+    """
+    if not isinstance(item, dict) or not tool:
+        return None
+    if tool.startswith("google_maps"):
+        # text_search items don't include `url`; build the canonical
+        # place-id deep link. place_details items do include `url`.
+        url = item.get("url")
+        if url:
+            return {"type": "url", "value": str(url)}
+        place_id = item.get("place_id")
+        if place_id:
+            return {
+                "type": "url",
+                "value": f"https://www.google.com/maps/place/?q=place_id:{place_id}",
+            }
+        return None
+    if tool.startswith("fullenrich"):
+        url = item.get("linkedin_url") or item.get("linkedinUrl")
+        if url:
+            return {"type": "url", "value": str(url)}
+        domain = item.get("domain") or item.get("website")
+        if domain:
+            v = str(domain)
+            if not v.startswith("http"):
+                v = f"https://{v}"
+            return {"type": "url", "value": v}
+        return None
+    if tool.startswith("apollo"):
+        url = item.get("linkedin_url") or item.get("website_url")
+        if url:
+            return {"type": "url", "value": str(url)}
+        domain = item.get("primary_domain") or item.get("domain")
+        if domain:
+            v = str(domain)
+            if not v.startswith("http"):
+                v = f"https://{v}"
+            return {"type": "url", "value": v}
+        return None
+    if tool.startswith("apify") or tool == "browser_use" or tool == "web_harvest":
+        url = (
+            item.get("url")
+            or item.get("link")
+            or item.get("href")
+            or item.get("source_url")
+            or item.get("profile_url")
+        )
+        if url:
+            return {"type": "url", "value": str(url)}
+        return None
+    return None
+
+
 async def execute_source_tool(
     name: str,
     args: Dict[str, Any],

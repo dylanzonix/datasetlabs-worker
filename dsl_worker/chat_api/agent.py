@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
@@ -1233,6 +1234,9 @@ def _tool_candidates_inspect(
     )
 
 
+_TOOL_FROM_FILE_RE = re.compile(r"^(.+)_[0-9a-f]{8}\.jsonl$")
+
+
 async def _tool_candidates_to_rows(
     db: Session,
     project: Project,
@@ -1248,6 +1252,11 @@ async def _tool_candidates_to_rows(
         return {}, {"error": "column_map must be a non-empty {source_field: column_name} dict"}
     filt = args.get("filter") or {}
     merge_key = args.get("merge_key")
+
+    # File names are written as "{tool}_{8-hex}.jsonl" by candidates.write_candidates.
+    # The tool name drives default source-citation attachment below.
+    m = _TOOL_FROM_FILE_RE.match(file_name)
+    file_tool = m.group(1) if m else ""
 
     BATCH = 100
     total_inserted = 0
@@ -1286,6 +1295,13 @@ async def _tool_candidates_to_rows(
             if all(v is None for v in mapped.values()):
                 total_skipped_filter += 1
                 continue
+            # Without this, candidates_to_rows-committed rows have empty
+            # tags and the UI's per-cell source dropdown is blank. Same
+            # source applies to every mapped column — they all came from
+            # the same candidate item.
+            src = sources.derive_default_source(file_tool, item)
+            if src:
+                mapped["_sources"] = {col: [src] for col in mapped}
             batch.append(mapped)
             if len(batch) >= BATCH:
                 await flush()
