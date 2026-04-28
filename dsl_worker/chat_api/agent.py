@@ -293,9 +293,15 @@ obvious — use judgment.
   source call → `columns_add` (using the candidate file's `fields` if
   helpful) → `candidates_to_rows` → text reply → `suggest_replies`. All
   in one turn. This is the harvest job.
-- **Trust the merge_key.** Don't manually dedup; pass a merge_key
-  (LinkedIn URL, domain, post_id, place_id) to `rows_add` /
-  `candidates_to_rows` and let it merge.
+- **Trust the merge_key — but only when a field is naturally unique
+  per row.** Pass a merge_key (LinkedIn URL, domain, post_id,
+  place_id) to `rows_add` / `candidates_to_rows` and let it merge,
+  when one of the candidate fields is genuinely unique per intended
+  row. **If no field is naturally unique** (e.g. multiple founders
+  per company with no founder-id, multiple posts per author with no
+  post-id), **don't pass merge_key.** Inserting and accepting
+  possible duplicates is safer than silently merging legitimate-but-
+  similar rows together.
 - **Once you've paid for a fetch, finish it.** Don't stop at the
   candidate file and ask "want me to load these?" — the candidate
   file is internal; the user can't see it. Use `candidates_to_rows`
