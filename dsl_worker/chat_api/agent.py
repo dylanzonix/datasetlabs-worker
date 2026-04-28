@@ -747,9 +747,11 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
         "type": "function",
         "name": "rows_delete",
         "description": (
-            "Delete rows matching `where`. Two-phase: first call without "
-            "`confirm` returns a preview (count + sample of what would be "
-            "deleted). Re-call with confirm=true to actually delete."
+            "Soft-delete rows matching `where`. Rows are hidden from all "
+            "active-row queries but kept in the DB and can be restored via "
+            "rows_undelete. Two-phase: first call without `confirm` returns "
+            "a preview (count + sample of what would be deleted). Re-call "
+            "with confirm=true to actually delete."
         ),
         "parameters": {
             "type": "object",
@@ -758,6 +760,27 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
                 "confirm": {
                     "type": "boolean",
                     "description": "False (default) returns preview only. Set true to actually delete.",
+                },
+            },
+            "required": ["where"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "rows_undelete",
+        "description": (
+            "Restore previously soft-deleted rows matching `where`. Two-phase: "
+            "preview shows count + sample of rows that would be restored; "
+            "confirm=true actually restores them. Same `where` dialect as "
+            "rows_delete but operates on the deleted set."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "where": {"type": "object"},
+                "confirm": {
+                    "type": "boolean",
+                    "description": "False (default) returns preview only. Set true to restore.",
                 },
             },
             "required": ["where"],
@@ -1064,7 +1087,7 @@ def start_user_turn_version(
                 "(id, project_id, version_id, seq, row, tags, enrichment_data, created_at) "
                 "SELECT gen_random_uuid(), :pid, :new_vid, seq, row, tags, "
                 "enrichment_data, NOW() "
-                "FROM samples WHERE version_id = :head_vid"
+                "FROM samples WHERE version_id = :head_vid AND deleted_at IS NULL"
             ),
             {
                 "pid": project.id,
@@ -1255,6 +1278,9 @@ async def execute_tool(
     if tool_name == "rows_delete":
         applied, result = _tool_rows_delete(db, project, version, args)
         return applied, result, 0.0
+    if tool_name == "rows_undelete":
+        applied, result = _tool_rows_undelete(db, project, version, args)
+        return applied, result, 0.0
     if tool_name == "rows_fill":
         applied, result, cost = await _tool_rows_fill(
             db, project, version, args, progress_cb=progress_cb
@@ -1370,7 +1396,7 @@ async def _tool_candidates_to_rows(
             existing = db.execute(
                 _text(
                     f"SELECT {_row_value_expr(merge_key)} FROM samples "
-                    f"WHERE version_id = :vid"
+                    f"WHERE version_id = :vid AND deleted_at IS NULL"
                 ),
                 {"vid": version.id},
             ).all()
@@ -1506,8 +1532,9 @@ async def _tool_candidates_to_rows(
         return {}, {"error": f"{type(e).__name__}: {e}"}
 
     total_rows = (
-        db.query(func.count(Sample.id)).filter(Sample.version_id == version.id).scalar()
-        or 0
+        db.query(func.count(Sample.id))
+        .filter(Sample.version_id == version.id, Sample.deleted_at.is_(None))
+        .scalar() or 0
     )
     return (
         {"rows": {"inserted": total_inserted, "merged": total_merged}},
@@ -1780,6 +1807,7 @@ async def _tool_rows_add(
                 from sqlalchemy import text
                 stmt = text(
                     f"SELECT id, row FROM samples WHERE version_id = :vid "
+                    f"AND deleted_at IS NULL "
                     f"AND ({_row_value_expr(merge_key)}) = :mv LIMIT 1"
                 )
                 existing = db.execute(
@@ -1837,7 +1865,11 @@ async def _tool_rows_add(
             except Exception:
                 log.exception("row_added progress_cb raised")
 
-    total = db.query(func.count(Sample.id)).filter(Sample.version_id == version.id).scalar() or 0
+    total = (
+        db.query(func.count(Sample.id))
+        .filter(Sample.version_id == version.id, Sample.deleted_at.is_(None))
+        .scalar() or 0
+    )
     return (
         {"rows": {"inserted": inserted, "merged": merged}},
         {"ok": True, "inserted": inserted, "merged": merged, "total": total},
@@ -1851,7 +1883,7 @@ def _tool_rows_count(
     sql, params = _where_to_sql(where)
     from sqlalchemy import text
     stmt = text(
-        f"SELECT COUNT(*) FROM samples WHERE version_id = :vid AND ({sql})"
+        f"SELECT COUNT(*) FROM samples WHERE version_id = :vid AND deleted_at IS NULL AND ({sql})"
     )
     n = db.execute(stmt, {"vid": version.id, **params}).scalar() or 0
     return {}, {"count": int(n)}
@@ -1866,7 +1898,7 @@ def _tool_rows_get(
     sql, params = _where_to_sql(where)
     from sqlalchemy import text
     base = (
-        f"SELECT id, seq, row FROM samples WHERE version_id = :vid AND ({sql}) "
+        f"SELECT id, seq, row FROM samples WHERE version_id = :vid AND deleted_at IS NULL AND ({sql}) "
         f"ORDER BY seq"
     )
     if limit is not None:
@@ -1891,7 +1923,7 @@ def _tool_rows_sample(
     n = int(args.get("n") or 3)
     from sqlalchemy import text
     rows = db.execute(
-        text("SELECT id, seq, row FROM samples WHERE version_id = :vid ORDER BY RANDOM() LIMIT :n"),
+        text("SELECT id, seq, row FROM samples WHERE version_id = :vid AND deleted_at IS NULL ORDER BY RANDOM() LIMIT :n"),
         {"vid": version.id, "n": n},
     ).all()
     out: List[Dict[str, Any]] = []
@@ -1917,13 +1949,13 @@ def _tool_rows_update(
 
     if not confirm:
         cnt = db.execute(
-            text(f"SELECT COUNT(*) FROM samples WHERE version_id = :vid AND ({sql})"),
+            text(f"SELECT COUNT(*) FROM samples WHERE version_id = :vid AND deleted_at IS NULL AND ({sql})"),
             {"vid": version.id, **params},
         ).scalar() or 0
         sample_rows = db.execute(
             text(
                 f"SELECT id, seq, row FROM samples WHERE version_id = :vid "
-                f"AND ({sql}) ORDER BY seq LIMIT 3"
+                f"AND deleted_at IS NULL AND ({sql}) ORDER BY seq LIMIT 3"
             ),
             {"vid": version.id, **params},
         ).all()
@@ -1942,7 +1974,7 @@ def _tool_rows_update(
         }
 
     rows = db.execute(
-        text(f"SELECT id FROM samples WHERE version_id = :vid AND ({sql})"),
+        text(f"SELECT id FROM samples WHERE version_id = :vid AND deleted_at IS NULL AND ({sql})"),
         {"vid": version.id, **params},
     ).all()
     affected = 0
@@ -1969,13 +2001,13 @@ def _tool_rows_delete(
         # Preview pass — show count + sample so the agent can sanity-check
         # before destroying anything.
         cnt = db.execute(
-            text(f"SELECT COUNT(*) FROM samples WHERE version_id = :vid AND ({sql})"),
+            text(f"SELECT COUNT(*) FROM samples WHERE version_id = :vid AND deleted_at IS NULL AND ({sql})"),
             {"vid": version.id, **params},
         ).scalar() or 0
         sample_rows = db.execute(
             text(
                 f"SELECT id, seq, row FROM samples WHERE version_id = :vid "
-                f"AND ({sql}) ORDER BY seq LIMIT 3"
+                f"AND deleted_at IS NULL AND ({sql}) ORDER BY seq LIMIT 3"
             ),
             {"vid": version.id, **params},
         ).all()
@@ -1992,17 +2024,78 @@ def _tool_rows_delete(
             ),
         }
 
-    # Confirmed — bulk DELETE via raw SQL (immediately visible to subsequent
-    # reads, unlike ORM-style db.delete which doesn't flush).
+    # Confirmed — soft delete via UPDATE deleted_at = now(). Recoverable
+    # via rows_undelete. Immediately visible to subsequent active-row
+    # queries because they all filter `deleted_at IS NULL`.
     result = db.execute(
-        text(f"DELETE FROM samples WHERE version_id = :vid AND ({sql})"),
+        text(
+            f"UPDATE samples SET deleted_at = NOW() "
+            f"WHERE version_id = :vid AND deleted_at IS NULL AND ({sql})"
+        ),
         {"vid": version.id, **params},
     )
     deleted = int(result.rowcount or 0)
     db.expire_all()
     if deleted and version.generated_count is not None:
         version.generated_count = max(0, version.generated_count - deleted)
-    return {"rows_deleted": deleted}, {"ok": True, "deleted": deleted}
+    return {"rows_deleted": deleted}, {
+        "ok": True,
+        "deleted": deleted,
+        "soft_deleted": True,
+        "hint": "Use rows_undelete with a matching `where` to restore.",
+    }
+
+
+def _tool_rows_undelete(
+    db: Session, project: Project, version: ProjectVersion, args: Dict[str, Any]
+):
+    """Restore soft-deleted rows. Same `where` dialect as rows_delete but
+    operates on the deleted set (deleted_at IS NOT NULL)."""
+    where = args.get("where") or {}
+    confirm = bool(args.get("confirm", False))
+    sql, params = _where_to_sql(where)
+    from sqlalchemy import text
+
+    if not confirm:
+        cnt = db.execute(
+            text(
+                f"SELECT COUNT(*) FROM samples WHERE version_id = :vid "
+                f"AND deleted_at IS NOT NULL AND ({sql})"
+            ),
+            {"vid": version.id, **params},
+        ).scalar() or 0
+        sample_rows = db.execute(
+            text(
+                f"SELECT id, seq, row FROM samples WHERE version_id = :vid "
+                f"AND deleted_at IS NOT NULL AND ({sql}) ORDER BY seq LIMIT 3"
+            ),
+            {"vid": version.id, **params},
+        ).all()
+        return {}, {
+            "preview": True,
+            "would_restore": int(cnt),
+            "sample": [
+                {"_id": str(r[0]), "_seq": r[1], **(r[2] or {})}
+                for r in sample_rows
+            ],
+            "hint": (
+                f"This would restore {int(cnt)} soft-deleted row(s). "
+                f"Re-call with confirm=true to apply."
+            ),
+        }
+
+    result = db.execute(
+        text(
+            f"UPDATE samples SET deleted_at = NULL "
+            f"WHERE version_id = :vid AND deleted_at IS NOT NULL AND ({sql})"
+        ),
+        {"vid": version.id, **params},
+    )
+    restored = int(result.rowcount or 0)
+    db.expire_all()
+    if restored and version.generated_count is not None:
+        version.generated_count = (version.generated_count or 0) + restored
+    return {"rows_restored": restored}, {"ok": True, "restored": restored}
 
 
 # ---------------------------------------------------------------------------
@@ -2016,18 +2109,43 @@ def format_tool_result(tool_name: str, result: Dict[str, Any]) -> str:
 
 
 def project_state_hint(db: Session, project: Project) -> str:
-    """A short '[Table now: N columns, M rows]' line appended after every
-    tool result so the agent constantly sees what the user actually has
-    on screen. Stops it from claiming work was done when nothing was
-    committed."""
+    """A one-line state line appended after every tool result so the agent
+    constantly sees what the user actually has on screen. Includes column
+    names (first 8) and active-row count, plus soft-deleted count if any.
+
+    Flushes pending session writes first so the count reflects this turn's
+    work — without flush, ORM-style mutations leave the count stale.
+    """
     try:
-        n_cols = len([c for c in (project.columns or []) if isinstance(c, dict)])
+        try:
+            db.flush()
+        except Exception:
+            pass
+        cols = [
+            c.get("name", "?")
+            for c in (project.columns or [])
+            if isinstance(c, dict)
+        ]
         n_rows = 0
+        n_deleted = 0
         if project.current_version_id:
             n_rows = db.query(func.count(Sample.id)).filter(
-                Sample.version_id == project.current_version_id
+                Sample.version_id == project.current_version_id,
+                Sample.deleted_at.is_(None),
             ).scalar() or 0
-        return f"\n\n[Table now: {n_cols} columns, {n_rows} rows]"
+            n_deleted = db.query(func.count(Sample.id)).filter(
+                Sample.version_id == project.current_version_id,
+                Sample.deleted_at.isnot(None),
+            ).scalar() or 0
+        col_preview = ", ".join(cols[:8])
+        if len(cols) > 8:
+            col_preview += f" (+{len(cols) - 8} more)"
+        cols_part = f"({col_preview})" if col_preview else "(none yet)"
+        deleted_part = f", {n_deleted} soft-deleted" if n_deleted else ""
+        return (
+            f"\n\n[Project state: {len(cols)} columns {cols_part}, "
+            f"{n_rows} rows{deleted_part}]"
+        )
     except Exception:
         return ""
 

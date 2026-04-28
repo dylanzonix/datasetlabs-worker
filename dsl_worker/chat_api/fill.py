@@ -345,7 +345,8 @@ async def fill_rows(
         if not version_id:
             return ({"error": "project has no version yet"}, 0.0)
         sql = (
-            f"SELECT id, row FROM samples WHERE version_id = :vid AND ({where_sql}) "
+            f"SELECT id, row FROM samples WHERE version_id = :vid "
+            f"AND deleted_at IS NULL AND ({where_sql}) "
             f"ORDER BY seq"
         )
         if limit is not None:
