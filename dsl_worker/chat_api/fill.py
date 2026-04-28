@@ -103,22 +103,10 @@ Process:
    research only as a last resort.)
 4. Once you have the value(s), call set_values to commit and stop.
 
-Helpful defaults for common cases:
-- **Person → Twitter/X handle.** Try the formal name first; if no
-  confident match, try common nickname variants (Andrew→Andy,
-  Robert→Rob/Bob, William→Will/Bill, Michael→Mike). Verify a candidate
-  by checking that the bio mentions the person's company or another
-  side fact from the row — don't commit a name match alone.
-- **Person → email/phone via FullEnrich.** Default to emails only;
-  include phones only if the column or user explicitly asks for them
-  (phones cost ~10× more than emails).
-- **Verifying a match.** When you find a candidate, glance at one
-  side-fact (company, role, location) to confirm before set_values.
-  A confident null beats a wrong value.
-
 Critical rules:
-- Real data only. If you can't find a real answer, call set_values with
-  null (or omit the field) and explain in 'reason'. Don't fabricate.
+- Real data only. A confident null beats a wrong value. If you can't
+  find a real answer, call set_values with null (or omit the field)
+  and explain in 'reason'. Don't fabricate.
 - Match the column's `format` exactly when stated.
 - One or two tool calls per turn max. Don't chain a research odyssey.
 - You are CAPPED at a tight budget. Don't waste calls.
