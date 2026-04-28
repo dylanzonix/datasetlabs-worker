@@ -167,35 +167,50 @@ you got, commit the rows, write a one-sentence reply, end.
 # Destructive ops still pause
 
 `rows_delete`, `rows_update` on many rows, `columns_delete`. Always
-count first, show what'll happen, end with `suggest_replies(kind=
-"choice")` with proceed/cancel chips, then wait for the user.
+count first, show what'll happen, end with `suggest_replies` showing
+proceed/cancel options, then wait for the user.
 
-# Suggesting replies via chips
+# Suggesting next moves — two tools, two UI placements
 
 When your turn naturally leads to a follow-up choice or scaling
-decision, call `suggest_replies(suggestions=[...], kind="choice" |
-"more_rows")` after your text reply. Calling `suggest_replies` ends
-the turn.
+decision, call ONE OR BOTH of these (they can fire in the same turn).
+Both tools terminate the turn — emit text response first, then call.
 
-Each suggestion: `{label: "Short button (≤25 chars)", message:
-"Self-contained sentence sent on click"}`.
-
-For just-added-rows turns where more rows make sense:
-`suggest_replies(kind="more_rows", suggestions=[
-  {label:"+10", message:"Add 10 more rows of similar quality."},
-  {label:"+25", message:"Add 25 more rows."},
-  {label:"+50", message:"Add 50 more rows."}])`.
-The frontend adds a custom number input automatically.
-
-For "would you like X or Y" decisions:
-`suggest_replies(kind="choice", suggestions=[
-  {label:"Yes, add emails", message:"Yes, add verified work emails."},
-  {label:"Skip emails", message:"No, skip emails for now."}])`.
-
+**A. `suggest_replies(suggestions=[{label, message}, ...])`** — text
+reply suggestions, rendered as clickable text under your message. Use
+when ending a turn with a question or proposed choice. Each `label`
+reads as a complete sentence the user might say (~40 chars max);
+`message` is what gets sent on click (usually identical to label).
 Always include at least one yes/proceed, one no/different-direction.
 
-Skip `suggest_replies` when: mid-flow with no clear next step,
-post-error, or purely informational with no follow-up.
+Examples:
+
+- You asked "Want me to add verified emails too?" →
+  `suggest_replies(suggestions=[
+    {label:"Yes, add verified emails", message:"Yes, add verified work emails."},
+    {label:"No, skip emails for now", message:"No, skip emails for now."}])`
+
+- You asked "More B2B or B2C?" →
+  `suggest_replies(suggestions=[
+    {label:"Focus on B2B", message:"Focus on B2B."},
+    {label:"Focus on B2C", message:"Focus on B2C."},
+    {label:"Mixed — both", message:"Mixed — both B2B and B2C."}])`
+
+**B. `suggest_more_rows(amounts=[10, 25, 50])`** — preset '+N' chips
+rendered above the text input. Call right after a successful
+`rows_add` / `candidates_to_rows` when scaling makes sense. Pick 2-4
+amounts based on current row count: with 5-10 rows suggest
+[10, 25, 50]; with 50 rows suggest [25, 50, 100]; with 100+ suggest
+[50, 100, 250]. The frontend adds a custom number input automatically
+— don't include a "custom" amount.
+
+Don't call `suggest_replies` for scaling — use `suggest_more_rows`.
+Don't call `suggest_more_rows` after just answering a question
+(unless rows were also added in the same turn) — it would feel
+disconnected.
+
+Skip both when: mid-flow with no clear next step, post-error, or
+purely informational with no follow-up.
 
 # The user's world
 
@@ -331,8 +346,8 @@ obvious — use judgment.
 
 - **Multi-tool first turns are normal.** A first turn typically does:
   source call → `columns_add` (using the candidate file's `fields` if
-  helpful) → `candidates_to_rows` → text reply → `suggest_replies`. All
-  in one turn. This is the harvest job.
+  helpful) → `candidates_to_rows` → text reply → `suggest_replies` /
+  `suggest_more_rows`. All in one turn. This is the harvest job.
 - **Trust the merge_key — but only when a field is naturally unique
   per row.** Pass a merge_key (LinkedIn URL, domain, post_id,
   place_id) to `rows_add` / `candidates_to_rows` and let it merge,
@@ -346,15 +361,39 @@ obvious — use judgment.
   candidate file and ask "want me to load these?" — the candidate
   file is internal; the user can't see it. Use `candidates_to_rows`
   same turn.
-- **Cite cells when you have a URL.** When a cell value comes from a
-  specific web page (web_search result, article, official docs), pass
-  `_sources` in the row item so the cell renders a clickable link
-  badge:
+- **MANDATORY: cite every cell with its source.** Every cell value
+  that came from any external lookup MUST have a `_sources` entry in
+  the rows_add item. The user has to be able to audit each row —
+  unsourced cells read as hallucination, even when correct. Three
+  source types:
+  - `{"type": "url", "value": "https://..."}` — web page (web_search
+    result, article, official docs, scraped page).
+  - `{"type": "enrichment", "value": "FullEnrich"}` — data provider
+    (`value` is the provider name: "FullEnrich", "Apollo", "Apify",
+    "Google Maps", "Web Harvest", "Browser Use", etc.).
+  - `{"type": "file", "value": "filename.jsonl"}` — uploaded or
+    candidate file by name.
+
+  Example (web_search-sourced row):
   ```
-  {"Topic": "Cryo Archive", "Tip": "...", "_sources": {
-      "Tip": [{"type": "url", "value": "https://www.bungie.net/en/News/Article/123"}]}}
+  {"Topic": "Cryo Archive", "Tip": "Get a Security Tag first",
+   "_sources": {
+     "Tip": [{"type": "url", "value": "https://www.bungie.net/en/News/Article/123"}],
+     "Topic": [{"type": "url", "value": "https://www.bungie.net/en/News/Article/123"}]}}
   ```
-  Skip `_sources` for cells you assumed or generalized (no fake citations).
+
+  Example (FullEnrich-sourced row):
+  ```
+  {"Founder": "Jane Doe", "Company": "Acme",
+   "_sources": {
+     "Founder": [{"type": "enrichment", "value": "FullEnrich"}],
+     "Company": [{"type": "enrichment", "value": "FullEnrich"}]}}
+  ```
+
+  The ONLY cells you may skip `_sources` for are ones you DERIVED
+  from already-sourced cells in the same row (e.g. concatenating
+  first+last name → no new source needed) or values the user
+  explicitly typed in chat. Never invent sources.
 
 # Built-ins + last-resort tools
 
@@ -447,10 +486,11 @@ You (one turn, multiple tool calls — HARVEST only):
 3. `candidates_to_rows` with that column_map, merge_key="LinkedIn URL".
 4. Text: "Added 20 US founders of small athletic-apparel brands.
    Started US-only — say if you want global. No verified emails yet."
-5. `suggest_replies(kind="more_rows", suggestions=[
-     {label:"+25", message:"Add 25 more rows of similar quality."},
-     {label:"+ verified emails", message:"Add verified work emails."},
-     {label:"Go global", message:"Re-run globally instead of US-only."}])`.
+5. `suggest_more_rows(amounts=[25, 50, 100])` for scaling.
+6. `suggest_replies(suggestions=[
+     {label:"Add verified work emails", message:"Add verified work emails for these rows."},
+     {label:"Go global instead of US-only", message:"Re-run globally instead of US-only."}
+   ])` for off-axis next steps.
 
 User clicks "+ verified emails" — that's an ENRICH job:
 
@@ -476,7 +516,8 @@ You (one turn):
    retweet_count, reply_count, url). `columns_add` for each.
 5. `candidates_to_rows` with column_map, merge_key="Post ID".
 6. Text: "Added 50 of @shannholmberg's posts."
-7. `suggest_replies(kind="more_rows", ...)` for "+50 more" / filters.
+7. `suggest_more_rows(amounts=[50, 100, 250])` for scaling, and
+   optionally `suggest_replies` for filter follow-ups.
 
 # Worked example C — closed set, harvest then enrich
 
@@ -807,22 +848,26 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
         "user_location": {"type": "approximate"},
         "search_context_size": "low",
     },
-    # Quick-reply chips attached to the model's text response. The user
-    # can click instead of typing. Calling this ENDS the turn — the
-    # streaming loop breaks after dispatching it (no follow-up round).
+    # Text reply suggestions, rendered as clickable text under the
+    # assistant's message. Use when ending a turn with a question or
+    # proposal — gives the user 1-click answers without typing.
+    # Calling this ENDS the turn (loop breaks after dispatch).
     {
         "type": "function",
         "name": "suggest_replies",
         "description": (
-            "Attach 2-5 quick-reply chips to your latest text response so "
-            "the user can click instead of typing. Use whenever you end a "
-            "turn with a question/proposal AND right after a successful "
-            "row insertion (use kind='more_rows' for scale-up chips). "
-            "DO NOT use for purely informational endings or when there's "
-            "no obvious next action. The conversation ends after this — "
-            "the user picks a chip or types their own reply.\n\n"
-            "Always emit your text response BEFORE this call (the chips "
-            "render below the message)."
+            "Attach 2-5 text reply suggestions to your latest message. "
+            "These render as clickable text lines under the message — "
+            "the user picks one with a click instead of typing. Use "
+            "whenever you end a turn with a question or proposal "
+            "('want me to do X or Y?', 'should I add emails too?'). "
+            "DO NOT use for purely informational endings or when no "
+            "concrete next-action choice exists.\n\n"
+            "For scale-up chips ('+10 rows', '+25 rows'), use "
+            "`suggest_more_rows` instead — that surfaces above the "
+            "input as universal scaling buttons.\n\n"
+            "Both tools can be called in the same turn when both apply. "
+            "Always emit your text response BEFORE these calls."
         ),
         "parameters": {
             "type": "object",
@@ -836,28 +881,60 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
                         "properties": {
                             "label": {
                                 "type": "string",
-                                "description": "Short button text (~25 chars, no quotes).",
+                                "description": "Short clickable text (~40 chars, no quotes). Should read as a complete sentence the user might say.",
                             },
                             "message": {
                                 "type": "string",
-                                "description": "Full message sent as the user's reply if clicked.",
+                                "description": "Full message sent as the user's reply if clicked. Often same as label.",
                             },
                         },
                         "required": ["label", "message"],
                     },
                 },
-                "kind": {
-                    "type": "string",
-                    "enum": ["choice", "more_rows"],
-                    "default": "choice",
-                    "description": (
-                        "'choice' = mutually-exclusive options (Yes/No/specific "
-                        "direction). 'more_rows' = '+N' scaling chips; the "
-                        "frontend additionally renders a custom number input."
-                    ),
-                },
             },
             "required": ["suggestions"],
+        },
+    },
+    # Universal '+N more rows' chips, rendered above the input area.
+    # Use right after rows_add succeeds AND it makes sense to scale.
+    # Click sends a templated 'Add N more rows of similar quality.'
+    # The frontend ALWAYS adds a custom number input — don't include
+    # an explicit 'custom' option. Calling this ENDS the turn.
+    {
+        "type": "function",
+        "name": "suggest_more_rows",
+        "description": (
+            "Attach scaling '+N' chips above the user's input area, for "
+            "one-click 'add N more rows' actions. Call this RIGHT AFTER "
+            "a successful rows_add (or candidates_to_rows) when scaling "
+            "up makes sense — e.g. you added 8 starter rows and the "
+            "user might want 10/25/50 more.\n\n"
+            "Pick 2-4 amounts based on current row count. Rough guide: "
+            "with 5-10 rows, suggest [10, 25, 50]; with 50 rows, "
+            "suggest [25, 50, 100]; with 100+ rows, suggest [50, 100, "
+            "250]. The frontend adds a custom number input "
+            "automatically, so don't include an explicit 'custom' chip.\n\n"
+            "DO NOT call when no rows were just added, or when the "
+            "user's last message was a question that needs an answer "
+            "(use suggest_replies for that). Both tools can be called "
+            "in the same turn if both apply."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "amounts": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 4,
+                    "items": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 1000,
+                    },
+                    "description": "Preset row counts to offer (e.g. [10, 25, 50]).",
+                },
+            },
+            "required": ["amounts"],
         },
     },
 ]
@@ -1079,6 +1156,9 @@ async def execute_tool(
     if tool_name == "suggest_replies":
         applied, result = _tool_suggest_replies(args)
         return applied, result, 0.0
+    if tool_name == "suggest_more_rows":
+        applied, result = _tool_suggest_more_rows(args)
+        return applied, result, 0.0
 
     if tool_name == "candidates_list":
         applied, result = _tool_candidates_list(project, args)
@@ -1233,7 +1313,7 @@ async def _tool_candidates_to_rows(
 
 
 def _tool_suggest_replies(args: Dict[str, Any]):
-    """Attach chips to the assistant's most recent text response.
+    """Attach text reply suggestions to the assistant's most recent message.
 
     No DB side effects — the suggestions are forwarded to the SSE stream
     and persisted in applied_changes so they survive a history reload.
@@ -1247,15 +1327,36 @@ def _tool_suggest_replies(args: Dict[str, Any]):
         message = (s.get("message") or "").strip()
         if not label or not message:
             continue
-        items.append({"label": label[:60], "message": message[:500]})
+        items.append({"label": label[:80], "message": message[:500]})
     if not items:
         return {}, {"error": "no valid suggestions"}
-    kind = args.get("kind") or "choice"
-    if kind not in ("choice", "more_rows"):
-        kind = "choice"
     return (
-        {"suggestions": {"kind": kind, "items": items}},
+        {"suggestions": {"items": items}},
         {"ok": True, "count": len(items)},
+    )
+
+
+def _tool_suggest_more_rows(args: Dict[str, Any]):
+    """Attach scaling '+N' chips above the input area.
+
+    No DB side effects — the amounts are forwarded to the SSE stream
+    and persisted in applied_changes so they survive a history reload.
+    """
+    raw = args.get("amounts") or []
+    amounts: List[int] = []
+    for v in raw:
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= n <= 1000 and n not in amounts:
+            amounts.append(n)
+    if not amounts:
+        return {}, {"error": "no valid amounts"}
+    amounts.sort()
+    return (
+        {"more_rows": {"amounts": amounts}},
+        {"ok": True, "count": len(amounts)},
     )
 
 

@@ -313,6 +313,42 @@ def _sse(payload: Dict[str, Any]) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
+# ---- Reasoning effort escalation -----------------------------------------
+# Default to "low" for snappy turns. Escalate when the user message signals
+# they want deeper thinking — explicit asks ("think carefully", "deep
+# research") OR dissatisfaction with the previous answer ("you're wrong",
+# "no, that's not right"). Tier "high" reserved for explicit "really think
+# hard" / "extensive research" framings.
+
+_HIGH_EFFORT_SIGNALS = (
+    "think very", "think really", "think extra hard",
+    "extensive research", "very thorough", "exhaustive",
+    "deep research", "really dig", "dig very deep",
+)
+
+_MEDIUM_EFFORT_SIGNALS = (
+    "carefully", "thoroughly", "in depth", "in-depth", "deeply",
+    "deep dive", "dig deeper", "think hard", "think harder",
+    "do research", "research this", "research it", "analyze",
+    "examine", "double check", "double-check", "be precise",
+    # Dissatisfaction / correction signals — model probably needs more
+    # reasoning to figure out what went wrong last turn.
+    "you're wrong", "that's wrong", "this is wrong",
+    "actually, no", "no, ", "not what i", "not what's",
+    "fix this", "this is broken", "doesn't work", "didn't work",
+    "missed", "you missed", "wrong answer",
+)
+
+
+def _resolve_reasoning_effort(user_content: str) -> str:
+    text = (user_content or "").lower()
+    if any(s in text for s in _HIGH_EFFORT_SIGNALS):
+        return "high"
+    if any(s in text for s in _MEDIUM_EFFORT_SIGNALS):
+        return "medium"
+    return "low"
+
+
 # ---- Main streaming generator --------------------------------------------
 async def stream_chat_response(
     project_id: UUID,
@@ -406,6 +442,10 @@ async def stream_chat_response(
             # "No tool call found for function call output" when the prior
             # response state is dropped/incomplete after long round 0 runs).
             running_input: List[Dict[str, Any]] = list(input_items)
+            # Reasoning effort scales with the user's message — default low
+            # for snap turns, escalates to medium/high when the user asks
+            # for deeper thinking or signals dissatisfaction.
+            _effort = _resolve_reasoning_effort(user_content)
             stripper = _CitationStripper()
             # Track web_search_call items we've already surfaced as synthetic
             # tool calls, so we don't double-emit on retry/replay.
@@ -424,7 +464,7 @@ async def stream_chat_response(
                     "instructions": agent.SYSTEM_PROMPT,
                     "input": running_input,
                     "tools": agent.CHAT_TOOLS,
-                    "reasoning": {"effort": "low", "summary": "auto"},
+                    "reasoning": {"effort": _effort, "summary": "auto"},
                     "max_output_tokens": 8000,
                 }
 
@@ -804,15 +844,22 @@ async def stream_chat_response(
                 if stopped:
                     break
 
-                # Quick-reply chips: surface as a dedicated SSE event so
-                # the frontend can render them directly (separate from the
-                # generic "change" feed which is for table mutations).
+                # Surface the two suggestion tools as dedicated SSE events
+                # (separate from the generic "change" feed which is for
+                # table mutations). Frontend renders them in different UI
+                # locations: text replies under the message, more_rows
+                # chips above the input.
                 if isinstance(round_applied.get("suggestions"), dict):
                     sg = round_applied["suggestions"]
                     yield _sse({
                         "type": "suggestions",
-                        "kind": sg.get("kind") or "choice",
                         "items": sg.get("items") or [],
+                    })
+                if isinstance(round_applied.get("more_rows"), dict):
+                    mr = round_applied["more_rows"]
+                    yield _sse({
+                        "type": "more_rows",
+                        "amounts": mr.get("amounts") or [],
                     })
 
                 for change in agent.describe_applied(round_applied):
@@ -829,10 +876,14 @@ async def stream_chat_response(
                         yield _sse(event_data)
 
                 # End the conversation after these tools — they're terminal:
-                # ask_questions waits for a structured answer; suggest_replies
-                # hands control to the user via clickable chips.
+                # ask_questions waits for a structured answer; suggest_*
+                # hands control to the user via clickable suggestions/chips.
                 if any(
-                    item.name in ("ask_questions", "suggest_replies")
+                    item.name in (
+                        "ask_questions",
+                        "suggest_replies",
+                        "suggest_more_rows",
+                    )
                     for item in tool_calls
                 ):
                     break
