@@ -1585,6 +1585,11 @@ def describe_applied(applied: Dict[str, Any]) -> List[AppliedChange]:
         out.append(AppliedChange(
             field="columns",
             description=f"Schema now {len(names)} column(s): {preview}",
+            # Send the full columns array so the frontend can patch its
+            # local project.columns state without a DB roundtrip. The
+            # value is the same shape ProjectOut.columns has (list of
+            # {name, format?, description?}).
+            value=cols,
         ))
     if "rows" in applied:
         ins = applied["rows"].get("inserted", 0)
