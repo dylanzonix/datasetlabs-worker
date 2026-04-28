@@ -344,28 +344,48 @@ def _resolve_reasoning_effort(user_content: str) -> str:
     return "medium"
 
 
+def _attr_or_key(obj: Any, *names: str) -> Any:
+    """Pull an attribute from a pydantic-ish model OR a key from a dict.
+    OpenAI's stream events sometimes hand us typed objects, sometimes
+    dicts depending on the event type — accept both."""
+    for n in names:
+        if obj is None:
+            return None
+        if hasattr(obj, n):
+            v = getattr(obj, n, None)
+            if v is not None:
+                return v
+        if isinstance(obj, dict) and n in obj and obj[n] is not None:
+            return obj[n]
+    return None
+
+
 def _web_search_args_preview(item: Any) -> str:
     """Format a web_search_call's action as `kind="value"` for the UI.
 
-    OpenAI's web_search built-in fires `output_item.added` and
-    `output_item.done` events with an `action` sub-object. The action
-    type is one of `search` (action.query), `open_page` (action.url),
-    or `find_in_page` (action.query). The query may be empty on the
-    initial added event and only populated by the time `done` fires —
-    callers re-run this on done to backfill.
+    OpenAI's web_search built-in fires `output_item.added`,
+    `response.web_search_call.*`, and `output_item.done` events with
+    an `action` sub-object. The action type is one of `search`
+    (action.query), `open_page` (action.url), or `find_in_page`
+    (action.query). The query may be empty on the initial added event
+    and populated later — callers re-run this on subsequent events to
+    backfill.
     """
-    action = getattr(item, "action", None)
+    action = _attr_or_key(item, "action")
     if action is None:
         return ""
-    a_type = getattr(action, "type", None)
+    a_type = _attr_or_key(action, "type")
     if a_type == "search":
-        v = (getattr(action, "query", None) or "")[:120]
+        raw = _attr_or_key(action, "query")
+        v = (str(raw) if raw else "")[:120]
         return f'query="{v}"' if v else ""
     if a_type == "open_page":
-        v = (getattr(action, "url", None) or "")[:120]
+        raw = _attr_or_key(action, "url")
+        v = (str(raw) if raw else "")[:160]
         return f'url="{v}"' if v else ""
     if a_type == "find_in_page":
-        v = (getattr(action, "query", None) or "")[:120]
+        raw = _attr_or_key(action, "query", "pattern")
+        v = (str(raw) if raw else "")[:120]
         return f'find="{v}"' if v else ""
     return ""
 
@@ -687,6 +707,39 @@ async def stream_chat_response(
                                                 "summary": summary,
                                                 "cost": 0,
                                                 "args_preview": final_args or None,
+                                            })
+                                            await asyncio.sleep(0)
+
+                                elif event_type and event_type.startswith("response.web_search_call."):
+                                    # Mid-flight progress events — we don't
+                                    # show the status text, but they're the
+                                    # earliest reliable carrier of action.query
+                                    # for some traffic patterns. If the args
+                                    # are now known but our entry is still
+                                    # blank, push a tool_call_update so the UI
+                                    # upgrades "Searching the web" to
+                                    # "Searching the web: <query>" while the
+                                    # search is still in flight.
+                                    progress_item = getattr(event, "item", None)
+                                    progress_id = (
+                                        getattr(event, "item_id", None)
+                                        or (getattr(progress_item, "id", None) if progress_item else None)
+                                        or ""
+                                    )
+                                    if progress_id and progress_id in tool_log_index:
+                                        idx = tool_log_index[progress_id]
+                                        existing_args = tool_log[idx].get("args_preview", "") or ""
+                                        new_args = (
+                                            _web_search_args_preview(progress_item)
+                                            if progress_item is not None
+                                            else ""
+                                        )
+                                        if new_args and new_args != existing_args:
+                                            tool_log[idx]["args_preview"] = new_args
+                                            yield _sse({
+                                                "type": "tool_call_update",
+                                                "id": progress_id,
+                                                "args_preview": new_args,
                                             })
                                             await asyncio.sleep(0)
 
