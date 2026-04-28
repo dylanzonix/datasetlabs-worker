@@ -341,12 +341,7 @@ _MEDIUM_EFFORT_SIGNALS = (
 
 
 def _resolve_reasoning_effort(user_content: str) -> str:
-    text = (user_content or "").lower()
-    if any(s in text for s in _HIGH_EFFORT_SIGNALS):
-        return "high"
-    if any(s in text for s in _MEDIUM_EFFORT_SIGNALS):
-        return "medium"
-    return "low"
+    return "high"
 
 
 # ---- Main streaming generator --------------------------------------------
