@@ -451,9 +451,6 @@ async def stream_chat_response(
                     stopped = True
                     break
 
-                round_thinking_start = time.time()
-                got_output_this_round = False
-
                 stream_kwargs: Dict[str, Any] = {
                     "model": settings.OPENAI_MODEL,
                     "instructions": agent.SYSTEM_PROMPT,
@@ -463,158 +460,199 @@ async def stream_chat_response(
                     "max_output_tokens": 8000,
                 }
 
+                # OpenAI sometimes ends a long-reasoning response without
+                # sending response.completed (server-side stream cut on
+                # heavy round-2 reasoning). Retry the inner stream once
+                # when this happens AND we haven't streamed any visible
+                # text yet — otherwise a retry would produce duplicate
+                # tokens for the user. Manual re-runs always succeed; an
+                # automatic retry turns the freeze into a slower-but-OK turn.
+                MAX_STREAM_RETRIES = 1
+                final_response = None
+                round_thinking_start = time.time()
+                got_output_this_round = False
                 round_text_collected = ""
-                with tracing.start_generation(
-                    f"openai.responses.round_{round_num}",
-                    model=settings.OPENAI_MODEL,
-                    input_payload=stream_kwargs.get("input"),
-                    metadata={"round": round_num},
-                ) as gen:
-                    async with client.responses.stream(**stream_kwargs) as stream:
-                        async for event in stream:
-                            event_type = getattr(event, "type", None)
 
-                            if event_type == "response.reasoning_summary_text.delta":
-                                delta = getattr(event, "delta", "") or ""
-                                if delta:
-                                    yield _sse({"type": "thinking", "content": delta})
-                                    await asyncio.sleep(0)
+                for attempt in range(MAX_STREAM_RETRIES + 1):
+                    # Reset per-attempt timing/output. full_content,
+                    # tool_log, seen_web_search_ids etc. stay (cumulative).
+                    round_thinking_start = time.time()
+                    got_output_this_round = False
+                    round_text_collected = ""
+                    final_response = None
 
-                            elif event_type == "response.output_text.annotation.added":
-                                ann = getattr(event, "annotation", None)
-                                if ann is not None:
-                                    a_type = getattr(ann, "type", None) or (
-                                        ann.get("type") if isinstance(ann, dict) else None
-                                    )
-                                    if a_type == "url_citation":
-                                        url = getattr(ann, "url", None) or (
-                                            ann.get("url") if isinstance(ann, dict) else None
+                    trace_label = (
+                        f"openai.responses.round_{round_num}"
+                        if attempt == 0
+                        else f"openai.responses.round_{round_num}_retry_{attempt}"
+                    )
+                    with tracing.start_generation(
+                        trace_label,
+                        model=settings.OPENAI_MODEL,
+                        input_payload=stream_kwargs.get("input"),
+                        metadata={"round": round_num, "attempt": attempt},
+                    ) as gen:
+                        async with client.responses.stream(**stream_kwargs) as stream:
+                            async for event in stream:
+                                event_type = getattr(event, "type", None)
+
+                                if event_type == "response.reasoning_summary_text.delta":
+                                    delta = getattr(event, "delta", "") or ""
+                                    if delta:
+                                        yield _sse({"type": "thinking", "content": delta})
+                                        await asyncio.sleep(0)
+
+                                elif event_type == "response.output_text.annotation.added":
+                                    ann = getattr(event, "annotation", None)
+                                    if ann is not None:
+                                        a_type = getattr(ann, "type", None) or (
+                                            ann.get("type") if isinstance(ann, dict) else None
                                         )
-                                        title = getattr(ann, "title", None) or (
-                                            ann.get("title") if isinstance(ann, dict) else None
-                                        )
-                                        added = _record_source(url, title)
-                                        if added is not None:
-                                            yield _sse({"type": "source_added", **added})
+                                        if a_type == "url_citation":
+                                            url = getattr(ann, "url", None) or (
+                                                ann.get("url") if isinstance(ann, dict) else None
+                                            )
+                                            title = getattr(ann, "title", None) or (
+                                                ann.get("title") if isinstance(ann, dict) else None
+                                            )
+                                            added = _record_source(url, title)
+                                            if added is not None:
+                                                yield _sse({"type": "source_added", **added})
+                                                await asyncio.sleep(0)
+
+                                elif event_type == "response.output_item.added":
+                                    # Surface OpenAI's built-in web_search calls
+                                    # as synthetic tool_call entries so the UI
+                                    # doesn't go silent during searches (which
+                                    # can each take 30-60s and chain).
+                                    added_item = getattr(event, "item", None)
+                                    if (
+                                        added_item is not None
+                                        and getattr(added_item, "type", None) == "web_search_call"
+                                    ):
+                                        item_id = getattr(added_item, "id", None) or ""
+                                        if item_id and item_id not in seen_web_search_ids:
+                                            seen_web_search_ids.add(item_id)
+                                            action = getattr(added_item, "action", None)
+                                            a_type = getattr(action, "type", None) if action else None
+                                            if a_type == "search":
+                                                preview = (getattr(action, "query", None) or "")[:120]
+                                                args_preview = f'query="{preview}"'
+                                            elif a_type == "open_page":
+                                                preview = (getattr(action, "url", None) or "")[:120]
+                                                args_preview = f'url="{preview}"'
+                                            elif a_type == "find_in_page":
+                                                preview = (getattr(action, "query", None) or "")[:120]
+                                                args_preview = f'find="{preview}"'
+                                            else:
+                                                args_preview = ""
+                                            tool_log_index[item_id] = len(tool_log)
+                                            tool_log.append({
+                                                "id": item_id,
+                                                "name": "web_search",
+                                                "args_preview": args_preview,
+                                            })
+                                            yield _sse({
+                                                "type": "tool_call",
+                                                "id": item_id,
+                                                "name": "web_search",
+                                                "args_preview": args_preview,
+                                            })
                                             await asyncio.sleep(0)
 
-                            elif event_type == "response.output_item.added":
-                                # Surface OpenAI's built-in web_search calls
-                                # as synthetic tool_call entries so the UI
-                                # doesn't go silent during searches (which
-                                # can each take 30-60s and chain).
-                                added_item = getattr(event, "item", None)
-                                if (
-                                    added_item is not None
-                                    and getattr(added_item, "type", None) == "web_search_call"
-                                ):
-                                    item_id = getattr(added_item, "id", None) or ""
-                                    if item_id and item_id not in seen_web_search_ids:
-                                        seen_web_search_ids.add(item_id)
-                                        action = getattr(added_item, "action", None)
-                                        a_type = getattr(action, "type", None) if action else None
-                                        if a_type == "search":
-                                            preview = (getattr(action, "query", None) or "")[:120]
-                                            args_preview = f'query="{preview}"'
-                                        elif a_type == "open_page":
-                                            preview = (getattr(action, "url", None) or "")[:120]
-                                            args_preview = f'url="{preview}"'
-                                        elif a_type == "find_in_page":
-                                            preview = (getattr(action, "query", None) or "")[:120]
-                                            args_preview = f'find="{preview}"'
-                                        else:
-                                            args_preview = ""
-                                        tool_log_index[item_id] = len(tool_log)
-                                        tool_log.append({
-                                            "id": item_id,
-                                            "name": "web_search",
-                                            "args_preview": args_preview,
-                                        })
-                                        yield _sse({
-                                            "type": "tool_call",
-                                            "id": item_id,
-                                            "name": "web_search",
-                                            "args_preview": args_preview,
-                                        })
-                                        await asyncio.sleep(0)
-
-                            elif event_type == "response.output_item.done":
-                                done_item = getattr(event, "item", None)
-                                if (
-                                    done_item is not None
-                                    and getattr(done_item, "type", None) == "web_search_call"
-                                ):
-                                    item_id = getattr(done_item, "id", None) or ""
-                                    if item_id:
-                                        status = getattr(done_item, "status", None) or "completed"
-                                        idx = tool_log_index.get(item_id)
-                                        summary = "done" if status == "completed" else status
-                                        if idx is not None:
-                                            tool_log[idx]["summary"] = summary
-                                        yield _sse({
-                                            "type": "tool_result",
-                                            "id": item_id,
-                                            "name": "web_search",
-                                            "summary": summary,
-                                            "cost": 0,
-                                        })
-                                        await asyncio.sleep(0)
-
-                            elif event_type == "response.output_text.delta":
-                                if not got_output_this_round:
-                                    got_output_this_round = True
-                                    thinking_total += time.time() - round_thinking_start
+                                elif event_type == "response.output_item.done":
+                                    done_item = getattr(event, "item", None)
                                     if (
-                                        round_num > 0
-                                        and full_content
-                                        and not full_content.endswith("\n\n")
+                                        done_item is not None
+                                        and getattr(done_item, "type", None) == "web_search_call"
                                     ):
-                                        sep = "\n\n"
-                                        full_content += sep
-                                        yield _sse({"type": "token", "content": sep})
+                                        item_id = getattr(done_item, "id", None) or ""
+                                        if item_id:
+                                            status = getattr(done_item, "status", None) or "completed"
+                                            idx = tool_log_index.get(item_id)
+                                            summary = "done" if status == "completed" else status
+                                            if idx is not None:
+                                                tool_log[idx]["summary"] = summary
+                                            yield _sse({
+                                                "type": "tool_result",
+                                                "id": item_id,
+                                                "name": "web_search",
+                                                "summary": summary,
+                                                "cost": 0,
+                                            })
+                                            await asyncio.sleep(0)
 
-                                token = event.delta or ""
-                                if token:
-                                    round_text_collected += token
-                                    clean = stripper.feed(token)
-                                    if clean:
-                                        full_content += clean
-                                        yield _sse({"type": "token", "content": clean})
-                                        await asyncio.sleep(0)
+                                elif event_type == "response.output_text.delta":
+                                    if not got_output_this_round:
+                                        got_output_this_round = True
+                                        thinking_total += time.time() - round_thinking_start
+                                        if (
+                                            round_num > 0
+                                            and full_content
+                                            and not full_content.endswith("\n\n")
+                                        ):
+                                            sep = "\n\n"
+                                            full_content += sep
+                                            yield _sse({"type": "token", "content": sep})
 
-                        # OpenAI's stream sometimes ends without sending a
-                        # `response.completed` event (network blip, Azure
-                        # mid-stream timeout, model truncation). The SDK
-                        # raises RuntimeError in that case. Don't crash —
-                        # treat as an incomplete round and break out
-                        # gracefully. The text the model already streamed
-                        # is on the client; we'll persist it as a stub
-                        # via the normal end-of-turn path.
-                        try:
-                            final_response = await stream.get_final_response()
-                        except RuntimeError as _rt:
-                            if "response.completed" in str(_rt):
-                                log.warning(
-                                    f"round {round_num}: stream ended without "
-                                    f"completion event — treating as incomplete"
-                                )
-                                final_response = None
-                            else:
-                                raise
+                                    token = event.delta or ""
+                                    if token:
+                                        round_text_collected += token
+                                        clean = stripper.feed(token)
+                                        if clean:
+                                            full_content += clean
+                                            yield _sse({"type": "token", "content": clean})
+                                            await asyncio.sleep(0)
 
-                    if final_response is None:
-                        # Incomplete round: skip post-stream processing and
-                        # exit the loop. full_content has whatever text we
-                        # streamed; the assistant message will persist with
-                        # that + a `stopped` flag.
-                        stopped = True
-                        remaining = stripper.flush()
-                        if remaining:
-                            full_content += remaining
-                            yield _sse({"type": "token", "content": remaining})
-                        if not got_output_this_round:
-                            thinking_total += time.time() - round_thinking_start
+                            # OpenAI's stream sometimes ends without sending
+                            # a `response.completed` event. The SDK raises
+                            # RuntimeError in that case. Caught and decided
+                            # below: retry, or treat as incomplete.
+                            try:
+                                final_response = await stream.get_final_response()
+                            except RuntimeError as _rt:
+                                if "response.completed" in str(_rt):
+                                    final_response = None
+                                else:
+                                    raise
+
+                    # End of attempt's tracing context. Now decide:
+                    # success → break; text-already-emitted or out-of-retries
+                    # → break (fall through to incomplete handler);
+                    # otherwise → retry.
+                    if final_response is not None:
                         break
+                    if round_text_collected:
+                        log.warning(
+                            f"round {round_num}: stream ended without completion "
+                            f"event after {len(round_text_collected)} chars "
+                            f"emitted — treating as incomplete"
+                        )
+                        break
+                    if attempt >= MAX_STREAM_RETRIES:
+                        log.warning(
+                            f"round {round_num}: stream ended without completion "
+                            f"event after {attempt + 1} attempt(s) — giving up"
+                        )
+                        break
+                    log.warning(
+                        f"round {round_num} attempt {attempt + 1}: stream ended "
+                        f"without completion event (no text emitted yet), retrying"
+                    )
+
+                if final_response is None:
+                    # Incomplete round: skip post-stream processing and
+                    # exit the loop. full_content has whatever text we
+                    # streamed; the assistant message will persist with
+                    # that + a `stopped` flag.
+                    stopped = True
+                    remaining = stripper.flush()
+                    if remaining:
+                        full_content += remaining
+                        yield _sse({"type": "token", "content": remaining})
+                    if not got_output_this_round:
+                        thinking_total += time.time() - round_thinking_start
+                    break
 
                     # Fallback: walk the final response for any url_citation
                     # annotations the streaming event missed (depends on SDK
