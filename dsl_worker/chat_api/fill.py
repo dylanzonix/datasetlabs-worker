@@ -232,7 +232,8 @@ async def _run_cell_agent(
         function_calls: List[Any] = []
         for item in resp.output:
             if item.type == "web_search_call":
-                result.cost_usd += sources._WEB_SEARCH_USD_PER_CALL
+                # Cell agent uses search_context_size="low" (see _cell_tools_for_columns).
+                result.cost_usd += sources.WEB_SEARCH_USD_BY_TIER["low"]
             elif item.type == "function_call":
                 function_calls.append(item)
 

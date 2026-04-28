@@ -28,7 +28,7 @@ from dsl_api.credits import consume_credits
 from dsl_api.db import SessionLocal
 from dsl_api.models import Account, ChatMessage, Project
 
-from dsl_worker.chat_api import agent, tracing
+from dsl_worker.chat_api import agent, sources as _sources, tracing
 
 log = logging.getLogger(__name__)
 
@@ -48,9 +48,6 @@ def get_openai_client() -> AsyncOpenAI:
 _INPUT_COST = 0.0000025          # $2.50 / 1M tokens
 _CACHED_INPUT_COST = 0.00000025  # $0.25 / 1M tokens
 _OUTPUT_COST = 0.000015          # $15.00 / 1M tokens
-# OpenAI bills built-in web_search at ~$25 / 1K calls (varies by tier).
-# Counted separately because usage.input/output tokens don't include it.
-_WEB_SEARCH_USD_PER_CALL = 0.025
 
 MAX_TOOL_ROUNDS = 12
 
@@ -642,7 +639,8 @@ async def stream_chat_response(
                     if item.type == "web_search_call"
                 )
                 if web_search_count:
-                    total_cost += web_search_count * _WEB_SEARCH_USD_PER_CALL
+                    # Main agent uses search_context_size="low" (see agent.py CHAT_TOOLS).
+                    total_cost += web_search_count * _sources.WEB_SEARCH_USD_BY_TIER["low"]
 
                 if not got_output_this_round:
                     thinking_total += time.time() - round_thinking_start

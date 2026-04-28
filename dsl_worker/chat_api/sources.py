@@ -733,9 +733,14 @@ async def _browser_use(args: Dict[str, Any], *, project_id: Optional[Any] = None
 _LLM_INPUT_USD = 0.0000025
 _LLM_CACHED_INPUT_USD = 0.00000025
 _LLM_OUTPUT_USD = 0.000015
-# Cost per OpenAI built-in web_search call (rough; updates over time).
-# Mirrors streaming._WEB_SEARCH_USD_PER_CALL — keep in sync.
-_WEB_SEARCH_USD_PER_CALL = 0.025
+# Per-call rates for OpenAI's built-in web_search, by search_context_size.
+# OpenAI bills at ~$25/$30/$50 per 1K calls for low/medium/high. Update if
+# OpenAI changes their pricing.
+WEB_SEARCH_USD_BY_TIER = {
+    "low": 0.025,
+    "medium": 0.030,
+    "high": 0.050,
+}
 
 
 def _response_cost(resp: Any) -> float:
@@ -900,7 +905,9 @@ async def _web_harvest(args: Dict[str, Any], *, project_id: Optional[Any] = None
 
         next_input = tool_outputs
 
-    total_cost += web_search_calls * _WEB_SEARCH_USD_PER_CALL
+    # web_harvest uses search_context_size=medium (line ~814), so bill at
+    # the medium rate, not the low default.
+    total_cost += web_search_calls * WEB_SEARCH_USD_BY_TIER["medium"]
 
     persisted = _persist_candidates(
         project_id,
