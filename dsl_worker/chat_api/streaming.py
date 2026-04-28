@@ -761,6 +761,10 @@ async def stream_chat_response(
 
                         item_applied, result, tool_cost = await tool_task
                         result_text = agent.format_tool_result(item.name, result)
+                        # Append a one-line table-state hint to every tool
+                        # result so the agent can't drift off thinking it
+                        # added rows when the table is still empty.
+                        result_text += agent.project_state_hint(db, project)
                         total_cost += tool_cost
                         round_applied.update(item_applied)
                         applied.update(item_applied)

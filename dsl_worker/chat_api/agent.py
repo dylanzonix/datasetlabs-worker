@@ -119,29 +119,28 @@ If the chosen strategy returns 0 results: broaden the SAME tool's
 filters and re-run. Escalating to a more expensive tool is the last
 move, not the second move.
 
-# The first source call that returns items IS the harvest. COMMIT IT.
+# What harvesting actually is
 
-This is the rule that matters most. The instant ANY source tool
-(apify_call_actor, fullenrich_*, apollo_*, google_maps_*, web_harvest,
-browser_use) returns a candidates_file with `items_count > 0`, your
-NEXT moves in this turn are ALWAYS:
+Harvesting is picking the source most likely to have what the user
+asked for, fetching from it, and landing the result on the table. It
+is NOT finding the perfect dataset on the first try. The first source
+that returns something usable IS your harvest. The candidates won't
+have every field the user might eventually want — that's fine.
+Imperfect rows on the table beat perfect rows in a candidates file
+the user can't see.
 
-1. `columns_add` for the columns you want from those candidates'
-   `fields` (unless they already exist).
-2. `candidates_to_rows` to land them as rows.
-3. Text reply.
+Projects are iterative. The user expects to take multiple turns:
 
-Do NOT in this same turn:
-- Run another source tool to "supplement" or "verify" the first batch.
-- Run code_exec to re-shape or filter — commit the raw harvest first;
-  reshape via `rows_update` / `rows_fill` later if needed.
-- Loop back into browser_use on individual entity pages to "enrich" —
-  that's `rows_fill`'s job, in a separate turn the user explicitly
-  asks for.
+- This turn: harvest a starter set with whatever schema the source
+  naturally returns. Commit. Show.
+- Next turn (user-driven): "add Twitter handles" → `rows_fill`. "More
+  cohorts" → another harvest. "Filter to US" → `rows_delete` or refine.
 
-The candidate file is not a draft. It's the answer. If the first
-fetch produced a usable schema, you're done with sourcing — the rest
-is plumbing into the table.
+Trying to make one turn perfect is the failure mode. Burning multiple
+source calls trying to find "the right data" is worse than landing
+imperfect data the user can react to. When a source returns something
+usable, your work for THIS turn is done sourcing — define the columns
+you got, commit the rows, write a one-sentence reply, end.
 
 # Destructive ops still pause
 
@@ -357,14 +356,9 @@ obvious — use judgment.
   `web_search` directly (one cheap call). Slow and pricey
   ($0.20–$0.50 typical).
 - **browser_use(task)** — last-resort cloud browser session. Slow
-  (30–180s) and $0.10–$0.50/call. Nuclear option — only when Apify has
-  no working actor for the site AND `web_search` can't surface the
-  content (JS-rendered, anti-bot, login wall). Use it ONCE per turn at
-  most. NEVER loop browser_use over individual entity pages to enrich
-  rows one at a time — at $0.20/call × N entities, that's a way to
-  spend $50 on a 250-row dataset. If you need per-entity enrichment,
-  finish the harvest first and let `rows_fill` handle it (it spawns
-  bounded per-cell agents with budget caps).
+  (30–180s) and $0.10–$0.50/call. Use it for ONE page extraction when
+  no Apify actor exists and the page needs JS rendering / anti-bot /
+  login. Per-row enrichment is `rows_fill`'s job, not browser_use's.
 
 # Picking a source
 
@@ -1594,6 +1588,23 @@ def _tool_rows_delete(
 def format_tool_result(tool_name: str, result: Dict[str, Any]) -> str:
     """Stringify the tool result for the LLM input feed."""
     return json.dumps(result, default=str)[:4000]
+
+
+def project_state_hint(db: Session, project: Project) -> str:
+    """A short '[Table now: N columns, M rows]' line appended after every
+    tool result so the agent constantly sees what the user actually has
+    on screen. Stops it from claiming work was done when nothing was
+    committed."""
+    try:
+        n_cols = len([c for c in (project.columns or []) if isinstance(c, dict)])
+        n_rows = 0
+        if project.current_version_id:
+            n_rows = db.query(func.count(Sample.id)).filter(
+                Sample.version_id == project.current_version_id
+            ).scalar() or 0
+        return f"\n\n[Table now: {n_cols} columns, {n_rows} rows]"
+    except Exception:
+        return ""
 
 
 def describe_applied(applied: Dict[str, Any]) -> List[AppliedChange]:
