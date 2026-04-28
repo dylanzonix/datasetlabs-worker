@@ -626,10 +626,21 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "name": "columns_delete",
-        "description": "Drop a column and remove its data from every row.",
+        "description": (
+            "Drop a column and remove its data from every row. Two-phase: "
+            "first call without `confirm` returns a preview (count of cells "
+            "that would be dropped + sample values). Re-call with "
+            "confirm=true to actually delete."
+        ),
         "parameters": {
             "type": "object",
-            "properties": {"name": {"type": "string"}},
+            "properties": {
+                "name": {"type": "string"},
+                "confirm": {
+                    "type": "boolean",
+                    "description": "False (default) returns preview only. Set true to actually delete.",
+                },
+            },
             "required": ["name"],
         },
     },
@@ -713,12 +724,21 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "name": "rows_update",
-        "description": "Set the given column values on every row matching `where`.",
+        "description": (
+            "Set the given column values on every row matching `where`. "
+            "Two-phase: first call without `confirm` returns a preview "
+            "(count + sample of rows before update). Re-call with "
+            "confirm=true to apply."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "where": {"type": "object"},
                 "values": {"type": "object"},
+                "confirm": {
+                    "type": "boolean",
+                    "description": "False (default) returns preview only. Set true to apply.",
+                },
             },
             "required": ["where", "values"],
         },
@@ -727,12 +747,19 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
         "type": "function",
         "name": "rows_delete",
         "description": (
-            "Delete every row matching `where`. Always run rows_count with the same `where` "
-            "first and tell the user how many will be deleted before calling this."
+            "Delete rows matching `where`. Two-phase: first call without "
+            "`confirm` returns a preview (count + sample of what would be "
+            "deleted). Re-call with confirm=true to actually delete."
         ),
         "parameters": {
             "type": "object",
-            "properties": {"where": {"type": "object"}},
+            "properties": {
+                "where": {"type": "object"},
+                "confirm": {
+                    "type": "boolean",
+                    "description": "False (default) returns preview only. Set true to actually delete.",
+                },
+            },
             "required": ["where"],
         },
     },
@@ -819,10 +846,11 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
         "description": (
             "Bulk-commit items from a candidate file as rows. Stream the file "
             "server-side, apply optional filter, map source fields to column "
-            "names, insert in batches. No LLM round-trip per row. Use this to "
-            "turn 1000 fetched candidates into 1000 rows in one call. The "
-            "column_map keys are source field names (from the candidate file), "
-            "values are project column names."
+            "names. Two-phase: first call without `confirm` returns a preview "
+            "showing how many would insert vs merge (with sample collisions "
+            "for any merge_key collapses). Re-call with confirm=true to "
+            "actually commit. Column_map keys are source-file fields, values "
+            "are project column names."
         ),
         "parameters": {
             "type": "object",
@@ -841,7 +869,11 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
                 "filter": {"type": "object", "description": _FILTER_DESC},
                 "merge_key": {
                     "type": "string",
-                    "description": "Column name to dedupe on (column-name in the project, post-mapping). If matching row exists, merge fields instead of inserting.",
+                    "description": "Column name (post-mapping) to dedupe on. Only pass when the field is genuinely unique per intended row. If non-unique candidates would collapse, the preview will warn you.",
+                },
+                "confirm": {
+                    "type": "boolean",
+                    "description": "False (default) returns preview only. Set true to commit.",
                 },
             },
             "required": ["file", "column_map"],
@@ -1326,6 +1358,93 @@ async def _tool_candidates_to_rows(
         return {}, {"error": "column_map must be a non-empty {source_field: column_name} dict"}
     filt = args.get("filter") or {}
     merge_key = args.get("merge_key")
+    confirm = bool(args.get("confirm", False))
+
+    if not confirm:
+        # Preview: scan the file, count items that would insert vs merge.
+        # Surfaces the merge-collapse problem (multiple founders per
+        # company silently merging into one row) BEFORE it happens.
+        from sqlalchemy import text as _text
+        existing_keys: set = set()
+        if merge_key:
+            existing = db.execute(
+                _text(
+                    f"SELECT {_row_value_expr(merge_key)} FROM samples "
+                    f"WHERE version_id = :vid"
+                ),
+                {"vid": version.id},
+            ).all()
+            existing_keys = {str(r[0]) for r in existing if r[0] is not None}
+
+        scanned = 0
+        skipped_filter = 0
+        would_insert = 0
+        would_merge_existing = 0
+        intra_batch_collisions = 0  # candidates that merge with EARLIER candidates in this same file
+        seen_keys: set = set()
+        sample_inserts: List[Dict[str, Any]] = []
+        sample_collisions: List[Dict[str, Any]] = []
+
+        try:
+            for item in candidates.stream_candidates(project.id, file_name):
+                scanned += 1
+                if not candidates.apply_filter(item, filt):
+                    skipped_filter += 1
+                    continue
+                mapped = {target: item.get(source) for source, target in column_map.items()}
+                if all(v is None for v in mapped.values()):
+                    skipped_filter += 1
+                    continue
+                if merge_key:
+                    mv = mapped.get(merge_key)
+                    if mv is not None:
+                        mv_s = str(mv)
+                        if mv_s in existing_keys:
+                            would_merge_existing += 1
+                            if len(sample_collisions) < 3:
+                                sample_collisions.append({"merge_key_value": mv, "with": "existing row"})
+                            continue
+                        if mv_s in seen_keys:
+                            intra_batch_collisions += 1
+                            if len(sample_collisions) < 3:
+                                sample_collisions.append({"merge_key_value": mv, "with": "earlier candidate"})
+                            continue
+                        seen_keys.add(mv_s)
+                would_insert += 1
+                if len(sample_inserts) < 3:
+                    sample_inserts.append(mapped)
+        except FileNotFoundError as e:
+            return {}, {"error": str(e)}
+
+        warning = None
+        total_collisions = would_merge_existing + intra_batch_collisions
+        if merge_key and total_collisions > 0 and (would_insert + total_collisions) > 0:
+            collision_rate = total_collisions / (would_insert + total_collisions)
+            if collision_rate >= 0.30:
+                warning = (
+                    f"merge_key={merge_key!r} causes {total_collisions} of "
+                    f"{would_insert + total_collisions} candidates to collapse "
+                    f"({collision_rate:.0%}). That's likely a non-unique key "
+                    f"(e.g. company when there are multiple founders per "
+                    f"company). Consider dropping merge_key or picking a "
+                    f"genuinely unique field."
+                )
+
+        return {}, {
+            "preview": True,
+            "scanned": scanned,
+            "skipped_filter": skipped_filter,
+            "would_insert": would_insert,
+            "would_merge_with_existing": would_merge_existing,
+            "intra_batch_collisions": intra_batch_collisions,
+            "sample_inserts": sample_inserts,
+            "sample_collisions": sample_collisions,
+            "warning": warning,
+            "hint": (
+                f"Would land {would_insert} new rows. Re-call with "
+                f"confirm=true to commit."
+            ),
+        }
 
     # File names are written as "{tool}_{8-hex}.jsonl" by candidates.write_candidates.
     # The tool name drives default source-citation attachment below.
@@ -1572,18 +1691,48 @@ def _tool_columns_modify(db: Session, project: Project, args: Dict[str, Any]):
 
 def _tool_columns_delete(db: Session, project: Project, args: Dict[str, Any]):
     name = (args.get("name") or "").strip()
+    confirm = bool(args.get("confirm", False))
     if not name:
         return {}, {"error": "name is required"}
     cols = list(project.columns or [])
     new_cols = [c for c in cols if not (isinstance(c, dict) and c.get("name") == name)]
     if len(new_cols) == len(cols):
         return {}, {"error": f"column {name!r} not found"}
+
+    version = project.current_version
+
+    if not confirm:
+        # Preview — count cells with data, show a few sample values
+        affected = 0
+        sample_values = []
+        if version is not None:
+            for sample in (
+                db.query(Sample)
+                .filter(Sample.version_id == version.id)
+                .all()
+            ):
+                data = sample.row or {}
+                if name in data and data[name] not in (None, ""):
+                    affected += 1
+                    if len(sample_values) < 3:
+                        sample_values.append(data[name])
+        return {}, {
+            "preview": True,
+            "column": name,
+            "would_drop_cells": affected,
+            "sample_values": sample_values,
+            "hint": (
+                f"This would remove column {name!r} and drop {affected} cell "
+                f"value(s). Re-call with confirm=true to delete."
+            ),
+        }
+
     project.columns = new_cols
-    if project.current_version is not None:
-        project.current_version.columns = new_cols
+    if version is not None:
+        version.columns = new_cols
         # Strip the field from every row in this version
         affected = 0
-        for sample in db.query(Sample).filter(Sample.version_id == project.current_version.id).all():
+        for sample in db.query(Sample).filter(Sample.version_id == version.id).all():
             data = dict(sample.row or {})
             if name in data:
                 data.pop(name)
@@ -1760,10 +1909,38 @@ def _tool_rows_update(
 ):
     where = args.get("where") or {}
     values = args.get("values") or {}
+    confirm = bool(args.get("confirm", False))
     if not isinstance(values, dict) or not values:
         return {}, {"error": "values must be a non-empty object"}
     sql, params = _where_to_sql(where)
     from sqlalchemy import text
+
+    if not confirm:
+        cnt = db.execute(
+            text(f"SELECT COUNT(*) FROM samples WHERE version_id = :vid AND ({sql})"),
+            {"vid": version.id, **params},
+        ).scalar() or 0
+        sample_rows = db.execute(
+            text(
+                f"SELECT id, seq, row FROM samples WHERE version_id = :vid "
+                f"AND ({sql}) ORDER BY seq LIMIT 3"
+            ),
+            {"vid": version.id, **params},
+        ).all()
+        return {}, {
+            "preview": True,
+            "would_update": int(cnt),
+            "values_to_set": values,
+            "sample_before": [
+                {"_id": str(r[0]), "_seq": r[1], **(r[2] or {})}
+                for r in sample_rows
+            ],
+            "hint": (
+                f"This would update {int(cnt)} row(s) with the given values. "
+                f"Re-call with confirm=true to apply, or refine `where` first."
+            ),
+        }
+
     rows = db.execute(
         text(f"SELECT id FROM samples WHERE version_id = :vid AND ({sql})"),
         {"vid": version.id, **params},
@@ -1784,18 +1961,45 @@ def _tool_rows_delete(
     db: Session, project: Project, version: ProjectVersion, args: Dict[str, Any]
 ):
     where = args.get("where") or {}
+    confirm = bool(args.get("confirm", False))
     sql, params = _where_to_sql(where)
     from sqlalchemy import text
-    rows = db.execute(
-        text(f"SELECT id FROM samples WHERE version_id = :vid AND ({sql})"),
+
+    if not confirm:
+        # Preview pass — show count + sample so the agent can sanity-check
+        # before destroying anything.
+        cnt = db.execute(
+            text(f"SELECT COUNT(*) FROM samples WHERE version_id = :vid AND ({sql})"),
+            {"vid": version.id, **params},
+        ).scalar() or 0
+        sample_rows = db.execute(
+            text(
+                f"SELECT id, seq, row FROM samples WHERE version_id = :vid "
+                f"AND ({sql}) ORDER BY seq LIMIT 3"
+            ),
+            {"vid": version.id, **params},
+        ).all()
+        return {}, {
+            "preview": True,
+            "would_delete": int(cnt),
+            "sample": [
+                {"_id": str(r[0]), "_seq": r[1], **(r[2] or {})}
+                for r in sample_rows
+            ],
+            "hint": (
+                f"This would delete {int(cnt)} row(s). Re-call with "
+                f"confirm=true to actually delete, or refine `where` first."
+            ),
+        }
+
+    # Confirmed — bulk DELETE via raw SQL (immediately visible to subsequent
+    # reads, unlike ORM-style db.delete which doesn't flush).
+    result = db.execute(
+        text(f"DELETE FROM samples WHERE version_id = :vid AND ({sql})"),
         {"vid": version.id, **params},
-    ).all()
-    deleted = 0
-    for (rid,) in rows:
-        sample = db.query(Sample).filter(Sample.id == rid).first()
-        if sample is not None:
-            db.delete(sample)
-            deleted += 1
+    )
+    deleted = int(result.rowcount or 0)
+    db.expire_all()
     if deleted and version.generated_count is not None:
         version.generated_count = max(0, version.generated_count - deleted)
     return {"rows_deleted": deleted}, {"ok": True, "deleted": deleted}
