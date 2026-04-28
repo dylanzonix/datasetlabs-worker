@@ -42,6 +42,17 @@ structured tables: lists of leads, products, places, jobs, anything they
 can describe. Your job is to make the table real — define the columns,
 source the rows, fill in the cells.
 
+# Versioning — call version_label early every turn
+
+Every user message forks a new table version automatically. Inherit the
+previous version's columns + rows; your tool calls land on the new one
+only. As soon as you understand what THIS turn does, call
+`version_label(label=...)` with a verbose-short name describing the
+change ("Initial 20 founders", "Added verified emails", "Filtered to
+US-only", "Dropped low-rated gyms"). The label appears in the version
+chip + dropdown so the user can navigate prior states. ONE call per
+turn, early. If you skip it, the UI falls back to "Version N".
+
 # The two jobs: harvest and enrich
 
 You do two distinct kinds of work:
@@ -850,6 +861,35 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
         "user_location": {"type": "approximate"},
         "search_context_size": "low",
     },
+    # Sets a verbose-short name for the table version this turn forks
+    # (e.g. "Filtered to US gyms"). Shown in the version chip + dropdown
+    # so the user can navigate prior states. Should be called early in
+    # each turn; falls back to "Version N" if not called.
+    {
+        "type": "function",
+        "name": "version_label",
+        "description": (
+            "Name this turn's table version with a short verbose-short "
+            "label (≤80 chars), like a project-name-style summary of "
+            "what THIS turn changes about the table. Examples: "
+            "'Initial 20 founders', 'Added verified emails', 'Filtered "
+            "to US-only', 'Dropped low-rated gyms'. The label appears "
+            "in the version chip at the top of the table and in the "
+            "version-history dropdown. Call this ONCE per turn, early "
+            "(before or right after the first source/row tool). If you "
+            "skip it, the UI falls back to 'Version N'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "label": {
+                    "type": "string",
+                    "description": "Short verbose-short version name (≤80 chars).",
+                },
+            },
+            "required": ["label"],
+        },
+    },
     # Text reply suggestions, rendered as clickable text under the
     # assistant's message. Use when ending a turn with a question,
     # proposal, OR scale-up prompt after harvesting rows. Gives the
@@ -909,6 +949,11 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
 def ensure_chat_version(db: Session, project: Project) -> ProjectVersion:
     """Make sure a chat-mode project has exactly one ProjectVersion to anchor
     samples on. Creates it lazily on first need.
+
+    With per-turn versioning (start_user_turn_version), every user message
+    forks a new version eagerly — so by the time tools run, the version
+    already exists. This function stays as a safety net for any non-chat
+    code path that might still create a version implicitly.
     """
     if project.current_version_id is not None:
         version = db.query(ProjectVersion).filter(
@@ -931,6 +976,75 @@ def ensure_chat_version(db: Session, project: Project) -> ProjectVersion:
     db.flush()
     project.current_version_id = version.id
     return version
+
+
+def start_user_turn_version(
+    db: Session,
+    project: Project,
+    user_msg,
+) -> ProjectVersion:
+    """Fork a new ProjectVersion for the user's turn.
+
+    Eager versioning: every user message gets its own version. The new
+    version inherits the previous head's columns and rows verbatim;
+    agent mutations (rows_*, columns_*) land on the new version only,
+    leaving older versions intact for switching.
+
+    First-ever message creates v1 with no rows to copy.
+    """
+    from sqlalchemy import text
+
+    head: Optional[ProjectVersion] = None
+    if project.current_version_id is not None:
+        head = db.query(ProjectVersion).filter(
+            ProjectVersion.id == project.current_version_id
+        ).first()
+
+    next_number = (head.version_number + 1) if head is not None else 1
+    if head is not None:
+        columns_copy = list(head.columns or [])
+        gen_count = int(head.generated_count or 0)
+    else:
+        columns_copy = list(project.columns or [])
+        gen_count = 0
+
+    new_version = ProjectVersion(
+        project_id=project.id,
+        version_number=next_number,
+        num_samples=0,
+        columns=columns_copy,
+        files_snapshot=[],
+        examples_snapshot=[],
+        status="chat",
+        generated_count=gen_count,
+    )
+    db.add(new_version)
+    db.flush()  # populates new_version.id
+
+    if head is not None:
+        # Copy every row to the new version. The unique-seq-per-version
+        # index is preserved because seqs are stable within a version.
+        # gen_random_uuid() requires the pgcrypto extension, which Supabase
+        # enables by default.
+        db.execute(
+            text(
+                "INSERT INTO samples "
+                "(id, project_id, version_id, seq, row, tags, enrichment_data, created_at) "
+                "SELECT gen_random_uuid(), :pid, :new_vid, seq, row, tags, "
+                "enrichment_data, NOW() "
+                "FROM samples WHERE version_id = :head_vid"
+            ),
+            {
+                "pid": project.id,
+                "new_vid": new_version.id,
+                "head_vid": head.id,
+            },
+        )
+
+    project.current_version_id = new_version.id
+    user_msg.version_id = new_version.id
+    db.flush()
+    return new_version
 
 
 _OP_SUFFIXES = {
@@ -1116,6 +1230,9 @@ async def execute_tool(
         return applied, result, cost
     if tool_name == "suggest_replies":
         applied, result = _tool_suggest_replies(args)
+        return applied, result, 0.0
+    if tool_name == "version_label":
+        applied, result = _tool_version_label(db, project, args)
         return applied, result, 0.0
 
     if tool_name == "candidates_list":
@@ -1306,6 +1423,38 @@ def _tool_suggest_replies(args: Dict[str, Any]):
     return (
         {"suggestions": {"items": items}},
         {"ok": True, "count": len(items)},
+    )
+
+
+def _tool_version_label(
+    db: Session, project: Project, args: Dict[str, Any]
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Set a label on the current ProjectVersion.
+
+    Per-turn versioning: streaming.py forks a new version before the
+    agent runs, so project.current_version_id already points to the
+    new version. We just stamp it with the label.
+    """
+    label = (args.get("label") or "").strip()
+    if not label:
+        return {}, {"error": "label is required"}
+    label = label[:120]
+    if project.current_version_id is None:
+        return {}, {"error": "no current version to label"}
+    version = db.query(ProjectVersion).filter(
+        ProjectVersion.id == project.current_version_id
+    ).first()
+    if version is None:
+        return {}, {"error": "current version not found"}
+    version.label = label
+    db.flush()
+    return (
+        {"version_label": {
+            "version_id": str(version.id),
+            "version_number": version.version_number,
+            "label": label,
+        }},
+        {"ok": True, "label": label},
     )
 
 

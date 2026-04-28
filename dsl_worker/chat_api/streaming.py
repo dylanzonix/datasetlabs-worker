@@ -397,7 +397,25 @@ async def stream_chat_response(
             project_id=project_id, role="user", content=user_content
         )
         db.add(user_msg)
+        db.flush()  # need user_msg.id before forking the version
+
+        # Fork a new ProjectVersion for this turn. Inherits the previous
+        # head's columns + rows; agent mutations land on the new version.
+        # user_msg.version_id is set inside the helper.
+        new_version = agent.start_user_turn_version(db, project, user_msg)
         db.commit()
+
+        # Tell the UI a new version exists (label is None until the agent
+        # calls version_label later in the turn). The frontend uses this
+        # to update the version chip + history dropdown without waiting
+        # for the turn to finish.
+        yield _sse({
+            "type": "version",
+            "version_id": str(new_version.id),
+            "version_number": new_version.version_number,
+            "label": new_version.label,
+            "message_id": str(user_msg.id),
+        })
 
         input_items: List[Dict[str, str]] = [
             {"role": "system", "content": agent.build_context_message(db, project)}
@@ -887,6 +905,17 @@ async def stream_chat_response(
                         "type": "suggestions",
                         "items": sg.get("items") or [],
                     })
+                # version_label tool stamped a name on this turn's version.
+                # Emit again so the UI can swap the chip from "Version N"
+                # to "Version N — <label>".
+                if isinstance(round_applied.get("version_label"), dict):
+                    vl = round_applied["version_label"]
+                    yield _sse({
+                        "type": "version",
+                        "version_id": vl.get("version_id"),
+                        "version_number": vl.get("version_number"),
+                        "label": vl.get("label"),
+                    })
 
                 for change in agent.describe_applied(round_applied):
                     if change.field == "questions":
@@ -938,6 +967,7 @@ async def stream_chat_response(
                     role="assistant",
                     content=_clean_citations(full_content),
                     applied_changes=err_ac,
+                    version_id=new_version.id,
                 )
                 db.add(partial)
                 _charge_credits(db, user_id, total_cost, project_id=project_id)
@@ -1024,6 +1054,7 @@ async def stream_chat_response(
             role="assistant",
             content=full_content,
             applied_changes=ac_data if ac_data else None,
+            version_id=new_version.id,
         )
         db.add(assistant_msg)
 
