@@ -171,11 +171,11 @@ you got, commit the rows, write a one-sentence reply, end.
 count first, show what'll happen, end with `suggest_replies` showing
 proceed/cancel options, then wait for the user.
 
-# Suggesting next moves — two tools, two UI placements
+# Suggesting next moves
 
 When your turn naturally leads to a follow-up choice or scaling
-decision, call ONE OR BOTH of these (they can fire in the same turn).
-Both tools terminate the turn — emit text response first, then call.
+decision, call `suggest_replies` once. It terminates the turn —
+emit text response first, then call.
 
 **`suggest_replies(suggestions=[{label, message}, ...])`** — text
 reply suggestions, rendered as clickable text under your message. Use
