@@ -1239,6 +1239,18 @@ async def run_agent_loop(
                     runs.update_run_phase(db, run, f"tool: {item.name}")
 
                     progress_q: asyncio.Queue = asyncio.Queue()
+                    # Track cell costs we've billed incrementally via
+                    # `cell_done` progress events. When the tool itself
+                    # finally returns, its tool_cost includes these
+                    # cells — subtract what we already billed so we
+                    # don't double-charge. Critical because if the tool
+                    # CRASHES mid-flight (e.g. rows_fill on row 91 of
+                    # 206), the orchestrator never gets tool_cost back
+                    # but the cells that DID complete still cost us
+                    # real money. Without this incremental path those
+                    # cells go unbilled — confirmed gap on ee0db354
+                    # which under-billed by ~$9.
+                    cell_cost_billed = 0.0
 
                     async def _on_progress(ev: Dict[str, Any]) -> None:
                         ev = dict(ev)
@@ -1263,6 +1275,15 @@ async def run_agent_loop(
                         if getter in done_set:
                             ev = getter.result()
                             ev_type = ev.pop("type", "progress")
+                            # Bill cell agents incrementally as they
+                            # complete — see cell_cost_billed comment
+                            # above. The dedupe at tool-end strips this
+                            # from the tool_cost so no double-charge.
+                            if ev_type == "cell_done":
+                                c = ev.get("cost") or 0
+                                if isinstance(c, (int, float)) and c > 0:
+                                    billing.add(float(c))
+                                    cell_cost_billed += float(c)
                             runs.emit_event(db, run, ev_type, ev)
                             await asyncio.sleep(0)
                         else:
@@ -1271,6 +1292,11 @@ async def run_agent_loop(
                             while not progress_q.empty():
                                 ev = progress_q.get_nowait()
                                 ev_type = ev.pop("type", "progress")
+                                if ev_type == "cell_done":
+                                    c = ev.get("cost") or 0
+                                    if isinstance(c, (int, float)) and c > 0:
+                                        billing.add(float(c))
+                                        cell_cost_billed += float(c)
                                 runs.emit_event(db, run, ev_type, ev)
                             break
 
@@ -1278,11 +1304,13 @@ async def run_agent_loop(
                     result_text = agent.format_tool_result(item.name, result)
                     result_text += agent.project_state_hint(db, project)
                     total_cost += tool_cost
-                    # Charge per tool — long-running tools (rows_fill,
-                    # apify_call_actor) are usually the biggest cost
-                    # contributors and the user wants to see the
-                    # balance move as they execute.
-                    billing.add(tool_cost)
+                    # Bill the residual: tool_cost includes the cells
+                    # we already billed incrementally (cell_cost_billed),
+                    # plus any orchestrator overhead inside the tool
+                    # (e.g. rows_fill's bookkeeping). Charge only the
+                    # difference. Negative deltas (rounding) clamp to 0.
+                    residual = max(0.0, tool_cost - cell_cost_billed)
+                    billing.add(residual)
                     round_applied.update(item_applied)
                     applied.update(item_applied)
 

@@ -546,6 +546,12 @@ obvious — use judgment.
   (30–180s) and $0.10–$0.50/call. Use it for ONE page extraction when
   no Apify actor exists and the page needs JS rendering / anti-bot /
   login. Per-row enrichment is `rows_fill`'s job, not browser_use's.
+  Keep tasks **narrow**: one URL, one specific extraction. State
+  what's ideal to grab if visible, but don't make the task hunt for
+  bonus fields ("also try to get social links, also pricing, also
+  team page…"). Each extra "also" makes the run slower and more
+  failure-prone. If a field isn't on the page being scraped, it's
+  not browser_use's job — that's a separate enrichment pass.
 
 # Picking a source
 
