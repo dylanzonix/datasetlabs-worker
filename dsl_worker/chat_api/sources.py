@@ -639,18 +639,61 @@ async def _gmaps_place_details(args: Dict[str, Any], *, project_id: Optional[Any
 # ---------------------------------------------------------------------------
 
 
+def _uploaded_file_urls(project_id: Optional[Any]) -> Dict[str, str]:
+    """Generate short-lived SAS read-URLs for every uploaded file on
+    this project. Returns ``{filename: sas_url}`` (possibly empty).
+
+    Mirrors the v13 pipeline's `_generate_file_urls` (job_processor.py)
+    so chat-mode runs see the same set of user uploads at the sandbox's
+    `/workspace/uploads/<filename>` path.
+    """
+    if project_id is None:
+        return {}
+    from dsl_api.azure.blob import create_download_url
+    from dsl_api.db import SessionLocal
+    from dsl_api.models.project_file import ProjectFile
+
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(ProjectFile)
+            .filter(
+                ProjectFile.project_id == project_id,
+                ProjectFile.deleted_at.is_(None),
+                ProjectFile.status == "uploaded",
+            )
+            .all()
+        )
+    finally:
+        db.close()
+
+    urls: Dict[str, str] = {}
+    for f in rows:
+        if not f.filename or not f.blob_path:
+            continue
+        try:
+            grant = create_download_url(f.blob_path)
+            urls[f.filename] = grant.upload_url
+        except Exception as e:
+            log.warning("Failed to generate SAS URL for %s: %s", f.filename, e)
+    return urls
+
+
 async def _code_exec(args: Dict[str, Any], *, project_id: Optional[Any] = None) -> Tuple[str, float]:
     """Run a Python snippet in the remote sandbox.
 
-    Stateless — fresh session per call. Use for parsing/processing data
-    (inline in the snippet, OR loaded from candidate files via the
-    `files` arg).
+    Stateless — fresh session per call. User-uploaded files are
+    auto-staged at `/workspace/uploads/<filename>`. Optional
+    `files=[...]` additionally stages named candidate files at the
+    workspace root.
 
-    When `files=[...]` is passed, each candidate file is fetched from
-    blob and uploaded into the sandbox before the snippet runs, so the
-    snippet can `open(filename)` or json-iter through it just like a
-    local file. Use this to filter / aggregate / transform large
-    candidate sets without holding them in LLM context.
+    The sandbox is OFFLINE (no network). To mutate the project from
+    Python, the snippet uses `dsl_tools` helpers (`add_rows`,
+    `add_columns`, etc.) which append intent records to
+    `/workspace/_dsl_ops.jsonl`. After exec, this function reads that
+    file and returns the ops embedded in the result; `agent.execute_tool`
+    applies them through the canonical chat-mode handlers and replaces
+    this payload with a small LLM-facing envelope.
     """
     code = args.get("code")
     if not code or not isinstance(code, str):
@@ -665,12 +708,43 @@ async def _code_exec(args: Dict[str, Any], *, project_id: Optional[Any] = None) 
     if not isinstance(file_names, list):
         return json.dumps({"error": "files must be a list of candidate file names"}), 0.0
 
+    upload_urls = _uploaded_file_urls(project_id)
+
     try:
         async with SandboxClient(sandbox_url, timeout=timeout + 30) as pool:
             session = await pool.create_session()
             session_id = session.session_id
             try:
-                # Stage requested candidate files into the sandbox workspace.
+                # Inject the dsl_tools module so the snippet can do
+                # `from dsl_tools import add_rows, add_columns, ...` —
+                # the bulk-write primitives that make data manipulation
+                # in code_exec viable. Without this upload, every
+                # snippet trying to use dsl_tools hits ModuleNotFoundError
+                # and falls back to pasting rows through tokens.
+                # (v13 does this in SandboxSession.upload_workspace; the
+                # chat-api path uses the raw session client and has to
+                # do it explicitly.)
+                try:
+                    from dsl_worker.infra.dsl_tools_module import DSL_TOOLS_SOURCE
+                    await session.upload_content(DSL_TOOLS_SOURCE, "dsl_tools.py")
+                except Exception as e:
+                    log.warning("Failed to upload dsl_tools.py to sandbox: %s", e)
+
+                # Auto-stage user uploads into /workspace/uploads/.
+                staged_uploads: List[str] = []
+                for upload_name, sas_url in upload_urls.items():
+                    try:
+                        await session.fetch_from_url(
+                            sas_url, f"uploads/{upload_name}"
+                        )
+                        staged_uploads.append(upload_name)
+                    except Exception as e:
+                        log.warning(
+                            "Failed to stage upload %s into sandbox: %s",
+                            upload_name, e,
+                        )
+
+                # Stage requested candidate files at the workspace root.
                 for fn in file_names:
                     if not isinstance(fn, str) or not fn:
                         continue
@@ -686,22 +760,56 @@ async def _code_exec(args: Dict[str, Any], *, project_id: Optional[Any] = None) 
                     await session.upload_content(blob_bytes, fn)
 
                 result = await session.exec_python(code, timeout=timeout)
-                return (
-                    json.dumps(
-                        {
-                            "success": result.success,
-                            "exit_code": result.exit_code,
-                            "stdout": (result.stdout or "")[:8000],
-                            "stderr": (result.stderr or "")[:4000],
-                            "duration_ms": result.duration_ms,
-                            "staged_files": [
-                                fn for fn in file_names if isinstance(fn, str) and fn
-                            ],
-                        },
-                        default=str,
-                    ),
-                    0.0,
-                )
+
+                # Drain `/workspace/_dsl_ops.jsonl` if the snippet
+                # emitted any project-mutation ops via dsl_tools. Each
+                # line is a JSON op dict ({"op": "add_rows", ...}). The
+                # sandbox is offline; ops haven't been applied yet —
+                # we hand them to execute_tool() which holds the DB
+                # context and applies via _tool_* handlers.
+                ops: List[Dict[str, Any]] = []
+                ops_read_error: Optional[str] = None
+                try:
+                    raw_ops = await session.read_file("_dsl_ops.jsonl")
+                except Exception:
+                    raw_ops = ""  # no ops emitted is the common case
+                if raw_ops:
+                    if len(raw_ops) > 25 * 1024 * 1024:
+                        ops_read_error = (
+                            f"ops log {len(raw_ops)} bytes > 25MB cap; "
+                            "split work across multiple code_exec calls"
+                        )
+                    else:
+                        for ln in raw_ops.splitlines():
+                            ln = ln.strip()
+                            if not ln:
+                                continue
+                            try:
+                                op = json.loads(ln)
+                            except Exception:
+                                continue
+                            if isinstance(op, dict) and op.get("op"):
+                                ops.append(op)
+
+                payload: Dict[str, Any] = {
+                    "success": result.success,
+                    "exit_code": result.exit_code,
+                    "stdout": (result.stdout or "")[:8000],
+                    "stderr": (result.stderr or "")[:4000],
+                    "duration_ms": result.duration_ms,
+                    "staged_files": [
+                        fn for fn in file_names if isinstance(fn, str) and fn
+                    ],
+                    "staged_uploads": staged_uploads,
+                    # `_pending_ops` is consumed by agent.execute_tool —
+                    # never goes back to the LLM directly. The dispatcher
+                    # applies them and replaces this whole payload with
+                    # a small envelope before serialization.
+                    "_pending_ops": ops,
+                }
+                if ops_read_error:
+                    payload["_pending_ops_error"] = ops_read_error
+                return (json.dumps(payload, default=str), 0.0)
             finally:
                 try:
                     await pool.destroy_session(session_id)

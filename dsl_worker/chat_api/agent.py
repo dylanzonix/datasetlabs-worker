@@ -24,6 +24,7 @@ from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
 from dsl_api.models import Project
+from dsl_api.models.project_file import ProjectFile
 from dsl_api.models.project_version import ProjectVersion
 from dsl_api.models.sample import Sample
 from dsl_api.schemas.chat import AppliedChange
@@ -457,7 +458,9 @@ lives in the candidates file; you read or commit it via three tools:
 For custom transforms (flatten nested JSON, derive columns, multi-source
 join), use **code_exec** with `files=['name.jsonl', ...]` — each file is
 staged into the sandbox so the snippet can `open(name)` like a local
-file.
+file. Inside the snippet, `from dsl_tools import add_rows, add_candidates`
+to commit the transformed result without round-tripping data through
+the LLM (see the `code_exec` section under "Built-ins" below).
 
 ## You don't have to predefine columns
 
@@ -528,12 +531,59 @@ obvious — use judgment.
   whether a directory exists). NOT a list-fetcher. Cheap (~$0.025/call)
   so use it freely for scoping; just don't loop on it in place of a
   proper source tool.
-- **code_exec(code, files?)** — Python sandbox, stateless per call. Pass
-  `files=[...]` to stage candidate files into the workspace; inside the
-  snippet they're openable as local files. Use for parsing nested data,
-  mapping JSON to flat dicts, computing derived fields, joining across
-  files. Stdlib + httpx + json + re. No DB access; print to stdout, then
-  use `candidates_to_rows` or `rows_add`.
+- **code_exec(code, files?)** — Python sandbox, stateless per call. Each
+  call gets a fresh container — files written in one call DO NOT persist
+  to the next. The sandbox is OFFLINE (no network). User-uploaded files
+  are auto-staged at `/workspace/uploads/<filename>` (see "Uploaded
+  files" in the per-turn context). Optional `files=[...]` stages named
+  candidate files (your scratch outputs from apify/apollo/etc.) at the
+  workspace root. Stdlib + pandas + httpx + json + re + openpyxl +
+  pdfplumber. Read uploads directly:
+  `pd.read_csv("/workspace/uploads/data.csv")`,
+  `open("/workspace/uploads/x.json")`.
+
+  **To mutate the project from inside a snippet, use `dsl_tools`** —
+  `from dsl_tools import add_rows, add_columns, update_rows,
+  delete_rows, add_candidates`. These are the bulk-write primitives.
+  They DON'T call the database (sandbox is offline) — they record
+  intents to a workspace file; after the snippet ends, the worker
+  applies them through the canonical handlers and persists a transcript.
+  The data never round-trips through the LLM. Use this for ANY case
+  where you have data in Python and want it in the table:
+
+  ```python
+  # Bulk-import an uploaded JSON file.
+  from dsl_tools import add_rows
+  import json
+  data = json.load(open("/workspace/uploads/file.json"))
+  add_rows(data)
+
+  # Filter then commit.
+  from dsl_tools import add_rows
+  data = json.load(open("/workspace/uploads/leads.json"))
+  high_priority = [d for d in data if d.get("priority") == "P1"]
+  add_rows(high_priority)
+
+  # Computed rows.
+  from dsl_tools import add_columns, add_rows
+  add_columns([{"name": "Score", "format": "0-100"}])
+  add_rows([{"Name": x["name"], "Score": x["a"] * x["b"]} for x in data])
+  ```
+
+  `add_rows.items` and `add_candidates.items` are capped at 10,000 per
+  call — split bigger batches across multiple `code_exec` calls.
+  Destructive ops require `confirm=True`:
+  `delete_rows({"col": "value"}, confirm=True)`.
+
+  **NEVER paste rows back into `rows_add` in a chunk loop.** That burns
+  ~$0.05–0.10 per round of reasoning, and the data is right there in
+  the sandbox. `add_rows(items)` is one call, no LLM tokens for the
+  data. Same for filtered commits, transformed commits, dedup commits.
+
+  After exec, the result envelope reports `applied: [{op, count, ok},
+  ...]` plus `exec_log: "exec_<id>.jsonl"` — you can inspect the full
+  transcript (stdout, stderr, per-op results, errors) via
+  `candidates_inspect(file=exec_<id>.jsonl, filter={"stream": "error"})`.
 - **web_harvest(query, candidate_description)** — runs a bounded
   sub-agent that iterates across the open web (multiple searches +
   page reads) to find entities. Use it ONLY when the entities live
@@ -1454,12 +1504,26 @@ async def execute_tool(
         result_text, cost_usd = await sources.execute_source_tool(
             tool_name, args, project_id=project.id
         )
-        # Source tools don't make table changes themselves; the agent calls
-        # rows_add / rows_update afterwards.
         try:
             result_dict = json.loads(result_text)
         except (TypeError, ValueError):
             result_dict = {"raw": result_text}
+
+        # `code_exec` is a source tool but it's special: snippets emit
+        # project-mutation intents to /workspace/_dsl_ops.jsonl via
+        # dsl_tools, and the sandbox-side helper packed them into
+        # `_pending_ops`. Drain them here, apply through the canonical
+        # _tool_* handlers, persist a transcript to blob, and replace
+        # the raw payload with a small LLM-facing envelope.
+        if tool_name == "code_exec" and isinstance(result_dict, dict) and (
+            "_pending_ops" in result_dict
+        ):
+            version = ensure_chat_version(db, project)
+            applied, envelope = await _apply_code_exec_ops(
+                db, project, version, result_dict, progress_cb=progress_cb
+            )
+            return applied, envelope, cost_usd
+
         return ({}, result_dict, cost_usd)
 
     version = ensure_chat_version(db, project)
@@ -1528,6 +1592,227 @@ async def execute_tool(
     return ({}, {"error": f"unknown tool: {tool_name}"}, 0.0)
 
 
+# --- code_exec ops applier (drains /workspace/_dsl_ops.jsonl) ---
+
+# Map an op name to its canonical handler invocation. Each entry takes
+# the op dict and a (db, project, version, progress_cb) context, runs
+# the underlying _tool_* handler(s), and returns
+# (applied_summary, llm_summary, log_lines, errors).
+_CODE_EXEC_STDOUT_TAIL = 200
+_CODE_EXEC_STDERR_TAIL = 200
+_CODE_EXEC_MAX_ERRORS_INLINE = 5
+
+
+async def _apply_code_exec_ops(
+    db: Session,
+    project: Project,
+    version: ProjectVersion,
+    raw_payload: Dict[str, Any],
+    progress_cb: Optional[fill.ProgressCallback] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Apply ops emitted by a code_exec snippet, persist a transcript
+    to blob, and return (applied_for_run, llm_envelope).
+
+    `applied_for_run` is the change-summary that lands on the assistant
+    chat message (drives the FE's "X changed" pills). `llm_envelope` is
+    what we feed back to the model — small by design (~600B); the full
+    transcript lives in blob and is inspectable via candidates_inspect
+    on the returned `exec_log` filename.
+    """
+    pending_ops: List[Dict[str, Any]] = list(raw_payload.pop("_pending_ops", []) or [])
+    pending_error: Optional[str] = raw_payload.pop("_pending_ops_error", None)
+
+    stdout = raw_payload.get("stdout") or ""
+    stderr = raw_payload.get("stderr") or ""
+
+    # Build the per-line transcript that goes to blob. Tagged streams so
+    # candidates_inspect(file=..., filter={"stream": "error"}) works.
+    log_lines: List[Dict[str, Any]] = []
+    for line in stdout.splitlines():
+        if line:
+            log_lines.append({"stream": "stdout", "text": line})
+    for line in stderr.splitlines():
+        if line:
+            log_lines.append({"stream": "stderr", "text": line})
+    if pending_error:
+        log_lines.append({
+            "stream": "error", "kind": "ops_drain", "error": pending_error,
+        })
+
+    applied_summary: Dict[str, Any] = {}
+    applied_per_op: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+
+    def _record_error(op_name: str, err: str) -> None:
+        errors.append({"op": op_name, "error": err[:200]})
+        log_lines.append({"stream": "error", "op": op_name, "error": err[:500]})
+
+    for op in pending_ops:
+        op_name = (op.get("op") or "").strip()
+        try:
+            if op_name == "add_columns":
+                specs = op.get("specs") or []
+                ok_n = 0
+                for spec in specs:
+                    if not isinstance(spec, dict) or not spec.get("name"):
+                        _record_error("add_columns", "spec missing 'name'")
+                        continue
+                    inner = {
+                        k: spec[k]
+                        for k in ("name", "format", "description")
+                        if k in spec
+                    }
+                    sub_applied, sub_result = _tool_columns_add(db, project, inner)
+                    if sub_result.get("ok"):
+                        ok_n += 1
+                        # Latest applied dict wins; we only need the
+                        # final column list for the FE summary.
+                        if "columns" in sub_applied:
+                            applied_summary["columns"] = sub_applied["columns"]
+                    else:
+                        _record_error("add_columns", str(sub_result.get("error", "?")))
+                applied_per_op.append({
+                    "op": "add_columns", "count": ok_n, "of": len(specs),
+                    "ok": ok_n == len(specs),
+                })
+                log_lines.append({
+                    "stream": "op", "op": "add_columns",
+                    "count": ok_n, "of": len(specs),
+                })
+
+            elif op_name == "add_rows":
+                items = op.get("items") or []
+                inner: Dict[str, Any] = {"items": items}
+                if op.get("merge_key"):
+                    inner["merge_key"] = op["merge_key"]
+                sub_applied, sub_result = await _tool_rows_add(
+                    db, project, version, inner, progress_cb=progress_cb,
+                )
+                inserted = int(sub_result.get("inserted", 0) or 0)
+                merged = int(sub_result.get("merged", 0) or 0)
+                ok = bool(sub_result.get("ok", False))
+                applied_per_op.append({
+                    "op": "add_rows", "inserted": inserted, "merged": merged, "ok": ok,
+                })
+                log_lines.append({
+                    "stream": "op", "op": "add_rows",
+                    "inserted": inserted, "merged": merged, "ok": ok,
+                })
+                # Roll up rows applied for the FE.
+                if "rows" in sub_applied:
+                    rows_app = applied_summary.setdefault("rows", {"inserted": 0, "merged": 0})
+                    rows_app["inserted"] = rows_app.get("inserted", 0) + inserted
+                    rows_app["merged"] = rows_app.get("merged", 0) + merged
+                if not ok and sub_result.get("error"):
+                    _record_error("add_rows", str(sub_result["error"]))
+
+            elif op_name == "update_rows":
+                inner = {
+                    "where": op.get("where") or {},
+                    "values": op.get("values") or {},
+                    "confirm": True,  # snippet had to pass it in dsl_tools
+                }
+                sub_applied, sub_result = _tool_rows_update(
+                    db, project, version, inner,
+                )
+                affected = int(sub_result.get("affected", 0) or 0)
+                ok = bool(sub_result.get("ok", False))
+                applied_per_op.append({
+                    "op": "update_rows", "updated": affected, "ok": ok,
+                })
+                log_lines.append({
+                    "stream": "op", "op": "update_rows",
+                    "updated": affected, "ok": ok,
+                })
+                if "rows_updated" in sub_applied:
+                    applied_summary["rows_updated"] = (
+                        applied_summary.get("rows_updated", 0) + affected
+                    )
+                if not ok and sub_result.get("error"):
+                    _record_error("update_rows", str(sub_result["error"]))
+
+            elif op_name == "delete_rows":
+                inner = {
+                    "where": op.get("where") or {},
+                    "confirm": True,
+                }
+                sub_applied, sub_result = _tool_rows_delete(
+                    db, project, version, inner,
+                )
+                deleted = int(sub_result.get("deleted", 0) or 0)
+                ok = bool(sub_result.get("ok", False))
+                applied_per_op.append({
+                    "op": "delete_rows", "deleted": deleted, "ok": ok,
+                })
+                log_lines.append({
+                    "stream": "op", "op": "delete_rows",
+                    "deleted": deleted, "ok": ok,
+                })
+                if not ok and sub_result.get("error"):
+                    _record_error("delete_rows", str(sub_result["error"]))
+
+            elif op_name == "add_candidates":
+                items = op.get("items") or []
+                tool_slug = op.get("name") or "code_exec"
+                meta = candidates.write_candidates(
+                    project.id, tool=tool_slug, items=items,
+                )
+                applied_per_op.append({
+                    "op": "add_candidates",
+                    "file": meta.file, "count": meta.items_count, "ok": True,
+                })
+                log_lines.append({
+                    "stream": "op", "op": "add_candidates",
+                    "file": meta.file, "count": meta.items_count,
+                })
+
+            else:
+                _record_error(op_name or "unknown", "unknown op")
+                applied_per_op.append({
+                    "op": op_name or "unknown", "ok": False,
+                })
+
+        except Exception as e:
+            err = f"{type(e).__name__}: {str(e)[:200]}"
+            _record_error(op_name or "unknown", err)
+            applied_per_op.append({"op": op_name or "unknown", "ok": False})
+
+    # Persist transcript to blob. Filename uses a fresh hex id; agent
+    # gets it back in the envelope and inspects via candidates_inspect.
+    exec_log_name = f"exec_{uuid.uuid4().hex[:12]}.jsonl"
+    persisted = False
+    try:
+        candidates.write_exec_log(project.id, exec_log_name, log_lines)
+        persisted = True
+    except Exception as e:
+        log.warning("Failed to persist exec_log %s: %s", exec_log_name, e)
+
+    # LLM-facing envelope. Keep small — tails not full text, no item
+    # echoes, error-count + first 5 distinct errors.
+    envelope: Dict[str, Any] = {
+        "ok": bool(raw_payload.get("success", False)) and not errors,
+        "duration_ms": raw_payload.get("duration_ms", 0),
+        "stdout_chars": len(stdout),
+        "stderr_chars": len(stderr),
+        "applied": applied_per_op,
+    }
+    if persisted:
+        envelope["exec_log"] = exec_log_name
+    if stdout:
+        envelope["stdout_tail"] = stdout[-_CODE_EXEC_STDOUT_TAIL:]
+    if stderr:
+        envelope["stderr_tail"] = stderr[-_CODE_EXEC_STDERR_TAIL:]
+    if raw_payload.get("staged_uploads"):
+        envelope["staged_uploads"] = raw_payload["staged_uploads"]
+    if errors:
+        envelope["errors"] = errors[:_CODE_EXEC_MAX_ERRORS_INLINE]
+        envelope["error_count"] = len(errors)
+    if pending_error:
+        envelope["ops_drain_error"] = pending_error
+
+    return applied_summary, envelope
+
+
 # --- Candidates tools (file-backed staging from source fetches) ---
 
 
@@ -1552,11 +1837,19 @@ def _tool_candidates_inspect(
     limit = min(int(args.get("limit", 20) or 20), 200)
     offset = max(int(args.get("offset", 0) or 0), 0)
 
+    # `exec_*.jsonl` files are code_exec transcripts under exec_logs/,
+    # not source-tool candidates. Same inspect surface, different prefix.
+    stream_fn = (
+        candidates.stream_exec_log
+        if candidates.is_exec_log_filename(file_name)
+        else candidates.stream_candidates
+    )
+
     matched = 0
     skipped = 0
     out: List[Dict[str, Any]] = []
     try:
-        for item in candidates.stream_candidates(project.id, file_name):
+        for item in stream_fn(project.id, file_name):
             if not candidates.apply_filter(item, filt):
                 continue
             matched += 1
@@ -2477,6 +2770,36 @@ def build_context_message(db: Session, project: Project) -> str:
             parts.append(line)
     else:
         parts.append("Columns: (none yet)")
+
+    # Uploaded files. Auto-staged into the sandbox at
+    # /workspace/uploads/<filename> on every code_exec call. Bulk-import
+    # path: code_exec a snippet that reads the upload and calls
+    # `dsl_tools.add_rows(items)` (or `add_candidates(items)`) — the
+    # rows are committed server-side after exec; data never round-trips
+    # through the LLM.
+    uploaded_files = (
+        db.query(ProjectFile)
+        .filter(
+            ProjectFile.project_id == project.id,
+            ProjectFile.deleted_at.is_(None),
+            ProjectFile.status == "uploaded",
+        )
+        .order_by(ProjectFile.uploaded_at.asc().nullslast(), ProjectFile.created_at.asc())
+        .all()
+    )
+    if uploaded_files:
+        parts.append("Uploaded files at /workspace/uploads/ (read via code_exec):")
+        for f in uploaded_files:
+            size_b = f.size_bytes or 0
+            if size_b < 1024:
+                size_str = f"{size_b}B"
+            elif size_b < 1024 * 1024:
+                size_str = f"{size_b / 1024:.1f}KB"
+            else:
+                size_str = f"{size_b / (1024 * 1024):.1f}MB"
+            parts.append(
+                f"  - {f.filename} ({f.content_type or 'unknown'}, {size_str})"
+            )
 
     # Row count + tiny sample (only if we have a version)
     if project.current_version_id:

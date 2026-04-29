@@ -2,10 +2,27 @@
 dsl_tools module — uploaded to sandbox as /workspace/dsl_tools.py on session init.
 
 Provides utility functions for code execution in the sandbox environment.
-The LLM imports these with: from dsl_tools import list_files, file_info, read_jsonl, write_jsonl
 
-NOTE: submit_candidates is NOT here — it's a native orchestrator tool call.
-The sandbox does data manipulation, tools do actions.
+Two families:
+
+1. **Workspace utilities** (`list_files`, `read_jsonl`, `write_jsonl`,
+   `read_csv`, `preview`, etc.) — pure local file-IO inside the sandbox.
+
+2. **Project ops** (`add_columns`, `add_rows`, `update_rows`,
+   `delete_rows`, `add_candidates`) — record an intent to mutate the
+   project. The sandbox is offline; these helpers DO NOT call the
+   database. They append a JSON line to `/workspace/_dsl_ops.jsonl`.
+   After `code_exec` returns, the worker reads that file, applies each
+   op through the canonical chat-mode tool handlers, and persists a
+   transcript (stdout + stderr + op results) to blob. The agent gets a
+   small summary back; the data never round-trips through the LLM.
+
+   Constraints (the helpers enforce locally; the worker re-validates):
+   - items lists are capped at 10,000 per op call
+   - destructive ops (`update_rows`, `delete_rows`) require `confirm=True`
+
+NOTE: submit_candidates is NOT here — that's a v13 orchestrator concept.
+The chat agent's bulk-write path is `add_rows` / `add_candidates`.
 """
 
 # This is the source code that gets uploaded to the sandbox.
@@ -159,6 +176,136 @@ def read_csv(path: str, max_rows: int = 0) -> List[Dict]:
                 break
             rows.append(dict(row))
     return rows
+
+
+_OPS_LOG = "/workspace/_dsl_ops.jsonl"
+_MAX_ITEMS_PER_OP = 10000
+
+
+def _emit_op(op: Dict[str, Any]) -> None:
+    """Append one op to the ops log. Local file write only — no network.
+    The worker reads this file after exec_python returns and applies
+    each op through the canonical chat-mode tool handlers.
+    """
+    os.makedirs(os.path.dirname(_OPS_LOG) or ".", exist_ok=True)
+    with open(_OPS_LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(op, ensure_ascii=False, default=str) + "\\n")
+
+
+def add_columns(specs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Add one or more columns to the project schema.
+
+    Each spec: {"name": str, "format"?: str, "description"?: str}.
+
+    Records the op locally; the worker creates each column post-exec.
+    Returns immediately with {"queued_columns": N} — no DB round-trip.
+    """
+    if not isinstance(specs, list):
+        raise TypeError("add_columns: specs must be a list of dicts")
+    if not specs:
+        return {"queued_columns": 0}
+    if len(specs) > _MAX_ITEMS_PER_OP:
+        raise ValueError(
+            f"add_columns: {len(specs)} specs > cap of {_MAX_ITEMS_PER_OP}"
+        )
+    for s in specs:
+        if not isinstance(s, dict) or not s.get("name"):
+            raise ValueError("add_columns: each spec must be a dict with a 'name' field")
+    _emit_op({"op": "add_columns", "specs": specs})
+    return {"queued_columns": len(specs)}
+
+
+def add_rows(items: List[Dict[str, Any]], merge_key: Optional[str] = None) -> Dict[str, Any]:
+    """Insert (or upsert by merge_key) a batch of rows.
+
+    Each item is a dict of column-name -> value. Pass the FULL list in
+    one call — items has no practical size limit up to the 10,000 cap;
+    chunking adds nothing. Records the op locally; the worker commits
+    server-side post-exec.
+    """
+    if not isinstance(items, list):
+        raise TypeError("add_rows: items must be a list of dicts")
+    if not items:
+        return {"queued_rows": 0}
+    if len(items) > _MAX_ITEMS_PER_OP:
+        raise ValueError(
+            f"add_rows: {len(items)} items > cap of {_MAX_ITEMS_PER_OP}. "
+            "Split across multiple add_rows() calls."
+        )
+    if not all(isinstance(it, dict) for it in items):
+        raise ValueError("add_rows: every item must be a dict")
+    op: Dict[str, Any] = {"op": "add_rows", "items": items}
+    if merge_key:
+        op["merge_key"] = merge_key
+    _emit_op(op)
+    return {"queued_rows": len(items)}
+
+
+def update_rows(
+    where: Dict[str, Any], values: Dict[str, Any], confirm: bool = False
+) -> Dict[str, Any]:
+    """Set column values on every row matching `where`. Destructive —
+    requires confirm=True (without it the worker rejects the op).
+
+    `where` uses the standard filter dialect: {col: v}, {col__lt: n},
+    {col__contains: s}, {col__in: [...]}, {col__isnull: bool}, etc.
+    """
+    if not isinstance(where, dict):
+        raise TypeError("update_rows: where must be a dict")
+    if not isinstance(values, dict) or not values:
+        raise ValueError("update_rows: values must be a non-empty dict")
+    if not confirm:
+        raise ValueError(
+            "update_rows: refused — pass confirm=True. Destructive ops "
+            "are gated to prevent accidental mass updates."
+        )
+    _emit_op({
+        "op": "update_rows",
+        "where": where,
+        "values": values,
+        "confirm": True,
+    })
+    return {"queued": "update_rows"}
+
+
+def delete_rows(where: Dict[str, Any], confirm: bool = False) -> Dict[str, Any]:
+    """Soft-delete every row matching `where`. Destructive — requires
+    confirm=True. Same filter dialect as update_rows."""
+    if not isinstance(where, dict):
+        raise TypeError("delete_rows: where must be a dict")
+    if not confirm:
+        raise ValueError(
+            "delete_rows: refused — pass confirm=True. Destructive ops "
+            "are gated to prevent accidental mass deletes."
+        )
+    _emit_op({"op": "delete_rows", "where": where, "confirm": True})
+    return {"queued": "delete_rows"}
+
+
+def add_candidates(items: List[Dict[str, Any]], name: Optional[str] = None) -> Dict[str, Any]:
+    """Stage `items` as a candidates JSONL file on the project. Use this
+    when you've computed a list of records via Python (e.g. flattened
+    from an upload, joined across files) and want to inspect or
+    bulk-commit them with `candidates_to_rows` later.
+
+    `name` is a short slug for the resulting file (defaults to "code_exec").
+    Returns immediately; the worker creates the candidates blob post-exec.
+    """
+    if not isinstance(items, list):
+        raise TypeError("add_candidates: items must be a list of dicts")
+    if not items:
+        return {"queued_candidates": 0}
+    if len(items) > _MAX_ITEMS_PER_OP:
+        raise ValueError(
+            f"add_candidates: {len(items)} items > cap of {_MAX_ITEMS_PER_OP}"
+        )
+    if not all(isinstance(it, dict) for it in items):
+        raise ValueError("add_candidates: every item must be a dict")
+    op: Dict[str, Any] = {"op": "add_candidates", "items": items}
+    if name:
+        op["name"] = str(name)
+    _emit_op(op)
+    return {"queued_candidates": len(items)}
 
 
 def preview(path: str, n: int = 5) -> str:

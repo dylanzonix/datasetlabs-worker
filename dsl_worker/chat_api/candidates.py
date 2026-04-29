@@ -48,6 +48,82 @@ def _candidate_blob_path(project_id, file_name: str) -> str:
     return f"{_candidates_prefix(project_id)}/{file_name}"
 
 
+# ---- Exec logs --------------------------------------------------------
+# Sibling to candidates/. Holds per-`code_exec`-call transcripts —
+# stdout/stderr lines, op results, and structured errors. The agent
+# inspects them via the same `candidates_inspect` machinery (the inspect
+# handler resolves `exec_*` filenames to this prefix). Apply a 7-day
+# Azure blob lifecycle rule on the `exec_logs/` prefix so they don't
+# accumulate forever.
+
+def _exec_logs_prefix(project_id) -> str:
+    return f"projects/{project_id}/exec_logs"
+
+
+def _exec_log_blob_path(project_id, file_name: str) -> str:
+    return f"{_exec_logs_prefix(project_id)}/{file_name}"
+
+
+def is_exec_log_filename(file_name: str) -> bool:
+    """`exec_*.jsonl` files live under exec_logs/, not candidates/."""
+    return isinstance(file_name, str) and file_name.startswith("exec_")
+
+
+def write_exec_log(
+    project_id, file_name: str, lines: Iterable[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Write a per-`code_exec` transcript as JSONL to exec_logs/.
+
+    Each line is a dict — typically {"stream": "stdout"|"stderr"|"op"|
+    "error", ...}. The agent never sees the full content; it gets a small
+    envelope back from `code_exec` with the filename + counts, and uses
+    `candidates_inspect(file=<exec_*.jsonl>, filter=..., limit=...)` to
+    fetch slices on demand.
+    """
+    blob_path = _exec_log_blob_path(project_id, file_name)
+    buf = io.BytesIO()
+    n = 0
+    for it in lines:
+        if not isinstance(it, dict):
+            continue
+        buf.write((json.dumps(it, default=str, ensure_ascii=False) + "\n").encode("utf-8"))
+        n += 1
+    buf.seek(0)
+    client = get_blob_client(blob_path)
+    md = {"kind": "exec_log", "lines": str(n)}
+    client.upload_blob(buf, overwrite=True, metadata=md)
+    return {"file": file_name, "lines": n}
+
+
+def stream_exec_log(project_id, file_name: str) -> Iterator[Dict[str, Any]]:
+    """Stream transcript lines from an exec log. Same shape as
+    stream_candidates but resolves to exec_logs/."""
+    blob_path = _exec_log_blob_path(project_id, file_name)
+    client = get_blob_client(blob_path)
+    try:
+        downloader = client.download_blob()
+    except ResourceNotFoundError as e:
+        raise FileNotFoundError(f"Exec log not found: {file_name}") from e
+
+    pending = b""
+    for chunk in downloader.chunks():
+        pending += chunk
+        while b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line.decode("utf-8"))
+            except json.JSONDecodeError:
+                continue
+    if pending.strip():
+        try:
+            yield json.loads(pending.decode("utf-8"))
+        except json.JSONDecodeError:
+            pass
+
+
 @dataclass
 class CandidatesFileMeta:
     file: str
