@@ -290,6 +290,20 @@ def emit_thinking_checkpoint(
     return emit_event(db, run, "thinking_checkpoint", payload)
 
 
+def replace_text_content(
+    db: Session, run: ChatRun, content: str
+) -> Dict[str, Any]:
+    """Overwrite the live content accumulator with `content` and persist
+    a text_checkpoint carrying it. Used when we need to scrub partial
+    output already streamed to subscribers — e.g. when an OpenAI stream
+    dies mid-sentence and we want to show a clean warning instead of the
+    half-thought the model managed to emit before being cut off. The FE
+    treats text_checkpoint as a replacement, so live subscribers see the
+    new content overwrite whatever they had displayed."""
+    _BUS._content[str(run.id)] = content
+    return emit_event(db, run, "text_checkpoint", {"full_content": content})
+
+
 # ---- Pause / cancel polling ----------------------------------------------
 def check_should_stop(db: Session, run: ChatRun) -> Optional[str]:
     """Re-read run.status. Returns 'pause' or 'cancel' if the agent

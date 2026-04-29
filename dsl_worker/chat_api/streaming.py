@@ -33,6 +33,19 @@ from dsl_worker.chat_api import agent, runs, sources as _sources, tracing
 log = logging.getLogger(__name__)
 
 
+# Shown to the user when an OpenAI stream ends without `response.completed`
+# (e.g. `response.incomplete` due to max_output_tokens, content_filter, or a
+# network drop). We replace whatever partial text the model emitted — it's
+# usually a half-thought that would read like gibberish — with this clean
+# warning. The partial reasoning + completed tool calls ARE preserved in
+# the assistant message's `applied_changes.resume_input` so the next user
+# message will resume from where the model left off.
+_INCOMPLETE_WARNING = (
+    "Something went wrong on my side mid-thought. Send any message "
+    "(e.g. \"continue\") and I'll pick up where I left off."
+)
+
+
 # ---- OpenAI client (singleton) -------------------------------------------
 _client: Optional[AsyncOpenAI] = None
 
@@ -596,10 +609,29 @@ async def run_agent_loop(
             .limit(50)
             .all()
         )
-        history = [
-            {"role": m.role, "content": m.content} for m in reversed(history_msgs)
-        ]
-        is_first_message = len(history) == 0
+        # If the most recent assistant message left a `resume_input`
+        # behind (because that turn's OpenAI stream ended with
+        # `response.incomplete`), replay the full prior input —
+        # including reasoning + tool calls + tool results — instead of
+        # rebuilding from `ChatMessage.content` only. This is what lets
+        # the user say "continue" after a silent stream death and have
+        # the model pick up where it left off without redoing research.
+        resume_input: Optional[List[Dict[str, Any]]] = None
+        for m in history_msgs:  # ordered desc, most recent first
+            if m.role == "assistant":
+                ac = m.applied_changes or {}
+                candidate = ac.get("resume_input")
+                if isinstance(candidate, list) and candidate:
+                    resume_input = candidate
+                break
+
+        if resume_input:
+            history = []  # resume_input already contains prior history
+        else:
+            history = [
+                {"role": m.role, "content": m.content} for m in reversed(history_msgs)
+            ]
+        is_first_message = (not resume_input) and len(history) == 0
 
         # Fork a new ProjectVersion for this turn — same semantics as
         # the legacy path. user_msg.version_id is set inside the helper.
@@ -637,11 +669,28 @@ async def run_agent_loop(
         if effort_hint:
             context_msg = f"{context_msg}\n\n{effort_hint}"
 
-        input_items: List[Dict[str, str]] = [
-            {"role": "system", "content": context_msg}
-        ]
-        input_items.extend(history)
-        input_items.append({"role": "user", "content": user_content})
+        if resume_input:
+            # Replace the (stale) system context_msg from the prior run
+            # with a fresh one — column/row counts may have changed —
+            # then keep everything else and append the new user message.
+            body = resume_input
+            if (
+                body
+                and isinstance(body[0], dict)
+                and body[0].get("role") == "system"
+            ):
+                body = body[1:]
+            input_items: List[Dict[str, Any]] = [
+                {"role": "system", "content": context_msg},
+                *body,
+                {"role": "user", "content": user_content},
+            ]
+        else:
+            input_items = [
+                {"role": "system", "content": context_msg},
+                *history,
+                {"role": "user", "content": user_content},
+            ]
 
         client = get_openai_client()
 
@@ -651,6 +700,12 @@ async def run_agent_loop(
         total_cost = 0.0
         stopped = False
         stop_reason: Optional[str] = None  # "pause" | "cancel" | None
+        # Set if this run dies because the OpenAI stream ended without
+        # `response.completed` (incomplete / network drop). Snapshot of
+        # the full `running_input` at the moment of failure goes here so
+        # the next user message can resume from the same model state.
+        resume_input_snapshot: Optional[List[Dict[str, Any]]] = None
+        resume_reason: Optional[str] = None
         # Charges credits live as cost accumulates instead of one big
         # debit at end-of-turn. See _BillingMeter docstring.
         billing = _BillingMeter(db, user_id, project.id)
@@ -693,7 +748,7 @@ async def run_agent_loop(
                     "input": running_input,
                     "tools": agent.CHAT_TOOLS,
                     "reasoning": {"effort": _effort, "summary": "auto"},
-                    "max_output_tokens": 8000,
+                    "max_output_tokens": 200000,
                 }
 
                 MAX_STREAM_RETRIES = 1
@@ -702,11 +757,22 @@ async def run_agent_loop(
                 got_output_this_round = False
                 round_text_collected = ""
 
+                # Per-attempt accumulator of fully-streamed output items.
+                # Used as the source-of-truth for "what the model managed
+                # to emit before the cap hit" when `final_response` ends
+                # up None (stream ended on `response.incomplete` instead
+                # of `response.completed`). Reset on every attempt so a
+                # retry doesn't double-count items from the prior try.
+                collected_round_items: List[Any] = []
+                incomplete_reason: Optional[str] = None
+
                 for attempt in range(MAX_STREAM_RETRIES + 1):
                     round_thinking_start = time.time()
                     got_output_this_round = False
                     round_text_collected = ""
                     final_response = None
+                    collected_round_items = []
+                    incomplete_reason = None
 
                     async with client.responses.stream(**stream_kwargs) as stream:
                         async for event in stream:
@@ -762,6 +828,11 @@ async def run_agent_loop(
 
                             elif event_type == "response.output_item.done":
                                 done_item = getattr(event, "item", None)
+                                # Capture every fully-streamed item so we
+                                # can replay them into running_input if
+                                # the stream dies before completion.
+                                if done_item is not None:
+                                    collected_round_items.append(done_item)
                                 if (
                                     done_item is not None
                                     and getattr(done_item, "type", None) == "web_search_call"
@@ -784,6 +855,39 @@ async def run_agent_loop(
                                             "args_preview": final_args or None,
                                         })
                                         await asyncio.sleep(0)
+
+                            elif event_type == "response.incomplete":
+                                # OpenAI signaled the response will end
+                                # without `response.completed`. Capture
+                                # the reason (max_output_tokens,
+                                # content_filter, …) for diagnostics.
+                                # The actual "treat as stopped + persist
+                                # resume" flow lives in the post-stream
+                                # `if final_response is None:` block —
+                                # this handler just records the cause.
+                                resp = getattr(event, "response", None)
+                                details = (
+                                    getattr(resp, "incomplete_details", None)
+                                    if resp is not None
+                                    else None
+                                )
+                                reason = None
+                                if details is not None:
+                                    reason = (
+                                        getattr(details, "reason", None)
+                                        or (
+                                            details.get("reason")
+                                            if isinstance(details, dict)
+                                            else None
+                                        )
+                                    )
+                                incomplete_reason = reason or "unknown"
+                                log.warning(
+                                    "run %s round %s: response.incomplete (%s)",
+                                    run_id,
+                                    round_num,
+                                    incomplete_reason,
+                                )
 
                             elif event_type and event_type.startswith("response.web_search_call."):
                                 progress_item = getattr(event, "item", None)
@@ -861,16 +965,66 @@ async def run_agent_loop(
 
                 if final_response is None:
                     stopped = True
-                    remaining = stripper.flush()
-                    if remaining:
-                        full_content += remaining
-                        runs.publish_token_delta(run.id, remaining)
                     if not got_output_this_round:
                         thinking_total += time.time() - round_thinking_start
-                    # Persist a checkpoint of whatever text we have so
-                    # reconnects don't lose the partial round.
-                    runs.emit_text_checkpoint(db, run)
+
+                    # Replay every fully-streamed item from the dead
+                    # round into running_input so the next user message
+                    # can resume from this exact state. Any function_call
+                    # that completed but never executed gets a stub
+                    # output — OpenAI's responses API rejects input
+                    # where a function_call has no matching
+                    # function_call_output, so without the stub the
+                    # resume request would 400.
+                    pending_call_ids: List[str] = []
+                    for out_item in collected_round_items:
+                        item_type = getattr(out_item, "type", None)
+                        if item_type == "reasoning":
+                            r_summary = []
+                            if getattr(out_item, "summary", None):
+                                r_summary = [
+                                    {"type": s.type, "text": s.text}
+                                    for s in out_item.summary
+                                ]
+                            running_input.append({
+                                "type": "reasoning",
+                                "id": out_item.id,
+                                "summary": r_summary,
+                            })
+                        else:
+                            running_input.append(out_item.model_dump(exclude_none=True))
+                            if item_type == "function_call":
+                                cid = getattr(out_item, "call_id", None)
+                                if cid:
+                                    pending_call_ids.append(cid)
+                    for cid in pending_call_ids:
+                        running_input.append({
+                            "type": "function_call_output",
+                            "call_id": cid,
+                            "output": "Error: round terminated before tool execution",
+                        })
+
+                    # Snapshot for resume on next user message.
+                    resume_input_snapshot = list(running_input)
+                    resume_reason = incomplete_reason or "stream_ended_without_completion"
+
+                    # Flush the round's reasoning buffer to DB before we
+                    # exit — otherwise the thinking text accumulated
+                    # during the dead round is lost from diagnose_run's
+                    # transcript. (Mirrors the success-path call below.)
                     runs.emit_thinking_checkpoint(db, run, round_num=round_num)
+
+                    # Replace any partial half-thought streamed before
+                    # the cap hit with a clean warning. The user sees a
+                    # friendly message; the actual reasoning + searches
+                    # they ran are preserved in resume_input_snapshot.
+                    # No "error" event — that's reserved for FAILED runs
+                    # (the FE shows it as a toast/banner). This run isn't
+                    # failed; it has a valid assistant message and the
+                    # next user message will resume cleanly.
+                    stripper.flush()  # drain stripper, discard tail
+                    full_content = _INCOMPLETE_WARNING
+                    runs.replace_text_content(db, run, full_content)
                     break
 
                 remaining = stripper.flush()
@@ -1205,6 +1359,14 @@ async def run_agent_loop(
             ac_data["total_cost_usd"] = round(total_cost, 4)
         if sources:
             ac_data["sources"] = sources
+        if resume_input_snapshot is not None:
+            # Replayed verbatim into the next user message's
+            # `running_input` so the model resumes with full context
+            # (reasoning chain, tool calls, search results) instead of
+            # restarting research from scratch.
+            ac_data["resume_input"] = resume_input_snapshot
+            if resume_reason:
+                ac_data["resume_reason"] = resume_reason
 
         assistant_msg = _persist_assistant_message(
             db, run, project, new_version,
@@ -1227,6 +1389,13 @@ async def run_agent_loop(
             done_payload["stopped"] = True
             if stop_reason:
                 done_payload["stop_reason"] = stop_reason
+        if resume_input_snapshot is not None:
+            # Surface "stream died, resume available on next message"
+            # so the FE can show a subtle hint if it wants. Distinct
+            # from `stop_reason` (pause/cancel) — those are user-driven.
+            done_payload["incomplete"] = True
+            if resume_reason:
+                done_payload["incomplete_reason"] = resume_reason
         if sources:
             done_payload["sources"] = sources
 
