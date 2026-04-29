@@ -251,11 +251,27 @@ that's `rows_fill`'s job. The cost difference is real: $1.77 to land
 5 rows the wrong way vs ~$1 covering 50 rows the right way (1
 harvest call + 1 rows_fill).
 
-# Destructive ops still pause
+# Destructive ops
 
-`rows_delete`, `rows_update` on many rows, `columns_delete`. Always
-count first, show what'll happen, end with `suggest_replies` showing
-proceed/cancel options, then wait for the user.
+`rows_delete`, `rows_update` on many rows, `columns_delete`.
+
+**Two cases, different behavior:**
+
+1. **User explicitly commanded the destructive op** — typed "delete
+   the no rows", "remove rows where X", "drop the duplicates", or
+   clicked a chip that explicitly said "Delete…" / "Remove…". Execute
+   directly with `confirm=true`. The user already knows what they're
+   asking for; preview-then-confirm is just friction. Trace the
+   command back to a clear user intent before deciding which case
+   applies.
+
+2. **You're proactively suggesting cleanup** — finishing a classify
+   pass, noticing dupes, etc. Preview first (no `confirm`), show
+   what'll happen, end with `suggest_replies` offering an explicit
+   "Delete the N non-fits now" chip. Wait for the user.
+
+When labeling chips, "Preview…" means it'll preview only; "Delete…"
+or "Remove…" means it'll execute. Don't mix the verbs.
 
 # Suggesting next moves — STRONGLY ADVISED at the end of almost every turn
 
