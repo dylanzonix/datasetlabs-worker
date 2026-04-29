@@ -163,24 +163,56 @@ def emit_event(
     payload: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Persist a ChatRunEvent row and fan out to live subscribers.
-    Returns the full {type, seq, ...payload} dict callers may forward."""
-    payload = dict(payload or {})
-    seq = run.next_event_seq
-    run.next_event_seq = seq + 1
-    db.add(ChatRunEvent(
-        run_id=run.id,
-        seq=seq,
-        type=event_type,
-        payload=payload,
-    ))
-    # Commit so reconnects see the event immediately. The DB is source
-    # of truth; in-flight progress that isn't committed could be lost
-    # on a worker crash, which we explicitly accept.
-    db.commit()
+    Returns the full {type, seq, ...payload} dict callers may forward.
 
-    full = {"type": event_type, "seq": seq, **payload}
-    _BUS.publish(run.id, full)
-    return full
+    Retries on `(run_id, seq)` unique violations: another writer (e.g.
+    a second worker process that recovered this run as an orphan,
+    uvicorn-reload spawn, etc.) may have advanced the seq counter
+    while we were holding our local copy. On conflict we rollback,
+    refresh `run.next_event_seq` from the DB, and retry with the new
+    seq. Up to 5 attempts so a real bug surfaces rather than masking
+    forever.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    payload = dict(payload or {})
+    last_err: Optional[Exception] = None
+    for attempt in range(5):
+        seq = run.next_event_seq
+        run.next_event_seq = seq + 1
+        db.add(ChatRunEvent(
+            run_id=run.id,
+            seq=seq,
+            type=event_type,
+            payload=payload,
+        ))
+        try:
+            db.commit()
+        except IntegrityError as e:
+            last_err = e
+            try:
+                db.rollback()
+            except Exception:
+                log.exception("rollback after seq conflict failed")
+            try:
+                # Re-read seq from DB so the next attempt picks up the
+                # advanced value committed by the other writer.
+                db.refresh(run, attribute_names=["next_event_seq"])
+            except Exception:
+                log.exception("refresh after seq conflict failed")
+            log.warning(
+                "emit_event seq conflict for run %s (attempt %d, seq=%d) — retrying",
+                run.id, attempt + 1, seq,
+            )
+            continue
+
+        full = {"type": event_type, "seq": seq, **payload}
+        _BUS.publish(run.id, full)
+        return full
+
+    # Out of retries — propagate the last error.
+    log.error("emit_event giving up after 5 seq-conflict retries for run %s", run.id)
+    raise last_err if last_err else RuntimeError("emit_event failed")
 
 
 def update_run_phase(db: Session, run: ChatRun, phase: Optional[str]) -> None:
@@ -685,30 +717,71 @@ async def run_ttl_cleanup_loop(interval_seconds: int = 3600) -> None:
 
 # ---- Crash recovery (called at app startup) ------------------------------
 def recover_orphan_runs() -> int:
-    """Worker process restart: any run in `running`, `pause_requested`,
-    or `queued` is orphaned because its asyncio.Task is dead. Mark them
-    `failed` so subscribers see a terminal event and the FE can clean
-    up. Returns count fixed."""
+    """Mark runs that look truly stale as failed.
+
+    Heartbeat-based: a run is only considered orphaned if it (a)
+    started more than 2 minutes ago AND (b) has not emitted any
+    ChatRunEvent in the last 60 seconds. Otherwise a freshly-started
+    second worker would murder another worker's live run via this
+    path, causing `(run_id, seq)` collisions on emit_event when both
+    write to the same event log.
+
+    Returns count fixed. Safe to call on a polling schedule, not just
+    at startup.
+    """
+    from sqlalchemy.sql import func
+    from sqlalchemy import select
+
     db = SessionLocal()
     try:
-        from sqlalchemy.sql import func
-        orphans = (
+        # Candidates: any non-terminal run started > 2 minutes ago.
+        candidates = (
             db.query(ChatRun)
             .filter(
                 ChatRun.status.in_([
                     RUN_STATUS_QUEUED,
                     RUN_STATUS_RUNNING,
                     RUN_STATUS_PAUSE_REQUESTED,
-                ])
+                ]),
+                ChatRun.started_at < func.now() - func.make_interval(0, 0, 0, 0, 0, 2, 0),
             )
             .all()
         )
-        for run in orphans:
+
+        fixed = 0
+        for run in candidates:
+            # Per-run heartbeat: latest ChatRunEvent timestamp. If
+            # something was emitted in the last 60s, another process
+            # is alive on this run — leave it alone.
+            last_evt_at = (
+                db.query(func.max(ChatRunEvent.created_at))
+                .filter(ChatRunEvent.run_id == run.id)
+                .scalar()
+            )
+            if last_evt_at is not None:
+                # Compare in DB to avoid timezone fudging in Python.
+                stale = db.execute(
+                    select(func.now() - last_evt_at > func.make_interval(0, 0, 0, 0, 0, 1, 0))
+                ).scalar()
+                if not stale:
+                    continue
+            elif run.started_at is None:
+                continue
+
             run.status = RUN_STATUS_FAILED
-            run.error = "Worker process restarted; run was orphaned."
+            run.error = "Worker process restarted; run was orphaned (no heartbeat)."
             run.completed_at = func.now()
-            emit_event(db, run, "error", {"message": run.error})
-            emit_event(db, run, "done", {"stopped": True, "error": run.error})
-        return len(orphans)
+            try:
+                emit_event(db, run, "error", {"message": run.error})
+                emit_event(db, run, "done", {"stopped": True, "error": run.error})
+            except Exception:
+                log.exception("orphan recovery: emit failed for run %s", run.id)
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                continue
+            fixed += 1
+        return fixed
     finally:
         db.close()
