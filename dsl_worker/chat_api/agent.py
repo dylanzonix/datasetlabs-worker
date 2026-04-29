@@ -134,13 +134,9 @@ scraping" filter. Don't pretend one might.
    plausible match (e.g. Apify Reddit search for "scrape OR scraper
    OR extract data"). Accept noise — 5% hit rate is fine.
 2. Land all candidates as rows.
-3. ENRICH via `rows_fill(columns=["fit", "fit_reason"],
-   where={"fit": null})` — each mini agent reads the post and
-   classifies. The `where={"fit": null}` is critical: without it,
-   `rows_fill` walks rows in seq order and `limit` caps at the FIRST
-   N rows, so a second call covers the same N again instead of the
-   remaining unclassified ones (real bug seen on project 051e8704
-   where rows 1-80 got classified twice and 81-109 never did).
+3. ENRICH via `rows_fill(columns=["fit", "fit_reason"])` — each
+   mini agent reads the post and classifies. Cells are write-once,
+   so re-running is an idempotent no-op on already-filled rows.
    Skip `limit` when you want to classify ALL rows; the per-cell
    budget cap protects against runaway cost.
 4. MODIFY: `rows_delete(where={"fit": "no"})` — drop the misses.
@@ -922,6 +918,17 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
             "access to source tools (FE / Apollo / Apify / Google Maps / "
             "browser_use / code_exec / web_search built-in). Up to 10 "
             "cells run in parallel.\n\n"
+            "**Cells are write-once**: rows_fill automatically skips any "
+            "(row, column) where a value already exists. Re-running on "
+            "already-filled rows is an idempotent no-op — don't worry "
+            "about double-billing or `where={col: null}` plumbing. To "
+            "actually re-fill, clear the values first via `rows_update` "
+            "(set the column to null) or `columns_delete` + `columns_add` "
+            "+ `rows_fill`.\n\n"
+            "Result includes `cells_filled` (NEW work) and "
+            "`rows_skipped_already_filled` (rows that matched `where` "
+            "but were already fully populated for the target columns) "
+            "so you can see what actually moved.\n\n"
             "Use this for THREE patterns, not just literal 'fill':\n"
             "1. ENRICH — 'find emails for these rows', 'add Twitter handles'\n"
             "2. CLASSIFY (then delete bad ones) — fill a 'fit' column "

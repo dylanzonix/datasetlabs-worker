@@ -386,6 +386,50 @@ async def fill_rows(
     if not rows:
         return ({"matched_rows": 0, "filled": 0, "summary": "no rows match"}, 0.0)
 
+    # Pre-filter: skip rows where ALL target columns are already filled,
+    # and per-row determine the SUBSET of target_columns the cell agent
+    # actually needs to fill. Cells are write-once at this layer — to
+    # re-fill, the caller clears values via rows_update or
+    # columns_delete + re-add. This makes rows_fill idempotent (re-runs
+    # are no-ops on already-filled cells) and removes the footgun where
+    # the model called rows_fill twice with no `where` and re-classified
+    # the same first 80 rows (project 051e8704). Lifts state-tracking
+    # off the model and into the system.
+    def _is_empty(v: Any) -> bool:
+        if v is None:
+            return True
+        if isinstance(v, str) and v.strip() == "":
+            return True
+        return False
+
+    work_items: List[Tuple[Any, Dict[str, Any], List[str]]] = []
+    rows_skipped_already_filled = 0
+    for row_id, row_data in rows:
+        existing = dict(row_data or {})
+        unfilled = [c for c in target_columns if _is_empty(existing.get(c))]
+        if unfilled:
+            work_items.append((row_id, existing, unfilled))
+        else:
+            rows_skipped_already_filled += 1
+
+    if not work_items:
+        # Every matched row was already filled — explicit feedback
+        # so the model knows this and doesn't re-call.
+        summary = {
+            "matched_rows": len(rows),
+            "rows_skipped_already_filled": rows_skipped_already_filled,
+            "processed": 0,
+            "cells_filled": 0,
+            "by_status": {},
+            "note": (
+                "All matched rows already have values in the target "
+                "columns. To re-fill, clear the existing values first "
+                "(rows_update with the column → null, or columns_delete "
+                "+ columns_add)."
+            ),
+        }
+        return (summary, 0.0)
+
     sem = asyncio.Semaphore(concurrency)
     total_cost = 0.0
     results: List[CellFillResult] = []
@@ -401,27 +445,33 @@ async def fill_rows(
     if progress_cb is not None:
         await _emit({
             "type": "fill_start",
-            "total": len(rows),
+            "total": len(work_items),
             "columns": list(target_columns),
         })
 
-    async def _process(row_id: Any, row_data: Any, idx: int) -> CellFillResult:
+    async def _process(
+        row_id: Any, row_data: Dict[str, Any], unfilled_cols: List[str], idx: int,
+    ) -> CellFillResult:
         async with sem:
             await _emit({
                 "type": "cell_start",
                 "row_id": str(row_id),
                 "index": idx,
-                "total": len(rows),
+                "total": len(work_items),
                 # FE marks each (row_id, column) as "processing" so the
                 # table can show per-cell spinners while the cell agent
-                # runs. cell_done clears these.
-                "columns": list(target_columns),
+                # runs. cell_done clears these. Only the unfilled subset
+                # for this row.
+                "columns": list(unfilled_cols),
             })
+            # Per-row specs are sliced to the unfilled subset so the
+            # cell agent only researches what's actually needed.
+            row_specs = {c: target_specs[c] for c in unfilled_cols if c in target_specs}
             res = await _run_cell_agent(
                 row_id=str(row_id),
-                row_data=dict(row_data or {}),
-                target_columns=target_columns,
-                target_specs=target_specs,
+                row_data=row_data,
+                target_columns=unfilled_cols,
+                target_specs=row_specs,
                 max_cost=max_cost,
             )
             # Persist this cell's values immediately so:
@@ -455,7 +505,7 @@ async def fill_rows(
                 "type": "cell_done",
                 "row_id": str(row_id),
                 "index": idx,
-                "total": len(rows),
+                "total": len(work_items),
                 "status": res.status,
                 "cost": round(res.cost_usd, 4),
                 "filled": [
@@ -470,8 +520,8 @@ async def fill_rows(
             return res
 
     tasks = [
-        _process(rid, rdata, i + 1)
-        for i, (rid, rdata) in enumerate(rows)
+        _process(rid, rdata, unfilled, i + 1)
+        for i, (rid, rdata, unfilled) in enumerate(work_items)
     ]
     completed = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -488,17 +538,20 @@ async def fill_rows(
         by_status[r.status] = by_status.get(r.status, 0) + 1
     filled_total = sum(1 for r in results if any(v is not None and v != "" for v in r.values.values()))
 
-    return (
-        {
-            "matched_rows": len(rows),
-            "processed": len(results),
-            "cells_filled": filled_total,
-            "by_status": by_status,
-            "avg_cost_per_row": round(total_cost / max(1, len(results)), 4),
-            "samples": [
-                {"row_id": r.row_id, "values": r.values, "status": r.status, "reason": r.reason, "cost": round(r.cost_usd, 4)}
-                for r in results[:5]
-            ],
-        },
-        total_cost,
-    )
+    summary: Dict[str, Any] = {
+        "matched_rows": len(rows),
+        "rows_skipped_already_filled": rows_skipped_already_filled,
+        "processed": len(results),
+        "cells_filled": filled_total,
+        "by_status": by_status,
+        "avg_cost_per_row": round(total_cost / max(1, len(results)), 4),
+        "samples": [
+            {"row_id": r.row_id, "values": r.values, "status": r.status, "reason": r.reason, "cost": round(r.cost_usd, 4)}
+            for r in results[:5]
+        ],
+    }
+    if rows_skipped_already_filled and len(results) == 0:
+        summary["note"] = (
+            "All matched rows already have values in the target columns."
+        )
+    return (summary, total_cost)
