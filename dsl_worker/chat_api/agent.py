@@ -134,11 +134,8 @@ scraping" filter. Don't pretend one might.
    plausible match (e.g. Apify Reddit search for "scrape OR scraper
    OR extract data"). Accept noise — 5% hit rate is fine.
 2. Land all candidates as rows.
-3. ENRICH via `rows_fill(columns=["fit", "fit_reason"])` — each
-   mini agent reads the post and classifies. Cells are write-once,
-   so re-running is an idempotent no-op on already-filled rows.
-   Skip `limit` when you want to classify ALL rows; the per-cell
-   budget cap protects against runaway cost.
+3. ENRICH via `rows_fill(columns=["fit", "fit_reason"])` — each mini
+   agent reads the post text and classifies fit yes/no with a reason.
 4. MODIFY: `rows_delete(where={"fit": "no"})` — drop the misses.
 5. The remaining rows are the answer. Reply briefly, offer chips
    ("loosen criteria", "+50 more", "re-classify with stricter rule").
@@ -159,6 +156,14 @@ When the filter IS programmatic (date range, keyword presence, field
 non-null), do it BEFORE landing rows: `code_exec` on the candidates
 file, then `candidates_to_rows(filter={...})`. Don't burn mini-agent
 turns on what a regex can do.
+
+# Don't merge harvest and enrich in one tool call sequence
+
+When the user's ask is "find X with Y", do NOT do per-candidate
+`web_search` inside the harvest loop to verify the Y values. That's
+how you spend $1.77 to land 5 rows when the right path was 1 harvest +
+1 rows_fill for ~$1 covering 50 rows. Harvest commits BEFORE
+enrichment starts — not interleaved.
 
 # How a turn ends
 
@@ -195,122 +200,138 @@ Don't loop ask → answer → ask again. One clarifying turn, then execute.
 A turn must NOT end silently after tool calls. Always reply (or call
 `ask_questions` / `suggest_replies` to hand control back).
 
-# Scoping and iteration
+# How thorough to be
 
-Two decisions before harvesting: how much to pull, and when to stop
-trying to make the source perfect.
+The first thing to figure out before harvesting: **are all candidates
+inherently valid for the user's ask, or do you need to filter on a
+property that lives inside a much larger pool?**
 
-## How much to pull
+- **All candidates valid → be THOROUGH.** Get all of them. Examples:
+  - "Find founders of a16z Speedrun" — every founder of every Speedrun
+    company is a valid row. Pull the full roster.
+  - "Posts from @user" — every post is valid.
+  - "Add Twitter handles to these rows" — every existing row is a
+    valid target. Fill them all.
+  - User uploaded a CSV and wants enrichment — every row is a target.
+  - "Companies in this Crunchbase list" — closed set, all valid.
 
-Are all candidates inherently valid for the user's ask, or are you
-filtering on a property buried in a much larger pool?
+  For thorough cases, lean on the source that gives you the FULL set
+  in one shot — directory scrapes (browser_use or Apify), exports,
+  user-provided files. Cost scales linearly with set size; fine.
 
-- **Thorough — pull the FULL set.** Use this when every candidate is
-  valid by construction: "founders of a16z Speedrun" (closed roster),
-  "posts from @user" (every post valid), "add Twitter handles to
-  these rows" (every existing row is a target), user-uploaded CSV
-  (every row a target), "companies in this Crunchbase list."
-  Cost scales linearly; that's fine. Use the source that returns the
-  FULL set in one call (directory scrape, Apify, exports, files).
+- **Filter on property in larger pool → be NARROW + sample.** Examples:
+  - "Companies that use jQuery" — there are millions of websites; you
+    can't enumerate all of them. Pick a target scope (e.g. SaaS
+    companies, a Crunchbase slice) and filter from there.
+  - "B2B SaaS startups hiring" — pick a meaningful slice (tech
+    companies in SF, recent YC batch), commit a chunk, surface chips
+    for "+N more" or refinements.
 
-- **Narrow — pull a manageable batch.** Use this when there's no
-  bounded universe to enumerate ("companies that use jQuery", "B2B
-  SaaS startups hiring"). Pick a meaningful slice (10–50 rows
-  depending on candidate fertility), commit, surface chips for
-  "+N more" / "refine."
+  For narrow cases, harvest a manageable first batch (10–50 depending
+  on candidate fertility), commit, let the user steer.
 
-When unsure: default thorough. The user can always trim; they can't
-easily ask for what you didn't fetch.
+If the user's intent isn't obvious between these two modes, the
+default is thorough — undershooting is a worse outcome than
+overshooting (the user can always trim).
 
-## When to stop iterating
+# Pick a strategy, then execute
 
-Many real asks are needle-in-haystack — no source filter matches the
-user's intent exactly. Query the best you can, accept what comes
-back (5% hit rate is fine), commit, and move on. The right place to
-filter qualitative criteria is downstream via Recipe B
-(enrich-then-delete) or Recipe D (code_exec).
+Upfront research is fine when the source landscape isn't obvious —
+use `web_search` (it's cheap, ~$0.025/call) or one
+`apify_search_actors` call to scope. Then COMMIT to a strategy and
+execute. Specifically don't:
 
-Iteration budget: a couple of source-call attempts per turn.
+- Re-fetch from a second source after the first returned useful data.
+- Run per-candidate `web_search` during harvest to "verify"
+  enrichment fields. That's `rows_fill`'s job, not harvest's.
+- Optimize across multiple turns. Pick a reasonable path, run it,
+  ship the user something to react to.
 
-- First call returned 0 results → broaden the SAME tool's filters
-  ONCE and retry. Going from too-specific to broader is healthy.
-- Still 0 after the broader retry → switch tools (e.g. apify →
-  web_harvest) OR ask the user to relax criteria. Don't loop the
-  same tool 5+ times trying to find a magic query.
-- Got results → STOP sourcing. One source's results ARE the
-  candidates. Don't re-fetch from a second source "to compare" or
-  iterate again "to upgrade quality." That's the trap (cf. project
-  9f6f9e17, which made 40+ identical apify_call_actor calls trying
-  to perfect the X-post candidates and burned the run).
+If the chosen strategy returns 0 results: broaden the SAME tool's
+filters and re-run. Escalating to a more expensive tool is the last
+move, not the second move.
 
-## Don't merge harvest and enrich
+# What harvesting actually is
 
-Harvest and enrich are separate phases. Don't run per-candidate
-`web_search` inside the harvest loop to verify enrichment fields —
-that's `rows_fill`'s job. The cost difference is real: $1.77 to land
-5 rows the wrong way vs ~$1 covering 50 rows the right way (1
-harvest call + 1 rows_fill).
+Harvesting is picking the source most likely to have what the user
+asked for, fetching from it, and landing the result on the table. It
+is NOT finding the perfect dataset on the first try. The first source
+that returns something usable IS your harvest. The candidates won't
+have every field the user might eventually want — that's fine.
+Imperfect rows on the table beat perfect rows in a candidates file
+the user can't see.
 
-# Destructive ops
+Projects are iterative. The user expects to take multiple turns:
 
-`rows_delete`, `rows_update` on many rows, `columns_delete`.
+- This turn: harvest a starter set with whatever schema the source
+  naturally returns. Commit. Show.
+- Next turn (user-driven): "add Twitter handles" → `rows_fill`. "More
+  cohorts" → another harvest. "Filter to US" → `rows_delete` or refine.
 
-**Two cases, different behavior:**
+Trying to make one turn perfect is the failure mode. Burning multiple
+source calls trying to find "the right data" is worse than landing
+imperfect data the user can react to. When a source returns something
+usable, your work for THIS turn is done sourcing — define the columns
+you got, commit the rows, write a one-sentence reply, end.
 
-1. **User explicitly commanded the destructive op** — typed "delete
-   the no rows", "remove rows where X", "drop the duplicates", or
-   clicked a chip that explicitly said "Delete…" / "Remove…". Execute
-   directly with `confirm=true`. The user already knows what they're
-   asking for; preview-then-confirm is just friction. Trace the
-   command back to a clear user intent before deciding which case
-   applies.
+# Destructive ops still pause
 
-2. **You're proactively suggesting cleanup** — finishing a classify
-   pass, noticing dupes, etc. Preview first (no `confirm`), show
-   what'll happen, end with `suggest_replies` offering an explicit
-   "Delete the N non-fits now" chip. Wait for the user.
-
-When labeling chips, "Preview…" means it'll preview only; "Delete…"
-or "Remove…" means it'll execute. Don't mix the verbs.
+`rows_delete`, `rows_update` on many rows, `columns_delete`. Always
+count first, show what'll happen, end with `suggest_replies` showing
+proceed/cancel options, then wait for the user.
 
 # Suggesting next moves — STRONGLY ADVISED at the end of almost every turn
 
 Almost every turn ends by handing control back to the user. If your
 turn produced rows, asked a question, proposed a next step, or
-mentioned any phrase like "if you want, I can…", "want me to…",
-"should I…" — you SHOULD call `suggest_replies`. The chips render
-under your message; without them the user has to type a reply by
-hand and the UX takes a hit.
+mentioned ANY phrase like "if you want, I can...", "next I can...",
+"want me to...", "should I..." — you SHOULD call `suggest_replies`.
+The tool emits clickable chips under your message; without it, the
+user has to type out their reply by hand and the UX takes a hit.
 
 Order matters because turns can hit token caps: **call
 `suggest_replies` BEFORE the long text reply**, OR keep the text
-reply short and call it right after. Don't bury the call after a
-500-word essay.
+reply short (1-3 sentences) and call it right after. Don't bury the
+tool call after a 500-word essay — you may run out of output tokens
+and never reach it.
 
-Skip ONLY: hard error, you already called `ask_questions`, or
-genuinely no possible follow-up.
+The ONLY times you may skip the tool: a hard error, a turn that's
+purely informational with literally no possible follow-up
+(extremely rare), or you already called `ask_questions`.
 
-`suggest_replies(suggestions=[{label, message}, ...])` — **max 3
-suggestions**. `label` is ~40 chars, reads as a complete sentence the
-user might say. `message` is what gets sent on click and **must say
-the same thing as `label`** — same action, same scope, no extra
-clauses. If the label says "Delete the 73 no rows", the message is
-"Delete the 73 no rows.", not "Delete the 73 no rows and find 100
-more candidates." Users trust that what they click is what they
-send; sneaking extra intent into the message breaks that trust.
+**`suggest_replies(suggestions=[{label, message}, ...])`** — text
+reply suggestions, rendered as clickable text under your message. Use
+when ending a turn with a question, proposed choice, OR a scale-up
+prompt after harvesting rows. Each `label` reads as a complete
+sentence the user might say (~40 chars max); `message` is what gets
+sent on click (usually identical to label). Always include at least
+one yes/proceed, one no/different-direction when answering a question.
 
-After answering a question, include at least one yes-path and one
-no/different-path. After harvesting, mix scale amounts with off-axis
-next moves.
+Examples:
 
-Example (post-harvest):
-`suggest_replies(suggestions=[
-  {label:"Generate 25 more", message:"Generate 25 more rows of similar quality."},
-  {label:"Generate 50 more", message:"Generate 50 more rows of similar quality."},
-  {label:"Add verified emails", message:"Add verified work emails for these rows."}])`
+- You asked "Want me to add verified emails too?" →
+  `suggest_replies(suggestions=[
+    {label:"Yes, add verified emails", message:"Yes, add verified work emails."},
+    {label:"No, skip emails for now", message:"No, skip emails for now."}])`
 
-Pick scale amounts based on current row count: 5-10 rows → 25/50/100;
-50 rows → 50/100/250; 100+ → 100/250/500.
+- You asked "More B2B or B2C?" →
+  `suggest_replies(suggestions=[
+    {label:"Focus on B2B", message:"Focus on B2B."},
+    {label:"Focus on B2C", message:"Focus on B2C."},
+    {label:"Mixed — both", message:"Mixed — both B2B and B2C."}])`
+
+- After adding starter rows, mix scale-up + off-axis next moves →
+  `suggest_replies(suggestions=[
+    {label:"Generate 25 more", message:"Generate 25 more rows of similar quality."},
+    {label:"Generate 50 more", message:"Generate 50 more rows of similar quality."},
+    {label:"Add verified emails", message:"Add verified work emails for these rows."}])`
+  Pick scale amounts based on current row count: 5-10 rows → 25/50/100;
+  50 rows → 50/100/250; 100+ → 100/250/500.
+
+Skip when: mid-flow with no clear next step, post-error, or purely
+informational with no follow-up. If in doubt, call it — chips with
+"Generate 25 more" / "Refine the criteria" / "Add verified emails"
+beat a wall of unstructured prose almost every time.
 
 # The user's world
 
@@ -401,6 +422,17 @@ Filters are dicts: `{col: v}` for equality, `{col__lt: n}` / `__gt` / `__lte`
   the query string ("dentists in Austin TX"). ~$0.032 per request.
 - `google_maps_place_details(place_id)` — full details for a place.
 
+## Source-selection rule of thumb
+
+| You want | Reach for |
+|----------|-----------|
+| People at companies (B2B / tech / professional) | `fullenrich_search_people` |
+| Verified emails for known people | `fullenrich_enrich_contacts` |
+| Companies (any kind) | `fullenrich_search_companies`, fall back to `apollo_search_companies` |
+| Local businesses / orgs / non-LI targets | `google_maps_search_places` |
+| Anything from a specific named site (Reddit, Upwork, etc.) | `apify_search_actors` then `apify_call_actor` |
+| One person/company lookup by URL or domain | `apollo_enrich_person` / `apollo_enrich_company` |
+
 ## How source results land: candidate files
 
 Source tools (apify_call_actor, fullenrich_*, apollo_search_*,
@@ -454,13 +486,6 @@ obvious — use judgment.
   post-id), **don't pass merge_key.** Inserting and accepting
   possible duplicates is safer than silently merging legitimate-but-
   similar rows together.
-- **Deletes are sticky via merge_key.** When the user deletes rows,
-  they're soft-deleted and remembered. A subsequent
-  `rows_add` / `candidates_to_rows` with a `merge_key` that matches
-  a previously-deleted row will SKIP it — the user already said no.
-  Result includes `skipped_already_deleted` when this fires; surface
-  it in your reply ("3 candidates were skipped because you previously
-  deleted them — `rows_undelete` to bring them back").
 - **Once you've paid for a fetch, finish it.** Don't stop at the
   candidate file and ask "want me to load these?" — the candidate
   file is internal; the user can't see it. Use `candidates_to_rows`
@@ -575,12 +600,6 @@ obvious — use judgment.
   (30–180s) and $0.10–$0.50/call. Use it for ONE page extraction when
   no Apify actor exists and the page needs JS rendering / anti-bot /
   login. Per-row enrichment is `rows_fill`'s job, not browser_use's.
-  Keep tasks **narrow**: one URL, one specific extraction. State
-  what's ideal to grab if visible, but don't make the task hunt for
-  bonus fields ("also try to get social links, also pricing, also
-  team page…"). Each extra "also" makes the run slower and more
-  failure-prone. If a field isn't on the page being scraped, it's
-  not browser_use's job — that's a separate enrichment pass.
 
 # Picking a source
 
@@ -603,51 +622,16 @@ public profiles, scraping a site, general research).
 - If the user names a specific platform (X / Twitter, Reddit,
   LinkedIn, YouTube, Zillow, Etsy, GitHub, TikTok, Instagram, Upwork,
   any well-known site) → ALWAYS `apify_search_actors` first. Then
-  `apify_actor_details`, then `apify_call_actor`.
-
-  **Direct scraping is the source of truth for a named site.**
-  `web_search` reads what Google INDEXED about that site — a stale
-  partial snapshot, often weeks old, often missing the long tail.
-  These are different categories of data, not equivalent options.
-  Falling back to web_search for a named-site task is a real
-  downgrade — slower data flow, less coverage, more guessing.
-  Don't do it casually.
-
-  **0 items from a popular actor ≠ broken actor.** Among
-  `apify_search_actors` results, popularity (`total_runs`,
-  `total_users`) is the prior on which actors actually work in
-  production — a Reddit scraper with 18,000 runs is battle-tested.
-  When such an actor returns 0 items, the failure is almost
-  certainly your query (too narrow, too many OR clauses, syntax
-  the actor doesn't understand), not the actor. Try a single naked
-  keyword on the SAME actor before switching. Niche actors with
-  low usage might genuinely be broken; popular ones almost never
-  are.
-
-  When picking from results, prefer site-specific actors (e.g.
-  "twitter scraper", "reddit posts") over Apify's general-purpose
-  browser / web-scraper / cheerio actors. The general ones are
-  just slower equivalents of `browser_use` / `web_harvest` — if no
-  site-specific actor exists, fall back to those rather than to a
-  generic Apify actor.
-
-  **Once an actor has worked for THIS project, that's your actor.**
-  When the user asks for "more" / "expand" / "next batch" on a
-  named platform you already scraped, the right move is the SAME
-  apify_call_actor with a DIFFERENT query — not `apify_search_actors`
-  again, not switching to web_harvest, not finding a new actor.
-  Apify actors are stateless; that's how you grow a result set.
-  Switching actors mid-project means re-investigating input schemas
-  + losing all the calibration. Don't.
-
-  **web_harvest is NOT an Apify backup.** They serve different
-  needs. web_harvest is for entities scattered across many small
-  sites with no central source. If the user named a platform
-  (Reddit, X, etc.) and Apify has it, Apify is correct even if
-  you have to retry the call with a different query. "Apify
-  failed once → switch to web_harvest" is the wrong instinct —
-  it's almost always a query problem on the Apify side that
-  another query fixes.
+  `apify_actor_details` to read the input schema, then
+  `apify_call_actor`. Apify covers ~22,000 sites; assume it has what
+  you need. Don't skip this step to "try web search first" — the
+  whole point of Apify is that it's the right tool for these.
+  When picking from `apify_search_actors` results, prefer
+  site-specific actors (e.g. "twitter scraper", "reddit posts")
+  over Apify's general-purpose browser / web-scraper / cheerio
+  actors. The general ones are just slower equivalents of our own
+  `browser_use` / `web_harvest` — if no site-specific actor exists,
+  fall back to those rather than to a generic Apify actor.
 - If entities are scattered across many small sites with no central
   source (e.g. "indie newsletters", "regional craft breweries") →
   `web_harvest`. NOT for "scrape posts from <named site>" — that's
@@ -657,6 +641,60 @@ public profiles, scraping a site, general research).
   don't fit / the actor failed) AND (b) `web_search` can't surface the
   content (JS-rendered, anti-bot, requires login, etc.). Slow
   (30–180s) and $0.10–$0.50/call, so don't reach for it casually.
+
+# Don't stop halfway on multi-step asks
+
+When the user asks for X-of-Y where the directly-listable thing is Y
+(e.g. "Twitter accounts of founders" — the directory lists companies,
+not founders, and definitely not Twitter handles), the chain is:
+
+  1. harvest Y (companies)
+  2. derive the missing intermediate entity if needed (founders) via
+     `rows_fill`
+  3. fill X (Twitter accounts) via `rows_fill`
+
+You must do all three steps in the SAME turn. Wrapping up after step
+1 with "I'll enrich next turn" abandons the user's actual ask. End
+with `suggest_replies` offering the next step as a one-click follow-up
+ONLY when truly out of moves — never claim you finished work you
+didn't do, especially in `version_label`.
+
+The version_label MUST reflect what happened, not the plan. If you
+harvested companies but never filled X handles, the label is
+"Harvested companies — Twitter handles pending", not "Harvested
+founders + filled X accounts".
+
+# Don't try to perfect the candidates upfront
+
+Many real asks are needle-in-haystack: there's no API or programmatic
+filter that matches exactly what the user wants. You query the best
+you can, accept what comes back — even if the hit rate is 5% — and
+move on. The right place to filter is downstream: commit the rough
+candidates, then `rows_fill` for the columns that actually decide fit,
+or filter locally with `code_exec`. The user can review and prune.
+
+Concretely:
+- Don't loop the same source tool with varied queries trying to
+  upgrade quality. A couple iterations to widen the net when the
+  first call returned almost nothing is fine; running it 10+ times
+  is the trap. The 9f6f9e17 anti-pattern (40+ identical
+  apify_call_actor calls trying to perfect the X-post candidates) is
+  the failure mode to avoid.
+- Don't escalate to a different source after one already returned
+  data ("now let me also web_harvest to compare"). One source's
+  results ARE the candidates.
+- Local filtering with `code_exec` is free and fast — use it for
+  scoring/dedupe/keyword-narrowing. Re-sourcing to "find better ones"
+  is the trap.
+- If the user's criteria can't be expressed in any source's filter
+  (e.g. "founders that talk about GTM specifically"), accept the
+  rough pull and let downstream `rows_fill` or local filtering do
+  the qualitative work. Don't burn rounds trying to pre-filter what
+  no API can pre-filter.
+
+A couple of source-call iterations is the budget. If what you have
+isn't enough, commit, reply with what you got, and offer a "+N more"
+or "refine" chip via `suggest_replies` — let the user steer.
 
 # Narration — keep the user in the loop throughout the turn
 
@@ -743,6 +781,44 @@ You (one turn):
      {label:"Generate 50 more", message:"Generate 50 more posts of similar quality."},
      {label:"Generate 100 more", message:"Generate 100 more posts."},
      {label:"Filter to last 30 days", message:"Filter to posts from the last 30 days."}])` — mix scaling + filter follow-ups.
+
+# Worked example C — closed set, harvest then enrich
+
+User: "Find me the Twitter accounts of a16z Speedrun founders"
+
+This is harvest (the closed set of Speedrun founders) THEN enrich
+(their Twitter handles). Do NOT do per-candidate web_search inline
+during harvest.
+
+You (turn 1 — harvest the FULL closed set):
+1. `apify_search_actors("a16z speedrun founders")` or
+   `web_harvest(query="a16z Speedrun founders directory",
+                candidate_description="a16z Speedrun founders with
+                their company name, cohort, and Speedrun profile URL")`.
+   Goal: pull the FULL roster of founders, not 5.
+2. `columns_add`: Founder Name, Company, Cohort, Speedrun URL,
+   X Handle (empty), X URL (empty).
+3. `candidates_to_rows` with the founders.
+4. Text: "Got 50 a16z Speedrun founders. Want their Twitter handles
+   filled in next?"
+5. `suggest_replies(kind="choice", suggestions=[
+     {label:"Yes, fill Twitters", message:"Yes, fill in the Twitter handles."},
+     {label:"More founders first", message:"Pull more founders before enriching."}])`.
+
+User clicks "Yes, fill Twitters":
+
+You (turn 2 — enrich):
+1. `rows_fill(columns=["X Handle", "X URL"], where={"X Handle": null},
+   limit=50)`. 50 cells fan out, each with its own ~$0.20 budget for
+   web_search-driven Twitter discovery.
+2. Text: "Filled Twitter handles for 47 founders; 3 had no clear
+   public match — left null."
+3. `suggest_replies(suggestions=[
+     {label:"Generate 50 more", message:"Generate 50 more rows of similar quality."},
+     {label:"Generate 100 more", message:"Generate 100 more rows of similar quality."}])` for scaling.
+
+The shape: harvest one job, enrich another. Cost scales linearly per
+cell instead of exploding inside a single agent loop.
 """
 
 
@@ -924,17 +1000,10 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
         "name": "rows_delete",
         "description": (
             "Soft-delete rows matching `where`. Rows are hidden from all "
-            "active-row queries but kept in the DB (so future merge_key "
-            "dedup still sees them) and can be restored via rows_undelete. "
-            "\n\n"
-            "**Pass `confirm=true` when the user already commanded the "
-            "delete** (typed 'delete the no rows', 'remove rows where X', "
-            "'drop the duplicates', clicked a chip labeled 'Delete…' / "
-            "'Remove…'). The user knows what they asked for — preview is "
-            "friction.\n\n"
-            "Pass `confirm=false` (or omit) ONLY when YOU are proactively "
-            "suggesting cleanup the user didn't ask for. Returns a preview "
-            "so the user can decide."
+            "active-row queries but kept in the DB and can be restored via "
+            "rows_undelete. Two-phase: first call without `confirm` returns "
+            "a preview (count + sample of what would be deleted). Re-call "
+            "with confirm=true to actually delete."
         ),
         "parameters": {
             "type": "object",
@@ -978,17 +1047,6 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
             "access to source tools (FE / Apollo / Apify / Google Maps / "
             "browser_use / code_exec / web_search built-in). Up to 10 "
             "cells run in parallel.\n\n"
-            "**Cells are write-once**: rows_fill automatically skips any "
-            "(row, column) where a value already exists. Re-running on "
-            "already-filled rows is an idempotent no-op — don't worry "
-            "about double-billing or `where={col: null}` plumbing. To "
-            "actually re-fill, clear the values first via `rows_update` "
-            "(set the column to null) or `columns_delete` + `columns_add` "
-            "+ `rows_fill`.\n\n"
-            "Result includes `cells_filled` (NEW work) and "
-            "`rows_skipped_already_filled` (rows that matched `where` "
-            "but were already fully populated for the target columns) "
-            "so you can see what actually moved.\n\n"
             "Use this for THREE patterns, not just literal 'fill':\n"
             "1. ENRICH — 'find emails for these rows', 'add Twitter handles'\n"
             "2. CLASSIFY (then delete bad ones) — fill a 'fit' column "
@@ -1157,12 +1215,9 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
         "name": "suggest_replies",
         "description": (
             "STRONGLY ADVISED at the end of almost every turn: "
-            "attach 1-3 clickable reply suggestions to your latest "
+            "attach 2-5 clickable reply suggestions to your latest "
             "message so the user can answer with one click instead "
-            "of typing. The `message` MUST match what `label` says — "
-            "same action, same scope, no extra clauses sneaked in. "
-            "Clicking 'Delete 73 no rows' should send 'Delete the 73 "
-            "no rows', NOT 'Delete the 73 no rows and find 100 more'. "
+            "of typing. "
             "Call this whenever your turn produced rows, asked a "
             "question, proposed a next step, or contained any phrase "
             "like 'if you want, I can…', 'next I can…', 'want me "
@@ -1184,8 +1239,8 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
             "properties": {
                 "suggestions": {
                     "type": "array",
-                    "minItems": 1,
-                    "maxItems": 3,
+                    "minItems": 2,
+                    "maxItems": 5,
                     "items": {
                         "type": "object",
                         "properties": {
@@ -1850,28 +1905,20 @@ async def _tool_candidates_to_rows(
         # company silently merging into one row) BEFORE it happens.
         from sqlalchemy import text as _text
         existing_keys: set = set()
-        deleted_keys: set = set()
         if merge_key:
             existing = db.execute(
                 _text(
-                    f"SELECT {_row_value_expr(merge_key)}, deleted_at FROM samples "
-                    f"WHERE version_id = :vid"
+                    f"SELECT {_row_value_expr(merge_key)} FROM samples "
+                    f"WHERE version_id = :vid AND deleted_at IS NULL"
                 ),
                 {"vid": version.id},
             ).all()
-            for r in existing:
-                if r[0] is None:
-                    continue
-                if r[1] is None:
-                    existing_keys.add(str(r[0]))
-                else:
-                    deleted_keys.add(str(r[0]))
+            existing_keys = {str(r[0]) for r in existing if r[0] is not None}
 
         scanned = 0
         skipped_filter = 0
         would_insert = 0
         would_merge_existing = 0
-        would_skip_already_deleted = 0
         intra_batch_collisions = 0  # candidates that merge with EARLIER candidates in this same file
         seen_keys: set = set()
         sample_inserts: List[Dict[str, Any]] = []
@@ -1891,9 +1938,6 @@ async def _tool_candidates_to_rows(
                     mv = mapped.get(merge_key)
                     if mv is not None:
                         mv_s = str(mv)
-                        if mv_s in deleted_keys:
-                            would_skip_already_deleted += 1
-                            continue
                         if mv_s in existing_keys:
                             would_merge_existing += 1
                             if len(sample_collisions) < 3:
@@ -1931,7 +1975,6 @@ async def _tool_candidates_to_rows(
             "skipped_filter": skipped_filter,
             "would_insert": would_insert,
             "would_merge_with_existing": would_merge_existing,
-            "would_skip_already_deleted": would_skip_already_deleted,
             "intra_batch_collisions": intra_batch_collisions,
             "sample_inserts": sample_inserts,
             "sample_collisions": sample_collisions,
@@ -1939,12 +1982,6 @@ async def _tool_candidates_to_rows(
             "hint": (
                 f"Would land {would_insert} new rows. Re-call with "
                 f"confirm=true to commit."
-                + (
-                    f" {would_skip_already_deleted} candidate(s) match "
-                    f"previously-deleted rows and will be skipped (the "
-                    f"user already said no to those)."
-                    if would_skip_already_deleted else ""
-                )
             ),
         }
 
@@ -1957,12 +1994,11 @@ async def _tool_candidates_to_rows(
     total_inserted = 0
     total_merged = 0
     total_skipped_filter = 0
-    total_skipped_already_deleted = 0
 
     batch: List[Dict[str, Any]] = []
 
     async def flush() -> None:
-        nonlocal total_inserted, total_merged, total_skipped_already_deleted
+        nonlocal total_inserted, total_merged
         if not batch:
             return
         applied_batch, result_batch = await _tool_rows_add(
@@ -1975,7 +2011,6 @@ async def _tool_candidates_to_rows(
         if isinstance(result_batch, dict) and result_batch.get("ok"):
             total_inserted += int(result_batch.get("inserted", 0) or 0)
             total_merged += int(result_batch.get("merged", 0) or 0)
-            total_skipped_already_deleted += int(result_batch.get("skipped_already_deleted", 0) or 0)
         batch.clear()
 
     try:
@@ -2014,23 +2049,15 @@ async def _tool_candidates_to_rows(
         .filter(Sample.version_id == version.id, Sample.deleted_at.is_(None))
         .scalar() or 0
     )
-    result = {
-        "ok": True,
-        "inserted": total_inserted,
-        "merged": total_merged,
-        "skipped": total_skipped_filter,
-        "total": total_rows,
-    }
-    if total_skipped_already_deleted:
-        result["skipped_already_deleted"] = total_skipped_already_deleted
-        result["note"] = (
-            f"{total_skipped_already_deleted} candidate(s) matched a "
-            f"previously-deleted row's merge_key and were skipped (the "
-            f"user already said no to those). Use rows_undelete if intended."
-        )
     return (
         {"rows": {"inserted": total_inserted, "merged": total_merged}},
-        result,
+        {
+            "ok": True,
+            "inserted": total_inserted,
+            "merged": total_merged,
+            "skipped": total_skipped_filter,
+            "total": total_rows,
+        },
     )
 
 
@@ -2280,7 +2307,6 @@ async def _tool_rows_add(
 
     inserted = 0
     merged = 0
-    skipped_already_deleted = 0
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -2299,21 +2325,14 @@ async def _tool_rows_add(
             mv = item.get(merge_key)
             if mv is not None:
                 from sqlalchemy import text
-                # Look up across ALL rows (including soft-deleted). If the
-                # user previously deleted a row with this merge_key value
-                # they've already said "no" to it — don't reinsert. Skipping
-                # is safer than resurrecting; user can rows_undelete if
-                # they actually want it back.
                 stmt = text(
-                    f"SELECT id, row, deleted_at FROM samples WHERE version_id = :vid "
+                    f"SELECT id, row FROM samples WHERE version_id = :vid "
+                    f"AND deleted_at IS NULL "
                     f"AND ({_row_value_expr(merge_key)}) = :mv LIMIT 1"
                 )
                 existing = db.execute(
                     stmt, {"vid": version.id, "mv": str(mv)}
                 ).first()
-                if existing and existing[2] is not None:
-                    skipped_already_deleted += 1
-                    continue
                 if existing:
                     sample = db.query(Sample).filter(Sample.id == existing[0]).first()
                     if sample is not None:
@@ -2371,18 +2390,9 @@ async def _tool_rows_add(
         .filter(Sample.version_id == version.id, Sample.deleted_at.is_(None))
         .scalar() or 0
     )
-    result = {"ok": True, "inserted": inserted, "merged": merged, "total": total}
-    if skipped_already_deleted:
-        result["skipped_already_deleted"] = skipped_already_deleted
-        result["note"] = (
-            f"{skipped_already_deleted} item(s) had a merge_key matching "
-            f"a previously-deleted row and were skipped. Call "
-            f"rows_undelete with the matching where to bring those back "
-            f"if intended."
-        )
     return (
         {"rows": {"inserted": inserted, "merged": merged}},
-        result,
+        {"ok": True, "inserted": inserted, "merged": merged, "total": total},
     )
 
 
