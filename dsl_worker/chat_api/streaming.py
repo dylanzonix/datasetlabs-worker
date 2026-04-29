@@ -773,6 +773,10 @@ async def run_agent_loop(
                     final_response = None
                     collected_round_items = []
                     incomplete_reason = None
+                    # Set when a tool fires mid-stream after text was emitted;
+                    # the next text delta prepends `\n\n` so narration around
+                    # built-in tools (web_search) doesn't mush together.
+                    text_resume_needs_separator = False
 
                     async with client.responses.stream(**stream_kwargs) as stream:
                         async for event in stream:
@@ -854,6 +858,14 @@ async def run_agent_loop(
                                             "cost": 0,
                                             "args_preview": final_args or None,
                                         })
+                                        # Web_search is a built-in tool that
+                                        # fires INSIDE a single OpenAI response,
+                                        # mid-text-stream. If the model already
+                                        # produced text in this round, the next
+                                        # text delta needs a paragraph break or
+                                        # we get "...accounts.I found..." mush.
+                                        if got_output_this_round:
+                                            text_resume_needs_separator = True
                                         await asyncio.sleep(0)
 
                             elif event_type == "response.incomplete":
@@ -924,6 +936,15 @@ async def run_agent_loop(
                                         sep = "\n\n"
                                         full_content += sep
                                         runs.publish_token_delta(run.id, sep)
+                                elif text_resume_needs_separator and not full_content.endswith("\n\n"):
+                                    # Mid-round text resuming after a built-in
+                                    # tool (web_search) fired. Insert a break
+                                    # so "...accounts.I found..." renders as
+                                    # two paragraphs.
+                                    sep = "\n\n"
+                                    full_content += sep
+                                    runs.publish_token_delta(run.id, sep)
+                                    text_resume_needs_separator = False
 
                                 token = event.delta or ""
                                 if token:
@@ -933,6 +954,11 @@ async def run_agent_loop(
                                         full_content += clean
                                         runs.publish_token_delta(run.id, clean)
                                         await asyncio.sleep(0)
+                                # Once we've emitted a real text token, clear
+                                # the resume-separator flag — already handled
+                                # above, but keep this idempotent.
+                                if token:
+                                    text_resume_needs_separator = False
 
                         try:
                             final_response = await stream.get_final_response()
