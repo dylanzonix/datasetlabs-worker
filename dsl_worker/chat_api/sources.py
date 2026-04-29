@@ -500,7 +500,53 @@ async def _apify_call_actor(args: Dict[str, Any], *, project_id: Optional[Any] =
     actor_id = args.get("actor_id")
     if not actor_id:
         return json.dumps({"error": "actor_id is required"}), 0.0
-    actor_input = args.get("input") or {}
+
+    # Validate input BEFORE running. Mirrors apify-mcp-server's behavior:
+    # an empty or invalid input typically means the actor falls back to
+    # the publisher's placeholder defaults (e.g. query="helloworld" or
+    # the publisher's username) and returns garbage that confuses the
+    # agent into bailing to web_search. Catch this up front and return
+    # the schema so the model can self-correct.
+    actor_input = args.get("input")
+    details = None
+    try:
+        details = await client.get_actor_details(actor_id)
+    except Exception as e:
+        log.warning("apify_call_actor: get_actor_details failed: %s", e)
+    input_schema = (details or {}).get("input_schema") if details else None
+
+    if not actor_input or not isinstance(actor_input, dict):
+        return json.dumps({
+            "error": "input is required and must be a non-empty object",
+            "hint": (
+                "Build `input` from the actor's input_schema.properties — "
+                "required fields are listed in input_schema.required. "
+                "Calling without input makes the actor fall back to the "
+                "publisher's placeholder defaults, which return garbage."
+            ),
+            "input_schema": input_schema,
+        }), 0.0
+
+    if input_schema and isinstance(input_schema, dict):
+        try:
+            import jsonschema
+            jsonschema.validate(instance=actor_input, schema=input_schema)
+        except jsonschema.ValidationError as ve:
+            return json.dumps({
+                "error": f"input failed validation against actor's input_schema: {ve.message}",
+                "validation_path": list(ve.absolute_path),
+                "input_schema": input_schema,
+                "your_input": actor_input,
+                "hint": (
+                    "Fix `input` to match input_schema.properties (types, "
+                    "enums, required fields) and call again."
+                ),
+            }), 0.0
+        except Exception:
+            # If validation itself errors (broken schema, jsonschema bug,
+            # etc.), don't block the call — let Apify reject it instead.
+            log.exception("apify_call_actor: schema validation crashed; proceeding")
+
     # max_items applies a server-side cap when paging the Apify dataset.
     # None = unbounded; the agent can pull large fetches without truncation
     # because we land them in a candidates file, not the LLM context.
@@ -1129,22 +1175,39 @@ SOURCE_TOOLS: List[Dict[str, Any]] = [
         "type": "function",
         "name": "apify_call_actor",
         "description": (
-            "Run an Apify actor and write results to a candidates file. "
-            "Use apify_actor_details first to understand the actor's input "
-            "schema. Returns the candidates_file path, items_count, fields, "
-            "and a small preview — NOT the full result set. To work with "
-            "items use candidates_inspect / candidates_to_rows / code_exec. "
-            "Apify run cost is billed separately on our account."
+            "Run an Apify actor and write results to a candidates file.\n\n"
+            "WORKFLOW:\n"
+            "1. apify_search_actors → find a relevant actor.\n"
+            "2. apify_actor_details(actor_id) → read the actor's input_schema.\n"
+            "3. apify_call_actor(actor_id, input=<object matching the schema>).\n\n"
+            "The `input` argument is REQUIRED and must contain real values for "
+            "the actor's filters / queries / URLs / etc — DO NOT call this with "
+            "an empty input or only actor_id. Many actors silently fall back to "
+            "their author's placeholder defaults (e.g. query='helloworld') and "
+            "return garbage results. Construct `input` from input_schema."
+            "properties — required fields are listed in input_schema.required."
+            "\n\n"
+            "Returns the candidates_file path, items_count, fields, and a small "
+            "preview — NOT the full result set. To work with items use "
+            "candidates_inspect / candidates_to_rows / code_exec. Apify run "
+            "cost is billed separately on our account."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "actor_id": {"type": "string"},
-                "input": {"type": "object", "description": "Actor-specific input. Check apify_actor_details for the schema."},
+                "input": {
+                    "type": "object",
+                    "description": (
+                        "Actor-specific input object matching the actor's "
+                        "input_schema. REQUIRED — never omit or pass {}. "
+                        "Get the schema from apify_actor_details first."
+                    ),
+                },
                 "max_items": {"type": "integer", "minimum": 1, "description": "Cap items returned by the actor. Omit for unbounded."},
                 "timeout_secs": {"type": "integer", "description": "Default 300."},
             },
-            "required": ["actor_id"],
+            "required": ["actor_id", "input"],
         },
     },
     # ── Google Maps ──────────────────────────────────────────────────────
