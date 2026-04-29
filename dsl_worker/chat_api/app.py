@@ -32,7 +32,7 @@ warnings.filterwarnings(
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from dsl_worker.chat_api import routes_chat, routes_health, tracing
+from dsl_worker.chat_api import routes_chat, routes_health, runs, tracing
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -68,6 +68,19 @@ async def _on_startup() -> None:
         "langfuse tracing %s",
         "ENABLED" if tracing.is_enabled() else "disabled (no LANGFUSE_SECRET_KEY)",
     )
+    # Worker process restart leaves any in-flight ChatRun rows orphaned
+    # (the asyncio.Task that owned them is dead). Mark them failed so
+    # subscribers see a terminal event and the FE cleans up its UI.
+    try:
+        n = runs.recover_orphan_runs()
+        if n:
+            log.warning("recovered %d orphan chat run(s)", n)
+    except Exception:
+        log.exception("orphan-run recovery failed")
+    # 30-day TTL on chat_run_events. Hourly pass; first pass runs after
+    # one interval, so startup isn't slowed by a large initial DELETE.
+    import asyncio
+    asyncio.create_task(runs.run_ttl_cleanup_loop(), name="chat-events-ttl")
 
 
 @app.on_event("shutdown")

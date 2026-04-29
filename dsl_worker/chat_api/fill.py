@@ -5,7 +5,7 @@ each matching row spawns a small bounded subagent that:
   - sees the row's existing column values
   - sees the goal (one or more column names + their `format` + `description`)
   - has access to all source tools (FE / Apollo / Apify / Google Maps /
-    code_exec / web_harvest / browser_use / web_search built-in)
+    code_exec / browser_use / web_search built-in)
   - has a `set_values(values)` tool to commit one or more cell values
   - has a `give_up(reason)` tool to bail
   - is capped at ~5 turns and ~$max_cost per cell
@@ -38,8 +38,11 @@ ProgressCallback = Callable[[Dict[str, Any]], Awaitable[None]]
 log = logging.getLogger(__name__)
 
 
-# Concurrent cell agents. Same default as V13 row-gens.
-_CELL_CONCURRENCY = 5
+# Concurrent cell agents. Continuous via asyncio.Semaphore + gather —
+# one straggler doesn't block the next slot. Bumped from 5 to 10 to
+# get more parallelism on long fills; per-source rate limits (Apollo,
+# FullEnrich) are still the real ceiling.
+_CELL_CONCURRENCY = 10
 
 # Per-cell budget tiers, keyed off the user's effort selection in the chat
 # input. The cell agent stops calling tools once cost_usd >= max_cost, so
@@ -81,9 +84,13 @@ _CELL_TOOL_NAMES = {
     "google_maps_search_places",
     "google_maps_place_details",
     "code_exec",
-    "web_harvest",
     "browser_use",
 }
+# web_harvest is intentionally NOT in the cell-agent toolset. It's a
+# multi-search discovery tool meant for orchestrator-level "iterate
+# across the web to find entities", not per-cell research. Per-cell
+# use would just burn budget on broad searches when targeted
+# enrichment APIs (FE/Apollo/Apify/GMaps) or web_search exist.
 
 
 _CELL_AGENT_SYSTEM_PROMPT = """\
@@ -98,9 +105,15 @@ Process:
    derive a domain from a website URL), call set_values with the result
    and exit immediately.
 3. Otherwise, use the source tools — pick the cheapest / most direct
-   one. (FullEnrich for verified contact info, Apollo for fallback,
-   Apify for site-specific scraping, Google Maps for local biz, web
-   research only as a last resort.)
+   one. Rough hierarchy:
+     - FullEnrich for verified contact info (email/phone/LinkedIn)
+     - Apollo as fallback for people/company enrichment
+     - Apify for site-specific scraping (22k+ actors, prefer over web)
+     - Google Maps for local businesses with a physical address
+     - web_search for quick factual lookups
+     - browser_use only as a true last resort (slow, $0.10-0.50/call;
+       use only when no source/Apify actor fits and the page needs JS
+       rendering or login).
 4. Once you have the value(s), call set_values to commit and stop.
 
 Critical rules:
@@ -399,6 +412,10 @@ async def fill_rows(
                 "row_id": str(row_id),
                 "index": idx,
                 "total": len(rows),
+                # FE marks each (row_id, column) as "processing" so the
+                # table can show per-cell spinners while the cell agent
+                # runs. cell_done clears these.
+                "columns": list(target_columns),
             })
             res = await _run_cell_agent(
                 row_id=str(row_id),

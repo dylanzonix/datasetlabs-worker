@@ -59,16 +59,32 @@ class ApifyClient:
         pricing = self._extract_pricing(d.get("pricingInfos", []))
         stats = self._extract_stats(d.get("stats", {}))
 
+        # NOTE: we deliberately omit `exampleRunInput` from the response.
+        # Many actor publishers set it to garbage placeholders like
+        # `{"helloWorld": 123}` which mislead the LLM into thinking the
+        # actor "doesn't take real input" and bailing to web_search.
+        # Real diagnosis 2026-04-29 on project 664dbc64: model's reasoning
+        # explicitly said "the Apify call can't take input" after seeing
+        # exactly that placeholder. The `input_schema` below is the
+        # authoritative source of truth — it has property names, types,
+        # descriptions, enums, and defaults. The agent should construct
+        # input from that.
         return {
             "actor_id": actor_id,
             "title": d.get("title", ""),
             "description": d.get("description", ""),
             "readme_summary": d.get("readmeSummary", ""),
-            "example_input": d.get("exampleRunInput", {}).get("body", ""),
             "input_schema": input_schema,
             "pricing": pricing,
             "stats": stats,
             "url": f"https://apify.com/{actor_id}",
+            "_input_hint": (
+                "Construct the input object from `input_schema.properties`. "
+                "Each property has a type, description, and often a default "
+                "or enum of valid values. Required fields are listed in "
+                "`input_schema.required`. Pass it as the `input` arg to "
+                "`apify_call_actor`."
+            ),
         }
 
     @staticmethod
@@ -241,20 +257,36 @@ class ApifyClient:
         if not run_id:
             return {"status": "FAILED", "items": [], "error": "No run ID returned"}
 
-        # Poll for completion
+        # Poll using Apify's `waitForFinish=N` long-poll: the GET hangs
+        # up to N seconds and returns early as soon as the run reaches a
+        # terminal status. Way better than fixed-interval polling — we
+        # see the finish within ~1s of when it happens. We loop in case
+        # the user-requested `timeout` is longer than the per-call cap
+        # (Apify caps waitForFinish at 60s).
+        WAIT_FOR_FINISH_SECS = 60
         start = asyncio.get_event_loop().time()
         status = "RUNNING"
+        run_info: Dict[str, Any] = {}
 
         while (asyncio.get_event_loop().time() - start) < timeout:
-            await asyncio.sleep(5)
-
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(
-                    f"{BASE_URL}/actor-runs/{run_id}",
-                    headers=self._headers,
-                )
+            wait_secs = min(
+                WAIT_FOR_FINISH_SECS,
+                max(1, int(timeout - (asyncio.get_event_loop().time() - start))),
+            )
+            try:
+                async with httpx.AsyncClient(timeout=wait_secs + 10.0) as client:
+                    resp = await client.get(
+                        f"{BASE_URL}/actor-runs/{run_id}",
+                        headers=self._headers,
+                        params={"waitForFinish": wait_secs},
+                    )
+            except httpx.RequestError:
+                # Network blip — short backoff, then retry the long-poll.
+                await asyncio.sleep(1)
+                continue
 
             if resp.status_code != 200:
+                await asyncio.sleep(1)
                 continue
 
             run_info = resp.json().get("data", {})
@@ -262,6 +294,7 @@ class ApifyClient:
 
             if status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
                 break
+            # Still RUNNING after the long-poll cap — loop and wait again.
 
         if status != "SUCCEEDED":
             return {
@@ -275,19 +308,9 @@ class ApifyClient:
         # Fetch results
         items = await self.get_dataset_items(dataset_id, limit=max_items)
 
-        # Get cost info
-        cost_usd = 0.0
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(
-                    f"{BASE_URL}/actor-runs/{run_id}",
-                    headers=self._headers,
-                )
-            if resp.status_code == 200:
-                run_info = resp.json().get("data", {})
-                cost_usd = run_info.get("usageTotalUsd", 0.0) or 0.0
-        except Exception:
-            pass
+        # Cost is already on the run_info we just fetched — no extra
+        # round-trip needed.
+        cost_usd = float(run_info.get("usageTotalUsd") or 0.0)
 
         return {
             "status": "SUCCEEDED",

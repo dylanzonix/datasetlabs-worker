@@ -26,9 +26,9 @@ from sqlalchemy.orm import Session
 from dsl_api.config import settings
 from dsl_api.credits import consume_credits
 from dsl_api.db import SessionLocal
-from dsl_api.models import Account, ChatMessage, Project
+from dsl_api.models import Account, ChatMessage, ChatRun, Project
 
-from dsl_worker.chat_api import agent, sources as _sources, tracing
+from dsl_worker.chat_api import agent, runs, sources as _sources, tracing
 
 log = logging.getLogger(__name__)
 
@@ -49,7 +49,12 @@ _INPUT_COST = 0.0000025          # $2.50 / 1M tokens
 _CACHED_INPUT_COST = 0.00000025  # $0.25 / 1M tokens
 _OUTPUT_COST = 0.000015          # $15.00 / 1M tokens
 
-MAX_TOOL_ROUNDS = 12
+# No round cap — the loop terminates naturally when the agent stops
+# calling tools (or hits ask_questions / suggest_replies, which are
+# turn-ending). Pause/cancel still bound runaway behavior via run.status
+# polling between rounds. With the "don't perfect candidates" prompt
+# guidance the agent self-limits; an explicit cap was just a way to
+# truncate output and confuse the user with "I ran out of rounds".
 
 
 def _response_cost_usd(response) -> float:
@@ -116,6 +121,55 @@ def _charge_credits(db: Session, user_id, cost_usd: float, project_id=None) -> N
         log.warning(f"No account found for user {user_id}, skipping credit charge")
         return
     consume_credits(db, account, credits, project_id=project_id)
+
+
+class _BillingMeter:
+    """Incremental credit-charging for a single chat run. Accumulates
+    unbilled cost; flushes whenever the running balance crosses the
+    consume_credits floor (0.01 credits ≈ $0.0025 at 25¢/credit).
+
+    Without this, a 5-minute turn shows $0 spent until the very end
+    when the legacy single-call _charge_credits fires — confusing for
+    the user staring at a stable balance while a deep agent run burns
+    real money. With it, the FE's credit display ticks down live.
+    """
+
+    def __init__(self, db: Session, user_id, project_id) -> None:
+        self._db = db
+        self._user_id = user_id
+        self._project_id = project_id
+        self._unbilled_cost = 0.0
+
+    def add(self, delta_usd: float) -> None:
+        if delta_usd <= 0:
+            return
+        self._unbilled_cost += delta_usd
+        self._try_flush()
+
+    def flush(self) -> None:
+        # Final pass at end-of-turn / pause / error. Residuals below
+        # the floor are intentionally dropped (rounding loss < $0.0025
+        # per turn — well under measurement noise).
+        self._try_flush()
+
+    def _try_flush(self) -> None:
+        if self._unbilled_cost <= 0:
+            return
+        credits = self._unbilled_cost / settings.COMPUTE_COST_PER_CREDIT
+        if credits < 0.01:
+            return
+        account = (
+            self._db.query(Account)
+            .filter(Account.user_id == str(self._user_id))
+            .first()
+        )
+        if account is None:
+            log.warning("No account for user %s; skipping incremental charge", self._user_id)
+            return
+        consume_credits(
+            self._db, account, credits, project_id=self._project_id
+        )
+        self._unbilled_cost = 0.0
 
 
 # ---- Citation stripping (web_search marker cleanup) ----------------------
@@ -475,84 +529,92 @@ _EFFORT_HINT = {
 }
 
 
-# ---- Main streaming generator --------------------------------------------
-async def stream_chat_response(
-    project_id: UUID,
+# ---- Run-aware agent loop ------------------------------------------------
+async def run_agent_loop(
+    run_id: UUID,
     user_id: UUID,
     user_content: str,
-    request: Request,
     effort: Optional[str] = None,
-) -> AsyncGenerator[str, None]:
-    """Run one send-message turn and stream SSE events.
+) -> None:
+    """Execute one chat turn against a ChatRun row.
 
-    Cooperative cancel: between rounds and between tool calls we check
-    `request.is_disconnected()` (frontend AbortController.abort closes the
-    stream). On disconnect we commit whatever ran and exit — the partial
-    assistant message is preserved.
+    Decoupled from any HTTP request. Events are persisted to
+    ChatRunEvent and fanned out via the in-process bus; subscribers
+    (HTTP handlers tailing the events) consume them.
+
+    Stop signals: `runs.check_should_stop()` is polled between rounds
+    and between tool calls. On `pause` we save partial progress and
+    mark the run paused; on `cancel` we save and mark cancelled.
     """
     db = SessionLocal()
     try:
-      with tracing.start_trace(
-          "chat_send_message",
-          user_id=str(user_id),
-          project_id=str(project_id),
-          input_text=user_content,
-          metadata={"endpoint": "chat_api.stream"},
-      ) as _trace_span:
+        run = db.query(ChatRun).filter(ChatRun.id == run_id).first()
+        if run is None:
+            log.warning("run_agent_loop: run %s not found", run_id)
+            return
+
         project = (
             db.query(Project)
             .filter(
-                Project.id == project_id,
+                Project.id == run.project_id,
                 Project.user_id == user_id,
                 Project.deleted_at.is_(None),
             )
             .first()
         )
-        if not project:
-            yield _sse({"type": "error", "message": "Project not found"})
+        if project is None:
+            runs.emit_event(db, run, "error", {"message": "Project not found"})
+            runs.mark_run_cancelled(db, run, {"reason": "project-not-found"})
             return
         if project.mode != "chat":
-            yield _sse({
-                "type": "error",
-                "message": "Project is not in chat mode (use the API's classic chat endpoint)",
-            })
+            runs.emit_event(db, run, "error", {"message": "Project is not in chat mode"})
+            runs.mark_run_cancelled(db, run, {"reason": "wrong-mode"})
             return
 
-        # Immediate signal so the UI doesn't sit silent during prompt
-        # assembly + the OpenAI Responses request's first-byte latency.
-        yield _sse({"type": "status", "content": "Thinking…"})
+        # The triggering user message was created by start_run(). Look
+        # it up so we can replay history *excluding* it (we'll inject
+        # the user content explicitly into input_items).
+        user_msg = (
+            db.query(ChatMessage)
+            .filter(ChatMessage.id == run.triggering_message_id)
+            .first()
+        )
 
-        history = _get_chat_history(db, project_id)
+        # Initial signal so live subscribers see something fast.
+        runs.update_run_phase(db, run, "thinking")
+        runs.emit_event(db, run, "status", {"content": "Thinking…"})
+
+        # Replay-friendly chat history for the model: exclude the
+        # current user message (already injected at the end below).
+        history_msgs = (
+            db.query(ChatMessage)
+            .filter(
+                ChatMessage.project_id == project.id,
+                ChatMessage.id != (user_msg.id if user_msg else None),
+            )
+            .order_by(ChatMessage.created_at.desc())
+            .limit(50)
+            .all()
+        )
+        history = [
+            {"role": m.role, "content": m.content} for m in reversed(history_msgs)
+        ]
         is_first_message = len(history) == 0
 
-        user_msg = ChatMessage(
-            project_id=project_id, role="user", content=user_content
-        )
-        db.add(user_msg)
-        db.flush()  # need user_msg.id before forking the version
-
-        # Fork a new ProjectVersion for this turn. Inherits the previous
-        # head's columns + rows; agent mutations land on the new version.
-        # user_msg.version_id is set inside the helper.
+        # Fork a new ProjectVersion for this turn — same semantics as
+        # the legacy path. user_msg.version_id is set inside the helper.
         new_version = agent.start_user_turn_version(db, project, user_msg)
+        run.version_id = new_version.id
         db.commit()
 
-        # Tell the UI a new version exists (label is None until the agent
-        # calls version_label later in the turn). The frontend uses this
-        # to update the version chip + history dropdown without waiting
-        # for the turn to finish.
-        yield _sse({
-            "type": "version",
+        runs.emit_event(db, run, "version", {
             "version_id": str(new_version.id),
             "version_number": new_version.version_number,
             "label": new_version.label,
-            "message_id": str(user_msg.id),
+            "message_id": str(user_msg.id) if user_msg else None,
         })
 
-        # Server-side gate: free-tier users can't pick "highest" even if
-        # the client sends it (tampered request, lapsed paid plan still
-        # in localStorage). Silently downgrade to balanced; the UI also
-        # disables the option client-side.
+        # Server-side gate for "highest" effort tier on free plans.
         effective_effort = effort
         if effective_effort == "highest":
             from dsl_api.models.subscription import Subscription
@@ -570,9 +632,6 @@ async def stream_chat_response(
             if not is_paid:
                 effective_effort = "balanced"
 
-        # Append the effort-tier hint to the per-turn context message so
-        # the agent scales research breadth to match the user's pick. auto
-        # / unset → no hint (preserves the existing dynamic behavior).
         context_msg = agent.build_context_message(db, project)
         effort_hint = _EFFORT_HINT.get(effective_effort or "")
         if effort_hint:
@@ -591,11 +650,12 @@ async def stream_chat_response(
         thinking_total = 0.0
         total_cost = 0.0
         stopped = False
+        stop_reason: Optional[str] = None  # "pause" | "cancel" | None
+        # Charges credits live as cost accumulates instead of one big
+        # debit at end-of-turn. See _BillingMeter docstring.
+        billing = _BillingMeter(db, user_id, project.id)
         tool_log: List[Dict[str, Any]] = []
-        # Map call_id -> index in tool_log so we can update on tool_result
         tool_log_index: Dict[str, int] = {}
-        # Web search citations the agent used. Stripped from the displayed
-        # text and rendered separately as a sources list. Deduped by URL.
         sources: List[Dict[str, Any]] = []
         sources_by_url: Dict[str, int] = {}
 
@@ -610,28 +670,22 @@ async def stream_chat_response(
             return entry
 
         try:
-            # Manual conversation state — replayed in full each round.
-            # Mirrors dsl_worker/agents/base.py so we don't depend on
-            # `previous_response_id` (which fails with HTTP 400
-            # "No tool call found for function call output" when the prior
-            # response state is dropped/incomplete after long round 0 runs).
             running_input: List[Dict[str, Any]] = list(input_items)
-            # User-picked tier maps directly to OpenAI reasoning_effort.
-            # auto / unset → fall back to the per-message dynamic
-            # resolver (today: returns "medium" but kept as a hook for
-            # future signal-based escalation). effective_effort was
-            # already decided above (after the free-tier gate).
             _effort = _EFFORT_TO_REASONING.get(effective_effort or "") \
                 or _resolve_reasoning_effort(user_content)
             stripper = _CitationStripper()
-            # Track web_search_call items we've already surfaced as synthetic
-            # tool calls, so we don't double-emit on retry/replay.
             seen_web_search_ids: set = set()
 
-            for round_num in range(MAX_TOOL_ROUNDS + 1):
-                if await request.is_disconnected():
+            round_num = 0
+            while True:
+                round_num += 1
+                signal = runs.check_should_stop(db, run)
+                if signal:
                     stopped = True
+                    stop_reason = signal
                     break
+
+                runs.update_run_phase(db, run, f"reasoning (round {round_num})")
 
                 stream_kwargs: Dict[str, Any] = {
                     "model": settings.OPENAI_MODEL,
@@ -642,13 +696,6 @@ async def stream_chat_response(
                     "max_output_tokens": 8000,
                 }
 
-                # OpenAI sometimes ends a long-reasoning response without
-                # sending response.completed (server-side stream cut on
-                # heavy round-2 reasoning). Retry the inner stream once
-                # when this happens AND we haven't streamed any visible
-                # text yet — otherwise a retry would produce duplicate
-                # tokens for the user. Manual re-runs always succeed; an
-                # automatic retry turns the freeze into a slower-but-OK turn.
                 MAX_STREAM_RETRIES = 1
                 final_response = None
                 round_thinking_start = time.time()
@@ -656,285 +703,204 @@ async def stream_chat_response(
                 round_text_collected = ""
 
                 for attempt in range(MAX_STREAM_RETRIES + 1):
-                    # Reset per-attempt timing/output. full_content,
-                    # tool_log, seen_web_search_ids etc. stay (cumulative).
                     round_thinking_start = time.time()
                     got_output_this_round = False
                     round_text_collected = ""
                     final_response = None
 
-                    trace_label = (
-                        f"openai.responses.round_{round_num}"
-                        if attempt == 0
-                        else f"openai.responses.round_{round_num}_retry_{attempt}"
-                    )
-                    with tracing.start_generation(
-                        trace_label,
-                        model=settings.OPENAI_MODEL,
-                        input_payload=stream_kwargs.get("input"),
-                        metadata={"round": round_num, "attempt": attempt},
-                    ) as gen:
-                        async with client.responses.stream(**stream_kwargs) as stream:
-                            async for event in stream:
-                                event_type = getattr(event, "type", None)
+                    async with client.responses.stream(**stream_kwargs) as stream:
+                        async for event in stream:
+                            event_type = getattr(event, "type", None)
 
-                                if event_type == "response.reasoning_summary_text.delta":
-                                    delta = getattr(event, "delta", "") or ""
-                                    if delta:
-                                        yield _sse({"type": "thinking", "content": delta})
+                            if event_type == "response.reasoning_summary_text.delta":
+                                delta = getattr(event, "delta", "") or ""
+                                if delta:
+                                    # Live-only: bus fanout, no DB write.
+                                    runs.publish_thinking_delta(run.id, delta)
+                                    await asyncio.sleep(0)
+
+                            elif event_type == "response.output_text.annotation.added":
+                                ann = getattr(event, "annotation", None)
+                                if ann is not None:
+                                    a_type = getattr(ann, "type", None) or (
+                                        ann.get("type") if isinstance(ann, dict) else None
+                                    )
+                                    if a_type == "url_citation":
+                                        url = getattr(ann, "url", None) or (
+                                            ann.get("url") if isinstance(ann, dict) else None
+                                        )
+                                        title = getattr(ann, "title", None) or (
+                                            ann.get("title") if isinstance(ann, dict) else None
+                                        )
+                                        added = _record_source(url, title)
+                                        if added is not None:
+                                            runs.emit_event(db, run, "source_added", added)
+                                            await asyncio.sleep(0)
+
+                            elif event_type == "response.output_item.added":
+                                added_item = getattr(event, "item", None)
+                                if (
+                                    added_item is not None
+                                    and getattr(added_item, "type", None) == "web_search_call"
+                                ):
+                                    item_id = getattr(added_item, "id", None) or ""
+                                    if item_id and item_id not in seen_web_search_ids:
+                                        seen_web_search_ids.add(item_id)
+                                        args_preview = _web_search_args_preview(added_item)
+                                        tool_log_index[item_id] = len(tool_log)
+                                        tool_log.append({
+                                            "id": item_id,
+                                            "name": "web_search",
+                                            "args_preview": args_preview,
+                                        })
+                                        runs.emit_event(db, run, "tool_call", {
+                                            "id": item_id,
+                                            "name": "web_search",
+                                            "args_preview": args_preview,
+                                        })
                                         await asyncio.sleep(0)
 
-                                elif event_type == "response.output_text.annotation.added":
-                                    ann = getattr(event, "annotation", None)
-                                    if ann is not None:
-                                        a_type = getattr(ann, "type", None) or (
-                                            ann.get("type") if isinstance(ann, dict) else None
-                                        )
-                                        if a_type == "url_citation":
-                                            url = getattr(ann, "url", None) or (
-                                                ann.get("url") if isinstance(ann, dict) else None
-                                            )
-                                            title = getattr(ann, "title", None) or (
-                                                ann.get("title") if isinstance(ann, dict) else None
-                                            )
-                                            added = _record_source(url, title)
-                                            if added is not None:
-                                                yield _sse({"type": "source_added", **added})
-                                                await asyncio.sleep(0)
+                            elif event_type == "response.output_item.done":
+                                done_item = getattr(event, "item", None)
+                                if (
+                                    done_item is not None
+                                    and getattr(done_item, "type", None) == "web_search_call"
+                                ):
+                                    item_id = getattr(done_item, "id", None) or ""
+                                    if item_id:
+                                        status = getattr(done_item, "status", None) or "completed"
+                                        idx = tool_log_index.get(item_id)
+                                        summary = "done" if status == "completed" else status
+                                        final_args = _web_search_args_preview(done_item)
+                                        if idx is not None:
+                                            tool_log[idx]["summary"] = summary
+                                            if final_args:
+                                                tool_log[idx]["args_preview"] = final_args
+                                        runs.emit_event(db, run, "tool_result", {
+                                            "id": item_id,
+                                            "name": "web_search",
+                                            "summary": summary,
+                                            "cost": 0,
+                                            "args_preview": final_args or None,
+                                        })
+                                        await asyncio.sleep(0)
 
-                                elif event_type == "response.output_item.added":
-                                    # Surface OpenAI's built-in web_search calls
-                                    # as synthetic tool_call entries so the UI
-                                    # doesn't go silent during searches (which
-                                    # can each take 30-60s and chain).
-                                    added_item = getattr(event, "item", None)
-                                    if (
-                                        added_item is not None
-                                        and getattr(added_item, "type", None) == "web_search_call"
-                                    ):
-                                        item_id = getattr(added_item, "id", None) or ""
-                                        if item_id and item_id not in seen_web_search_ids:
-                                            seen_web_search_ids.add(item_id)
-                                            args_preview = _web_search_args_preview(added_item)
-                                            tool_log_index[item_id] = len(tool_log)
-                                            tool_log.append({
-                                                "id": item_id,
-                                                "name": "web_search",
-                                                "args_preview": args_preview,
-                                            })
-                                            yield _sse({
-                                                "type": "tool_call",
-                                                "id": item_id,
-                                                "name": "web_search",
-                                                "args_preview": args_preview,
-                                            })
-                                            await asyncio.sleep(0)
-
-                                elif event_type == "response.output_item.done":
-                                    done_item = getattr(event, "item", None)
-                                    if (
-                                        done_item is not None
-                                        and getattr(done_item, "type", None) == "web_search_call"
-                                    ):
-                                        item_id = getattr(done_item, "id", None) or ""
-                                        if item_id:
-                                            status = getattr(done_item, "status", None) or "completed"
-                                            idx = tool_log_index.get(item_id)
-                                            summary = "done" if status == "completed" else status
-                                            # Re-derive the args preview from the
-                                            # done payload — the initial added
-                                            # event sometimes fires before
-                                            # action.query is populated, so the
-                                            # done event is the reliable source
-                                            # for the final query string.
-                                            final_args = _web_search_args_preview(done_item)
-                                            if idx is not None:
-                                                tool_log[idx]["summary"] = summary
-                                                if final_args:
-                                                    tool_log[idx]["args_preview"] = final_args
-                                            yield _sse({
-                                                "type": "tool_result",
-                                                "id": item_id,
-                                                "name": "web_search",
-                                                "summary": summary,
-                                                "cost": 0,
-                                                "args_preview": final_args or None,
-                                            })
-                                            await asyncio.sleep(0)
-
-                                elif event_type and event_type.startswith("response.web_search_call."):
-                                    # Mid-flight progress events — we don't
-                                    # show the status text, but they're the
-                                    # earliest reliable carrier of action.query
-                                    # for some traffic patterns. If the args
-                                    # are now known but our entry is still
-                                    # blank, push a tool_call_update so the UI
-                                    # upgrades "Searching the web" to
-                                    # "Searching the web: <query>" while the
-                                    # search is still in flight.
-                                    progress_item = getattr(event, "item", None)
-                                    progress_id = (
-                                        getattr(event, "item_id", None)
-                                        or (getattr(progress_item, "id", None) if progress_item else None)
-                                        or ""
+                            elif event_type and event_type.startswith("response.web_search_call."):
+                                progress_item = getattr(event, "item", None)
+                                progress_id = (
+                                    getattr(event, "item_id", None)
+                                    or (getattr(progress_item, "id", None) if progress_item else None)
+                                    or ""
+                                )
+                                if progress_id and progress_id in tool_log_index:
+                                    idx = tool_log_index[progress_id]
+                                    existing_args = tool_log[idx].get("args_preview", "") or ""
+                                    new_args = (
+                                        _web_search_args_preview(progress_item)
+                                        if progress_item is not None
+                                        else ""
                                     )
-                                    if progress_id and progress_id in tool_log_index:
-                                        idx = tool_log_index[progress_id]
-                                        existing_args = tool_log[idx].get("args_preview", "") or ""
-                                        new_args = (
-                                            _web_search_args_preview(progress_item)
-                                            if progress_item is not None
-                                            else ""
-                                        )
-                                        if new_args and new_args != existing_args:
-                                            tool_log[idx]["args_preview"] = new_args
-                                            yield _sse({
-                                                "type": "tool_call_update",
-                                                "id": progress_id,
-                                                "args_preview": new_args,
-                                            })
-                                            await asyncio.sleep(0)
+                                    if new_args and new_args != existing_args:
+                                        tool_log[idx]["args_preview"] = new_args
+                                        runs.emit_event(db, run, "tool_call_update", {
+                                            "id": progress_id,
+                                            "args_preview": new_args,
+                                        })
+                                        await asyncio.sleep(0)
 
-                                elif event_type == "response.output_text.delta":
-                                    if not got_output_this_round:
-                                        got_output_this_round = True
-                                        thinking_total += time.time() - round_thinking_start
-                                        if (
-                                            round_num > 0
-                                            and full_content
-                                            and not full_content.endswith("\n\n")
-                                        ):
-                                            sep = "\n\n"
-                                            full_content += sep
-                                            yield _sse({"type": "token", "content": sep})
+                            elif event_type == "response.output_text.delta":
+                                if not got_output_this_round:
+                                    got_output_this_round = True
+                                    thinking_total += time.time() - round_thinking_start
+                                    if (
+                                        round_num > 0
+                                        and full_content
+                                        and not full_content.endswith("\n\n")
+                                    ):
+                                        sep = "\n\n"
+                                        full_content += sep
+                                        runs.publish_token_delta(run.id, sep)
 
-                                    token = event.delta or ""
-                                    if token:
-                                        round_text_collected += token
-                                        clean = stripper.feed(token)
-                                        if clean:
-                                            full_content += clean
-                                            yield _sse({"type": "token", "content": clean})
-                                            await asyncio.sleep(0)
+                                token = event.delta or ""
+                                if token:
+                                    round_text_collected += token
+                                    clean = stripper.feed(token)
+                                    if clean:
+                                        full_content += clean
+                                        runs.publish_token_delta(run.id, clean)
+                                        await asyncio.sleep(0)
 
-                            # OpenAI's stream sometimes ends without sending
-                            # a `response.completed` event. The SDK raises
-                            # RuntimeError in that case. Caught and decided
-                            # below: retry, or treat as incomplete.
-                            try:
-                                final_response = await stream.get_final_response()
-                            except RuntimeError as _rt:
-                                if "response.completed" in str(_rt):
-                                    final_response = None
-                                else:
-                                    raise
+                        try:
+                            final_response = await stream.get_final_response()
+                        except RuntimeError as _rt:
+                            if "response.completed" in str(_rt):
+                                final_response = None
+                            else:
+                                raise
 
-                    # End of attempt's tracing context. Now decide:
-                    # success → break; text-already-emitted or out-of-retries
-                    # → break (fall through to incomplete handler);
-                    # otherwise → retry.
                     if final_response is not None:
                         break
                     if round_text_collected:
                         log.warning(
-                            f"round {round_num}: stream ended without completion "
-                            f"event after {len(round_text_collected)} chars "
-                            f"emitted — treating as incomplete"
+                            f"run {run_id} round {round_num}: stream ended without "
+                            f"completion event after {len(round_text_collected)} "
+                            f"chars emitted — treating as incomplete"
                         )
                         break
                     if attempt >= MAX_STREAM_RETRIES:
                         log.warning(
-                            f"round {round_num}: stream ended without completion "
-                            f"event after {attempt + 1} attempt(s) — giving up"
+                            f"run {run_id} round {round_num}: stream ended without "
+                            f"completion event after {attempt + 1} attempt(s) — giving up"
                         )
                         break
                     log.warning(
-                        f"round {round_num} attempt {attempt + 1}: stream ended "
-                        f"without completion event (no text emitted yet), retrying"
+                        f"run {run_id} round {round_num} attempt {attempt + 1}: "
+                        f"stream ended without completion event "
+                        f"(no text emitted yet), retrying"
                     )
 
                 if final_response is None:
-                    # Incomplete round: skip post-stream processing and
-                    # exit the loop. full_content has whatever text we
-                    # streamed; the assistant message will persist with
-                    # that + a `stopped` flag.
                     stopped = True
                     remaining = stripper.flush()
                     if remaining:
                         full_content += remaining
-                        yield _sse({"type": "token", "content": remaining})
+                        runs.publish_token_delta(run.id, remaining)
                     if not got_output_this_round:
                         thinking_total += time.time() - round_thinking_start
+                    # Persist a checkpoint of whatever text we have so
+                    # reconnects don't lose the partial round.
+                    runs.emit_text_checkpoint(db, run)
                     break
-
-                    # Fallback: walk the final response for any url_citation
-                    # annotations the streaming event missed (depends on SDK
-                    # / model version). De-duped by URL via _record_source.
-                    for out_item in getattr(final_response, "output", []) or []:
-                        content = getattr(out_item, "content", None) or []
-                        for block in content:
-                            anns = getattr(block, "annotations", None) or []
-                            for ann in anns:
-                                a_type = getattr(ann, "type", None) or (
-                                    ann.get("type") if isinstance(ann, dict) else None
-                                )
-                                if a_type != "url_citation":
-                                    continue
-                                url = getattr(ann, "url", None) or (
-                                    ann.get("url") if isinstance(ann, dict) else None
-                                )
-                                title = getattr(ann, "title", None) or (
-                                    ann.get("title") if isinstance(ann, dict) else None
-                                )
-                                added = _record_source(url, title)
-                                if added is not None:
-                                    yield _sse({"type": "source_added", **added})
-                                    await asyncio.sleep(0)
-
-                    usage = getattr(final_response, "usage", None)
-                    usage_dict: Dict[str, Any] = {}
-                    if usage:
-                        usage_dict = {
-                            "input": usage.input_tokens or 0,
-                            "output": usage.output_tokens or 0,
-                        }
-                        details = getattr(usage, "input_tokens_details", None)
-                        if details:
-                            usage_dict["cache_read_input_tokens"] = (
-                                getattr(details, "cached_tokens", 0) or 0
-                            )
-                    tracing.update_generation(
-                        gen,
-                        output=round_text_collected,
-                        usage=usage_dict,
-                        cost_usd=_response_cost_usd(final_response),
-                    )
 
                 remaining = stripper.flush()
                 if remaining:
                     full_content += remaining
-                    yield _sse({"type": "token", "content": remaining})
+                    runs.publish_token_delta(run.id, remaining)
 
-                total_cost += _response_cost_usd(final_response)
+                # Round complete — persist a durable text checkpoint.
+                # All token deltas in this round were live-only; this is
+                # what reconnects after the round will see.
+                runs.emit_text_checkpoint(db, run)
 
-                # Bill built-in web_search calls separately — they're not
-                # included in usage.input/output_tokens, only as
-                # web_search_call items in response.output.
+                round_cost = _response_cost_usd(final_response)
+                total_cost += round_cost
+
                 web_search_count = sum(
                     1 for item in final_response.output
                     if item.type == "web_search_call"
                 )
                 if web_search_count:
-                    # Main agent uses search_context_size="low" (see agent.py CHAT_TOOLS).
-                    total_cost += web_search_count * _sources.WEB_SEARCH_USD_BY_TIER["low"]
+                    web_cost = web_search_count * _sources.WEB_SEARCH_USD_BY_TIER["low"]
+                    total_cost += web_cost
+                    round_cost += web_cost
+
+                # Bill the round incrementally so the FE credit display
+                # ticks down live instead of jumping at end-of-turn.
+                billing.add(round_cost)
 
                 if not got_output_this_round:
                     thinking_total += time.time() - round_thinking_start
 
-                # Capture every output item into running_input so the next
-                # round sees the full conversation. Reasoning items get a
-                # manual dump because model_dump(exclude_none=True) drops
-                # the required `summary` field when the API returns null.
                 for out_item in final_response.output or []:
                     if out_item.type == "reasoning":
                         summary = []
@@ -958,8 +924,7 @@ async def stream_chat_response(
                 if not tool_calls:
                     break
 
-                yield _sse({
-                    "type": "tool_start",
+                runs.emit_event(db, run, "tool_start", {
                     "tools": [item.name for item in tool_calls],
                 })
                 await asyncio.sleep(0)
@@ -968,8 +933,10 @@ async def stream_chat_response(
                 round_applied: Dict[str, Any] = {}
 
                 for item in tool_calls:
-                    if await request.is_disconnected():
+                    signal = runs.check_should_stop(db, run)
+                    if signal:
                         stopped = True
+                        stop_reason = signal
                         break
 
                     try:
@@ -989,77 +956,77 @@ async def stream_chat_response(
                         "name": item.name,
                         "args_preview": args_preview,
                     })
-                    yield _sse({
-                        "type": "tool_call",
+                    runs.emit_event(db, run, "tool_call", {
                         "id": item.call_id,
                         "name": item.name,
                         "args_preview": args_preview,
+                        # Full input the model passed to the tool — used
+                        # for offline diagnosis. Not rendered by the FE
+                        # (which uses args_preview).
+                        "args_full": args,
                     })
                     await asyncio.sleep(0)
+                    runs.update_run_phase(db, run, f"tool: {item.name}")
 
-                    # For long tools (notably rows_fill), pipe progress events
-                    # back through SSE so the UI isn't a black box.
                     progress_q: asyncio.Queue = asyncio.Queue()
 
                     async def _on_progress(ev: Dict[str, Any]) -> None:
                         ev = dict(ev)
                         ev.setdefault("tool_call_id", item.call_id)
                         await progress_q.put(ev)
-                        # Hand control back to the event loop so the SSE
-                        # drain coroutine actually runs between emits.
-                        # Without this, an unbounded asyncio.Queue.put never
-                        # yields, and tight emit loops (e.g. rows_add over
-                        # N items) starve the streaming generator — all
-                        # events arrive in a single burst at tool end.
                         await asyncio.sleep(0)
 
-                    with tracing.start_span(
-                        f"tool.{item.name}",
-                        input_payload=args,
-                        metadata={"call_id": item.call_id, "round": round_num},
-                    ) as tool_span:
-                        tool_task = asyncio.create_task(
-                            agent.execute_tool(
-                                db, project, item.name, args,
-                                progress_cb=_on_progress,
-                                effort=effective_effort,
-                            )
+                    tool_task = asyncio.create_task(
+                        agent.execute_tool(
+                            db, project, item.name, args,
+                            progress_cb=_on_progress,
+                            effort=effective_effort,
                         )
+                    )
 
-                        while True:
-                            # Race: queue.get vs task done. Whichever fires first.
-                            getter = asyncio.create_task(progress_q.get())
-                            done_set, _pending = await asyncio.wait(
-                                {getter, tool_task},
-                                return_when=asyncio.FIRST_COMPLETED,
-                            )
-                            if getter in done_set:
-                                ev = getter.result()
-                                yield _sse(ev)
-                                await asyncio.sleep(0)
-                            else:
-                                getter.cancel()
-                            if tool_task in done_set:
-                                # Drain anything remaining in the queue
-                                while not progress_q.empty():
-                                    ev = progress_q.get_nowait()
-                                    yield _sse(ev)
-                                break
-
-                        item_applied, result, tool_cost = await tool_task
-                        result_text = agent.format_tool_result(item.name, result)
-                        # Append a one-line table-state hint to every tool
-                        # result so the agent can't drift off thinking it
-                        # added rows when the table is still empty.
-                        result_text += agent.project_state_hint(db, project)
-                        total_cost += tool_cost
-                        round_applied.update(item_applied)
-                        applied.update(item_applied)
-                        tracing.update_span(
-                            tool_span,
-                            output=result,
-                            cost_usd=tool_cost,
+                    while True:
+                        getter = asyncio.create_task(progress_q.get())
+                        done_set, _pending = await asyncio.wait(
+                            {getter, tool_task},
+                            return_when=asyncio.FIRST_COMPLETED,
                         )
+                        if getter in done_set:
+                            ev = getter.result()
+                            ev_type = ev.pop("type", "progress")
+                            runs.emit_event(db, run, ev_type, ev)
+                            await asyncio.sleep(0)
+                        else:
+                            getter.cancel()
+                        if tool_task in done_set:
+                            while not progress_q.empty():
+                                ev = progress_q.get_nowait()
+                                ev_type = ev.pop("type", "progress")
+                                runs.emit_event(db, run, ev_type, ev)
+                            break
+
+                    item_applied, result, tool_cost = await tool_task
+                    result_text = agent.format_tool_result(item.name, result)
+                    result_text += agent.project_state_hint(db, project)
+                    total_cost += tool_cost
+                    # Charge per tool — long-running tools (rows_fill,
+                    # apify_call_actor) are usually the biggest cost
+                    # contributors and the user wants to see the
+                    # balance move as they execute.
+                    billing.add(tool_cost)
+                    round_applied.update(item_applied)
+                    applied.update(item_applied)
+
+                    # Emit live row count so the FE pagination total
+                    # tracks rows_delete / rows_add as they happen.
+                    # Without this the FE only reconciles at end-of-turn
+                    # and a user mid-stream can land on an invalid page
+                    # when rows_delete shrinks the table under them.
+                    try:
+                        runs.emit_event(db, run, "row_count", {
+                            "count": agent.project_row_count(db, project),
+                        })
+                    except Exception:
+                        log.exception("run %s: row_count emit failed", run_id)
 
                     summary = _summarize_result(item.name, result_text)
                     cost_rounded = round(tool_cost, 4) if tool_cost > 0 else 0
@@ -1068,12 +1035,15 @@ async def stream_chat_response(
                         tool_log[idx]["summary"] = summary
                         tool_log[idx]["cost"] = cost_rounded
 
-                    yield _sse({
-                        "type": "tool_result",
+                    runs.emit_event(db, run, "tool_result", {
                         "id": item.call_id,
                         "name": item.name,
                         "summary": summary,
                         "cost": cost_rounded,
+                        # Full result text — exactly what the model saw
+                        # back from the tool. Diagnosis fuel; not used
+                        # for FE rendering.
+                        "result_text": result_text,
                     })
                     await asyncio.sleep(0)
 
@@ -1083,31 +1053,19 @@ async def stream_chat_response(
                         "output": result_text,
                     })
 
-                # Carry tool outputs into the conversation state so the
-                # next round's input includes them (replaces the old
-                # previous_response_id-based chaining).
                 running_input.extend(tool_result_items)
 
                 if stopped:
                     break
 
-                # Surface suggest_replies as a dedicated SSE event
-                # (separate from the generic "change" feed which is for
-                # table mutations). Frontend renders these as clickable
-                # text replies under the assistant's message.
                 if isinstance(round_applied.get("suggestions"), dict):
                     sg = round_applied["suggestions"]
-                    yield _sse({
-                        "type": "suggestions",
+                    runs.emit_event(db, run, "suggestions", {
                         "items": sg.get("items") or [],
                     })
-                # version_label tool stamped a name on this turn's version.
-                # Emit again so the UI can swap the chip from "Version N"
-                # to "Version N — <label>".
                 if isinstance(round_applied.get("version_label"), dict):
                     vl = round_applied["version_label"]
-                    yield _sse({
-                        "type": "version",
+                    runs.emit_event(db, run, "version", {
                         "version_id": vl.get("version_id"),
                         "version_number": vl.get("version_number"),
                         "label": vl.get("label"),
@@ -1115,77 +1073,66 @@ async def stream_chat_response(
 
                 for change in agent.describe_applied(round_applied):
                     if change.field == "questions":
-                        yield _sse({"type": "questions", "questions": change.value})
+                        runs.emit_event(db, run, "questions", {"questions": change.value})
                     else:
                         event_data: dict = {
-                            "type": "change",
                             "field": change.field,
                             "description": change.description,
                         }
                         if change.value is not None:
                             event_data["value"] = change.value
-                        yield _sse(event_data)
+                        runs.emit_event(db, run, "change", event_data)
 
-                # End the conversation after these tools — they're terminal:
-                # ask_questions waits for a structured answer;
-                # suggest_replies hands control to the user via clickable
-                # text suggestions.
                 if any(
-                    item.name in (
-                        "ask_questions",
-                        "suggest_replies",
-                    )
+                    item.name in ("ask_questions", "suggest_replies")
                     for item in tool_calls
                 ):
                     break
 
         except Exception as e:
-            log.exception("OpenAI streaming error")
-            yield _sse({"type": "error", "message": f"AI service error: {str(e)}"})
-            # Best-effort: persist whatever we have so the user sees a trace
-            # on history reload instead of a silent disappearance. Without
-            # this, a mid-stream error leaves only the user message in DB
-            # and the UI shows nothing on reload.
+            log.exception("run %s agent loop crashed", run_id)
+            err_ac: Dict[str, Any] = {"error": str(e)[:500]}
+            if applied:
+                err_ac["changes"] = applied
+            if tool_log:
+                err_ac["tool_log"] = tool_log
+            if total_cost > 0:
+                err_ac["total_cost_usd"] = round(total_cost, 4)
+            if sources:
+                err_ac["sources"] = sources
+            if thinking_total >= 0.5:
+                err_ac["thinking_duration"] = round(thinking_total, 1)
             try:
-                err_ac: Dict[str, Any] = {"error": str(e)[:500]}
-                if applied:
-                    err_ac["changes"] = applied
-                if tool_log:
-                    err_ac["tool_log"] = tool_log
-                if total_cost > 0:
-                    err_ac["total_cost_usd"] = round(total_cost, 4)
-                if sources:
-                    err_ac["sources"] = sources
-                if thinking_total >= 0.5:
-                    err_ac["thinking_duration"] = round(thinking_total, 1)
-                partial = ChatMessage(
-                    project_id=project_id,
-                    role="assistant",
-                    content=_clean_citations(full_content),
+                _persist_assistant_message(
+                    db, run, project, new_version,
+                    full_content=_clean_citations(full_content),
                     applied_changes=err_ac,
-                    version_id=new_version.id,
                 )
-                db.add(partial)
-                _charge_credits(db, user_id, total_cost, project_id=project_id)
+                # Flush whatever incremental charges hadn't crossed the
+                # consume_credits floor yet. Most cost was already
+                # billed live; this catches the residual.
+                billing.flush()
                 _commit_with_deadlock_retry(db)
             except Exception:
-                log.exception("Failed to persist error stub")
+                log.exception("run %s: failed to persist error stub", run_id)
                 try:
                     db.rollback()
                 except Exception:
                     pass
+            # Never leak raw exception text to the FE — it dumps SQL,
+            # frame names, and DB internals (e.g. DeadlockDetected
+            # includes the offending UPDATE verbatim). Full detail goes
+            # to the worker log + the run.error column for diagnosis.
+            user_safe_msg = "Something went wrong on our end. Please try again."
+            runs.emit_event(db, run, "error", {"message": user_safe_msg})
+            from sqlalchemy.sql import func
+            run.status = runs.RUN_STATUS_FAILED
+            run.error = str(e)[:500]
+            run.completed_at = func.now()
+            runs.emit_event(db, run, "done", {"stopped": True, "error": user_safe_msg})
             return
 
-        # Forced text wrap-up if we exited the tool loop with no text. Hits
-        # when the agent burned all rounds on tools and never produced a
-        # final reply (e.g. round cap reached). Without this we save an
-        # empty assistant message — visually "nothing happened" to the user
-        # even though tools ran. One non-streaming call replays the full
-        # input and forces a short summary.
-        # NOTE: we don't use previous_response_id here — Azure's saved
-        # state can drop after long rounds, causing HTTP 400 "No tool
-        # call found for function call output". Pass running_input
-        # (the replayed conversation) directly instead.
+        # Forced text wrap-up if we exited the loop with no text.
         if (
             not stopped
             and len(tool_log) > 0
@@ -1196,12 +1143,11 @@ async def stream_chat_response(
                     "role": "user",
                     "content": (
                         "(System note — not from the user.) You ran tools "
-                        "but produced no text reply, and the tool-round "
-                        "cap stopped the loop. Look at the project state "
-                        "in the prior context and write ONE short reply "
-                        "summarizing what you did this turn AND, if rows "
-                        "did not actually land in the table, finish the "
-                        "job: add columns + commit candidates_to_rows "
+                        "but produced no text reply. Look at the project "
+                        "state in the prior context and write ONE short "
+                        "reply summarizing what you did this turn AND, if "
+                        "rows did not actually land in the table, finish "
+                        "the job: add columns + commit candidates_to_rows "
                         "before replying. The user is staring at the "
                         "table waiting."
                     ),
@@ -1212,22 +1158,26 @@ async def stream_chat_response(
                     input=wrap_input,
                     max_output_tokens=600,
                 )
-                total_cost += _response_cost_usd(wrap)
+                wrap_cost = _response_cost_usd(wrap)
+                total_cost += wrap_cost
+                billing.add(wrap_cost)
                 for item in wrap.output:
                     if item.type == "message":
                         for block in item.content:
                             text = getattr(block, "text", None)
                             if text:
                                 full_content += text
-                                yield _sse({"type": "token", "content": text})
+                                runs.publish_token_delta(run.id, text)
+                # Persist the wrap-up text into the durable checkpoint.
+                runs.emit_text_checkpoint(db, run)
             except Exception:
-                log.exception("forced-text wrap-up failed")
+                log.exception("run %s: forced-text wrap-up failed", run_id)
 
-        # Auto-name on first message
         if is_first_message and not stopped:
             name_cost = await _auto_name_project(client, project, user_content)
             total_cost += name_cost
-            yield _sse({"type": "project_name", "name": project.name})
+            billing.add(name_cost)
+            runs.emit_event(db, run, "project_name", {"name": project.name})
 
         full_content = _clean_citations(full_content)
 
@@ -1238,6 +1188,8 @@ async def stream_chat_response(
             ac_data["thinking_duration"] = round(thinking_total, 1)
         if stopped:
             ac_data["stopped"] = True
+            if stop_reason:
+                ac_data["stop_reason"] = stop_reason
         if tool_log:
             ac_data["tool_log"] = tool_log
         if total_cost > 0:
@@ -1245,54 +1197,127 @@ async def stream_chat_response(
         if sources:
             ac_data["sources"] = sources
 
-        assistant_msg = ChatMessage(
-            project_id=project_id,
-            role="assistant",
-            content=full_content,
+        assistant_msg = _persist_assistant_message(
+            db, run, project, new_version,
+            full_content=full_content,
             applied_changes=ac_data if ac_data else None,
-            version_id=new_version.id,
         )
-        db.add(assistant_msg)
-
-        _charge_credits(db, user_id, total_cost, project_id=project_id)
+        # Final flush — most cost was billed incrementally during the
+        # run; this catches any residual under the per-call floor.
+        billing.flush()
         _commit_with_deadlock_retry(db)
         db.refresh(assistant_msg)
 
-        tracing.update_span(
-            _trace_span,
-            output=full_content,
-            cost_usd=total_cost,
-            metadata={
-                "tool_count": len(tool_log),
-                "stopped": stopped,
-                "message_id": str(assistant_msg.id),
-            },
-        )
-
-        done_event: Dict[str, Any] = {
-            "type": "done",
+        done_payload: Dict[str, Any] = {
             "message_id": str(assistant_msg.id),
             "total_cost_usd": round(total_cost, 4),
         }
         if thinking_total >= 0.5:
-            done_event["thinking_duration"] = round(thinking_total, 1)
+            done_payload["thinking_duration"] = round(thinking_total, 1)
         if stopped:
-            done_event["stopped"] = True
+            done_payload["stopped"] = True
+            if stop_reason:
+                done_payload["stop_reason"] = stop_reason
         if sources:
-            done_event["sources"] = sources
-        yield _sse(done_event)
+            done_payload["sources"] = sources
 
-    except Exception as e:
-        log.exception("Streaming error")
-        # Never ship raw exception text to the client — it leaks SQL
-        # statements, library frames, and DB structure (e.g. a
-        # DeadlockDetected dumps the offending UPDATE verbatim). The
-        # full detail is in the worker log via log.exception above;
-        # show the user a generic message instead.
-        yield _sse({
-            "type": "error",
-            "message": "Something went wrong on our end. Please try again.",
-        })
+        if stopped and stop_reason == "pause":
+            runs.mark_run_paused(db, run, done_payload)
+        elif stopped and stop_reason == "cancel":
+            runs.mark_run_cancelled(db, run, done_payload)
+        else:
+            runs.mark_run_completed(db, run, done_payload)
+
     finally:
         db.close()
-        tracing.flush()
+
+
+def _persist_assistant_message(
+    db: Session,
+    run: ChatRun,
+    project: Project,
+    new_version,
+    *,
+    full_content: str,
+    applied_changes: Optional[Dict[str, Any]],
+) -> ChatMessage:
+    """Create-or-update the assistant ChatMessage attached to this
+    run. Re-entrant: if the run already has an assistant_message_id,
+    we update that row in place (used by the error path)."""
+    if run.assistant_message_id is not None:
+        msg = (
+            db.query(ChatMessage)
+            .filter(ChatMessage.id == run.assistant_message_id)
+            .first()
+        )
+        if msg is not None:
+            msg.content = full_content
+            msg.applied_changes = applied_changes
+            return msg
+    msg = ChatMessage(
+        project_id=project.id,
+        role="assistant",
+        content=full_content,
+        applied_changes=applied_changes,
+        version_id=new_version.id,
+        run_id=run.id,
+    )
+    db.add(msg)
+    db.flush()
+    run.assistant_message_id = msg.id
+    return msg
+
+
+# ---- Legacy /chat/stream wrapper -----------------------------------------
+async def stream_chat_response(
+    project_id: UUID,
+    user_id: UUID,
+    user_content: str,
+    request: Request,
+    effort: Optional[str] = None,
+) -> AsyncGenerator[str, None]:
+    """Wire-compatible legacy wrapper around the run-based pipeline.
+
+    Creates a ChatRun, tails its events, yields SSE. If the HTTP client
+    disconnects (AbortController.abort), we request a pause on the run
+    so the prior FE behavior is preserved during the rollover. The new
+    explicit endpoints (POST /chat/runs + GET /chat/runs/{id}/events)
+    do NOT pause-on-disconnect; they let the run keep running in the
+    background and rely on /pause to stop it.
+    """
+    try:
+        run = await runs.start_run(
+            project_id=project_id,
+            user_id=user_id,
+            user_content=user_content,
+            effort=effort,
+        )
+    except ValueError as e:
+        yield _sse({"type": "error", "message": str(e)})
+        return
+    except Exception as e:
+        log.exception("legacy stream: start_run failed")
+        yield _sse({"type": "error", "message": f"AI service error: {e}"})
+        return
+
+    run_id = run.id
+    disconnected = False
+    try:
+        async for event in runs.tail_events(
+            run_id,
+            cursor=0,
+            is_disconnected=request.is_disconnected,
+        ):
+            yield _sse(event)
+    finally:
+        # If the client dropped, fall back to legacy behavior: pause.
+        if await request.is_disconnected():
+            disconnected = True
+            try:
+                runs.request_pause(run_id)
+            except Exception:
+                log.exception("legacy stream: request_pause failed for %s", run_id)
+        if disconnected:
+            log.info("legacy stream %s: client disconnected, paused run", run_id)
+
+
