@@ -70,6 +70,41 @@ def _response_cost_usd(response) -> float:
     )
 
 
+def _commit_with_deadlock_retry(db: Session, max_attempts: int = 3) -> None:
+    """Commit, retrying on transient Postgres deadlocks.
+
+    A turn's final commit batches the assistant message, the auto-name
+    rename, and the credit charge — that touches projects + accounts +
+    chat_messages + balance_ledger in one go. If a concurrent request
+    holds locks in opposite order Postgres picks a victim, and we'd
+    otherwise lose the entire turn (the user already saw the streamed
+    reply). Postgres's deadlock detector is fast and the loser is
+    safe to re-run; one or two retries clears it in practice.
+    """
+    for attempt in range(max_attempts):
+        try:
+            db.commit()
+            return
+        except Exception as e:
+            cause = e.__cause__ or e.__context__
+            cause_name = type(cause).__name__ if cause is not None else ""
+            is_deadlock = (
+                "DeadlockDetected" in cause_name
+                or "deadlock detected" in str(e).lower()
+            )
+            if is_deadlock and attempt < max_attempts - 1:
+                log.warning(
+                    f"deadlock on commit (attempt {attempt + 1}/{max_attempts}), "
+                    f"rolling back + retrying"
+                )
+                try:
+                    db.rollback()
+                except Exception:
+                    log.exception("rollback after deadlock failed")
+                continue
+            raise
+
+
 def _charge_credits(db: Session, user_id, cost_usd: float, project_id=None) -> None:
     if cost_usd <= 0:
         return
@@ -1132,7 +1167,7 @@ async def stream_chat_response(
                 )
                 db.add(partial)
                 _charge_credits(db, user_id, total_cost, project_id=project_id)
-                db.commit()
+                _commit_with_deadlock_retry(db)
             except Exception:
                 log.exception("Failed to persist error stub")
                 try:
@@ -1220,7 +1255,7 @@ async def stream_chat_response(
         db.add(assistant_msg)
 
         _charge_credits(db, user_id, total_cost, project_id=project_id)
-        db.commit()
+        _commit_with_deadlock_retry(db)
         db.refresh(assistant_msg)
 
         tracing.update_span(
@@ -1249,7 +1284,15 @@ async def stream_chat_response(
 
     except Exception as e:
         log.exception("Streaming error")
-        yield _sse({"type": "error", "message": str(e)})
+        # Never ship raw exception text to the client — it leaks SQL
+        # statements, library frames, and DB structure (e.g. a
+        # DeadlockDetected dumps the offending UPDATE verbatim). The
+        # full detail is in the worker log via log.exception above;
+        # show the user a generic message instead.
+        yield _sse({
+            "type": "error",
+            "message": "Something went wrong on our end. Please try again.",
+        })
     finally:
         db.close()
         tracing.flush()
