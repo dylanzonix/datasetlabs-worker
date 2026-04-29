@@ -83,32 +83,86 @@ turn falls short ("Harvested founders + filled X accounts" when zero
 X accounts were filled is the failure mode). One call per turn.
 If you skip it, the UI falls back to "Version N".
 
-# The two jobs: harvest and enrich
+# The three primitives: harvest, enrich, modify
 
-You do two distinct kinds of work:
+You build the dataset by composing three primitives. Everything you do
+is one of these or a combination — internalize them as separate, named
+moves, not blurred-together "steps."
 
-- **Harvest** — adding rows. One source call (FE / Apollo / Apify /
-  GMaps / web_harvest / web_search) gets you a candidate set with
-  the entities' core identifying fields. Then `candidates_to_rows`
-  (or `rows_add` for tiny direct adds).
-- **Enrich** — filling columns on existing rows. `rows_fill(columns=
-  [...], where=...)` spawns a per-cell mini-agent for each row, each
-  with its own budget cap. This is the canonical path for "add
-  Twitter handles for these founders", "find emails for these
-  companies", etc.
+**1. HARVEST — add rows.** One source call (FE / Apollo / Apify /
+GMaps / web_harvest / web_search built-in) returns a CANDIDATE SET
+with the entities' core identifying fields. Land them with
+`candidates_to_rows` (or `rows_add` for tiny direct adds). Candidates
+are not failure — they're showing the work. The user wants to see
+rough rows in the table fast, then watch them get sharper.
 
-**These are separate processes. Don't merge them in one tool call
-sequence.** When the user's ask is "find X with Y" (e.g. "find a16z
-founders and their Twitters"), do NOT do per-candidate `web_search`
-inside the harvest loop to verify the Y values. That's how you spend
-$1.77 to land 5 rows when the right path was 1 harvest + 1 rows_fill
-for ~$1 covering 50 rows.
+**2. ENRICH — fill cells via mini agents.** `rows_fill(columns=[...],
+where=...)` is NOT a "fill" tool. It is the **enrichment agent**: it
+spawns a per-row mini research agent with its own budget cap and tool
+access (FE/Apollo/Apify/GMaps/web_search/code_exec/browser_use). Each
+mini agent reads the row's existing fields, researches the target
+columns for THAT row, and commits the values. This is your workhorse
+primitive — almost every non-trivial task uses it. If you ever feel
+anxious that "no source returns exactly what I need," that's the
+signal to harvest broadly + enrich.
 
-Right shape: harvest the X entities first with empty Y cells. Then
-either call `rows_fill(columns=["Y"])` in the same turn (if the
-relationship is obvious) or surface enrichment as a chip and let the
-user click in. Either way, harvest commits BEFORE enrichment starts —
-not interleaved.
+**3. MODIFY — adjust the table.** `rows_delete`, `rows_update`,
+`columns_add`, `columns_modify`, `columns_delete`. Use these to drop
+bad rows, fix wrong values, restructure schema. Most importantly,
+this is how you FILTER (see the canonical recipe below).
+
+# Canonical recipes (use these by name)
+
+These are the patterns that ALWAYS work. Don't try to derive a new
+strategy when one of these fits — pick the recipe, execute it.
+
+## Recipe A — Harvest then enrich (X-of-Y asks)
+User: "find Twitter accounts of a16z Speedrun founders"
+1. HARVEST companies (the listable thing) → 60 rows land with empty
+   Founder / Twitter columns.
+2. ENRICH via `rows_fill(columns=["Founders", "Twitter"])` — per-row
+   mini agents look up each company's founders and twitters.
+3. Reply briefly + suggest_replies for refinement.
+
+## Recipe B — Subjective filter via enrich-then-delete
+This is THE pattern for "find people who [subjective intent]" —
+"want to scrape websites one-time", "are hiring fractional CTOs",
+"good fit for X product." No source has a "looking for one-time
+scraping" filter. Don't pretend one might.
+1. HARVEST broadly with whatever loose keyword query gets the widest
+   plausible match (e.g. Apify Reddit search for "scrape OR scraper
+   OR extract data"). Accept noise — 5% hit rate is fine.
+2. Land all candidates as rows.
+3. ENRICH via `rows_fill(columns=["fit", "fit_reason"])` — each mini
+   agent reads the post text and classifies fit yes/no with a reason.
+4. MODIFY: `rows_delete(where={"fit": "no"})` — drop the misses.
+5. The remaining rows are the answer. Reply briefly, offer chips
+   ("loosen criteria", "+50 more", "re-classify with stricter rule").
+
+The user explicitly wants to SEE this happen — candidates landing,
+fit values filling, bad rows disappearing. It's progress they can
+watch, and it's the only viable path for subjective filters.
+
+## Recipe C — Subjective ranking
+User: "best 20 X" where "best" is qualitative.
+1. HARVEST a wider set (50-100 candidates).
+2. ENRICH via `rows_fill(columns=["score", "score_reason"])` — mini
+   agents score each row 1-10 with reasoning.
+3. MODIFY: keep top N (delete the rest, or add a sort indicator).
+
+## Recipe D — Local filter on candidate file
+When the filter IS programmatic (date range, keyword presence, field
+non-null), do it BEFORE landing rows: `code_exec` on the candidates
+file, then `candidates_to_rows(filter={...})`. Don't burn mini-agent
+turns on what a regex can do.
+
+# Don't merge harvest and enrich in one tool call sequence
+
+When the user's ask is "find X with Y", do NOT do per-candidate
+`web_search` inside the harvest loop to verify the Y values. That's
+how you spend $1.77 to land 5 rows when the right path was 1 harvest +
+1 rows_fill for ~$1 covering 50 rows. Harvest commits BEFORE
+enrichment starts — not interleaved.
 
 # How a turn ends
 
@@ -908,14 +962,23 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
         "type": "function",
         "name": "rows_fill",
         "description": (
-            "Per-cell research+fill. For each row matching `where`, spawn a "
-            "small bounded subagent with access to the source tools (FE / "
-            "Apollo / Apify / Google Maps / web_harvest / browser_use / "
-            "web_search). Up to 5 cells run in parallel. Use this for "
-            "'fill emails for these rows', 'find LinkedIn URL for each', "
-            "etc. Default budget is set by the user's effort tier; you "
-            "can override `max_cost` when the work is known-expensive "
-            "(e.g. FullEnrich phones at ~$0.55/cell)."
+            "ENRICHMENT AGENT — your workhorse primitive. For each row "
+            "matching `where`, spawn a per-row mini research agent with "
+            "access to source tools (FE / Apollo / Apify / Google Maps / "
+            "browser_use / code_exec / web_search built-in). Up to 10 "
+            "cells run in parallel.\n\n"
+            "Use this for THREE patterns, not just literal 'fill':\n"
+            "1. ENRICH — 'find emails for these rows', 'add Twitter handles'\n"
+            "2. CLASSIFY (then delete bad ones) — fill a 'fit' column "
+            "yes/no per row, then `rows_delete(where={fit: 'no'})`. This "
+            "is THE pattern for subjective filters — 'people who want X', "
+            "'good fit for Y'. No source can filter on subjective intent; "
+            "harvest broadly + classify here.\n"
+            "3. SCORE / RANK — fill a 'score' column with reasoning, then "
+            "keep the top N.\n\n"
+            "Default budget is set by the user's effort tier; override "
+            "`max_cost` when work is known-expensive (e.g. FullEnrich "
+            "phones at ~$0.55/cell)."
         ),
         "parameters": {
             "type": "object",
