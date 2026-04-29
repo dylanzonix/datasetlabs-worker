@@ -64,6 +64,11 @@ class _RunBus:
         # the agent streams; used to bootstrap mid-stream reconnects
         # without per-token DB writes. Reset on run cleanup.
         self._content: Dict[str, str] = defaultdict(str)
+        # Cumulative reasoning summary text per run-round. Persisted
+        # at each round boundary as `thinking_checkpoint` so we can
+        # diagnose why the model made decisions (e.g. why it bailed
+        # apify_call_actor → web_search). Reset at round end.
+        self._thinking: Dict[str, str] = defaultdict(str)
 
     def subscribe(self, run_id: UUID) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=1024)
@@ -108,11 +113,10 @@ class _RunBus:
     def publish_delta(self, run_id: UUID, kind: str, content: str) -> None:
         """Live-only delta — fanout to subscribers, no DB write.
 
-        For `token` deltas, also append to the per-run cumulative
-        content accumulator so reconnects can bootstrap mid-round.
-        For `thinking` deltas, fanout only (thinking is per-round
-        ephemeral display; reconnect mid-round won't show prior
-        thinking, which is acceptable).
+        Both `token` and `thinking` deltas accumulate per-run so
+        round-boundary checkpoints can persist the full text. Tokens
+        carry across rounds (assistant content keeps growing); thinking
+        is reset each round end (per-round display).
 
         Live deltas have no `seq` — `tail_events` lets them through
         the seq guard (seq is the cursor for persisted events only).
@@ -121,6 +125,8 @@ class _RunBus:
             return
         if kind == "token":
             self._content[str(run_id)] += content
+        elif kind == "thinking":
+            self._thinking[str(run_id)] += content
         ev = {"type": kind, "content": content}
         for q in list(self._subs.get(str(run_id), [])):
             try:
@@ -128,11 +134,18 @@ class _RunBus:
             except asyncio.QueueFull:
                 log.warning("run %s subscriber queue full, dropping delta", run_id)
 
+    def reset_thinking(self, run_id: UUID) -> str:
+        """Pop and return the run's accumulated thinking text. Called
+        at round boundaries — the popped string is persisted as a
+        thinking_checkpoint, then the buffer is empty for next round."""
+        return self._thinking.pop(str(run_id), "")
+
     def cleanup_run(self, run_id: UUID) -> None:
         """Drop in-memory state for a run. Called when the run reaches
         a terminal status."""
         key = str(run_id)
         self._content.pop(key, None)
+        self._thinking.pop(key, None)
         # Subscribers' queues are cleaned up on unsubscribe in tail_events.
 
 
@@ -256,6 +269,25 @@ def emit_text_checkpoint(db: Session, run: ChatRun) -> Dict[str, Any]:
     already matches) and rebuilding for reconnects."""
     full = _BUS._content.get(str(run.id), "")
     return emit_event(db, run, "text_checkpoint", {"full_content": full})
+
+
+def emit_thinking_checkpoint(
+    db: Session, run: ChatRun, round_num: Optional[int] = None
+) -> Optional[Dict[str, Any]]:
+    """Persist the run's accumulated reasoning text for the just-completed
+    round, then clear the buffer. The diagnose CLI reads these to show
+    why the model made decisions; the FE doesn't need them (live tail
+    already showed the deltas, end-of-round display is just the answer).
+
+    Returns None if the buffer was empty (no reasoning emitted this
+    round) so we don't pollute the event log with empty rows."""
+    text = _BUS.reset_thinking(run.id)
+    if not text:
+        return None
+    payload: Dict[str, Any] = {"content": text}
+    if round_num is not None:
+        payload["round"] = round_num
+    return emit_event(db, run, "thinking_checkpoint", payload)
 
 
 # ---- Pause / cancel polling ----------------------------------------------

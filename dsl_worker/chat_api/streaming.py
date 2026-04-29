@@ -870,6 +870,7 @@ async def run_agent_loop(
                     # Persist a checkpoint of whatever text we have so
                     # reconnects don't lose the partial round.
                     runs.emit_text_checkpoint(db, run)
+                    runs.emit_thinking_checkpoint(db, run, round_num=round_num)
                     break
 
                 remaining = stripper.flush()
@@ -877,10 +878,12 @@ async def run_agent_loop(
                     full_content += remaining
                     runs.publish_token_delta(run.id, remaining)
 
-                # Round complete — persist a durable text checkpoint.
-                # All token deltas in this round were live-only; this is
-                # what reconnects after the round will see.
+                # Round complete — persist durable checkpoints. Token
+                # deltas were live-only; reasoning summary deltas were
+                # too. Both get persisted here so reconnects + offline
+                # diagnosis can read the full transcript.
                 runs.emit_text_checkpoint(db, run)
+                runs.emit_thinking_checkpoint(db, run, round_num=round_num)
 
                 round_cost = _response_cost_usd(final_response)
                 total_cost += round_cost

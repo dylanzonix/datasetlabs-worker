@@ -116,6 +116,20 @@ def _dump_run(db, run: ChatRun, project: Project) -> None:
                 summary = pl.get("summary") or ""
                 print(f"  summary (legacy, truncated): {summary}")
             print()
+        elif e.type == "thinking_checkpoint":
+            content = pl.get("content") or ""
+            round_num = pl.get("round")
+            tag = f"round {round_num}" if round_num is not None else "—"
+            print(f"--- [{ts}] seq={e.seq} THINKING_CHECKPOINT ({tag}) "
+                  f"({len(content)} chars) ---")
+            print("    " + content.replace("\n", "\n    "))
+            print()
+        elif e.type == "text_checkpoint":
+            content = pl.get("full_content") or ""
+            print(f"--- [{ts}] seq={e.seq} TEXT_CHECKPOINT "
+                  f"(cumulative content, {len(content)} chars) ---")
+            print("    " + content.replace("\n", "\n    "))
+            print()
         elif e.type in ("done", "paused", "cancelled", "error"):
             print(f"=== [{ts}] seq={e.seq} {e.type.upper()}: {_pretty(pl, 800)}")
             print()
