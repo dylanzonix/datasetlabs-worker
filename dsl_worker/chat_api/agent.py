@@ -290,10 +290,16 @@ reply short and call it right after. Don't bury the call after a
 Skip ONLY: hard error, you already called `ask_questions`, or
 genuinely no possible follow-up.
 
-`suggest_replies(suggestions=[{label, message}, ...])` — `label` is
-~40 chars max, reads as a complete sentence the user might say;
-`message` is what gets sent on click (usually identical). After
-answering a question, include at least one yes-path and one
+`suggest_replies(suggestions=[{label, message}, ...])` — **max 3
+suggestions**. `label` is ~40 chars, reads as a complete sentence the
+user might say. `message` is what gets sent on click and **must say
+the same thing as `label`** — same action, same scope, no extra
+clauses. If the label says "Delete the 73 no rows", the message is
+"Delete the 73 no rows.", not "Delete the 73 no rows and find 100
+more candidates." Users trust that what they click is what they
+send; sneaking extra intent into the message breaks that trust.
+
+After answering a question, include at least one yes-path and one
 no/different-path. After harvesting, mix scale amounts with off-axis
 next moves.
 
@@ -448,6 +454,13 @@ obvious — use judgment.
   post-id), **don't pass merge_key.** Inserting and accepting
   possible duplicates is safer than silently merging legitimate-but-
   similar rows together.
+- **Deletes are sticky via merge_key.** When the user deletes rows,
+  they're soft-deleted and remembered. A subsequent
+  `rows_add` / `candidates_to_rows` with a `merge_key` that matches
+  a previously-deleted row will SKIP it — the user already said no.
+  Result includes `skipped_already_deleted` when this fires; surface
+  it in your reply ("3 candidates were skipped because you previously
+  deleted them — `rows_undelete` to bring them back").
 - **Once you've paid for a fetch, finish it.** Don't stop at the
   candidate file and ask "want me to load these?" — the candidate
   file is internal; the user can't see it. Use `candidates_to_rows`
@@ -911,10 +924,17 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
         "name": "rows_delete",
         "description": (
             "Soft-delete rows matching `where`. Rows are hidden from all "
-            "active-row queries but kept in the DB and can be restored via "
-            "rows_undelete. Two-phase: first call without `confirm` returns "
-            "a preview (count + sample of what would be deleted). Re-call "
-            "with confirm=true to actually delete."
+            "active-row queries but kept in the DB (so future merge_key "
+            "dedup still sees them) and can be restored via rows_undelete. "
+            "\n\n"
+            "**Pass `confirm=true` when the user already commanded the "
+            "delete** (typed 'delete the no rows', 'remove rows where X', "
+            "'drop the duplicates', clicked a chip labeled 'Delete…' / "
+            "'Remove…'). The user knows what they asked for — preview is "
+            "friction.\n\n"
+            "Pass `confirm=false` (or omit) ONLY when YOU are proactively "
+            "suggesting cleanup the user didn't ask for. Returns a preview "
+            "so the user can decide."
         ),
         "parameters": {
             "type": "object",
@@ -1137,9 +1157,12 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
         "name": "suggest_replies",
         "description": (
             "STRONGLY ADVISED at the end of almost every turn: "
-            "attach 2-5 clickable reply suggestions to your latest "
+            "attach 1-3 clickable reply suggestions to your latest "
             "message so the user can answer with one click instead "
-            "of typing. "
+            "of typing. The `message` MUST match what `label` says — "
+            "same action, same scope, no extra clauses sneaked in. "
+            "Clicking 'Delete 73 no rows' should send 'Delete the 73 "
+            "no rows', NOT 'Delete the 73 no rows and find 100 more'. "
             "Call this whenever your turn produced rows, asked a "
             "question, proposed a next step, or contained any phrase "
             "like 'if you want, I can…', 'next I can…', 'want me "
@@ -1161,8 +1184,8 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
             "properties": {
                 "suggestions": {
                     "type": "array",
-                    "minItems": 2,
-                    "maxItems": 5,
+                    "minItems": 1,
+                    "maxItems": 3,
                     "items": {
                         "type": "object",
                         "properties": {
@@ -1827,20 +1850,28 @@ async def _tool_candidates_to_rows(
         # company silently merging into one row) BEFORE it happens.
         from sqlalchemy import text as _text
         existing_keys: set = set()
+        deleted_keys: set = set()
         if merge_key:
             existing = db.execute(
                 _text(
-                    f"SELECT {_row_value_expr(merge_key)} FROM samples "
-                    f"WHERE version_id = :vid AND deleted_at IS NULL"
+                    f"SELECT {_row_value_expr(merge_key)}, deleted_at FROM samples "
+                    f"WHERE version_id = :vid"
                 ),
                 {"vid": version.id},
             ).all()
-            existing_keys = {str(r[0]) for r in existing if r[0] is not None}
+            for r in existing:
+                if r[0] is None:
+                    continue
+                if r[1] is None:
+                    existing_keys.add(str(r[0]))
+                else:
+                    deleted_keys.add(str(r[0]))
 
         scanned = 0
         skipped_filter = 0
         would_insert = 0
         would_merge_existing = 0
+        would_skip_already_deleted = 0
         intra_batch_collisions = 0  # candidates that merge with EARLIER candidates in this same file
         seen_keys: set = set()
         sample_inserts: List[Dict[str, Any]] = []
@@ -1860,6 +1891,9 @@ async def _tool_candidates_to_rows(
                     mv = mapped.get(merge_key)
                     if mv is not None:
                         mv_s = str(mv)
+                        if mv_s in deleted_keys:
+                            would_skip_already_deleted += 1
+                            continue
                         if mv_s in existing_keys:
                             would_merge_existing += 1
                             if len(sample_collisions) < 3:
@@ -1897,6 +1931,7 @@ async def _tool_candidates_to_rows(
             "skipped_filter": skipped_filter,
             "would_insert": would_insert,
             "would_merge_with_existing": would_merge_existing,
+            "would_skip_already_deleted": would_skip_already_deleted,
             "intra_batch_collisions": intra_batch_collisions,
             "sample_inserts": sample_inserts,
             "sample_collisions": sample_collisions,
@@ -1904,6 +1939,12 @@ async def _tool_candidates_to_rows(
             "hint": (
                 f"Would land {would_insert} new rows. Re-call with "
                 f"confirm=true to commit."
+                + (
+                    f" {would_skip_already_deleted} candidate(s) match "
+                    f"previously-deleted rows and will be skipped (the "
+                    f"user already said no to those)."
+                    if would_skip_already_deleted else ""
+                )
             ),
         }
 
@@ -1916,11 +1957,12 @@ async def _tool_candidates_to_rows(
     total_inserted = 0
     total_merged = 0
     total_skipped_filter = 0
+    total_skipped_already_deleted = 0
 
     batch: List[Dict[str, Any]] = []
 
     async def flush() -> None:
-        nonlocal total_inserted, total_merged
+        nonlocal total_inserted, total_merged, total_skipped_already_deleted
         if not batch:
             return
         applied_batch, result_batch = await _tool_rows_add(
@@ -1933,6 +1975,7 @@ async def _tool_candidates_to_rows(
         if isinstance(result_batch, dict) and result_batch.get("ok"):
             total_inserted += int(result_batch.get("inserted", 0) or 0)
             total_merged += int(result_batch.get("merged", 0) or 0)
+            total_skipped_already_deleted += int(result_batch.get("skipped_already_deleted", 0) or 0)
         batch.clear()
 
     try:
@@ -1971,15 +2014,23 @@ async def _tool_candidates_to_rows(
         .filter(Sample.version_id == version.id, Sample.deleted_at.is_(None))
         .scalar() or 0
     )
+    result = {
+        "ok": True,
+        "inserted": total_inserted,
+        "merged": total_merged,
+        "skipped": total_skipped_filter,
+        "total": total_rows,
+    }
+    if total_skipped_already_deleted:
+        result["skipped_already_deleted"] = total_skipped_already_deleted
+        result["note"] = (
+            f"{total_skipped_already_deleted} candidate(s) matched a "
+            f"previously-deleted row's merge_key and were skipped (the "
+            f"user already said no to those). Use rows_undelete if intended."
+        )
     return (
         {"rows": {"inserted": total_inserted, "merged": total_merged}},
-        {
-            "ok": True,
-            "inserted": total_inserted,
-            "merged": total_merged,
-            "skipped": total_skipped_filter,
-            "total": total_rows,
-        },
+        result,
     )
 
 
@@ -2229,6 +2280,7 @@ async def _tool_rows_add(
 
     inserted = 0
     merged = 0
+    skipped_already_deleted = 0
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -2247,14 +2299,21 @@ async def _tool_rows_add(
             mv = item.get(merge_key)
             if mv is not None:
                 from sqlalchemy import text
+                # Look up across ALL rows (including soft-deleted). If the
+                # user previously deleted a row with this merge_key value
+                # they've already said "no" to it — don't reinsert. Skipping
+                # is safer than resurrecting; user can rows_undelete if
+                # they actually want it back.
                 stmt = text(
-                    f"SELECT id, row FROM samples WHERE version_id = :vid "
-                    f"AND deleted_at IS NULL "
+                    f"SELECT id, row, deleted_at FROM samples WHERE version_id = :vid "
                     f"AND ({_row_value_expr(merge_key)}) = :mv LIMIT 1"
                 )
                 existing = db.execute(
                     stmt, {"vid": version.id, "mv": str(mv)}
                 ).first()
+                if existing and existing[2] is not None:
+                    skipped_already_deleted += 1
+                    continue
                 if existing:
                     sample = db.query(Sample).filter(Sample.id == existing[0]).first()
                     if sample is not None:
@@ -2312,9 +2371,18 @@ async def _tool_rows_add(
         .filter(Sample.version_id == version.id, Sample.deleted_at.is_(None))
         .scalar() or 0
     )
+    result = {"ok": True, "inserted": inserted, "merged": merged, "total": total}
+    if skipped_already_deleted:
+        result["skipped_already_deleted"] = skipped_already_deleted
+        result["note"] = (
+            f"{skipped_already_deleted} item(s) had a merge_key matching "
+            f"a previously-deleted row and were skipped. Call "
+            f"rows_undelete with the matching where to bring those back "
+            f"if intended."
+        )
     return (
         {"rows": {"inserted": inserted, "merged": merged}},
-        {"ok": True, "inserted": inserted, "merged": merged, "total": total},
+        result,
     )
 
 
