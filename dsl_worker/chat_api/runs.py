@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections import defaultdict
 from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional
 from uuid import UUID
@@ -157,6 +158,23 @@ _BUS = _RunBus()
 # In-process only (per worker process). On restart, queued/running
 # rows are recovered by `recover_orphan_runs()` at startup.
 _PROJECT_LOCKS: Dict[str, asyncio.Lock] = {}
+
+# ---- Global concurrency cap ----------------------------------------------
+# Per-project lock prevents same-project pile-up; this prevents N projects
+# from spawning N concurrent worker tasks and exhausting the DB pool /
+# OpenAI rate limits. Excess runs queue at the asyncio task level.
+# Sized for ~10-20 concurrent active users — safe for the Supabase pool
+# (5 + 10 overflow) since each run holds at most 1 connection at a time.
+_GLOBAL_RUN_CAP = int(os.getenv("CHAT_GLOBAL_RUN_CAP", "20"))
+_GLOBAL_RUN_SEMAPHORE: Optional[asyncio.Semaphore] = None
+
+
+def _global_run_semaphore() -> asyncio.Semaphore:
+    """Lazy-init so the semaphore is bound to the running event loop."""
+    global _GLOBAL_RUN_SEMAPHORE
+    if _GLOBAL_RUN_SEMAPHORE is None:
+        _GLOBAL_RUN_SEMAPHORE = asyncio.Semaphore(_GLOBAL_RUN_CAP)
+    return _GLOBAL_RUN_SEMAPHORE
 
 
 def _project_lock(project_id: UUID) -> asyncio.Lock:
@@ -418,34 +436,40 @@ async def _run_agent_task(
     finally:
         db.close()
 
-    async with _project_lock(project_id):
-        # Re-check status after acquiring the lock — could have been
-        # cancelled while waiting in the queue.
-        db = SessionLocal()
-        try:
-            run = db.query(ChatRun).filter(ChatRun.id == run_id).first()
-            if run is None or run.status in RUN_TERMINAL_STATUSES:
-                return
-            run.status = RUN_STATUS_RUNNING
-            from sqlalchemy.sql import func
-            run.started_at = func.now()
-            db.commit()
-        finally:
-            db.close()
+    # Acquire BOTH the per-project lock (serializes runs on the same
+    # project) AND the global cap (bounds total concurrent agent
+    # tasks across the worker process). Order matters: global semaphore
+    # OUTSIDE so a queued run on an idle project can still progress
+    # without holding the project lock while waiting for capacity.
+    async with _global_run_semaphore():
+        async with _project_lock(project_id):
+            # Re-check status after acquiring the lock — could have been
+            # cancelled while waiting in the queue.
+            db = SessionLocal()
+            try:
+                run = db.query(ChatRun).filter(ChatRun.id == run_id).first()
+                if run is None or run.status in RUN_TERMINAL_STATUSES:
+                    return
+                run.status = RUN_STATUS_RUNNING
+                from sqlalchemy.sql import func
+                run.started_at = func.now()
+                db.commit()
+            finally:
+                db.close()
 
-        # Now run the agent loop. It opens its own session and emits
-        # events via the bus + ChatRunEvent. Errors are caught here
-        # and persisted as a final "failed" status.
-        try:
-            await run_agent_loop(
-                run_id=run_id,
-                user_id=user_id,
-                user_content=user_content,
-                effort=effort,
-            )
-        except Exception as e:
-            log.exception("run %s crashed", run_id)
-            _mark_run_failed(run_id, str(e)[:500])
+            # Now run the agent loop. It opens its own session and emits
+            # events via the bus + ChatRunEvent. Errors are caught here
+            # and persisted as a final "failed" status.
+            try:
+                await run_agent_loop(
+                    run_id=run_id,
+                    user_id=user_id,
+                    user_content=user_content,
+                    effort=effort,
+                )
+            except Exception as e:
+                log.exception("run %s crashed", run_id)
+                _mark_run_failed(run_id, str(e)[:500])
 
 
 def _mark_run_failed(run_id: UUID, error: str) -> None:
@@ -461,6 +485,64 @@ def _mark_run_failed(run_id: UUID, error: str) -> None:
         # to the client.
         run.error = error
         run.completed_at = func.now()
+        # Belt-and-suspenders: if streaming.run_agent_loop crashed
+        # before getting a chance to persist its own assistant message,
+        # write a minimal stub here so chat history always shows
+        # something for the failed turn. This is the last line of
+        # defense — the in-loop exception path tries first via the
+        # main session, then falls back to a fresh session via
+        # _force_persist_assistant_message. We only land here if BOTH
+        # of those failed (or run_agent_loop died before reaching its
+        # own except block).
+        if run.assistant_message_id is None:
+            try:
+                # Reconstruct what we can from chat_run_events. The
+                # latest text_checkpoint has the cumulative content;
+                # tool_call/tool_result events compose the tool_log.
+                content = ""
+                tool_log: List[Dict[str, Any]] = []
+                tool_log_idx: Dict[str, int] = {}
+                evs = (
+                    db.query(ChatRunEvent)
+                    .filter(ChatRunEvent.run_id == run.id)
+                    .order_by(ChatRunEvent.seq.asc())
+                    .all()
+                )
+                for e in evs:
+                    pl = e.payload or {}
+                    if e.type == "text_checkpoint":
+                        content = pl.get("full_content") or content
+                    elif e.type == "tool_call":
+                        cid = pl.get("id") or f"_evt_{e.seq}"
+                        tool_log_idx[cid] = len(tool_log)
+                        tool_log.append({
+                            "id": cid,
+                            "name": pl.get("name", "?"),
+                            "args_preview": pl.get("args_preview", ""),
+                        })
+                    elif e.type == "tool_result":
+                        cid = pl.get("id")
+                        if cid and cid in tool_log_idx:
+                            tool_log[tool_log_idx[cid]].update({
+                                "summary": pl.get("summary"),
+                                "cost": pl.get("cost"),
+                            })
+                ac: Dict[str, Any] = {"error": error[:500], "interrupted": True}
+                if tool_log:
+                    ac["tool_log"] = tool_log
+                msg = ChatMessage(
+                    project_id=run.project_id,
+                    role="assistant",
+                    content=content,
+                    applied_changes=ac,
+                    version_id=run.version_id,
+                    run_id=run.id,
+                )
+                db.add(msg)
+                db.flush()
+                run.assistant_message_id = msg.id
+            except Exception:
+                log.exception("mark_run_failed: stub-msg recovery failed for run %s", run_id)
         user_safe_msg = "Something went wrong on our end. Please try again."
         emit_event(db, run, "error", {"message": user_safe_msg})
         emit_event(db, run, "done", {"stopped": True, "error": user_safe_msg})

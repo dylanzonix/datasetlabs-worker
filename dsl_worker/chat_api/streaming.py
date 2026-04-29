@@ -1274,7 +1274,7 @@ async def run_agent_loop(
 
         except Exception as e:
             log.exception("run %s agent loop crashed", run_id)
-            err_ac: Dict[str, Any] = {"error": str(e)[:500]}
+            err_ac: Dict[str, Any] = {"error": str(e)[:500], "interrupted": True}
             if applied:
                 err_ac["changes"] = applied
             if tool_log:
@@ -1285,10 +1285,19 @@ async def run_agent_loop(
                 err_ac["sources"] = sources
             if thinking_total >= 0.5:
                 err_ac["thinking_duration"] = round(thinking_total, 1)
+            # Snapshot running_input as resume_input so the next user
+            # message can pick up exactly where we left off — same
+            # mechanism cofounder added for response.incomplete. We
+            # capture completed function_calls; the in-flight one (if
+            # any) is dropped, the user will re-trigger it.
+            if running_input:
+                err_ac["resume_input"] = list(running_input)
+            cleaned_content = _clean_citations(full_content)
+            persisted_via_main_session = False
             try:
                 _persist_assistant_message(
                     db, run, project, new_version,
-                    full_content=_clean_citations(full_content),
+                    full_content=cleaned_content,
                     applied_changes=err_ac,
                 )
                 # Flush whatever incremental charges hadn't crossed the
@@ -1296,12 +1305,25 @@ async def run_agent_loop(
                 # billed live; this catches the residual.
                 billing.flush()
                 _commit_with_deadlock_retry(db)
+                persisted_via_main_session = True
             except Exception:
                 log.exception("run %s: failed to persist error stub", run_id)
                 try:
                     db.rollback()
                 except Exception:
                     pass
+            # Fresh-session fallback: if the main session was poisoned
+            # by the originating exception (PendingRollbackError,
+            # deadlock, etc.), open a clean session and write a stub
+            # message so the user always sees what happened, never a
+            # silent void. Bug seen on ee0db354 was exactly this case.
+            if not persisted_via_main_session:
+                _force_persist_assistant_message(
+                    run_id=run.id,
+                    project_id=project.id,
+                    full_content=cleaned_content,
+                    applied_changes=err_ac,
+                )
             # Never leak raw exception text to the FE — it dumps SQL,
             # frame names, and DB internals (e.g. DeadlockDetected
             # includes the offending UPDATE verbatim). Full detail goes
@@ -1470,6 +1492,64 @@ def _persist_assistant_message(
     db.flush()
     run.assistant_message_id = msg.id
     return msg
+
+
+def _force_persist_assistant_message(
+    run_id: UUID,
+    project_id: UUID,
+    *,
+    full_content: str,
+    applied_changes: Optional[Dict[str, Any]],
+) -> bool:
+    """Belt-and-suspenders persist using a FRESH SessionLocal.
+
+    Called only from the exception path when the main session is
+    poisoned (PendingRollbackError, deadlock, etc.) and the normal
+    `_persist_assistant_message` failed. Opens a clean session,
+    creates a minimal ChatMessage row, and links it to the run via
+    `assistant_message_id`. This is the last line of defense against
+    a run going terminal with NO visible message in chat history —
+    the failure mode that bit project ee0db354.
+
+    Returns True if persisted, False if even the fresh session
+    couldn't write (logged but swallowed — caller continues).
+    """
+    fresh_db = SessionLocal()
+    try:
+        run = fresh_db.query(ChatRun).filter(ChatRun.id == run_id).first()
+        if run is None:
+            log.warning("force_persist: run %s vanished", run_id)
+            return False
+        # Don't double-write if the main session somehow already did.
+        if run.assistant_message_id is not None:
+            return True
+        version_id = run.version_id  # already committed at fork time
+        msg = ChatMessage(
+            project_id=project_id,
+            role="assistant",
+            content=full_content,
+            applied_changes=applied_changes,
+            version_id=version_id,
+            run_id=run.id,
+        )
+        fresh_db.add(msg)
+        fresh_db.flush()
+        run.assistant_message_id = msg.id
+        fresh_db.commit()
+        log.warning(
+            "force_persist: wrote stub assistant message %s for run %s "
+            "(main session was poisoned)", msg.id, run_id,
+        )
+        return True
+    except Exception:
+        log.exception("force_persist: even fresh session failed for run %s", run_id)
+        try:
+            fresh_db.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        fresh_db.close()
 
 
 # ---- Legacy /chat/stream wrapper -----------------------------------------
