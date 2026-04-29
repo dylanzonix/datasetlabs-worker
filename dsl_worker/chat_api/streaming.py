@@ -1132,10 +1132,16 @@ async def run_agent_loop(
             runs.emit_event(db, run, "done", {"stopped": True, "error": user_safe_msg})
             return
 
-        # Forced text wrap-up if we exited the loop with no text.
+        # Forced text wrap-up if we exited the loop with no text. Run
+        # this even when stopped=True (incomplete OpenAI stream / pause
+        # / cancel) — otherwise we ship an empty assistant message
+        # after a real turn's work, which is the worst possible UX.
+        # Cause that bit us 2026-04-29 on project 7941c11b: 87 events,
+        # $0.92 spent, 1/60 rows committed, empty body because the
+        # final round's stream cut off without response.completed and
+        # we skipped the wrap-up.
         if (
-            not stopped
-            and len(tool_log) > 0
+            len(tool_log) > 0
             and not full_content.strip()
         ):
             try:
