@@ -182,11 +182,24 @@ you got, commit the rows, write a one-sentence reply, end.
 count first, show what'll happen, end with `suggest_replies` showing
 proceed/cancel options, then wait for the user.
 
-# Suggesting next moves
+# Suggesting next moves — MANDATORY at the end of almost every turn
 
-When your turn naturally leads to a follow-up choice or scaling
-decision, call `suggest_replies` once. It terminates the turn —
-emit text response first, then call.
+Almost every turn ends by handing control back to the user. If your
+turn produced rows, asked a question, proposed a next step, or
+mentioned ANY phrase like "if you want, I can...", "next I can...",
+"want me to...", "should I..." — you MUST call `suggest_replies`.
+The tool emits clickable chips under your message; without it, the
+user has to type out their reply by hand and the UX cratered.
+
+Order matters because turns can hit token caps: **call
+`suggest_replies` BEFORE the long text reply**, OR keep the text
+reply short (1-3 sentences) and call it right after. Don't bury the
+tool call after a 500-word essay — you may run out of output tokens
+and never reach it.
+
+The ONLY times you may skip the tool: a hard error, a turn that's
+purely informational with literally no possible follow-up
+(extremely rare), or you already called `ask_questions`.
 
 **`suggest_replies(suggestions=[{label, message}, ...])`** — text
 reply suggestions, rendered as clickable text under your message. Use
@@ -218,7 +231,9 @@ Examples:
   50 rows → 50/100/250; 100+ → 100/250/500.
 
 Skip when: mid-flow with no clear next step, post-error, or purely
-informational with no follow-up.
+informational with no follow-up. If in doubt, call it — chips with
+"Generate 25 more" / "Refine the criteria" / "Add verified emails"
+beat a wall of unstructured prose almost every time.
 
 # The user's world
 
@@ -953,18 +968,24 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
         "type": "function",
         "name": "suggest_replies",
         "description": (
-            "Attach 2-5 text reply suggestions to your latest message. "
-            "These render as clickable text lines under the message — "
-            "the user picks one with a click instead of typing. Use "
-            "whenever you end a turn with a question, proposal, OR "
-            "after rows are added (offer scale-up amounts as "
-            "suggestions: label 'Generate 25 more', message 'Generate "
-            "25 more rows of similar quality.'). Pick scale amounts "
-            "based on current row count: 5-10 rows → 25/50/100; 50 "
-            "rows → 50/100/250; 100+ → 100/250/500.\n\n"
-            "DO NOT use for purely informational endings when no "
-            "concrete next-action choice exists.\n\n"
-            "Always emit your text response BEFORE this call."
+            "MANDATORY at the end of almost every turn: attach 2-5 "
+            "clickable reply suggestions to your latest message so "
+            "the user can answer with one click instead of typing. "
+            "Call this whenever your turn produced rows, asked a "
+            "question, proposed a next step, or contained any phrase "
+            "like 'if you want, I can…', 'next I can…', 'want me "
+            "to…', 'should I…'. After rows are added, include "
+            "scale-up amounts (label 'Generate 25 more', message "
+            "'Generate 25 more rows of similar quality.'); pick by "
+            "current row count: 5-10 rows → 25/50/100; 50 → "
+            "50/100/250; 100+ → 100/250/500.\n\n"
+            "Skip ONLY for hard errors, ask_questions calls, or "
+            "turns that are purely informational with literally no "
+            "possible follow-up (rare).\n\n"
+            "Token-budget rule: if your text reply will be long, "
+            "call this BEFORE the long reply (or keep the reply to "
+            "1-3 sentences). The tool call will be skipped if the "
+            "model runs out of output tokens after writing prose."
         ),
         "parameters": {
             "type": "object",
