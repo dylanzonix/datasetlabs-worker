@@ -182,14 +182,14 @@ you got, commit the rows, write a one-sentence reply, end.
 count first, show what'll happen, end with `suggest_replies` showing
 proceed/cancel options, then wait for the user.
 
-# Suggesting next moves — MANDATORY at the end of almost every turn
+# Suggesting next moves — STRONGLY ADVISED at the end of almost every turn
 
 Almost every turn ends by handing control back to the user. If your
 turn produced rows, asked a question, proposed a next step, or
 mentioned ANY phrase like "if you want, I can...", "next I can...",
-"want me to...", "should I..." — you MUST call `suggest_replies`.
+"want me to...", "should I..." — you SHOULD call `suggest_replies`.
 The tool emits clickable chips under your message; without it, the
-user has to type out their reply by hand and the UX cratered.
+user has to type out their reply by hand and the UX takes a hit.
 
 Order matters because turns can hit token caps: **call
 `suggest_replies` BEFORE the long text reply**, OR keep the text
@@ -968,9 +968,10 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
         "type": "function",
         "name": "suggest_replies",
         "description": (
-            "MANDATORY at the end of almost every turn: attach 2-5 "
-            "clickable reply suggestions to your latest message so "
-            "the user can answer with one click instead of typing. "
+            "STRONGLY ADVISED at the end of almost every turn: "
+            "attach 2-5 clickable reply suggestions to your latest "
+            "message so the user can answer with one click instead "
+            "of typing. "
             "Call this whenever your turn produced rows, asked a "
             "question, proposed a next step, or contained any phrase "
             "like 'if you want, I can…', 'next I can…', 'want me "
