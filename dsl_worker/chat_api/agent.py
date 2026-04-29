@@ -595,6 +595,24 @@ public profiles, scraping a site, general research).
   just slower equivalents of `browser_use` / `web_harvest` — if no
   site-specific actor exists, fall back to those rather than to a
   generic Apify actor.
+
+  **Once an actor has worked for THIS project, that's your actor.**
+  When the user asks for "more" / "expand" / "next batch" on a
+  named platform you already scraped, the right move is the SAME
+  apify_call_actor with a DIFFERENT query — not `apify_search_actors`
+  again, not switching to web_harvest, not finding a new actor.
+  Apify actors are stateless; that's how you grow a result set.
+  Switching actors mid-project means re-investigating input schemas
+  + losing all the calibration. Don't.
+
+  **web_harvest is NOT an Apify backup.** They serve different
+  needs. web_harvest is for entities scattered across many small
+  sites with no central source. If the user named a platform
+  (Reddit, X, etc.) and Apify has it, Apify is correct even if
+  you have to retry the call with a different query. "Apify
+  failed once → switch to web_harvest" is the wrong instinct —
+  it's almost always a query problem on the Apify side that
+  another query fixes.
 - If entities are scattered across many small sites with no central
   source (e.g. "indie newsletters", "regional craft breweries") →
   `web_harvest`. NOT for "scrape posts from <named site>" — that's
