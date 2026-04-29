@@ -176,6 +176,67 @@ class _BillingMeter:
         # per turn — well under measurement noise).
         self._try_flush()
 
+    def force_flush_with_fresh_session(self) -> bool:
+        """Last-resort billing flush when the main session is poisoned.
+
+        Opens a brand-new SessionLocal so a PendingRollbackError or
+        deadlock on `self._db` can't strand unbilled cost. Same idea as
+        _force_persist_assistant_message: belt-and-suspenders so a
+        failure mid-turn never silently drops accrued compute charges.
+
+        Returns True if anything was actually flushed (ledger row
+        written or below-floor residual swallowed), False on failure.
+
+        Bug seen on ee0db354 (Apr 28): run died ~T+469s after last
+        successful billing flush, then ran ~159s more before crashing
+        terminally. That tail of work never made it to the ledger
+        because billing.flush() on the poisoned main session raised
+        and the inner except just logged.
+        """
+        if self._unbilled_cost <= 0:
+            return True
+        credits = self._unbilled_cost / settings.COMPUTE_COST_PER_CREDIT
+        if credits < 0.01:
+            self._unbilled_cost = 0.0  # below floor — accept rounding loss
+            return True
+        fresh = SessionLocal()
+        try:
+            account = (
+                fresh.query(Account)
+                .filter(Account.user_id == str(self._user_id))
+                .first()
+            )
+            if account is None:
+                log.warning(
+                    "force_flush: no account for user %s; %s credits unbilled",
+                    self._user_id, credits,
+                )
+                return False
+            ok = consume_credits(
+                fresh, account, credits, project_id=self._project_id
+            )
+            fresh.commit()
+            self._unbilled_cost = 0.0
+            if not ok:
+                self._out_of_credits = True
+            log.warning(
+                "force_flush: charged %.4f credits via fresh session for user %s",
+                credits, self._user_id,
+            )
+            return True
+        except Exception:
+            log.exception(
+                "force_flush: fresh-session billing failed for user %s "
+                "(%.4f credits unbilled)", self._user_id, credits,
+            )
+            try:
+                fresh.rollback()
+            except Exception:
+                pass
+            return False
+        finally:
+            fresh.close()
+
     def _try_flush(self) -> None:
         if self._unbilled_cost <= 0:
             return
@@ -1350,6 +1411,12 @@ async def run_agent_loop(
                     full_content=cleaned_content,
                     applied_changes=err_ac,
                 )
+                # Same belt-and-suspenders for billing: if main session
+                # was poisoned, billing.flush() above raised and was
+                # caught — residual unbilled compute hasn't hit the
+                # ledger yet. Force-flush via a fresh session so we
+                # don't silently swallow real costs.
+                billing.force_flush_with_fresh_session()
             # Never leak raw exception text to the FE — it dumps SQL,
             # frame names, and DB internals (e.g. DeadlockDetected
             # includes the offending UPDATE verbatim). Full detail goes
