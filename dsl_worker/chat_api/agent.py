@@ -134,8 +134,15 @@ scraping" filter. Don't pretend one might.
    plausible match (e.g. Apify Reddit search for "scrape OR scraper
    OR extract data"). Accept noise — 5% hit rate is fine.
 2. Land all candidates as rows.
-3. ENRICH via `rows_fill(columns=["fit", "fit_reason"])` — each mini
-   agent reads the post text and classifies fit yes/no with a reason.
+3. ENRICH via `rows_fill(columns=["fit", "fit_reason"],
+   where={"fit": null})` — each mini agent reads the post and
+   classifies. The `where={"fit": null}` is critical: without it,
+   `rows_fill` walks rows in seq order and `limit` caps at the FIRST
+   N rows, so a second call covers the same N again instead of the
+   remaining unclassified ones (real bug seen on project 051e8704
+   where rows 1-80 got classified twice and 81-109 never did).
+   Skip `limit` when you want to classify ALL rows; the per-cell
+   budget cap protects against runaway cost.
 4. MODIFY: `rows_delete(where={"fit": "no"})` — drop the misses.
 5. The remaining rows are the answer. Reply briefly, offer chips
    ("loosen criteria", "+50 more", "re-classify with stricter rule").
@@ -565,16 +572,33 @@ public profiles, scraping a site, general research).
 - If the user names a specific platform (X / Twitter, Reddit,
   LinkedIn, YouTube, Zillow, Etsy, GitHub, TikTok, Instagram, Upwork,
   any well-known site) → ALWAYS `apify_search_actors` first. Then
-  `apify_actor_details` to read the input schema, then
-  `apify_call_actor`. Apify covers ~22,000 sites; assume it has what
-  you need. Don't skip this step to "try web search first" — the
-  whole point of Apify is that it's the right tool for these.
-  When picking from `apify_search_actors` results, prefer
-  site-specific actors (e.g. "twitter scraper", "reddit posts")
-  over Apify's general-purpose browser / web-scraper / cheerio
-  actors. The general ones are just slower equivalents of our own
-  `browser_use` / `web_harvest` — if no site-specific actor exists,
-  fall back to those rather than to a generic Apify actor.
+  `apify_actor_details`, then `apify_call_actor`.
+
+  **Direct scraping is the source of truth for a named site.**
+  `web_search` reads what Google INDEXED about that site — a stale
+  partial snapshot, often weeks old, often missing the long tail.
+  These are different categories of data, not equivalent options.
+  Falling back to web_search for a named-site task is a real
+  downgrade — slower data flow, less coverage, more guessing.
+  Don't do it casually.
+
+  **0 items from a popular actor ≠ broken actor.** Among
+  `apify_search_actors` results, popularity (`total_runs`,
+  `total_users`) is the prior on which actors actually work in
+  production — a Reddit scraper with 18,000 runs is battle-tested.
+  When such an actor returns 0 items, the failure is almost
+  certainly your query (too narrow, too many OR clauses, syntax
+  the actor doesn't understand), not the actor. Try a single naked
+  keyword on the SAME actor before switching. Niche actors with
+  low usage might genuinely be broken; popular ones almost never
+  are.
+
+  When picking from results, prefer site-specific actors (e.g.
+  "twitter scraper", "reddit posts") over Apify's general-purpose
+  browser / web-scraper / cheerio actors. The general ones are
+  just slower equivalents of `browser_use` / `web_harvest` — if no
+  site-specific actor exists, fall back to those rather than to a
+  generic Apify actor.
 - If entities are scattered across many small sites with no central
   source (e.g. "indie newsletters", "regional craft breweries") →
   `web_harvest`. NOT for "scrape posts from <named site>" — that's
