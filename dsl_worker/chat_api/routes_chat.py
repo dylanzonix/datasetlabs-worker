@@ -130,6 +130,22 @@ async def create_run(
     db = SessionLocal()
     try:
         _verify_project_access(project_id, user.user_id, db)
+        # Pre-flight balance check: refuse to start a run when the
+        # account has no remaining credits. Without this an account
+        # at 0 credits could fire unlimited runs (the in-flight
+        # billing meter would catch it eventually but only after
+        # burning real OpenAI cost).
+        from dsl_api.models import Account
+        from dsl_api.credits import get_credit_balance
+        account = db.query(Account).filter(Account.user_id == str(user.user_id)).first()
+        if account is None:
+            raise HTTPException(status_code=402, detail="No account found.")
+        bal = get_credit_balance(db, account)
+        if (bal.get("total_available") or 0) < 1:
+            raise HTTPException(
+                status_code=402,
+                detail="Out of credits. Top up to continue.",
+            )
     finally:
         db.close()
 

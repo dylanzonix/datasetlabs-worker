@@ -145,6 +145,12 @@ class _BillingMeter:
     when the legacy single-call _charge_credits fires — confusing for
     the user staring at a stable balance while a deep agent run burns
     real money. With it, the FE's credit display ticks down live.
+
+    Also enforces balance: `out_of_credits` is set when consume_credits
+    returns False (account has no remaining balance). The agent loop
+    polls this between tool calls and ends the run cleanly when set —
+    same pattern as runs.check_should_stop. Without this, an account
+    at $0 keeps firing OpenAI calls with nothing to charge against.
     """
 
     def __init__(self, db: Session, user_id, project_id) -> None:
@@ -152,6 +158,11 @@ class _BillingMeter:
         self._user_id = user_id
         self._project_id = project_id
         self._unbilled_cost = 0.0
+        self._out_of_credits = False
+
+    @property
+    def out_of_credits(self) -> bool:
+        return self._out_of_credits
 
     def add(self, delta_usd: float) -> None:
         if delta_usd <= 0:
@@ -179,10 +190,17 @@ class _BillingMeter:
         if account is None:
             log.warning("No account for user %s; skipping incremental charge", self._user_id)
             return
-        consume_credits(
+        ok = consume_credits(
             self._db, account, credits, project_id=self._project_id
         )
         self._unbilled_cost = 0.0
+        if not ok:
+            self._out_of_credits = True
+            log.warning(
+                "user %s ran out of credits mid-turn (project %s); "
+                "agent loop will end cleanly at next checkpoint",
+                self._user_id, self._project_id,
+            )
 
 
 # ---- Citation stripping (web_search marker cleanup) ----------------------
@@ -739,6 +757,10 @@ async def run_agent_loop(
                     stopped = True
                     stop_reason = signal
                     break
+                if billing.out_of_credits:
+                    stopped = True
+                    stop_reason = "out_of_credits"
+                    break
 
                 runs.update_run_phase(db, run, f"reasoning (round {round_num})")
 
@@ -1120,6 +1142,10 @@ async def run_agent_loop(
                     if signal:
                         stopped = True
                         stop_reason = signal
+                        break
+                    if billing.out_of_credits:
+                        stopped = True
+                        stop_reason = "out_of_credits"
                         break
 
                     try:
