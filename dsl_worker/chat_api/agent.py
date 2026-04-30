@@ -2436,6 +2436,88 @@ def _tool_confirm_budget(args: Dict[str, Any]):
     )
 
 
+def _tool_confirm_budget(args: Dict[str, Any]):
+    """End the turn with a budget-approval chip block.
+
+    Like suggest_replies but the FE renders these chips with cost-aware
+    copy and a header showing the estimated spend. Each option may carry
+    a `cap_override_cents` value — when the user clicks it, the next
+    turn starts with that cap instead of the recomputed tier-default.
+
+    Server-side validation:
+      - At least one option must have a cap_override_cents > 0 (an
+        approve path), otherwise the user has no way to authorize
+        spending and the chip block is just a confusing dead end.
+      - cap_override_cents values are bounded server-side at the
+        approval ceiling — see budget._approval_ceiling_cents on the
+        next-turn entry path. We don't ceiling here because the
+        agent's stated value is the user-facing intent; clamping
+        happens when the next run actually starts.
+    """
+    from dsl_worker.chat_api import budget as _budget
+
+    summary = (args.get("summary") or "").strip()
+    raw_options = args.get("options") or []
+    reason = (args.get("reason") or "scope_ambiguous").strip()
+    if not summary:
+        return {}, {"error": "summary is required"}
+    if reason not in ("scope_ambiguous", "projection_exceeds_cap"):
+        reason = "scope_ambiguous"
+
+    options: List[Dict[str, Any]] = []
+    has_approve = False
+    for opt in raw_options:
+        if not isinstance(opt, dict):
+            continue
+        label = (opt.get("label") or "").strip()
+        message = (opt.get("message") or "").strip()
+        if not label or not message:
+            continue
+        clean: Dict[str, Any] = {
+            "label": label[:80],
+            "message": message[:500],
+        }
+        cap_override = opt.get("cap_override_cents")
+        if isinstance(cap_override, (int, float)) and cap_override > 0:
+            clean["cap_override_cents"] = int(cap_override)
+            has_approve = True
+        options.append(clean)
+
+    if len(options) < 2:
+        return {}, {"error": "confirm_budget requires at least 2 options"}
+    if not has_approve:
+        return {}, {
+            "error": (
+                "confirm_budget requires at least one option with "
+                "cap_override_cents > 0 — otherwise the user can't "
+                "approve more spending"
+            )
+        }
+
+    est_cents = args.get("estimated_cost_cents")
+    if isinstance(est_cents, (int, float)) and est_cents > 0:
+        projection_cents: Optional[int] = int(est_cents)
+    else:
+        projection_cents = None
+
+    payload = _budget.build_budget_check_payload(
+        summary=summary[:500],
+        # spent_cents is filled in at emit-time from the running
+        # BillingMeter total — the agent doesn't know its own spend.
+        spent_cents=0,
+        # cap_cents is filled in at emit-time from the BillingMeter's
+        # configured cap. Same reasoning.
+        cap_cents=0,
+        options=options,
+        projection_cents=projection_cents,
+        reason=reason,
+    )
+    return (
+        {"budget_check": payload},
+        {"ok": True, "options": len(options)},
+    )
+
+
 def _tool_suggest_replies(args: Dict[str, Any]):
     """Attach text reply suggestions to the assistant's most recent message.
 
