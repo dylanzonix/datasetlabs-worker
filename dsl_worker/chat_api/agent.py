@@ -1854,7 +1854,27 @@ async def execute_tool(
                 # First-item schema setup (and on each subsequent item
                 # this is just a cheap dict-membership check). New keys
                 # become new project columns, rendered immediately.
-                _ensure_columns_from_item(project, stream_version, item)
+                new_cols = _ensure_columns_from_item(project, stream_version, item)
+                # If we added any columns, tell the FE BEFORE the
+                # row_added event fires — otherwise the row arrives
+                # with field names the FE doesn't know about and
+                # silently renders nothing. Same `change` event the
+                # columns_add tool uses, so the FE's existing column-
+                # patch handler picks it up.
+                if new_cols and progress_cb is not None:
+                    try:
+                        await progress_cb({
+                            "type": "change",
+                            "field": "columns",
+                            "description": (
+                                f"added column {new_cols[0]!r}"
+                                if len(new_cols) == 1 else
+                                f"added {len(new_cols)} columns"
+                            ),
+                            "value": list(project.columns or []),
+                        })
+                    except Exception:
+                        log.exception("on_candidate columns change cb raised")
                 # Insert the candidate as a row.
                 seq = _next_seq(db, stream_version.id)
                 sample = Sample(
