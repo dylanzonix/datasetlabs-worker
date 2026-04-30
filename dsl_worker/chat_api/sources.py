@@ -493,7 +493,12 @@ async def _apify_actor_details(args: Dict[str, Any], *, project_id: Optional[Any
     return json.dumps(details, default=str), 0.0
 
 
-async def _apify_call_actor(args: Dict[str, Any], *, project_id: Optional[Any] = None) -> Tuple[str, float]:
+async def _apify_call_actor(
+    args: Dict[str, Any],
+    *,
+    project_id: Optional[Any] = None,
+    on_candidate: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+) -> Tuple[str, float]:
     client = _apify()
     if client is None:
         return json.dumps({"error": "APIFY_API_KEY not configured"}), 0.0
@@ -560,6 +565,7 @@ async def _apify_call_actor(args: Dict[str, Any], *, project_id: Optional[Any] =
             run_input=actor_input,
             timeout=timeout_secs,
             max_items=max_items,
+            on_item=on_candidate,
         )
         if not run_info or run_info.get("status") != "SUCCEEDED":
             return json.dumps({"ok": False, "run_info": run_info}, default=str), 0.0
@@ -938,12 +944,20 @@ Rules:
 """
 
 
-async def _web_harvest(args: Dict[str, Any], *, project_id: Optional[Any] = None) -> Tuple[str, float]:
+async def _web_harvest(
+    args: Dict[str, Any],
+    *,
+    project_id: Optional[Any] = None,
+    on_candidate: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+) -> Tuple[str, float]:
     """Spawn a small bounded web-research agent. Returns yielded
     candidates inline.
 
     Use sparingly — slower and pricier than a direct API source. Only
     when no Apify actor or structured source matches the target.
+
+    on_candidate fires per yielded candidate so the caller can commit
+    rows live — see execute_source_tool docs.
     """
     query = args.get("query")
     if not query:
@@ -1036,6 +1050,11 @@ async def _web_harvest(args: Dict[str, Any], *, project_id: Optional[Any] = None
                 data = fc_args.get("data") or {}
                 if isinstance(data, dict) and data:
                     harvested.append(data)
+                    if on_candidate is not None:
+                        try:
+                            await on_candidate(data)
+                        except Exception:
+                            log.exception("web_harvest on_candidate cb raised")
                     tool_outputs.append({
                         "type": "function_call_output",
                         "call_id": fc.call_id,
@@ -1533,6 +1552,7 @@ async def execute_source_tool(
     args: Dict[str, Any],
     *,
     project_id: Optional[Any] = None,
+    on_candidate: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
 ) -> Tuple[str, float]:
     """Run a source tool by name. Returns (result_json_text, cost_usd).
 
@@ -1541,11 +1561,21 @@ async def execute_source_tool(
 
     project_id is threaded to handlers that write candidates files. Tools
     that don't need it ignore the kwarg.
+
+    on_candidate is called per item as candidates are produced (apify
+    polls its dataset incrementally, web_harvest yields per LLM call).
+    Lets the caller commit rows live so the user sees them appearing
+    instead of waiting for the whole tool call to finish. Tools that
+    don't have a streaming seam ignore it and emit nothing.
     """
     handler = _HANDLERS.get(name)
     if handler is None:
         return json.dumps({"error": f"unknown source tool: {name}"}), 0.0
     try:
+        # Only handlers we've wired for streaming accept on_candidate.
+        # Others ignore it (signature mismatch would be a bug).
+        if name in ("apify_call_actor", "web_harvest") and on_candidate is not None:
+            return await handler(args, project_id=project_id, on_candidate=on_candidate)
         return await handler(args, project_id=project_id)
     except Exception as e:
         log.exception("source tool %s failed", name)
