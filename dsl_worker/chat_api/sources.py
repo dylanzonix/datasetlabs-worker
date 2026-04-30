@@ -1302,7 +1302,10 @@ SOURCE_TOOLS: List[Dict[str, Any]] = [
         "type": "function",
         "name": "apify_call_actor",
         "description": (
-            "Run an Apify actor and write results to a candidates file.\n\n"
+            "Run an Apify actor. Items stream into the table as rows AS "
+            "THE ACTOR PRODUCES THEM (every ~3s); columns auto-create "
+            "from the first item's fields. By the time this tool returns, "
+            "rows are already committed.\n\n"
             "WORKFLOW:\n"
             "1. apify_search_actors → find a relevant actor.\n"
             "2. apify_actor_details(actor_id) → read the actor's input_schema.\n"
@@ -1314,10 +1317,11 @@ SOURCE_TOOLS: List[Dict[str, Any]] = [
             "return garbage results. Construct `input` from input_schema."
             "properties — required fields are listed in input_schema.required."
             "\n\n"
-            "Returns the candidates_file path, items_count, fields, and a small "
-            "preview — NOT the full result set. To work with items use "
-            "candidates_inspect / candidates_to_rows / code_exec. Apify run "
-            "cost is billed separately on our account."
+            "Result is rows-add-shaped: `{ok, rows_committed_live: N, total}`. "
+            "DO NOT call `candidates_to_rows` after this — rows already exist. "
+            "DO NOT call `candidates_list` looking for a file to commit; the "
+            "rows are in the table. Just write your reply.\n\n"
+            "Apify run cost is billed separately on our account."
         ),
         "parameters": {
             "type": "object",
@@ -1398,13 +1402,20 @@ SOURCE_TOOLS: List[Dict[str, Any]] = [
         "name": "web_harvest",
         "description": (
             "Spawn a small bounded research subagent that uses web_search "
-            "to find candidates and yields them as structured JSON. Slower "
-            "and pricier than direct API sources — use ONLY when there's "
-            "no Apify actor for the target site and no structured source "
-            "(FE / Apollo / Google Maps) covers the target. Good for "
-            "discovery tasks like 'find indie hackers building X', "
-            "'startups in this niche cohort', etc. Returns up to "
-            "max_candidates inline."
+            "to find candidates and yields them as structured JSON. "
+            "Candidates stream into the table as rows AS THE SUBAGENT "
+            "FINDS THEM (per-yield); columns auto-create from the first "
+            "candidate's fields. By the time this tool returns, rows are "
+            "already committed.\n\n"
+            "Slower and pricier than direct API sources — use ONLY when "
+            "there's no Apify actor for the target site and no structured "
+            "source (FE / Apollo / Google Maps) covers the target. Good "
+            "for discovery tasks like 'find indie hackers building X', "
+            "'startups in this niche cohort', etc.\n\n"
+            "Result is rows-add-shaped: `{ok, rows_committed_live: N, total}`. "
+            "DO NOT call `candidates_to_rows` after this — rows already exist. "
+            "DO NOT call `candidates_list` looking for a file to commit. "
+            "Just write your reply."
         ),
         "parameters": {
             "type": "object",
