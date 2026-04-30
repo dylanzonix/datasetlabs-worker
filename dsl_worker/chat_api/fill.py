@@ -133,10 +133,13 @@ Critical rules:
   and explain in 'reason'. Don't fabricate.
 - Match the column's `format` exactly when stated.
 - One or two tool calls per turn max. Don't chain a research odyssey.
-- You are CAPPED at a tight budget — the system enforces the cap, you
-  don't have to bail early. Use the budget you have to actually find
-  the answer; switch tactics if a source returns nothing, but don't
-  give up just because the first call returned empty.
+- You are CAPPED at a tight budget. Don't waste calls.
+- **Bail early on dead ends.** If your first tool call returns an
+  error or empty data, switch tactics ONCE. If your second attempt
+  also returns nothing useful, call `give_up` immediately — don't
+  keep paying for retries that won't yield. A clean give_up after 2
+  bad turns is better than burning the full per-cell budget producing
+  nothing.
 - ALWAYS finish by calling either `set_values` or `give_up`. Don't trail
   off.
 """
@@ -254,6 +257,12 @@ async def _run_cell_agent(
     cell_tools = _cell_tools_for_columns(target_columns)
     next_input: Any = [{"role": "user", "content": user_msg}]
     previous_response_id: Optional[str] = None
+    # Tracks consecutive turns where every source-tool call returned an
+    # error (or no source tool was called at all). When this hits 2, we
+    # force-bail the cell — see the early-exit block at the bottom of
+    # the loop. Cells that can't get a single productive tool result in
+    # 2 turns aren't going to yield, and continuing burns budget.
+    unproductive_streak = 0
     # One-shot escape hatch when the model returns text instead of a
     # tool call. Empirically this happens A LOT — project a7b01689 saw
     # 47 of 60 cells (78%) bail as no_op on turn 1, each costing ~$0.07
@@ -343,6 +352,10 @@ async def _run_cell_agent(
         # Process tool calls
         tool_outputs: List[Dict[str, Any]] = []
         terminated = False
+        # True once any source tool returns a non-error result this turn.
+        # Drives the unproductive_streak counter; cells where every call
+        # errors or short-circuits to budget_exhausted don't bump this.
+        had_productive_source_call = False
         for fc in function_calls:
             try:
                 fc_args = json.loads(fc.arguments) if fc.arguments else {}
@@ -380,6 +393,7 @@ async def _run_cell_agent(
                     out_text, tool_cost = await sources.execute_source_tool(fc.name, fc_args)
                     result.cost_usd += tool_cost
                     tool_outputs.append({"type": "function_call_output", "call_id": fc.call_id, "output": out_text[:6000]})
+                    had_productive_source_call = True
                 except Exception as e:
                     tool_outputs.append({"type": "function_call_output", "call_id": fc.call_id, "output": f"error: {type(e).__name__}: {e}"})
 
@@ -387,6 +401,25 @@ async def _run_cell_agent(
                 tool_outputs.append({"type": "function_call_output", "call_id": fc.call_id, "output": f"unknown tool: {fc.name}"})
 
         if terminated:
+            return result
+
+        # Early-bail backstop. The cell-agent prompt already tells the
+        # model to give_up after 2 dead-end turns; this is the safety
+        # net for when it doesn't. After 2 consecutive turns where no
+        # source tool returned a non-error result, force-bail rather
+        # than burn the rest of the per-cell budget on calls that
+        # aren't going to yield. Reset on any productive turn.
+        if had_productive_source_call:
+            unproductive_streak = 0
+        else:
+            unproductive_streak += 1
+        if unproductive_streak >= 2:
+            result.status = "error"
+            result.reason = (
+                "Bailed early: 2 consecutive turns with no useful tool "
+                "results — stopped to avoid burning the per-cell budget "
+                "on a cell that won't yield."
+            )
             return result
 
         next_input = tool_outputs
