@@ -801,6 +801,17 @@ public profiles, scraping a site, general research).
   content (JS-rendered, anti-bot, requires login, etc.). Slow
   (30–180s) and $0.10–$0.50/call, so don't reach for it casually.
 
+**When Apify returns 0 items, that's almost never the actor.** Among
+`apify_search_actors` matches, popularity (`total_runs`, `total_users`)
+is your prior — a Reddit scraper with 18k+ runs is battle-tested. 0
+items from a popular actor = the QUERY is wrong, not the actor. Refine
+the input args and retry the same actor; don't switch tools. And on
+follow-ups ("100 more", refinements), KEEP the actor that just worked
+— don't re-run `apify_search_actors` and pick a different one.
+web_harvest is NOT an Apify backup; it's for entities scattered across
+small sites with no central source, not for re-trying a named-platform
+scrape that returned 0.
+
 # Don't stop halfway on multi-step asks
 
 When the user asks for X-of-Y where the directly-listable thing is Y
