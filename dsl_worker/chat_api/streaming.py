@@ -28,7 +28,7 @@ from dsl_api.credits import consume_credits
 from dsl_api.db import SessionLocal
 from dsl_api.models import Account, ChatMessage, ChatRun, Project
 
-from dsl_worker.chat_api import agent, runs, sources as _sources, tracing
+from dsl_worker.chat_api import agent, budget, runs, sources as _sources, tracing
 
 log = logging.getLogger(__name__)
 
@@ -151,23 +151,50 @@ class _BillingMeter:
     polls this between tool calls and ends the run cleanly when set —
     same pattern as runs.check_should_stop. Without this, an account
     at $0 keeps firing OpenAI calls with nothing to charge against.
+
+    Note on the soft cap: this class tracks `soft_cap_cents` and
+    `total_spent_cents` for telemetry and for surfacing the cap value
+    in the agent's context message, but the cap is NOT enforced here.
+    There's no programmatic stop when the cap is crossed; the agent
+    sees the cap and decides on its own when to call confirm_budget.
+    Out_of_credits remains the only hard-stop tripwire.
     """
 
-    def __init__(self, db: Session, user_id, project_id) -> None:
+    def __init__(
+        self,
+        db: Session,
+        user_id,
+        project_id,
+        soft_cap_cents: Optional[int] = None,
+    ) -> None:
         self._db = db
         self._user_id = user_id
         self._project_id = project_id
         self._unbilled_cost = 0.0
         self._out_of_credits = False
+        # Cumulative turn spend in cents — kept for telemetry and for
+        # the per-message cost indicator on the FE.
+        self._total_spent_cents = 0
+        # Surfaced to the agent in its context message; not enforced.
+        self._soft_cap_cents = soft_cap_cents
 
     @property
     def out_of_credits(self) -> bool:
         return self._out_of_credits
 
+    @property
+    def total_spent_cents(self) -> int:
+        return self._total_spent_cents
+
+    @property
+    def soft_cap_cents(self) -> Optional[int]:
+        return self._soft_cap_cents
+
     def add(self, delta_usd: float) -> None:
         if delta_usd <= 0:
             return
         self._unbilled_cost += delta_usd
+        self._total_spent_cents += int(round(delta_usd * 100))
         self._try_flush()
 
     def flush(self) -> None:
@@ -627,6 +654,7 @@ async def run_agent_loop(
     user_id: UUID,
     user_content: str,
     effort: Optional[str] = None,
+    budget_cap_override_cents: Optional[int] = None,
 ) -> None:
     """Execute one chat turn against a ChatRun row.
 
@@ -748,6 +776,45 @@ async def run_agent_loop(
         if effort_hint:
             context_msg = f"{context_msg}\n\n{effort_hint}"
 
+        # Soft budget cap for this turn. Tier-agnostic baseline scaled
+        # by effort, tightened if the user's balance is low. An override
+        # (set when the user clicks a budget-approval chip from the
+        # prior turn) replaces the baseline — the user explicitly
+        # authorized that amount, so use it instead of recomputing.
+        balance_cents = budget.lookup_balance_cents(db, user_id)
+        if budget_cap_override_cents and budget_cap_override_cents > 0:
+            soft_cap_cents = min(
+                int(budget_cap_override_cents),
+                budget.approval_ceiling_cents(balance_cents),
+            )
+        else:
+            soft_cap_cents = budget.compute_soft_cap_cents(
+                balance_cents, effective_effort
+            )
+        # Surface the cap to the agent so it can self-limit before
+        # fanning out — confirm_budget is called proactively, not just
+        # reactively after the tripwire fires.
+        #
+        # IMPORTANT scoping: the cap is a backstop for ENRICHMENT
+        # runaway, not a permission slip for routine work. Harvesting
+        # 400 founders never needs confirmation; spawning a 200-cell
+        # expensive enrichment does. The wording is deliberately
+        # scoped so the agent doesn't get gun-shy about ordinary
+        # harvests + commits.
+        context_msg = (
+            f"{context_msg}\n\n"
+            f"Budget: this turn has a soft cap of "
+            f"{budget.format_credits(soft_cap_cents)}. The transparency "
+            f"rule: write a 1-line cost estimate for any non-trivial "
+            f"work (especially rows_fill) BEFORE the call, so the user "
+            f"sees the spend coming. If the estimate exceeds the cap, "
+            f"call `confirm_budget` instead of plowing ahead. Routine "
+            f"harvests, committing rows, columns_*, ask_questions, and "
+            f"suggest_replies do NOT need budget approval — just do "
+            f"them. Balance available: "
+            f"{budget.format_credits(balance_cents)}."
+        )
+
         if resume_input:
             # Replace the (stale) system context_msg from the prior run
             # with a fresh one — column/row counts may have changed —
@@ -773,6 +840,14 @@ async def run_agent_loop(
 
         client = get_openai_client()
 
+        # Wall-clock start of the turn — used to surface a "Took X
+        # seconds" duration to the user. We capture it here, right
+        # before opening the OpenAI stream, so it covers the entire
+        # interactive part of the turn (reasoning + tool calls +
+        # streaming text) without including the upstream DB / history
+        # bookkeeping that the user perceives as part of submission.
+        turn_start = time.time()
+
         full_content = ""
         applied: Dict[str, Any] = {}
         thinking_total = 0.0
@@ -786,8 +861,12 @@ async def run_agent_loop(
         resume_input_snapshot: Optional[List[Dict[str, Any]]] = None
         resume_reason: Optional[str] = None
         # Charges credits live as cost accumulates instead of one big
-        # debit at end-of-turn. See _BillingMeter docstring.
-        billing = _BillingMeter(db, user_id, project.id)
+        # debit at end-of-turn. See _BillingMeter docstring. The soft
+        # cap is the per-turn budget — when crossed, the loop ends with
+        # a budget_check event that asks the user whether to keep going.
+        billing = _BillingMeter(
+            db, user_id, project.id, soft_cap_cents=soft_cap_cents
+        )
         tool_log: List[Dict[str, Any]] = []
         tool_log_index: Dict[str, int] = {}
         sources: List[Dict[str, Any]] = []
@@ -822,6 +901,15 @@ async def run_agent_loop(
                     stopped = True
                     stop_reason = "out_of_credits"
                     break
+                # Soft cap is intentionally NOT enforced here. The agent
+                # sees the cap in its context message and decides on its
+                # own whether to keep going, ask via confirm_budget, or
+                # stop. Programmatic stop-at-cap was the failure mode
+                # the user flagged: e.g. 9.5 of a 10-credit cap spent
+                # finding the data, then 3 more credits would land 500
+                # rows — hard-stopping there cost the user the records
+                # they actually wanted. Out_of_credits remains the only
+                # hard stop; balance is the real ceiling.
 
                 runs.update_run_phase(db, run, f"reasoning (round {round_num})")
 
@@ -1289,6 +1377,16 @@ async def run_agent_loop(
                         else:
                             getter.cancel()
                         if tool_task in done_set:
+                            # Drain remaining events. We MUST yield between
+                            # them — emit_event does a sync DB commit, so a
+                            # tight drain on a backlog of 300 events would
+                            # block the event loop for ~9s, during which
+                            # the SSE writer can't push anything to the
+                            # browser. Result: rows trickle in slowly while
+                            # the tool runs, then "+N instantly" when the
+                            # tool finishes and the drain bursts. Adding
+                            # asyncio.sleep(0) lets the SSE task interleave
+                            # so the trickle stays steady through the tail.
                             while not progress_q.empty():
                                 ev = progress_q.get_nowait()
                                 ev_type = ev.pop("type", "progress")
@@ -1298,6 +1396,7 @@ async def run_agent_loop(
                                         billing.add(float(c))
                                         cell_cost_billed += float(c)
                                 runs.emit_event(db, run, ev_type, ev)
+                                await asyncio.sleep(0)
                             break
 
                     item_applied, result, tool_cost = await tool_task
@@ -1361,6 +1460,17 @@ async def run_agent_loop(
                     runs.emit_event(db, run, "suggestions", {
                         "items": sg.get("items") or [],
                     })
+                if isinstance(round_applied.get("budget_check"), dict):
+                    bc = dict(round_applied["budget_check"])
+                    # Backfill spent + cap from the live meter — the
+                    # tool handler doesn't know either at compose time.
+                    bc["spent_cents"] = billing.total_spent_cents
+                    bc["cap_cents"] = billing.soft_cap_cents or 0
+                    # Persist the backfilled values onto applied so the
+                    # next turn's reload reads accurate numbers.
+                    applied["budget_check"] = bc
+                    round_applied["budget_check"] = bc
+                    runs.emit_event(db, run, "budget_check", bc)
                 if isinstance(round_applied.get("version_label"), dict):
                     vl = round_applied["version_label"]
                     runs.emit_event(db, run, "version", {
@@ -1382,7 +1492,9 @@ async def run_agent_loop(
                         runs.emit_event(db, run, "change", event_data)
 
                 if any(
-                    item.name in ("ask_questions", "suggest_replies")
+                    item.name in (
+                        "ask_questions", "suggest_replies", "confirm_budget"
+                    )
                     for item in tool_calls
                 ):
                     break
@@ -1398,8 +1510,9 @@ async def run_agent_loop(
                 err_ac["total_cost_usd"] = round(total_cost, 4)
             if sources:
                 err_ac["sources"] = sources
-            if thinking_total >= 0.5:
-                err_ac["thinking_duration"] = round(thinking_total, 1)
+            turn_total_err = time.time() - turn_start
+            if turn_total_err >= 0.5:
+                err_ac["thinking_duration"] = round(turn_total_err, 1)
             # Snapshot running_input as resume_input so the next user
             # message can pick up exactly where we left off — same
             # mechanism cofounder added for response.incomplete. We
@@ -1513,11 +1626,17 @@ async def run_agent_loop(
 
         full_content = _clean_citations(full_content)
 
+        # Full wall-clock duration of the turn from stream open to
+        # terminal event. Replaces the per-round reasoning accumulator
+        # so the user sees how long the *entire* turn took (reasoning +
+        # tool calls + streaming) instead of just reasoning bursts.
+        turn_total = time.time() - turn_start
+
         ac_data: Dict[str, Any] = {}
         if applied:
             ac_data["changes"] = applied
-        if thinking_total >= 0.5:
-            ac_data["thinking_duration"] = round(thinking_total, 1)
+        if turn_total >= 0.5:
+            ac_data["thinking_duration"] = round(turn_total, 1)
         if stopped:
             ac_data["stopped"] = True
             if stop_reason:
@@ -1552,8 +1671,8 @@ async def run_agent_loop(
             "message_id": str(assistant_msg.id),
             "total_cost_usd": round(total_cost, 4),
         }
-        if thinking_total >= 0.5:
-            done_payload["thinking_duration"] = round(thinking_total, 1)
+        if turn_total >= 0.5:
+            done_payload["thinking_duration"] = round(turn_total, 1)
         if stopped:
             done_payload["stopped"] = True
             if stop_reason:
@@ -1680,6 +1799,7 @@ async def stream_chat_response(
     user_content: str,
     request: Request,
     effort: Optional[str] = None,
+    budget_cap_override_cents: Optional[int] = None,
 ) -> AsyncGenerator[str, None]:
     """Wire-compatible legacy wrapper around the run-based pipeline.
 
@@ -1696,6 +1816,7 @@ async def stream_chat_response(
             user_id=user_id,
             user_content=user_content,
             effort=effort,
+            budget_cap_override_cents=budget_cap_override_cents,
         )
     except ValueError as e:
         yield _sse({"type": "error", "message": str(e)})

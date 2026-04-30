@@ -64,8 +64,19 @@ _HARD_TURN_LIMIT = 10
 
 
 def tier_default_max_cost(effort: Optional[str]) -> float:
-    """Resolve the per-cell budget from the user's effort tier."""
-    return _TIER_MAX_COST.get(effort or "balanced", _TIER_MAX_COST["balanced"])
+    """Resolve the per-cell budget from the user's effort tier.
+
+    If a cheaper mini model is configured for cell agents
+    (OPENAI_MODEL_MINI), bump the budget — the same per-cell dollar cap
+    translates to more model + tool calls, which is the actual lever for
+    success rate on hard enrichments (more web_search retries, more
+    candidate sources tried). Net effect: same or lower turn-level spend,
+    higher fill success.
+    """
+    base = _TIER_MAX_COST.get(effort or "balanced", _TIER_MAX_COST["balanced"])
+    if _api_settings.OPENAI_MODEL_MINI:
+        return base * 2.5
+    return base
 
 # Subset of the chat-mode tool surface that the cell agent gets. All the
 # row/column management tools are excluded — a cell agent should NOT
@@ -123,6 +134,12 @@ Critical rules:
 - Match the column's `format` exactly when stated.
 - One or two tool calls per turn max. Don't chain a research odyssey.
 - You are CAPPED at a tight budget. Don't waste calls.
+- **Bail early on dead ends.** If your first tool call returns an
+  error or empty data, switch tactics ONCE. If your second attempt
+  also returns nothing useful, call `give_up` immediately — don't
+  keep paying for retries that won't yield. A clean give_up after 2
+  bad turns is better than burning the full per-cell budget producing
+  nothing.
 - ALWAYS finish by calling either `set_values` or `give_up`. Don't trail
   off.
 """
@@ -132,7 +149,18 @@ Critical rules:
 class CellFillResult:
     row_id: str
     values: Dict[str, Any] = field(default_factory=dict)
-    status: str = "filled"   # filled | null_legitimate | error | budget_exhausted | no_op
+    # filled — agent committed real values
+    # null_legitimate — agent looked, returned null deliberately
+    # error — agent crashed / source errored
+    # budget_exhausted — agent ran but hit its OWN per-cell cost cap
+    # no_op — agent ended without committing
+    # deferred — system skipped this cell because of a TURN-level
+    #            decision (sample-and-project projection too high,
+    #            or cumulative turn cost crossed the soft cap before
+    #            this cell could start). Distinct from budget_exhausted
+    #            so the FE can label it "Left empty for now" — these
+    #            cells weren't tried, just postponed.
+    status: str = "filled"
     reason: Optional[str] = None
     cost_usd: float = 0.0
     turns: int = 0
@@ -229,18 +257,45 @@ async def _run_cell_agent(
     cell_tools = _cell_tools_for_columns(target_columns)
     next_input: Any = [{"role": "user", "content": user_msg}]
     previous_response_id: Optional[str] = None
+    # Tracks consecutive turns where every source-tool call returned an
+    # error (or no source tool was called at all). When this hits 2, we
+    # force-bail the cell — see the early-exit block at the bottom of
+    # the loop. Cells that can't get a single productive tool result in
+    # 2 turns aren't going to yield, and continuing burns budget.
+    unproductive_streak = 0
+    # One-shot escape hatch when the model returns text instead of a
+    # tool call. Empirically this happens A LOT — project a7b01689 saw
+    # 47 of 60 cells (78%) bail as no_op on turn 1, each costing ~$0.07
+    # of reasoning + output for zero output. The re-prompt converts most
+    # of those into a real set_values(null) or give_up, so the cost
+    # actually buys a status badge instead of being burned.
+    no_op_retried = False
 
     for turn_idx in range(_HARD_TURN_LIMIT):
         result.turns = turn_idx + 1
 
         if result.cost_usd >= max_cost:
             result.status = "budget_exhausted"
-            result.reason = f"hit ${max_cost:.2f} cap after {turn_idx} turn(s)"
+            cap_credits = max_cost / 0.1
+            cap_str = (
+                f"{round(cap_credits)} credits"
+                if cap_credits >= 10
+                else f"{cap_credits:.1f} credits"
+            )
+            result.reason = (
+                f"Couldn't finish researching this cell in time — "
+                f"used the per-cell budget ({cap_str}) without finding "
+                f"a confident answer."
+            )
             break
 
         try:
+            # Cell agents use the cheaper mini model when configured.
+            # Falls back to the main OPENAI_MODEL when OPENAI_MODEL_MINI
+            # is empty so behavior is unchanged unless the env is set.
+            cell_model = _api_settings.OPENAI_MODEL_MINI or _api_settings.OPENAI_MODEL
             kwargs: Dict[str, Any] = {
-                "model": _api_settings.OPENAI_MODEL,
+                "model": cell_model,
                 "input": next_input,
                 "tools": cell_tools,
                 "max_output_tokens": 2000,
@@ -267,14 +322,40 @@ async def _run_cell_agent(
                 function_calls.append(item)
 
         if not function_calls:
-            # Model returned text without committing. Mark as no-op.
+            # Model returned text without committing. Give it ONE more
+            # turn with an explicit nudge before bailing — cheaper than
+            # eating the no_op cost for a non-result. After re-prompt,
+            # bail for real if the model still won't call a tool.
+            if not no_op_retried:
+                no_op_retried = True
+                next_input = [
+                    {
+                        "role": "user",
+                        "content": (
+                            "You returned text without calling any tool. "
+                            "You MUST commit by calling `set_values` "
+                            "(use null for any value you couldn't find) "
+                            "or `give_up` if you genuinely can't proceed. "
+                            "Do not respond with text — call a tool now."
+                        ),
+                    }
+                ]
+                previous_response_id = resp.id
+                continue
             result.status = "no_op"
-            result.reason = "agent ended without calling set_values"
+            result.reason = (
+                "agent ended without calling set_values "
+                "(re-prompted once, still wouldn't commit)"
+            )
             return result
 
         # Process tool calls
         tool_outputs: List[Dict[str, Any]] = []
         terminated = False
+        # True once any source tool returns a non-error result this turn.
+        # Drives the unproductive_streak counter; cells where every call
+        # errors or short-circuits to budget_exhausted don't bump this.
+        had_productive_source_call = False
         for fc in function_calls:
             try:
                 fc_args = json.loads(fc.arguments) if fc.arguments else {}
@@ -312,6 +393,7 @@ async def _run_cell_agent(
                     out_text, tool_cost = await sources.execute_source_tool(fc.name, fc_args)
                     result.cost_usd += tool_cost
                     tool_outputs.append({"type": "function_call_output", "call_id": fc.call_id, "output": out_text[:6000]})
+                    had_productive_source_call = True
                 except Exception as e:
                     tool_outputs.append({"type": "function_call_output", "call_id": fc.call_id, "output": f"error: {type(e).__name__}: {e}"})
 
@@ -319,6 +401,25 @@ async def _run_cell_agent(
                 tool_outputs.append({"type": "function_call_output", "call_id": fc.call_id, "output": f"unknown tool: {fc.name}"})
 
         if terminated:
+            return result
+
+        # Early-bail backstop. The cell-agent prompt already tells the
+        # model to give_up after 2 dead-end turns; this is the safety
+        # net for when it doesn't. After 2 consecutive turns where no
+        # source tool returned a non-error result, force-bail rather
+        # than burn the rest of the per-cell budget on calls that
+        # aren't going to yield. Reset on any productive turn.
+        if had_productive_source_call:
+            unproductive_streak = 0
+        else:
+            unproductive_streak += 1
+        if unproductive_streak >= 2:
+            result.status = "error"
+            result.reason = (
+                "Bailed early: 2 consecutive turns with no useful tool "
+                "results — stopped to avoid burning the per-cell budget "
+                "on a cell that won't yield."
+            )
             return result
 
         next_input = tool_outputs
@@ -345,6 +446,13 @@ async def fill_rows(
     """Run cell agents over all matching rows.
 
     Returns (summary_dict, total_cost_usd).
+
+    No programmatic budget enforcement here. All matching rows run to
+    completion, subject only to per-cell `max_cost` (the cell agent's
+    own budget cap) and the user's actual balance (out_of_credits at
+    the meter level). The agent is expected to call `confirm_budget`
+    BEFORE this when it suspects the fanout will be expensive — see
+    the chat agent's prompt.
     """
     # Build column specs from project.columns
     project_columns = {
@@ -480,19 +588,72 @@ async def fill_rows(
             #  (b) if rows_fill is interrupted, partial progress is in
             #      the DB — re-running with where={col: null} resumes
             #      naturally.
+            #
+            # Also persist a per-column fill_status entry under tags for
+            # any column that was attempted but ended up empty (legit
+            # null, error, budget_exhausted, no_op). The frontend reads
+            # these to render a "couldn't fill — here's why" badge so an
+            # empty cell isn't silently empty.
             updated_row: Optional[Dict[str, Any]] = None
-            if res.values:
+            failed_cols: Dict[str, Dict[str, Any]] = {}
+            for col in unfilled_cols:
+                v = res.values.get(col) if res.values else None
+                if v is None or v == "":
+                    failed_cols[col] = {
+                        "status": res.status,
+                        "reason": res.reason or None,
+                        "cost": round(res.cost_usd, 4),
+                    }
+            # Tracks which columns the agent committed real values for —
+            # a re-fill that succeeded clears any stale "couldn't fill"
+            # badge for those columns, so a retry doesn't leave both a
+            # value and a leftover failure tooltip.
+            succeeded_cols = (
+                {
+                    k for k, v in res.values.items()
+                    if v is not None and v != ""
+                }
+                if res.values
+                else set()
+            )
+            needs_persist = bool(res.values) or bool(failed_cols)
+            if needs_persist:
                 write_db = SessionLocal()
                 try:
                     sample = write_db.query(Sample).filter(Sample.id == res.row_id).first()
                     if sample is not None:
-                        d = dict(sample.row or {})
-                        for k, v in res.values.items():
-                            d[k] = v
-                        sample.row = d
+                        if res.values:
+                            d = dict(sample.row or {})
+                            for k, v in res.values.items():
+                                d[k] = v
+                            sample.row = d
+                        # Reconcile fill_status in one pass so partial
+                        # successes (some cols filled, some not) leave
+                        # exactly the right markers behind.
+                        existing_tags = dict(sample.tags or {})
+                        existing_status = dict(existing_tags.get("fill_status") or {})
+                        status_changed = False
+                        for col in succeeded_cols:
+                            if col in existing_status:
+                                del existing_status[col]
+                                status_changed = True
+                        if failed_cols:
+                            existing_status.update(failed_cols)
+                            status_changed = True
+                        if status_changed:
+                            if existing_status:
+                                existing_tags["fill_status"] = existing_status
+                            else:
+                                existing_tags.pop("fill_status", None)
+                            sample.tags = existing_tags
                         write_db.commit()
                         write_db.refresh(sample)
-                        updated_row = {"_id": str(sample.id), "_seq": sample.seq, **(sample.row or {})}
+                        updated_row = {
+                            "_id": str(sample.id),
+                            "_seq": sample.seq,
+                            "_tags": sample.tags or {},
+                            **(sample.row or {}),
+                        }
                 except Exception:
                     log.exception("per-cell persist failed for row %s", res.row_id)
                     try:
@@ -524,8 +685,6 @@ async def fill_rows(
         for i, (rid, rdata, unfilled) in enumerate(work_items)
     ]
     completed = await asyncio.gather(*tasks, return_exceptions=True)
-
-    # Aggregate-only pass — DB writes already happened per-cell above.
     for r in completed:
         if isinstance(r, Exception):
             continue

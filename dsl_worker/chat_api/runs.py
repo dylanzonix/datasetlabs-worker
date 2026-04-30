@@ -345,6 +345,7 @@ async def start_run(
     user_id: UUID,
     user_content: str,
     effort: Optional[str] = None,
+    budget_cap_override_cents: Optional[int] = None,
 ) -> ChatRun:
     """Create a ChatRun and the user ChatMessage; schedule the
     background task. Returns the ChatRun (detached — caller should
@@ -389,7 +390,9 @@ async def start_run(
         db.close()
 
     asyncio.create_task(
-        _run_agent_task(run_id, user_id, user_content, effort),
+        _run_agent_task(
+            run_id, user_id, user_content, effort, budget_cap_override_cents
+        ),
         name=f"chat-run-{run_id}",
     )
 
@@ -410,6 +413,7 @@ async def _run_agent_task(
     user_id: UUID,
     user_content: str,
     effort: Optional[str],
+    budget_cap_override_cents: Optional[int] = None,
 ) -> None:
     """Background coroutine for a single ChatRun. Acquires the
     per-project lock so multiple runs on the same project serialize.
@@ -466,6 +470,7 @@ async def _run_agent_task(
                     user_id=user_id,
                     user_content=user_content,
                     effort=effort,
+                    budget_cap_override_cents=budget_cap_override_cents,
                 )
             except Exception as e:
                 log.exception("run %s crashed", run_id)

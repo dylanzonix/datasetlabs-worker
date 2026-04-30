@@ -110,6 +110,7 @@ async def stream_chat_message(
             payload.content,
             request,
             effort=payload.effort,
+            budget_cap_override_cents=payload.budget_cap_override_cents,
         ),
         media_type="text/event-stream",
         headers={
@@ -155,6 +156,7 @@ async def create_run(
             user_id=user.user_id,
             user_content=payload.content,
             effort=payload.effort,
+            budget_cap_override_cents=payload.budget_cap_override_cents,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

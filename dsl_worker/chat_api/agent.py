@@ -77,7 +77,7 @@ the previous version's columns + rows; your tool calls land on the
 new one only. Call `version_label(label=...)` AFTER the substantive
 work for this turn is done, right before your final text reply. The
 label must describe what actually happened, not the plan
-("Harvested 60 Speedrun companies", "Added verified emails for 18
+("Harvested 10 Speedrun companies", "Added verified emails for 18
 rows", "Filtered to US-only — kept 23"). Labeling at the start of
 the turn with the planned outcome ships dishonest labels when the
 turn falls short ("Harvested founders + filled X accounts" when zero
@@ -119,10 +119,10 @@ strategy when one of these fits — pick the recipe, execute it.
 
 ## Recipe A — Harvest then enrich (X-of-Y asks)
 User: "find Twitter accounts of a16z Speedrun founders"
-1. HARVEST companies (the listable thing) → 60 rows land with empty
-   Founder / Twitter columns.
-2. ENRICH via `rows_fill(columns=["Founders", "Twitter"])` — per-row
-   mini agents look up each company's founders and twitters.
+1. HARVEST companies (the listable thing) → rows land with empty
+   Twitter columns.
+2. ENRICH via `rows_fill(columns=["Twitter"])` — per-row
+   mini agents look up each company's twitters.
 3. Reply briefly + suggest_replies for refinement.
 
 ## Recipe B — Subjective filter via enrich-then-delete
@@ -279,6 +279,165 @@ you got, commit the rows, write a one-sentence reply, end.
 `rows_delete`, `rows_update` on many rows, `columns_delete`. Always
 count first, show what'll happen, end with `suggest_replies` showing
 proceed/cancel options, then wait for the user.
+
+**EXCEPTION — user already approved.** If the user's CURRENT message
+explicitly approves the destructive op ("Yes, delete the X Handle
+column", "Yes, drop those rows", "Yes, do it") — i.e. they're
+responding to a preview you (or a prior turn) already showed — call
+the tool directly with `confirm=True`. Do NOT re-preview. Re-running
+the preview after the user has already said "yes" makes them say
+"yes" again, which they perceive as the agent ignoring them. The
+preview/confirm two-phase is for FIRST-time destructive intent, not
+for every turn that touches it.
+
+Concretely: if your previous turn showed a delete preview and ended
+with `suggest_replies(["Yes, drop X", "Keep it"])`, and this turn's
+user message reads as approval of that prior preview, this turn
+should be `columns_delete(confirm=True)` immediately, then a
+one-line "Done — deleted X" reply. Not another preview.
+
+# Harvest-then-enrich, never half-and-half
+
+**Harvesting and committing rows is FREE and never requires
+confirmation.** Don't call `confirm_budget` before a harvest. Don't
+ask the user "should I commit?". Don't show a confirmation dialog
+of any kind. The user expects to type a request and get rows in the
+table — adding a permission step before that breaks the contract.
+
+When the user's ask combines a known closed set with extra columns
+("a16z speedrun founders + their X handles", "FAANG companies + CEO
+tenure", "every YC W24 startup + their email"), you MUST stage the
+work like this:
+
+1. **Harvest the closed set in FULL FIRST.** Don't undersize the
+   harvest because of budget concerns — harvest is cheap (one source
+   call typically gets the whole list). If a source returns 20 but you
+   know there are 200, fetch more pages, paginate, OR use a different
+   source. Don't accept a truncated harvest. Just do it; don't ask.
+2. **Pre-flight estimate for EVERY rows_fill — even small ones.**
+   Before the call, write a 1-line cost estimate in your reply:
+   "Filling [columns] for [N] rows ≈ ~Y credits (X credits/cell)".
+   This is a TRANSPARENCY rule, not just a runaway-prevention rule —
+   the user should never see a charge they weren't told about. Use
+   these per-cell ballparks:
+     - Pure derive / single web_search lookup (handle, URL, public
+       fact): ~0.5–1 credit/cell
+     - One enrichment API call (Apollo person, GMaps detail) or one
+       Apify actor: ~2–4 credits/cell
+     - Multi-source lookup or FullEnrich email: ~3–5 credits/cell
+     - Heavy (FullEnrich phone, deep browser_use, multi-step
+       research): ~6–10 credits/cell
+3. **If Y exceeds the soft cap, call `confirm_budget` BEFORE
+   rows_fill — do NOT just call rows_fill and hope.** The system
+   does NOT auto-defer; it will run all N rows and bill it. If you
+   skip the column, skip it for ALL rows (uniform blank beats
+   half-filled). Chips: "Skip [column] for now (leave blank)",
+   "Fill all N rows (about Y credits)", and a cheaper alternative
+   if there is one.
+
+When you call confirm_budget for a column-expense decision, your
+TEXT reply must explain the situation in clear language with the
+relevant facts in **bold**. Don't bury the cost reality in a chip
+label — the user shouldn't have to read a chip to know why the
+column is empty. Example reply: "Got all 218 founders. **Filling
+the X handles for all of them would cost about 30 credits** — way
+over my normal budget for one turn. I left that column blank for
+now; pick from the chips below if you want me to do it anyway."
+
+The failure mode we're preventing: 5 of 20 rows have an X handle, the
+other 15 are blank with no markers, and the user has a half-filled
+mess they have to manually clean up. If you can't fill ALL rows of an
+enrichment column within budget, fill NONE — uniformly blank with
+`deferred` markers is a clean state the user can reason about.
+
+# Budget — communicate first, pause before expensive work, never after
+
+You are spending real credits on the user's behalf. **The single most
+important budget rule: the user should NEVER be surprised by what a
+turn costs.** They should see the cost coming in your reply BEFORE
+the charge lands. This is true even for small spends (a few credits)
+— a one-line "this should cost ~3 credits" is enough; the cost
+shouldn't appear out of thin air in the indicator.
+
+Every turn has a soft budget cap (you'll see the exact number in your
+context message, e.g. "Budget: this turn has a soft cap of 10
+credits"). The cap is the same for everyone — it's the trip-wire
+after which you must STOP and ask the user instead of just
+proceeding, not a tier difference. The user is the boss; you are an
+employee with a budget. Reasonable employees don't ping the boss for
+tiny expenses, but they DO state what something costs before doing
+it, and they ASK before spending past the budget.
+
+ALL user-facing cost language should be in CREDITS, never dollars.
+The user pays in credits and sees credit counts on every message.
+Saying "this would cost $15" reads as a foreign unit; "this would
+cost about 60 credits" matches what they actually see deducted.
+
+When to call `confirm_budget` (turn-ending — same idea as
+`ask_questions` / `suggest_replies` but with cost-aware chips):
+
+1. **Unbounded scope, can't narrow it yourself.** "Find all people",
+   "every founder", "complete list of X" — you can't enumerate
+   billions of anything. If you can pick a reasonable narrowing
+   yourself (default to NARROW + sample mode), do that. If you
+   genuinely cannot, call `confirm_budget` with the scope
+   alternatives as chips. `reason="scope_ambiguous"`.
+
+2. **Pre-flight when projected spend > soft cap.** Always estimate
+   before any rows_fill (see the cost cheatsheet in the
+   harvest-then-enrich section). For projections that fit within
+   the cap, just write the 1-line cost note in your reply and
+   proceed. For projections that exceed the cap, call `confirm_budget`
+   with chips. Same applies to any single tool you expect to cost
+   >50% of the cap (FullEnrich phones at ~5 credits/call, broad
+   browser_use sweeps). `reason="projection_exceeds_cap"`.
+
+   The system used to do sample-and-project (run 3 cells, measure,
+   stop early) for you, but that's gone — too eager, kept stopping
+   normal work mid-flight. Now you carry the estimate yourself,
+   based on per-tool cost intuition + row count. Be reasonable:
+   spending 50% over the cap to land 500 rows is a judgment call
+   (lean toward confirm_budget when in doubt — cap is low, the
+   user wants to be in the loop). Spending 500% over to land 5
+   rows is clearly bad — confirm_budget always.
+
+How to phrase confirm_budget options:
+- ALWAYS include 2-4 options.
+- **Bundle related decisions into ONE chip set** when you can foresee
+  multiple confirm_budget asks across turns. Example: user asks "find
+  a16z Speedrun founders + their X handles" — DON'T ask scope this
+  turn and projection next turn (two clicks). Instead, encode both
+  decisions into each chip:
+    - "Cohort 5 only, fill X handles (~7 credits)"
+    - "All 218 founders, fill X handles (~70 credits)"
+    - "All 218 founders, skip X handles for now"
+  One click resolves scope AND enrichment.
+- For column-expense decisions, the FIRST option should usually be
+  "Skip [column] for now" (no cap_override — just leaves the column
+  blank with deferred markers). That matches the user's likely
+  preference when something turns out to be expensive.
+- At least one option must approve more spending — give it a
+  `cap_override_cents` value (your `estimated_cost_cents` is a good
+  default, or 2× the current cap if you're not sure).
+- At least one should redirect to a cheaper path (narrower scope,
+  smaller batch, different source).
+- Labels read as complete sentences. Mention costs naturally, not as
+  warnings — the user will see a separate cost indicator on each
+  message, so chips don't need cost-of-living-essay framing.
+- Good: "Skip the X handles for now", "Fill all 200 (~60 credits)",
+  "Try a cheaper source", "Just do the first 20".
+- Bad: "⚠ APPROVE BUDGET INCREASE OF 60 CREDITS ⚠".
+- Never use $ in chip labels or text reply — credits everywhere.
+
+What NOT to do:
+- DO NOT call `confirm_budget` for routine work that comfortably
+  fits the cap. Stop bothering the boss with $0.10 questions. The
+  passive tripwire fires its own chip block if you blow the cap by
+  accident.
+- DO NOT call `confirm_budget` AFTER a tool already cost too much.
+  Pre-flight only. The tripwire handles post-fact cases.
+- DO NOT call `confirm_budget` AND `suggest_replies` in the same
+  turn — confirm_budget IS the chip block for that turn.
 
 # Suggesting next moves — STRONGLY ADVISED at the end of almost every turn
 
@@ -1047,6 +1206,23 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
             "access to source tools (FE / Apollo / Apify / Google Maps / "
             "browser_use / code_exec / web_search built-in). Up to 10 "
             "cells run in parallel.\n\n"
+            "**PRE-FLIGHT ESTIMATE REQUIRED.** Before this call, write a "
+            "1-line cost note in your reply: 'Filling [columns] for [N] "
+            "rows ≈ ~Y credits (X credits/cell)'. The user must see the "
+            "cost coming. If Y exceeds the soft cap, call "
+            "`confirm_budget` instead of rows_fill — see the budget "
+            "section of your prompt for per-cell ballparks.\n\n"
+            "**DO NOT retry a failed rows_fill with the same approach.** "
+            "If the previous call returned mostly `no_op` / `error` / "
+            "`budget_exhausted` (check the by_status breakdown in the "
+            "result), the cells couldn't find values via the source mix "
+            "they had. Repeating the same call burns credits for the "
+            "same outcome. Either switch source (e.g. browser_use sweep "
+            "of an official directory page if web_search alone failed), "
+            "drop the column entirely, or stop and ask the user via "
+            "`confirm_budget` whether to keep trying with a different "
+            "approach. Re-running the same fill on the same rows with "
+            "different column groupings is the classic anti-pattern.\n\n"
             "Use this for THREE patterns, not just literal 'fill':\n"
             "1. ENRICH — 'find emails for these rows', 'add Twitter handles'\n"
             "2. CLASSIFY (then delete bad ones) — fill a 'fit' column "
@@ -1056,9 +1232,10 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
             "harvest broadly + classify here.\n"
             "3. SCORE / RANK — fill a 'score' column with reasoning, then "
             "keep the top N.\n\n"
-            "Default budget is set by the user's effort tier; override "
-            "`max_cost` when work is known-expensive (e.g. FullEnrich "
-            "phones at ~$0.55/cell)."
+            "Per-cell budget is set automatically by the system. If a "
+            "column is known-expensive (FullEnrich phones, deep "
+            "browser_use), don't try to lower per-cell cost — call "
+            "`confirm_budget` BEFORE rows_fill to ask the user instead."
         ),
         "parameters": {
             "type": "object",
@@ -1076,7 +1253,6 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
                     ),
                 },
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Max rows to fill in this call. Omit to process all matching rows."},
-                "max_cost": {"type": "number", "description": "Per-cell budget cap in USD (safety net). Defaults from effort tier: fast ~$0.10, balanced ~$0.30, highest ~$1.00."},
             },
             "required": ["columns"],
         },
@@ -1203,6 +1379,115 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
                 },
             },
             "required": ["label"],
+        },
+    },
+    # Budget-approval chips. Use when scope is unbounded ("all people")
+    # OR before a known-expensive operation (large rows_fill on phones,
+    # >50 cells of deep enrichment, broad browser_use sweeps) where the
+    # cost would push the turn past its soft cap.
+    # Calling this ENDS the turn (loop breaks after dispatch).
+    {
+        "type": "function",
+        "name": "confirm_budget",
+        "description": (
+            "Pause the turn and ask the user to approve (or redirect) "
+            "spending BEFORE doing expensive work. Call this when:\n"
+            "  - The user's request has unbounded scope ('all people', "
+            "'every founder', 'complete list of X') and you can't pick "
+            "a sensible narrowing yourself.\n"
+            "  - You estimate ahead of time that a planned tool call "
+            "(big rows_fill, broad harvest, expensive enrichment like "
+            "FullEnrich phones) will push the turn's spend past the "
+            "soft cap noted in your context message.\n"
+            "  - A tool returned a 'projection_exceeds_cap' marker — "
+            "the sample-and-project layer ran 3-5 cells, measured the "
+            "real cost, and projected the rest would blow the cap.\n\n"
+            "Calling this ENDS the turn. The user sees your chips, "
+            "clicks one, and the next turn picks up with their choice. "
+            "DO NOT call this for routine work that fits the cap. DO "
+            "NOT call this AFTER spending the budget — the system "
+            "fires its own safety chip if you blow past the cap. Your "
+            "job is to call this BEFORE.\n\n"
+            "Always provide 2-4 options. At least one should approve "
+            "(with a sensible cap_override_cents — usually the "
+            "estimated_cost_cents you reported, or 2x the current cap "
+            "if you're not sure). At least one should redirect to a "
+            "cheaper path (narrower scope, smaller batch, different "
+            "source). Make the labels read as complete sentences the "
+            "user might say, like suggest_replies."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": (
+                        "1-2 sentences explaining what's about to "
+                        "happen and why it would be expensive. "
+                        "Reference real numbers in CREDITS if you "
+                        "have them (e.g. '~50 rows × 3 credits ≈ "
+                        "150 credits total'). Never use $ — the "
+                        "user pays in credits. Written for the boss "
+                        "who's deciding whether to authorize the spend."
+                    ),
+                },
+                "estimated_cost_cents": {
+                    "type": "integer",
+                    "description": (
+                        "Your best estimate of what completing the "
+                        "request would cost, in cents. Used by the FE "
+                        "to render the cost preview. Skip if you "
+                        "genuinely have no idea."
+                    ),
+                    "minimum": 0,
+                },
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "Why you're asking. One of "
+                        "'scope_ambiguous' (vague request, can't pick "
+                        "narrowing) or 'projection_exceeds_cap' "
+                        "(measured cost on a sample shows the rest "
+                        "would blow the cap)."
+                    ),
+                    "enum": ["scope_ambiguous", "projection_exceeds_cap"],
+                },
+                "options": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 4,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": {
+                                "type": "string",
+                                "description": "Short clickable text (~40 chars).",
+                            },
+                            "message": {
+                                "type": "string",
+                                "description": (
+                                    "Full message sent as the user's "
+                                    "reply if clicked."
+                                ),
+                            },
+                            "cap_override_cents": {
+                                "type": "integer",
+                                "description": (
+                                    "When this option authorizes more "
+                                    "spending, the cap (in cents) the "
+                                    "next turn should run with. "
+                                    "Required on at least one "
+                                    "approve-style option. Omit on "
+                                    "decline / redirect options."
+                                ),
+                                "minimum": 0,
+                            },
+                        },
+                        "required": ["label", "message"],
+                    },
+                },
+            },
+            "required": ["summary", "options", "reason"],
         },
     },
     # Text reply suggestions, rendered as clickable text under the
@@ -1473,7 +1758,12 @@ def _next_seq(db: Session, version_id: uuid.UUID) -> int:
 
 
 def _row_to_dict(s: Sample) -> Dict[str, Any]:
-    out = {"_id": str(s.id), "_seq": s.seq}
+    out: Dict[str, Any] = {"_id": str(s.id), "_seq": s.seq}
+    if s.tags:
+        # Pass tags alongside row data on streaming events so the UI
+        # can render per-cell metadata (sources, fill_status badges)
+        # live without an extra fetch.
+        out["_tags"] = s.tags
     if isinstance(s.row, dict):
         for k, v in s.row.items():
             out[k] = v
@@ -1572,6 +1862,9 @@ async def execute_tool(
         return applied, result, cost
     if tool_name == "suggest_replies":
         applied, result = _tool_suggest_replies(args)
+        return applied, result, 0.0
+    if tool_name == "confirm_budget":
+        applied, result = _tool_confirm_budget(args)
         return applied, result, 0.0
     if tool_name == "version_label":
         applied, result = _tool_version_label(db, project, args)
@@ -2061,6 +2354,88 @@ async def _tool_candidates_to_rows(
     )
 
 
+def _tool_confirm_budget(args: Dict[str, Any]):
+    """End the turn with a budget-approval chip block.
+
+    Like suggest_replies but the FE renders these chips with cost-aware
+    copy and a header showing the estimated spend. Each option may carry
+    a `cap_override_cents` value — when the user clicks it, the next
+    turn starts with that cap instead of the recomputed tier-default.
+
+    Server-side validation:
+      - At least one option must have a cap_override_cents > 0 (an
+        approve path), otherwise the user has no way to authorize
+        spending and the chip block is just a confusing dead end.
+      - cap_override_cents values are bounded server-side at the
+        approval ceiling — see budget._approval_ceiling_cents on the
+        next-turn entry path. We don't ceiling here because the
+        agent's stated value is the user-facing intent; clamping
+        happens when the next run actually starts.
+    """
+    from dsl_worker.chat_api import budget as _budget
+
+    summary = (args.get("summary") or "").strip()
+    raw_options = args.get("options") or []
+    reason = (args.get("reason") or "scope_ambiguous").strip()
+    if not summary:
+        return {}, {"error": "summary is required"}
+    if reason not in ("scope_ambiguous", "projection_exceeds_cap"):
+        reason = "scope_ambiguous"
+
+    options: List[Dict[str, Any]] = []
+    has_approve = False
+    for opt in raw_options:
+        if not isinstance(opt, dict):
+            continue
+        label = (opt.get("label") or "").strip()
+        message = (opt.get("message") or "").strip()
+        if not label or not message:
+            continue
+        clean: Dict[str, Any] = {
+            "label": label[:80],
+            "message": message[:500],
+        }
+        cap_override = opt.get("cap_override_cents")
+        if isinstance(cap_override, (int, float)) and cap_override > 0:
+            clean["cap_override_cents"] = int(cap_override)
+            has_approve = True
+        options.append(clean)
+
+    if len(options) < 2:
+        return {}, {"error": "confirm_budget requires at least 2 options"}
+    if not has_approve:
+        return {}, {
+            "error": (
+                "confirm_budget requires at least one option with "
+                "cap_override_cents > 0 — otherwise the user can't "
+                "approve more spending"
+            )
+        }
+
+    est_cents = args.get("estimated_cost_cents")
+    if isinstance(est_cents, (int, float)) and est_cents > 0:
+        projection_cents: Optional[int] = int(est_cents)
+    else:
+        projection_cents = None
+
+    payload = _budget.build_budget_check_payload(
+        summary=summary[:500],
+        # spent_cents is filled in at emit-time from the running
+        # BillingMeter total — the agent doesn't know its own spend.
+        spent_cents=0,
+        # cap_cents is filled in at emit-time from the BillingMeter's
+        # configured cap. Same reasoning.
+        cap_cents=0,
+        options=options,
+        projection_cents=projection_cents,
+        reason=reason,
+    )
+    return (
+        {"budget_check": payload},
+        {"ok": True, "options": len(options)},
+    )
+
+
 def _tool_suggest_replies(args: Dict[str, Any]):
     """Attach text reply suggestions to the assistant's most recent message.
 
@@ -2134,14 +2509,24 @@ async def _tool_rows_fill(
     if limit is not None:
         limit = min(int(limit), 200)
 
-    # Per-cell budget. Defaults derive from the user-selected effort tier
-    # (no `max_cost` arg → fall back to tier default); the agent can still
-    # override explicitly when it knows the column is expensive (e.g.
-    # FullEnrich phones at ~$0.55).
+    # Per-cell budget. The agent can no longer pass max_cost — it was
+    # dropped from the schema after observing the agent set it tight
+    # ($0.01) on cea954b4 and burning ~5 credits across 20 cells for
+    # 1 successful value. The system picks the per-cell cap from the
+    # effort tier; agent-driven overrides only happen via confirm_budget
+    # (which triggers a user-approved larger turn cap, not a per-cell
+    # squeeze). If callers somehow still pass max_cost, treat it as
+    # advisory but never go BELOW the tier default — too-tight caps
+    # cause cells to fail without producing values.
+    tier_default = fill.tier_default_max_cost(effort)
     if "max_cost" in args and args["max_cost"] is not None:
-        max_cost = float(args["max_cost"])
+        try:
+            user_max_cost = float(args["max_cost"])
+            max_cost = max(user_max_cost, tier_default)
+        except (TypeError, ValueError):
+            max_cost = tier_default
     else:
-        max_cost = fill.tier_default_max_cost(effort)
+        max_cost = tier_default
 
     where_sql, where_params = _where_to_sql(where)
 
