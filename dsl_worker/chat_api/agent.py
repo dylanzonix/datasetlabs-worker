@@ -1867,7 +1867,7 @@ async def execute_tool(
         # enough that the LLM can call rows_add itself).
         on_candidate = None
         live_committed_count = 0
-        if tool_name in ("apify_call_actor", "web_harvest"):
+        if tool_name in ("apify_commit_stream", "web_harvest"):
             stream_version = ensure_chat_version(db, project)
 
             async def _on_candidate(item: Dict[str, Any]) -> None:
