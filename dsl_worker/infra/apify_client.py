@@ -11,7 +11,7 @@ Cost varies per actor. Most are pay-per-result or pay-per-compute-unit.
 
 import asyncio
 import logging
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 
@@ -223,7 +223,6 @@ class ApifyClient:
         run_input: Dict[str, Any],
         timeout: int = 300,
         max_items: Optional[int] = None,
-        on_item: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
         """Run an Apify actor and wait for completion.
 
@@ -232,18 +231,9 @@ class ApifyClient:
             run_input: Input parameters for the actor
             timeout: Max seconds to wait for completion
             max_items: Max items to return from dataset (None = all)
-            on_item: Optional async callback fired per item as the
-                actor's dataset grows. When provided, the loop short-
-                polls (3s) the run status AND fetches new dataset items
-                by offset on each tick — streaming items to the caller
-                as they're written. When None, uses the long-poll path
-                (single GET hangs up to 60s on terminal status) which
-                is faster for non-streaming callers.
 
         Returns dict with: status, items (list of result dicts),
-        dataset_id, run_id, cost_usd. When on_item is set, items are
-        also yielded incrementally to the callback during the run; the
-        final list returned matches what was streamed.
+        dataset_id, run_id, cost_usd.
         """
         # Normalize actor_id: slash → tilde for API
         actor_path = actor_id.replace("/", "~")
@@ -267,134 +257,44 @@ class ApifyClient:
         if not run_id:
             return {"status": "FAILED", "items": [], "error": "No run ID returned"}
 
-        TERMINAL = ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT")
+        # Poll using Apify's `waitForFinish=N` long-poll: the GET hangs
+        # up to N seconds and returns early as soon as the run reaches a
+        # terminal status. Way better than fixed-interval polling — we
+        # see the finish within ~1s of when it happens. We loop in case
+        # the user-requested `timeout` is longer than the per-call cap
+        # (Apify caps waitForFinish at 60s).
+        WAIT_FOR_FINISH_SECS = 60
         start = asyncio.get_event_loop().time()
         status = "RUNNING"
         run_info: Dict[str, Any] = {}
 
-        if on_item is None:
-            # Non-streaming: long-poll for terminal status (fastest).
-            WAIT_FOR_FINISH_SECS = 60
-            while (asyncio.get_event_loop().time() - start) < timeout:
-                wait_secs = min(
-                    WAIT_FOR_FINISH_SECS,
-                    max(1, int(timeout - (asyncio.get_event_loop().time() - start))),
-                )
-                try:
-                    async with httpx.AsyncClient(timeout=wait_secs + 10.0) as client:
-                        resp = await client.get(
-                            f"{BASE_URL}/actor-runs/{run_id}",
-                            headers=self._headers,
-                            params={"waitForFinish": wait_secs},
-                        )
-                except httpx.RequestError:
-                    await asyncio.sleep(1)
-                    continue
-                if resp.status_code != 200:
-                    await asyncio.sleep(1)
-                    continue
-                run_info = resp.json().get("data", {})
-                status = run_info.get("status", "RUNNING")
-                if status in TERMINAL:
-                    break
-        else:
-            # Streaming: short-poll (3s) status + drain new dataset
-            # items by offset on each tick. Verified end-to-end against
-            # apify in scripts/test_apify_streaming.py: items appear in
-            # the dataset within seconds of the actor producing them,
-            # so this is real streaming, not best-effort.
-            POLL_INTERVAL = 3.0
-            seen_count = 0
-            streamed_items: List[Dict[str, Any]] = []
-            cap = max_items if max_items is not None else None
-            while (asyncio.get_event_loop().time() - start) < timeout:
-                # Status check
-                try:
-                    async with httpx.AsyncClient(timeout=10.0) as client:
-                        s_resp = await client.get(
-                            f"{BASE_URL}/actor-runs/{run_id}",
-                            headers=self._headers,
-                        )
-                    if s_resp.status_code == 200:
-                        run_info = s_resp.json().get("data", {})
-                        status = run_info.get("status", "RUNNING")
-                except httpx.RequestError:
-                    await asyncio.sleep(POLL_INTERVAL)
-                    continue
-                # New items beyond what we've drained
-                try:
-                    async with httpx.AsyncClient(timeout=15.0) as client:
-                        i_resp = await client.get(
-                            f"{BASE_URL}/datasets/{dataset_id}/items",
-                            headers=self._headers,
-                            params={
-                                "offset": seen_count,
-                                "limit": 1000,
-                                "clean": 1,
-                            },
-                        )
-                    if i_resp.status_code == 200:
-                        new_items = i_resp.json() or []
-                    else:
-                        new_items = []
-                except httpx.RequestError:
-                    new_items = []
-                for item in new_items:
-                    if cap is not None and len(streamed_items) >= cap:
-                        break
-                    streamed_items.append(item)
-                    seen_count += 1
-                    try:
-                        await on_item(item)
-                    except Exception:
-                        logger.exception("on_item callback raised")
-                if status in TERMINAL:
-                    break
-                if cap is not None and len(streamed_items) >= cap:
-                    # Hit max_items — abort the actor server-side so
-                    # it doesn't keep running (and billing) after we
-                    # have what we asked for. Caller-perspective success.
-                    try:
-                        async with httpx.AsyncClient(timeout=10.0) as client:
-                            await client.post(
-                                f"{BASE_URL}/actor-runs/{run_id}/abort",
-                                headers=self._headers,
-                            )
-                    except Exception:
-                        logger.exception("abort after max_items raised")
-                    # Re-fetch run_info to get final cost after abort
-                    try:
-                        async with httpx.AsyncClient(timeout=10.0) as client:
-                            s_resp = await client.get(
-                                f"{BASE_URL}/actor-runs/{run_id}",
-                                headers=self._headers,
-                            )
-                        if s_resp.status_code == 200:
-                            run_info = s_resp.json().get("data", run_info)
-                    except Exception:
-                        pass
-                    status = "SUCCEEDED"  # caller got their N items
-                    break
-                await asyncio.sleep(POLL_INTERVAL)
+        while (asyncio.get_event_loop().time() - start) < timeout:
+            wait_secs = min(
+                WAIT_FOR_FINISH_SECS,
+                max(1, int(timeout - (asyncio.get_event_loop().time() - start))),
+            )
+            try:
+                async with httpx.AsyncClient(timeout=wait_secs + 10.0) as client:
+                    resp = await client.get(
+                        f"{BASE_URL}/actor-runs/{run_id}",
+                        headers=self._headers,
+                        params={"waitForFinish": wait_secs},
+                    )
+            except httpx.RequestError:
+                # Network blip — short backoff, then retry the long-poll.
+                await asyncio.sleep(1)
+                continue
 
-            cost_usd = float(run_info.get("usageTotalUsd") or 0.0)
-            if status == "SUCCEEDED":
-                return {
-                    "status": "SUCCEEDED",
-                    "items": streamed_items,
-                    "run_id": run_id,
-                    "dataset_id": dataset_id,
-                    "cost_usd": cost_usd,
-                }
-            # Terminal-but-failed (FAILED/ABORTED-by-server/TIMED-OUT)
-            return {
-                "status": status,
-                "items": streamed_items,
-                "run_id": run_id,
-                "dataset_id": dataset_id,
-                "cost_usd": cost_usd,
-                "error": f"Actor run ended with status: {status}",
-            }
+            if resp.status_code != 200:
+                await asyncio.sleep(1)
+                continue
+
+            run_info = resp.json().get("data", {})
+            status = run_info.get("status", "RUNNING")
+
+            if status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
+                break
+            # Still RUNNING after the long-poll cap — loop and wait again.
 
         if status != "SUCCEEDED":
             return {

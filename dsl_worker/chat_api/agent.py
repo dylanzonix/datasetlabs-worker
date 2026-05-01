@@ -893,21 +893,44 @@ narrative thread. You CAN interleave short text with tool calls
 freely — the OpenAI Responses API handles it, the FE streams it live.
 Use this.
 
+**Speak the user's vocabulary, not the system's.** The user sees one
+thing: the table and what's in it. They do NOT know about Apify
+actors, candidate files, input schemas, code_exec scratch files,
+fetch files, candidates_inspect, or the existence of any candidates
+file at all. NEVER mention these terms. Translate to user-facing
+language at all times:
+
+  WRONG → RIGHT
+  "Searching Apify for X scrapers" → "Pulling Reddit now."
+  "Found a strong actor (mikolabs/x-twitter-scraper)" → (skip)
+  "Got a raw fetch file, scoring it now" → "Got the posts. Filtering
+    for buyer intent now."
+  "Re-running the same actor with tighter input" → "Trying a
+    narrower query."
+  "Classifying via code_exec on the candidates file" → "Tagging each
+    post for fit."
+  "The first keyword sweep caught freelancer spam, drilling into
+    candidates_inspect" → "First batch was mostly seller spam.
+    Looking at the few buyer-side posts now."
+
+If the sentence references a tool name, file name, schema, or
+internal mechanic, rewrite it to describe the OUTCOME or DATA the
+user cares about. The test: would a non-engineer friend understand
+this without you explaining what a tool is? If no, rewrite.
+
 The cadence:
-- **One short line before a major move**: "Searching Apify for X
-  scrapers." / "Pulling a broad batch first — will filter after." /
-  "Going to classify each row for fit, then delete the misses."
-- **One short line after a meaningful result**: "Got 120 candidates."
-  / "Found a strong actor: mikolabs/x-twitter-scraper." / "Schema
-  needs a `query` field — building input."
-- **Heads-up before destructive moves**: "About to drop 47 rows that
-  classified as not-a-fit." / "Replacing the Founders column with the
-  cleaned list."
+- **One short line before a major move**: "Pulling a broad batch
+  first — will filter after." / "Going to score each post for fit
+  and drop the misses."
+- **One short line after a meaningful result**: "Got 120 posts." /
+  "Most look like self-promo. Tightening the query."
+- **Heads-up before destructive moves**: "About to drop 47 rows
+  that don't look like a fit."
 - **Final reply**: still required. Brief summary + suggest_replies.
 
 What "short" means: typically one sentence, max two. Don't write
 paragraphs. Don't recap project state — the user can see the table.
-Don't narrate every micro-step (every web_search query, every cell);
+Don't narrate every micro-step (every search query, every cell);
 narrate the SHAPE of what you're doing — phases, decisions,
 heads-ups before destructive ops.
 
@@ -1823,37 +1846,6 @@ def _next_seq(db: Session, version_id: uuid.UUID) -> int:
     return (last or 0) + 1
 
 
-def _ensure_columns_from_item(
-    project: Project,
-    version: ProjectVersion,
-    item: Dict[str, Any],
-) -> List[str]:
-    """Add any new top-level keys from `item` to project.columns.
-
-    Used by the live-commit path on streaming source tools (apify,
-    web_harvest): the first candidate's keys define the schema, and
-    subsequent candidates that introduce new fields tack on additional
-    columns. Skips reserved keys starting with `_` (like `_sources`).
-    Returns the list of newly-added column names.
-    """
-    cols = list(project.columns or [])
-    existing = {c.get("name") for c in cols if isinstance(c, dict)}
-    added: List[str] = []
-    for k in (item or {}).keys():
-        if not isinstance(k, str) or not k or k.startswith("_"):
-            continue
-        if k in existing:
-            continue
-        cols.append({"name": k})
-        added.append(k)
-        existing.add(k)
-    if added:
-        project.columns = cols
-        if version is not None:
-            version.columns = cols
-    return added
-
-
 def _row_to_dict(s: Sample) -> Dict[str, Any]:
     out: Dict[str, Any] = {"_id": str(s.id), "_seq": s.seq}
     if s.tags:
@@ -1888,83 +1880,13 @@ async def execute_tool(
     # Source tools (FullEnrich, etc.) — handled inline since they're async
     # and have their own cost reporting.
     if sources.is_source_tool(tool_name):
-        # For tools that produce rows of candidates (apify_call_actor,
-        # web_harvest), wire an on_candidate callback that commits each
-        # item as a row LIVE — auto-creating columns from the first
-        # item, then inserting + emitting `row_added` events on every
-        # subsequent one. Net: rows appear in the table as the tool
-        # finds them instead of the user staring at nothing for the
-        # full run duration. Other source tools (FullEnrich, Apollo,
-        # GMaps) ignore on_candidate (their batch responses are fast
-        # enough that the LLM can call rows_add itself).
-        on_candidate = None
-        live_committed_count = 0
-        if tool_name in ("apify_call_actor", "web_harvest"):
-            stream_version = ensure_chat_version(db, project)
-
-            async def _on_candidate(item: Dict[str, Any]) -> None:
-                nonlocal live_committed_count
-                if not isinstance(item, dict) or not item:
-                    return
-                # First-item schema setup (and on each subsequent item
-                # this is just a cheap dict-membership check). New keys
-                # become new project columns, rendered immediately.
-                _ensure_columns_from_item(project, stream_version, item)
-                # Insert the candidate as a row.
-                seq = _next_seq(db, stream_version.id)
-                sample = Sample(
-                    project_id=project.id,
-                    version_id=stream_version.id,
-                    seq=seq,
-                    row=dict(item),
-                    tags={},
-                )
-                db.add(sample)
-                db.flush()
-                stream_version.generated_count = (stream_version.generated_count or 0) + 1
-                live_committed_count += 1
-                if progress_cb is not None:
-                    try:
-                        await progress_cb({
-                            "type": "row_added",
-                            "row": _row_to_dict(sample),
-                        })
-                    except Exception:
-                        log.exception("on_candidate row_added cb raised")
-
-            on_candidate = _on_candidate
-
         result_text, cost_usd = await sources.execute_source_tool(
-            tool_name, args, project_id=project.id, on_candidate=on_candidate,
+            tool_name, args, project_id=project.id
         )
         try:
             result_dict = json.loads(result_text)
         except (TypeError, ValueError):
             result_dict = {"raw": result_text}
-
-        # If we streamed rows live, replace the candidates-file shape
-        # with a rows_add-shaped result so the LLM sees a normal "rows
-        # added" outcome and doesn't try to call candidates_to_rows on
-        # already-committed candidates.
-        if on_candidate is not None and live_committed_count > 0:
-            total = (
-                db.query(func.count(Sample.id))
-                .filter(Sample.version_id == stream_version.id, Sample.deleted_at.is_(None))
-                .scalar() or 0
-            )
-            applied = {"rows": {"inserted": live_committed_count, "merged": 0}}
-            new_result = {
-                "ok": True,
-                "rows_committed_live": live_committed_count,
-                "total": total,
-            }
-            # Preserve diagnostic fields the LLM might want (cost, cap
-            # warnings, errors) but drop the candidates-file pointer
-            # since rows already exist.
-            for k in ("cost_usd", "warning", "error", "actor_id", "status", "stats", "usage", "query"):
-                if k in result_dict:
-                    new_result[k] = result_dict[k]
-            return applied, new_result, cost_usd
 
         # `code_exec` is a source tool but it's special: snippets emit
         # project-mutation intents to /workspace/_dsl_ops.jsonl via
