@@ -888,11 +888,35 @@ async def _browser_use(args: Dict[str, Any], *, project_id: Optional[Any] = None
 # web_harvest — bounded research subagent
 # ---------------------------------------------------------------------------
 
-# Cost — approximate OpenAI Responses pricing for the subagent's LLM.
-# (Mirrors chat.py's _INPUT_COST / _OUTPUT_COST.)
-_LLM_INPUT_USD = 0.0000025
-_LLM_CACHED_INPUT_USD = 0.00000025
-_LLM_OUTPUT_USD = 0.000015
+# Per-model token rates. Keys are model name prefixes; longest match wins
+# so "gpt-5.4-mini" resolves before "gpt-5.4". Unknown models fall back
+# to the full-model rates — over-reporting cost is safer than
+# under-reporting (we'd rather display a slightly high number than
+# silently bill the user more than they were told).
+#
+# Rates in USD per token. Update when OpenAI changes pricing.
+_MODEL_RATES: Dict[str, Dict[str, float]] = {
+    # gpt-5.4 (full): $2.50 input / $0.25 cached / $15.00 output per 1M
+    "gpt-5.4": {
+        "input":  0.0000025,
+        "cached": 0.00000025,
+        "output": 0.000015,
+    },
+    # gpt-5.4-mini: $0.75 input / $0.075 cached / $4.50 output per 1M
+    "gpt-5.4-mini": {
+        "input":  0.00000075,
+        "cached": 0.000000075,
+        "output": 0.0000045,
+    },
+}
+
+# Backwards-compat aliases — kept so any external code importing these
+# constants directly still works. The canonical path is `_response_cost`
+# with a `model=` kwarg.
+_LLM_INPUT_USD = _MODEL_RATES["gpt-5.4"]["input"]
+_LLM_CACHED_INPUT_USD = _MODEL_RATES["gpt-5.4"]["cached"]
+_LLM_OUTPUT_USD = _MODEL_RATES["gpt-5.4"]["output"]
+
 # Per-call rates for OpenAI's built-in web_search, by search_context_size.
 # OpenAI bills at ~$25/$30/$50 per 1K calls for low/medium/high. Update if
 # OpenAI changes their pricing.
@@ -903,7 +927,37 @@ WEB_SEARCH_USD_BY_TIER = {
 }
 
 
-def _response_cost(resp: Any) -> float:
+def _resolve_rates(model: Optional[str]) -> Dict[str, float]:
+    """Pick the rate table for a model name. Longest-prefix match.
+
+    Falls back to full-model rates when the model name is unknown so
+    cost is over-reported rather than under-reported. We log a warning
+    once per unknown model so the rate table can be kept current.
+    """
+    if not model:
+        return _MODEL_RATES["gpt-5.4"]
+    if model in _MODEL_RATES:
+        return _MODEL_RATES[model]
+    for key in sorted(_MODEL_RATES.keys(), key=len, reverse=True):
+        if model.startswith(key):
+            return _MODEL_RATES[key]
+    log.warning(
+        "sources._resolve_rates: unknown model %r — falling back to "
+        "gpt-5.4 rates. Add an entry to _MODEL_RATES.",
+        model,
+    )
+    return _MODEL_RATES["gpt-5.4"]
+
+
+def _response_cost(resp: Any, model: Optional[str] = None) -> float:
+    """Compute the dollar cost of a single Responses API response.
+
+    Pass `model` so per-model rates are applied. The cell agent calls
+    gpt-5.4-mini; the chat agent calls gpt-5.4 (full). Without `model`,
+    full-model rates are used as a safe fallback — that overstates
+    mini-generated costs and was the source of the "cell costs ~1
+    credit" bug (mini tokens were being priced at full rates).
+    """
     usage = getattr(resp, "usage", None)
     if not usage:
         return 0.0
@@ -914,7 +968,12 @@ def _response_cost(resp: Any) -> float:
     if details:
         cached = getattr(details, "cached_tokens", 0) or 0
     non_cached = max(0, inp - cached)
-    return non_cached * _LLM_INPUT_USD + cached * _LLM_CACHED_INPUT_USD + outp * _LLM_OUTPUT_USD
+    rates = _resolve_rates(model)
+    return (
+        non_cached * rates["input"]
+        + cached * rates["cached"]
+        + outp * rates["output"]
+    )
 
 
 _subagent_client: Optional[AsyncOpenAI] = None
@@ -1022,7 +1081,7 @@ async def _web_harvest(
                 total_cost,
             )
 
-        total_cost += _response_cost(resp)
+        total_cost += _response_cost(resp, model=_api_settings.OPENAI_MODEL)
         previous_response_id = resp.id
 
         function_calls: List[Any] = []

@@ -20,7 +20,9 @@ import asyncio
 import json
 import logging
 import os
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
@@ -30,7 +32,8 @@ from dsl_api.db import SessionLocal
 from dsl_api.models import Project
 from dsl_api.models.sample import Sample
 
-from dsl_worker.chat_api import sources
+from dsl_worker import skills as skills_loader
+from dsl_worker.chat_api import cell_traces, sources
 
 ProgressCallback = Callable[[Dict[str, Any]], Awaitable[None]]
 
@@ -164,6 +167,11 @@ class CellFillResult:
     reason: Optional[str] = None
     cost_usd: float = 0.0
     turns: int = 0
+    # Forensic transcript of this cell's run — populated as the agent
+    # progresses through turns. Persisted by fill_rows to a per-batch
+    # blob (cell_traces module). The chat agent never sees the full
+    # trace inline; it inspects via cell_traces_inspect on demand.
+    trace: Optional[cell_traces.CellTrace] = None
 
 
 def _cell_tools_for_columns(target_columns: List[str]) -> List[Dict[str, Any]]:
@@ -246,12 +254,37 @@ async def _run_cell_agent(
     target_columns: List[str],
     target_specs: Dict[str, Dict[str, str]],
     max_cost: float,
+    extra_system: Optional[str] = None,
+    skills_applied: Optional[List[str]] = None,
 ) -> CellFillResult:
-    """Spawn the bounded subagent for one row and return its CellFillResult."""
+    """Spawn the bounded subagent for one row and return its CellFillResult.
+
+    `extra_system`: optional snippet appended to the cell-agent system
+    prompt. Used to inject matched skills (per-fill, based on the target
+    columns). Kept short — skills are markdown bullet rules, not essays.
+    """
     from openai import AsyncOpenAI
 
     result = CellFillResult(row_id=row_id)
+    result.trace = cell_traces.new_trace(row_id=row_id, columns=target_columns)
+    if skills_applied:
+        result.trace.skills_applied = list(skills_applied)
     client = AsyncOpenAI(api_key=_api_settings.OPENAI_API_KEY)
+
+    def _done() -> CellFillResult:
+        # Mirror terminal CellFillResult fields onto the trace so the
+        # forensic record matches what the chat agent ultimately sees.
+        # Called from every return path in this function — keeps trace
+        # finalization in one place instead of scattered through six
+        # exits.
+        if result.trace is not None:
+            result.trace.status = result.status
+            result.trace.reason = result.reason
+            result.trace.values = dict(result.values)
+            result.trace.cost_usd = result.cost_usd
+            result.trace.turns_used = result.turns
+            result.trace.ended_at = datetime.now(timezone.utc).isoformat()
+        return result
 
     user_msg = _row_context(row_data, target_columns, target_specs)
     cell_tools = _cell_tools_for_columns(target_columns)
@@ -301,16 +334,26 @@ async def _run_cell_agent(
                 "max_output_tokens": 2000,
             }
             if turn_idx == 0:
-                kwargs["instructions"] = _CELL_AGENT_SYSTEM_PROMPT
+                instructions = _CELL_AGENT_SYSTEM_PROMPT
+                if extra_system:
+                    instructions = instructions + "\n\n" + extra_system.strip() + "\n"
+                kwargs["instructions"] = instructions
             else:
                 kwargs["previous_response_id"] = previous_response_id
             resp = await client.responses.create(**kwargs)
         except Exception as e:
             result.status = "error"
             result.reason = f"{type(e).__name__}: {e}"
-            return result
+            if result.trace is not None:
+                result.trace.turn_log.append(cell_traces.CellTraceTurn(
+                    turn=turn_idx + 1,
+                    kind="tool_call",
+                    name="responses.create",
+                    error=f"{type(e).__name__}: {e}",
+                ))
+            return _done()
 
-        result.cost_usd += sources._response_cost(resp)
+        result.cost_usd += sources._response_cost(resp, model=cell_model)
         previous_response_id = resp.id
 
         function_calls: List[Any] = []
@@ -318,6 +361,11 @@ async def _run_cell_agent(
             if item.type == "web_search_call":
                 # Cell agent uses search_context_size="low" (see _cell_tools_for_columns).
                 result.cost_usd += sources.WEB_SEARCH_USD_BY_TIER["low"]
+                if result.trace is not None:
+                    result.trace.add_web_search(
+                        turn=turn_idx + 1,
+                        cost_usd=sources.WEB_SEARCH_USD_BY_TIER["low"],
+                    )
             elif item.type == "function_call":
                 function_calls.append(item)
 
@@ -347,7 +395,12 @@ async def _run_cell_agent(
                 "agent ended without calling set_values "
                 "(re-prompted once, still wouldn't commit)"
             )
-            return result
+            if result.trace is not None:
+                result.trace.add_no_op(
+                    turn=turn_idx + 1,
+                    note="agent returned text (no tool call) after re-prompt",
+                )
+            return _done()
 
         # Process tool calls
         tool_outputs: List[Dict[str, Any]] = []
@@ -361,12 +414,28 @@ async def _run_cell_agent(
                 fc_args = json.loads(fc.arguments) if fc.arguments else {}
             except json.JSONDecodeError:
                 tool_outputs.append({"type": "function_call_output", "call_id": fc.call_id, "output": "Error: invalid arguments"})
+                if result.trace is not None:
+                    result.trace.add_tool_call(
+                        turn=turn_idx + 1,
+                        name=fc.name,
+                        args=fc.arguments,
+                        result=None,
+                        error="invalid JSON arguments",
+                    )
                 continue
 
             if fc.name == "set_values":
                 values = fc_args.get("values") or {}
                 if not isinstance(values, dict):
                     tool_outputs.append({"type": "function_call_output", "call_id": fc.call_id, "output": "Error: values must be an object"})
+                    if result.trace is not None:
+                        result.trace.add_tool_call(
+                            turn=turn_idx + 1,
+                            name="set_values",
+                            args=fc_args,
+                            result=None,
+                            error="values must be an object",
+                        )
                     continue
                 # Filter to target columns only — the agent might emit extras
                 clean = {k: v for k, v in values.items() if k in target_columns}
@@ -377,31 +446,76 @@ async def _run_cell_agent(
                 result.status = "filled" if non_null_count > 0 else "null_legitimate"
                 terminated = True
                 tool_outputs.append({"type": "function_call_output", "call_id": fc.call_id, "output": "ok"})
+                if result.trace is not None:
+                    result.trace.add_tool_call(
+                        turn=turn_idx + 1,
+                        name="set_values",
+                        args={"values": clean, "reason": result.reason},
+                        result="ok",
+                    )
 
             elif fc.name == "give_up":
                 result.status = "error"
                 result.reason = fc_args.get("reason") or "agent gave up"
                 terminated = True
                 tool_outputs.append({"type": "function_call_output", "call_id": fc.call_id, "output": "ok"})
+                if result.trace is not None:
+                    result.trace.add_tool_call(
+                        turn=turn_idx + 1,
+                        name="give_up",
+                        args=fc_args,
+                        result="ok",
+                    )
 
             elif fc.name in sources._HANDLERS:
                 # Source tool — execute and feed result back
                 if result.cost_usd >= max_cost:
                     tool_outputs.append({"type": "function_call_output", "call_id": fc.call_id, "output": "budget_exhausted; finish via set_values or give_up"})
+                    if result.trace is not None:
+                        result.trace.add_tool_call(
+                            turn=turn_idx + 1,
+                            name=fc.name,
+                            args=fc_args,
+                            result="skipped — budget_exhausted",
+                        )
                     continue
                 try:
                     out_text, tool_cost = await sources.execute_source_tool(fc.name, fc_args)
                     result.cost_usd += tool_cost
                     tool_outputs.append({"type": "function_call_output", "call_id": fc.call_id, "output": out_text[:6000]})
                     had_productive_source_call = True
+                    if result.trace is not None:
+                        result.trace.add_tool_call(
+                            turn=turn_idx + 1,
+                            name=fc.name,
+                            args=fc_args,
+                            result=out_text,
+                            cost_usd=tool_cost,
+                        )
                 except Exception as e:
                     tool_outputs.append({"type": "function_call_output", "call_id": fc.call_id, "output": f"error: {type(e).__name__}: {e}"})
+                    if result.trace is not None:
+                        result.trace.add_tool_call(
+                            turn=turn_idx + 1,
+                            name=fc.name,
+                            args=fc_args,
+                            result=None,
+                            error=f"{type(e).__name__}: {e}",
+                        )
 
             else:
                 tool_outputs.append({"type": "function_call_output", "call_id": fc.call_id, "output": f"unknown tool: {fc.name}"})
+                if result.trace is not None:
+                    result.trace.add_tool_call(
+                        turn=turn_idx + 1,
+                        name=fc.name,
+                        args=fc_args,
+                        result=None,
+                        error="unknown tool",
+                    )
 
         if terminated:
-            return result
+            return _done()
 
         # Early-bail backstop. The cell-agent prompt already tells the
         # model to give_up after 2 dead-end turns; this is the safety
@@ -420,16 +534,16 @@ async def _run_cell_agent(
                 "results — stopped to avoid burning the per-cell budget "
                 "on a cell that won't yield."
             )
-            return result
+            return _done()
 
         next_input = tool_outputs
 
     # Out of turns without termination
     if result.status == "filled":
-        return result  # was set in the last turn
+        return _done()  # was set in the last turn
     result.status = "budget_exhausted"
     result.reason = result.reason or f"reached turn ceiling without calling set_values"
-    return result
+    return _done()
 
 
 async def fill_rows(
@@ -454,6 +568,11 @@ async def fill_rows(
     BEFORE this when it suspects the fanout will be expensive — see
     the chat agent's prompt.
     """
+    # One run_id per fill batch — drives the cell trace filename so the
+    # chat agent can inspect this exact run via cell_traces_inspect. Also
+    # surfaced in the summary so the LLM has a stable handle.
+    run_id = uuid.uuid4().hex[:12]
+
     # Build column specs from project.columns
     project_columns = {
         c.get("name"): c for c in (project.columns or []) if isinstance(c, dict)
@@ -472,6 +591,28 @@ async def fill_rows(
             "format": spec.get("format") or "",
             "description": spec.get("description") or "",
         }
+
+    # Skills matching: once per fill batch (same target columns for every
+    # row). Builds the prompt extension and a list of skill names to record
+    # in each cell trace, so we can correlate "which skills were active"
+    # with which cells succeeded/failed when iterating on the playbook.
+    skill_columns_for_match = [
+        {
+            "name": col,
+            "description": target_specs[col]["description"],
+            "format": target_specs[col]["format"],
+        }
+        for col in target_columns
+    ]
+    try:
+        matched_skills = skills_loader.match_skills("cell_agent", skill_columns_for_match)
+        skills_extra_system = skills_loader.render_skills(matched_skills)
+        skills_applied_names = [s.name for s in matched_skills]
+    except Exception:
+        log.exception("skills loader failed (continuing without skills)")
+        matched_skills = []
+        skills_extra_system = ""
+        skills_applied_names = []
 
     # Fetch rows in a short-lived session — we'll then spawn per-cell sessions.
     db = SessionLocal()
@@ -581,6 +722,8 @@ async def fill_rows(
                 target_columns=unfilled_cols,
                 target_specs=row_specs,
                 max_cost=max_cost,
+                extra_system=skills_extra_system or None,
+                skills_applied=skills_applied_names or None,
             )
             # Persist this cell's values immediately so:
             #  (a) the table updates live as cells fill, not in one
@@ -691,11 +834,46 @@ async def fill_rows(
         results.append(r)
         total_cost += r.cost_usd
 
+    # Persist forensic traces — one JSONL line per cell, keyed by run_id.
+    # Best-effort: any blob error is logged inside write_traces and the
+    # fill summary still returns normally. The chat agent inspects via
+    # cell_traces_inspect(run_id=..., filter=...).
+    traces = [r.trace for r in results if r.trace is not None]
+    trace_persist_info: Optional[Dict[str, Any]] = None
+    if traces:
+        try:
+            trace_persist_info = cell_traces.write_traces(
+                project.id,
+                run_id,
+                traces,
+                target_columns=list(target_columns),
+            )
+        except Exception:
+            log.exception("cell_traces persist failed (continuing)")
+
     # Aggregate summary
     by_status: Dict[str, int] = {}
     for r in results:
         by_status[r.status] = by_status.get(r.status, 0) + 1
     filled_total = sum(1 for r in results if any(v is not None and v != "" for v in r.values.values()))
+
+    # Top failure reasons: bag-of-similar reasons across non-filled cells
+    # so the chat agent sees clustering ("8 of 12 cells failed: name not
+    # findable on X — try checking bio links") at a glance, without
+    # paging through cell_traces. Reasons are normalized loosely: lower-
+    # cased + first 100 chars. Same reason text from many cells collapses
+    # naturally; truly distinct reasons stay distinct.
+    failure_buckets: Dict[str, int] = {}
+    for r in results:
+        if r.status == "filled":
+            continue
+        key = (r.reason or f"({r.status})").strip().lower()[:100]
+        failure_buckets[key] = failure_buckets.get(key, 0) + 1
+    top_failures = sorted(
+        ({"reason": k, "count": v} for k, v in failure_buckets.items()),
+        key=lambda x: x["count"],
+        reverse=True,
+    )[:5]
 
     summary: Dict[str, Any] = {
         "matched_rows": len(rows),
@@ -708,7 +886,13 @@ async def fill_rows(
             {"row_id": r.row_id, "values": r.values, "status": r.status, "reason": r.reason, "cost": round(r.cost_usd, 4)}
             for r in results[:5]
         ],
+        "run_id": run_id,
+        "top_failure_reasons": top_failures,
     }
+    if trace_persist_info and trace_persist_info.get("persisted"):
+        summary["trace_file"] = trace_persist_info.get("file")
+    if skills_applied_names:
+        summary["skills_applied"] = list(skills_applied_names)
     if rows_skipped_already_filled and len(results) == 0:
         summary["note"] = (
             "All matched rows already have values in the target columns."

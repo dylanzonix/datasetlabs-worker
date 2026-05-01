@@ -58,9 +58,11 @@ def get_openai_client() -> AsyncOpenAI:
 
 
 # ---- Cost / billing -------------------------------------------------------
-_INPUT_COST = 0.0000025          # $2.50 / 1M tokens
-_CACHED_INPUT_COST = 0.00000025  # $0.25 / 1M tokens
-_OUTPUT_COST = 0.000015          # $15.00 / 1M tokens
+# Delegated to sources._response_cost (model-aware). The chat agent
+# always uses settings.OPENAI_MODEL, so this thin wrapper passes that
+# explicitly. Cell agents go through fill.py and pass their own
+# (mini) model directly to sources._response_cost — a key fix: pricing
+# at full-model rates over-reported mini-driven cell costs by ~3.3×.
 
 # No round cap — the loop terminates naturally when the agent stops
 # calling tools (or hits ask_questions / suggest_replies, which are
@@ -71,21 +73,8 @@ _OUTPUT_COST = 0.000015          # $15.00 / 1M tokens
 
 
 def _response_cost_usd(response) -> float:
-    usage = getattr(response, "usage", None)
-    if not usage:
-        return 0.0
-    input_tokens = usage.input_tokens or 0
-    output_tokens = usage.output_tokens or 0
-    cached_tokens = 0
-    details = getattr(usage, "input_tokens_details", None)
-    if details:
-        cached_tokens = getattr(details, "cached_tokens", 0) or 0
-    non_cached = max(0, input_tokens - cached_tokens)
-    return (
-        non_cached * _INPUT_COST
-        + cached_tokens * _CACHED_INPUT_COST
-        + output_tokens * _OUTPUT_COST
-    )
+    """Cost of a chat-agent response. Always uses the chat model."""
+    return _sources._response_cost(response, model=settings.OPENAI_MODEL)
 
 
 def _commit_with_deadlock_retry(db: Session, max_attempts: int = 3) -> None:

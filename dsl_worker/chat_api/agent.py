@@ -30,6 +30,7 @@ from dsl_api.models.sample import Sample
 from dsl_api.schemas.chat import AppliedChange
 
 from dsl_worker.chat_api import candidates
+from dsl_worker.chat_api import cell_traces
 from dsl_worker.chat_api import sources
 from dsl_worker.chat_api import fill
 
@@ -834,6 +835,23 @@ harvested companies but never filled X handles, the label is
 "Harvested companies — Twitter handles pending", not "Harvested
 founders + filled X accounts".
 
+# When a fill returns poor results
+
+Low `cells_filled` or one dominant entry in `top_failure_reasons` →
+call `cell_traces_inspect` (e.g. `filter={"status": "error"}`) to read
+the actual cell-agent tool calls before retrying. Re-running the same
+fill with the same setup almost never lifts the rate — adjust harvest
+source, column phrasing, or skip the column instead.
+
+**After `cell_traces_inspect`, your TEXT reply MUST state the concrete
+finding before any chips.** Not "I'm checking the trace" — the actual
+verdict: which cells, what their cell agents did, why they failed.
+Example: "Paul's cell did 1 search and bailed at the verify step; 4 of
+6 nulls were 'couldn't confirm bio match'." Ending a diagnostic turn
+with chips alone, no explanation, reads as "didn't actually answer" —
+the user asked a question, answer it. Then offer chips for what to do
+about it.
+
 # Don't try to perfect the candidates upfront
 
 Many real asks are needle-in-haystack: there's no API or programmatic
@@ -1289,7 +1307,8 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
             "Read a slice of items from a candidate file without holding the "
             "whole dataset in context. Apply filters and project to a subset "
             "of fields. Use this to look around before committing to rows. "
-            "Default limit 20, max 200."
+            "Default limit 20, max 200. For cell-fill forensics (per-row "
+            "transcript of cell-agent runs), use cell_traces_inspect."
         ),
         "parameters": {
             "type": "object",
@@ -1308,6 +1327,42 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
                 "offset": {"type": "integer", "minimum": 0, "description": "Skip first N matched items. Default 0."},
             },
             "required": ["file"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "cell_traces_inspect",
+        "description": (
+            "Forensic transcript of a recent rows_fill run. Each line is one "
+            "cell's full record: row_id, columns, final status, reason, cost, "
+            "skills_applied, and (optionally) a turn-by-turn log of every "
+            "tool call / web_search / set_values / give_up. Use when a fill "
+            "returned poor results (low cells_filled, clustered "
+            "top_failure_reasons) to see WHY before retrying with a different "
+            "strategy. Default returns the latest trace file for the project."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file": {
+                    "type": "string",
+                    "description": "Trace file (from a prior rows_fill summary's `trace_file`). Omit to use the latest trace for this project.",
+                },
+                "filter": {
+                    "type": "object",
+                    "description": (
+                        "Match cell-level fields: e.g. {'status': 'error'}, "
+                        "{'row_id': '...'}, {'status__in': ['error', 'budget_exhausted']}. "
+                        "Same dialect as candidates_inspect."
+                    ),
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Default 5. Max 50."},
+                "include_turns": {
+                    "type": "boolean",
+                    "description": "Include the full turn-by-turn log per cell. Default false (cell summary only — much smaller). Set true when you need to see the actual tool calls + responses.",
+                },
+            },
+            "required": [],
         },
     },
     {
@@ -1988,6 +2043,9 @@ async def execute_tool(
     if tool_name == "candidates_inspect":
         applied, result = _tool_candidates_inspect(project, args)
         return applied, result, 0.0
+    if tool_name == "cell_traces_inspect":
+        applied, result = _tool_cell_traces_inspect(project, args)
+        return applied, result, 0.0
     if tool_name == "candidates_to_rows":
         applied, result = await _tool_candidates_to_rows(
             db, project, version, args, progress_cb=progress_cb
@@ -2280,6 +2338,59 @@ def _tool_candidates_inspect(
             "returned": len(out),
             "offset": offset,
             "items": out,
+        },
+    )
+
+
+def _tool_cell_traces_inspect(
+    project: Project, args: Dict[str, Any]
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Stream a slice of cell traces from a recent rows_fill run.
+
+    Mirrors candidates_inspect: stream the JSONL, apply filter, return
+    a bounded slice. When `include_turns` is false (default), the heavy
+    `turns` array is stripped from each record so the agent sees just
+    the per-cell summary (status, reason, cost, columns, values,
+    skills_applied) — plenty for triage. Pass `include_turns=true` to
+    see the full transcript for selected cells.
+    """
+    file_name = args.get("file")
+    if not file_name:
+        latest = cell_traces.latest_trace_file(project.id)
+        if not latest:
+            return {}, {"error": "no cell trace files found for this project — run rows_fill first"}
+        file_name = latest
+    if not isinstance(file_name, str):
+        return {}, {"error": "file must be a string"}
+    filt = args.get("filter") or {}
+    limit = min(int(args.get("limit", 5) or 5), 50)
+    include_turns = bool(args.get("include_turns", False))
+
+    matched = 0
+    out: List[Dict[str, Any]] = []
+    try:
+        for item in cell_traces.stream_trace(project.id, file_name):
+            if not candidates.apply_filter(item, filt):
+                continue
+            matched += 1
+            if len(out) < limit:
+                view = dict(item)
+                if not include_turns:
+                    view.pop("turns", None)
+                out.append(view)
+    except FileNotFoundError as e:
+        return {}, {"error": str(e)}
+    except Exception as e:
+        return {}, {"error": f"{type(e).__name__}: {e}"}
+
+    return (
+        {},
+        {
+            "file": file_name,
+            "matched": matched,
+            "returned": len(out),
+            "include_turns": include_turns,
+            "cells": out,
         },
     )
 
