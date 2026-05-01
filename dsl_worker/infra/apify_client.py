@@ -224,8 +224,6 @@ class ApifyClient:
         timeout: int = 300,
         max_items: Optional[int] = None,
         on_item: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
-        early_return_after: Optional[int] = None,
-        early_return_timeout: int = 30,
     ) -> Dict[str, Any]:
         """Run an Apify actor and wait for completion.
 
@@ -241,21 +239,11 @@ class ApifyClient:
                 as they're written. When None, uses the long-poll path
                 (single GET hangs up to 60s on terminal status) which
                 is faster for non-streaming callers.
-            early_return_after: When set to N (e.g. 5), return as soon
-                as we have N items in the dataset. The run continues
-                running on Apify's side; the caller gets a sample +
-                run_id/dataset_id and can resume via drain_dataset to
-                stream the rest. Used by the 2-step UX where the LLM
-                picks column mapping from the sample, then commits the
-                rest with the chosen columns.
-            early_return_timeout: Max seconds to wait for the first N
-                items before returning with whatever we have (could be
-                0). Default 30s.
 
-        Returns dict with: status, items, dataset_id, run_id, cost_usd.
-        With `early_return_after`, status will be "RUNNING" if items
-        arrived before the run finished — caller should call
-        drain_dataset to consume the rest.
+        Returns dict with: status, items (list of result dicts),
+        dataset_id, run_id, cost_usd. When on_item is set, items are
+        also yielded incrementally to the callback during the run; the
+        final list returned matches what was streamed.
         """
         # Normalize actor_id: slash → tilde for API
         actor_path = actor_id.replace("/", "~")
@@ -284,55 +272,7 @@ class ApifyClient:
         status = "RUNNING"
         run_info: Dict[str, Any] = {}
 
-        if early_return_after is not None:
-            # Early-return mode: poll until we have N items or the
-            # early_return_timeout elapses, then return with whatever
-            # we have. Run continues server-side; caller can resume
-            # via drain_dataset to stream the rest with column mapping.
-            POLL_INTERVAL = 2.0
-            deadline = start + early_return_timeout
-            sample_items: List[Dict[str, Any]] = []
-            while asyncio.get_event_loop().time() < deadline:
-                # Drain dataset
-                try:
-                    async with httpx.AsyncClient(timeout=15.0) as client:
-                        i_resp = await client.get(
-                            f"{BASE_URL}/datasets/{dataset_id}/items",
-                            headers=self._headers,
-                            params={"offset": 0, "limit": early_return_after, "clean": 1},
-                        )
-                    if i_resp.status_code == 200:
-                        sample_items = i_resp.json() or []
-                except httpx.RequestError:
-                    pass
-                # Check status (may finish before sample fills)
-                try:
-                    async with httpx.AsyncClient(timeout=10.0) as client:
-                        s_resp = await client.get(
-                            f"{BASE_URL}/actor-runs/{run_id}",
-                            headers=self._headers,
-                        )
-                    if s_resp.status_code == 200:
-                        run_info = s_resp.json().get("data", {})
-                        status = run_info.get("status", "RUNNING")
-                except httpx.RequestError:
-                    pass
-                # Stop when we have enough items OR run finished
-                if len(sample_items) >= early_return_after:
-                    break
-                if status in TERMINAL:
-                    break
-                await asyncio.sleep(POLL_INTERVAL)
-            cost_usd = float(run_info.get("usageTotalUsd") or 0.0)
-            return {
-                "status": status,
-                "items": sample_items,
-                "run_id": run_id,
-                "dataset_id": dataset_id,
-                "cost_usd": cost_usd,
-                "early_return": True,
-            }
-        elif on_item is None:
+        if on_item is None:
             # Non-streaming: long-poll for terminal status (fastest).
             WAIT_FOR_FINISH_SECS = 60
             while (asyncio.get_event_loop().time() - start) < timeout:
@@ -509,92 +449,6 @@ class ApifyClient:
             return []
 
         return resp.json() if isinstance(resp.json(), list) else []
-
-    async def drain_dataset(
-        self,
-        run_id: str,
-        dataset_id: str,
-        on_item: Callable[[Dict[str, Any]], Awaitable[None]],
-        offset: int = 0,
-        timeout: int = 600,
-        max_items: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Resume streaming an Apify dataset from `offset`.
-
-        Used by the 2-step UX: after run_actor returned early with a
-        sample (and run still going), the caller does column setup,
-        then calls this to drain the rest. Polls the run status + the
-        dataset by offset every 3s; fires on_item per new item; returns
-        when the run is terminal or the cap is hit.
-
-        Returns dict with: status, items_streamed, cost_usd, error.
-        """
-        TERMINAL = ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT")
-        POLL_INTERVAL = 3.0
-        start = asyncio.get_event_loop().time()
-        seen_count = offset
-        items_streamed = 0
-        status = "RUNNING"
-        run_info: Dict[str, Any] = {}
-
-        while (asyncio.get_event_loop().time() - start) < timeout:
-            # Status
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    s_resp = await client.get(
-                        f"{BASE_URL}/actor-runs/{run_id}",
-                        headers=self._headers,
-                    )
-                if s_resp.status_code == 200:
-                    run_info = s_resp.json().get("data", {})
-                    status = run_info.get("status", "RUNNING")
-            except httpx.RequestError:
-                await asyncio.sleep(POLL_INTERVAL)
-                continue
-            # New items
-            try:
-                async with httpx.AsyncClient(timeout=15.0) as client:
-                    i_resp = await client.get(
-                        f"{BASE_URL}/datasets/{dataset_id}/items",
-                        headers=self._headers,
-                        params={"offset": seen_count, "limit": 1000, "clean": 1},
-                    )
-                new_items = i_resp.json() if i_resp.status_code == 200 else []
-                new_items = new_items or []
-            except httpx.RequestError:
-                new_items = []
-            for item in new_items:
-                if max_items is not None and items_streamed >= max_items:
-                    break
-                seen_count += 1
-                items_streamed += 1
-                try:
-                    await on_item(item)
-                except Exception:
-                    logger.exception("drain_dataset on_item raised")
-            if status in TERMINAL:
-                break
-            if max_items is not None and items_streamed >= max_items:
-                # Hit cap — abort the actor server-side
-                try:
-                    async with httpx.AsyncClient(timeout=10.0) as client:
-                        await client.post(
-                            f"{BASE_URL}/actor-runs/{run_id}/abort",
-                            headers=self._headers,
-                        )
-                except Exception:
-                    logger.exception("abort after max_items raised")
-                status = "SUCCEEDED"
-                break
-            await asyncio.sleep(POLL_INTERVAL)
-
-        cost_usd = float(run_info.get("usageTotalUsd") or 0.0)
-        return {
-            "status": status,
-            "items_streamed": items_streamed,
-            "cost_usd": cost_usd,
-            **({"error": f"Actor run ended with status: {status}"} if status not in ("SUCCEEDED", "RUNNING") else {}),
-        }
 
     async def close(self) -> None:
         """No persistent connections to close."""

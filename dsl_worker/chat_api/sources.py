@@ -499,16 +499,6 @@ async def _apify_call_actor(
     project_id: Optional[Any] = None,
     on_candidate: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
 ) -> Tuple[str, float]:
-    """Start an Apify actor run and return AS SOON AS the first sample
-    of items is available (or after a short timeout).
-
-    The run continues server-side. The LLM picks columns from the
-    sample, calls columns_add, then calls apify_commit_stream(run_id,
-    dataset_id, column_map) to drain the rest with the chosen mapping.
-
-    `on_candidate` is accepted for backward-compat but ignored — the
-    new 2-step flow handles row commits in apify_commit_stream.
-    """
     client = _apify()
     if client is None:
         return json.dumps({"error": "APIFY_API_KEY not configured"}), 0.0
@@ -570,134 +560,32 @@ async def _apify_call_actor(
         max_items = int(max_items)
     timeout_secs = int(args.get("timeout_secs", 300))
     try:
-        # Early-return mode: kick off the actor and return as soon as
-        # ~5 items show up so the LLM can pick columns. Sample size is
-        # configurable via `sample_size` arg (default 5, max 20).
-        sample_size = int(args.get("sample_size") or 5)
-        sample_size = max(1, min(20, sample_size))
         run_info = await client.run_actor(
             actor_id=actor_id,
             run_input=actor_input,
             timeout=timeout_secs,
             max_items=max_items,
-            early_return_after=sample_size,
-            early_return_timeout=int(args.get("sample_timeout_secs") or 30),
+            on_item=on_candidate,
         )
-        if not run_info:
-            return json.dumps({"error": "actor run never started"}), 0.0
+        if not run_info or run_info.get("status") != "SUCCEEDED":
+            return json.dumps({"ok": False, "run_info": run_info}, default=str), 0.0
         items = run_info.get("items", []) or []
-        if run_info.get("status") in ("FAILED", "ABORTED", "TIMED-OUT"):
-            return json.dumps({
-                "ok": False,
-                "status": run_info.get("status"),
-                "error": run_info.get("error") or "actor failed",
-                "items": items,
-            }), 0.0
     except Exception as e:
         return json.dumps({"error": f"{type(e).__name__}: {e}"}), 0.0
 
+    # Apify reports the run's billed-USD via usageTotalUsd. Pass it through
+    # so the chat handler bills the user's credits at COMPUTE_COST_PER_CREDIT.
     cost_usd = float(run_info.get("cost_usd") or 0.0)
-    run_id = run_info.get("run_id")
-    dataset_id = run_info.get("dataset_id")
-    status = run_info.get("status", "RUNNING")
-
-    # Build the sample fields list from the first item so the LLM
-    # knows what to map. Pull a max of 30 keys so we don't bloat the
-    # tool result if the actor returns hundreds of fields.
-    sample_fields: List[str] = []
-    if items:
-        for k in (items[0] or {}).keys():
-            if isinstance(k, str) and not k.startswith("_") and k not in sample_fields:
-                sample_fields.append(k)
-            if len(sample_fields) >= 30:
-                break
-
-    result = {
-        "ok": True,
-        "status": status,
+    extra = {
         "actor_id": actor_id,
-        "run_id": run_id,
-        "dataset_id": dataset_id,
-        "sample_count": len(items),
-        "sample_fields": sample_fields,
-        "sample_items": items[:5],
-        "max_items": max_items,
-        "still_running": status not in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"),
-        "next_step_hint": (
-            "Pick columns from sample_fields, call columns_add for each, "
-            "then call apify_commit_stream(run_id, dataset_id, column_map) "
-            "to commit the rest of the rows live as the actor finishes."
-        ),
+        "status": run_info.get("status"),
+        "stats": run_info.get("stats"),
+        "usage": run_info.get("usage"),
     }
+    result = _persist_candidates(
+        project_id, "apify_call_actor", items, cost_usd=cost_usd, extra=extra
+    )
     return json.dumps(result, default=str), cost_usd
-
-
-async def _apify_commit_stream(
-    args: Dict[str, Any],
-    *,
-    project_id: Optional[Any] = None,
-    on_candidate: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
-) -> Tuple[str, float]:
-    """Drain an Apify dataset (still running, or already terminal),
-    streaming each item through `on_candidate` with column mapping
-    applied. Used after `apify_call_actor` returned an early sample.
-    """
-    client = _apify()
-    if client is None:
-        return json.dumps({"error": "APIFY_API_KEY not configured"}), 0.0
-    run_id = args.get("run_id")
-    dataset_id = args.get("dataset_id")
-    if not run_id or not dataset_id:
-        return json.dumps({"error": "run_id and dataset_id are required"}), 0.0
-    column_map = args.get("column_map") or {}
-    if not isinstance(column_map, dict) or not column_map:
-        return json.dumps({"error": "column_map is required (source_field → column_name)"}), 0.0
-    offset = int(args.get("offset") or 0)
-    timeout_secs = int(args.get("timeout_secs") or 600)
-    max_items = args.get("max_items")
-    if max_items is not None:
-        max_items = int(max_items)
-
-    items_streamed = 0
-
-    async def _on_apify_item(item: Dict[str, Any]) -> None:
-        nonlocal items_streamed
-        if not isinstance(item, dict):
-            return
-        # Apply column mapping: source_field → column_name
-        mapped: Dict[str, Any] = {}
-        for src, dst in column_map.items():
-            if src in item:
-                mapped[dst] = item[src]
-        if not mapped:
-            return
-        if on_candidate is not None:
-            try:
-                await on_candidate(mapped)
-            except Exception:
-                log.exception("apify_commit_stream on_candidate raised")
-        items_streamed += 1
-
-    try:
-        result = await client.drain_dataset(
-            run_id=run_id,
-            dataset_id=dataset_id,
-            on_item=_on_apify_item,
-            offset=offset,
-            timeout=timeout_secs,
-            max_items=max_items,
-        )
-    except Exception as e:
-        return json.dumps({"error": f"{type(e).__name__}: {e}"}), 0.0
-
-    cost_usd = float(result.get("cost_usd") or 0.0)
-    return json.dumps({
-        "ok": True,
-        "status": result.get("status"),
-        "rows_committed_live": items_streamed,
-        "run_id": run_id,
-        **({"error": result["error"]} if "error" in result else {}),
-    }, default=str), cost_usd
 
 
 # ---------------------------------------------------------------------------
@@ -1414,33 +1302,26 @@ SOURCE_TOOLS: List[Dict[str, Any]] = [
         "type": "function",
         "name": "apify_call_actor",
         "description": (
-            "Start an Apify actor run and return a SAMPLE of the first "
-            "few items as soon as they're available. The run continues "
-            "on Apify's side; you'll commit the rest with apify_commit_"
-            "stream after picking columns.\n\n"
-            "FULL WORKFLOW:\n"
+            "Run an Apify actor. Items stream into the table as rows AS "
+            "THE ACTOR PRODUCES THEM (every ~3s); columns auto-create "
+            "from the first item's fields. By the time this tool returns, "
+            "rows are already committed.\n\n"
+            "WORKFLOW:\n"
             "1. apify_search_actors → find a relevant actor.\n"
-            "2. apify_actor_details(actor_id) → read input_schema.\n"
-            "3. apify_call_actor(actor_id, input=...) → returns sample\n"
-            "   items + sample_fields + run_id + dataset_id.\n"
-            "4. Look at sample_fields, decide which fields you want as\n"
-            "   columns, and call columns_add for each (with descriptive\n"
-            "   names — actor field names are often noisy).\n"
-            "5. apify_commit_stream(run_id, dataset_id, column_map=\n"
-            "   {source_field: column_name, ...}) → streams the rest of\n"
-            "   the rows into the table live with your column mapping.\n\n"
-            "The `input` argument is REQUIRED and must contain real values "
-            "for the actor's filters / queries / URLs / etc — DO NOT call "
-            "this with an empty input or only actor_id. Many actors "
-            "silently fall back to their author's placeholder defaults "
-            "(e.g. query='helloworld') and return garbage. Construct "
-            "`input` from input_schema.properties — required fields are "
-            "listed in input_schema.required.\n\n"
-            "Why two steps: actors return raw fields (often 20-30, "
-            "including noise like isStickied, thumbnail, "
-            "subredditSubscribers). Auto-mapping all of them clutters "
-            "the table. Picking from the sample lets you keep only the "
-            "5-6 fields the user actually cares about."
+            "2. apify_actor_details(actor_id) → read the actor's input_schema.\n"
+            "3. apify_call_actor(actor_id, input=<object matching the schema>).\n\n"
+            "The `input` argument is REQUIRED and must contain real values for "
+            "the actor's filters / queries / URLs / etc — DO NOT call this with "
+            "an empty input or only actor_id. Many actors silently fall back to "
+            "their author's placeholder defaults (e.g. query='helloworld') and "
+            "return garbage results. Construct `input` from input_schema."
+            "properties — required fields are listed in input_schema.required."
+            "\n\n"
+            "Result is rows-add-shaped: `{ok, rows_committed_live: N, total}`. "
+            "DO NOT call `candidates_to_rows` after this — rows already exist. "
+            "DO NOT call `candidates_list` looking for a file to commit; the "
+            "rows are in the table. Just write your reply.\n\n"
+            "Apify run cost is billed separately on our account."
         ),
         "parameters": {
             "type": "object",
@@ -1454,45 +1335,10 @@ SOURCE_TOOLS: List[Dict[str, Any]] = [
                         "Get the schema from apify_actor_details first."
                     ),
                 },
-                "max_items": {"type": "integer", "minimum": 1, "description": "Cap items the actor produces. Omit for unbounded."},
+                "max_items": {"type": "integer", "minimum": 1, "description": "Cap items returned by the actor. Omit for unbounded."},
                 "timeout_secs": {"type": "integer", "description": "Default 300."},
-                "sample_size": {"type": "integer", "minimum": 1, "maximum": 20, "description": "How many items to wait for in the sample. Default 5."},
-                "sample_timeout_secs": {"type": "integer", "description": "Max seconds to wait for the sample before returning whatever's there. Default 30."},
             },
             "required": ["actor_id", "input"],
-        },
-    },
-    {
-        "type": "function",
-        "name": "apify_commit_stream",
-        "description": (
-            "Commit rows from an Apify run that's already in progress "
-            "(or finished). Use AFTER apify_call_actor returned a sample "
-            "and you've added the columns you want to keep. Streams each "
-            "item through the column_map you provide, committing rows "
-            "live as the actor produces them. Returns when the run is "
-            "terminal or max_items is hit.\n\n"
-            "column_map keys are source-field names (from sample_fields "
-            "in apify_call_actor's result); values are the column names "
-            "you created via columns_add. Only fields in column_map make "
-            "it into rows — other fields are dropped, keeping the table "
-            "clean."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "run_id": {"type": "string", "description": "From apify_call_actor result."},
-                "dataset_id": {"type": "string", "description": "From apify_call_actor result."},
-                "column_map": {
-                    "type": "object",
-                    "description": "Source field name → target column name. Only listed fields become row data.",
-                    "additionalProperties": {"type": "string"},
-                },
-                "offset": {"type": "integer", "minimum": 0, "description": "Skip the first N items already streamed elsewhere. Default 0."},
-                "max_items": {"type": "integer", "minimum": 1, "description": "Cap rows committed. Omit for unbounded (subject to Apify's max_items from the original call)."},
-                "timeout_secs": {"type": "integer", "description": "Max seconds to keep streaming. Default 600."},
-            },
-            "required": ["run_id", "dataset_id", "column_map"],
         },
     },
     # ── Google Maps ──────────────────────────────────────────────────────
@@ -1639,7 +1485,6 @@ _HANDLERS: Dict[str, _HandlerType] = {
     "apify_search_actors": _apify_search_actors,
     "apify_actor_details": _apify_actor_details,
     "apify_call_actor": _apify_call_actor,
-    "apify_commit_stream": _apify_commit_stream,
     "google_maps_search_places": _gmaps_search_places,
     "google_maps_place_details": _gmaps_place_details,
     "code_exec": _code_exec,
@@ -1740,7 +1585,7 @@ async def execute_source_tool(
     try:
         # Only handlers we've wired for streaming accept on_candidate.
         # Others ignore it (signature mismatch would be a bug).
-        if name in ("apify_commit_stream", "web_harvest") and on_candidate is not None:
+        if name in ("apify_call_actor", "web_harvest") and on_candidate is not None:
             return await handler(args, project_id=project_id, on_candidate=on_candidate)
         return await handler(args, project_id=project_id)
     except Exception as e:
