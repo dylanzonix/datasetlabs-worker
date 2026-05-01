@@ -898,3 +898,175 @@ async def fill_rows(
             "All matched rows already have values in the target columns."
         )
     return (summary, total_cost)
+
+
+# Escalation thresholds for rows_fill_with_escalation. These are
+# intentionally hardcoded — the chat agent's only decisional input is
+# whether to set the flag at all; tuning the thresholds would push more
+# tunables into the prompt without much benefit.
+_ESCALATION_MIN_NULL_ROWS = 5
+_ESCALATION_YIELD_THRESHOLD = 0.7
+
+
+def _merge_fill_summaries(
+    p1: Dict[str, Any], p2: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Combine phase-1 (per-cell) and phase-2 (bulk_browser) summaries.
+
+    Phase 2 runs over the same where clause; its pre-filter automatically
+    skips rows whose target columns are now all filled, so its
+    `cells_filled` is additive to phase 1's.
+
+    The merged shape stays familiar to the chat agent — same top-level
+    keys as phase 1 — but adds a `phase2` block so the LLM can see the
+    breakdown.
+    """
+    p1_filled = int(p1.get("cells_filled", 0) or 0)
+    p2_filled = int(p2.get("cells_filled", 0) or 0)
+    total_filled = p1_filled + p2_filled
+
+    p1_status = p1.get("by_status", {}) or {}
+    p2_status = p2.get("by_status", {}) or {}
+
+    # Approximate by_status: start from phase 1, decrement
+    # null_legitimate / error by phase 2's wins, increment filled. Not
+    # row-perfect (we don't track per-row before/after status here),
+    # but close enough for the LLM to understand the rollup. The
+    # samples + per-phase blocks below are the source of truth for
+    # detail.
+    by_status: Dict[str, int] = {k: int(v) for k, v in p1_status.items()}
+    if p2_filled:
+        for src_key in ("null_legitimate", "error", "no_op", "budget_exhausted"):
+            if p2_filled <= 0:
+                break
+            current = by_status.get(src_key, 0)
+            if current <= 0:
+                continue
+            decrement = min(current, p2_filled)
+            by_status[src_key] = current - decrement
+            by_status["filled"] = by_status.get("filled", 0) + decrement
+            p2_filled -= decrement
+
+    merged: Dict[str, Any] = {
+        "matched_rows": p1.get("matched_rows", 0),
+        "rows_skipped_already_filled": p1.get("rows_skipped_already_filled", 0),
+        "processed": p1.get("processed", 0),
+        "cells_filled": total_filled,
+        "by_status": by_status,
+        "escalated": True,
+        # Phase 2's residual top reasons are more useful (these are the
+        # rows BU also couldn't get). Fall back to phase 1's if phase 2
+        # cleared everything.
+        "top_failure_reasons": (
+            p2.get("top_failure_reasons")
+            or p1.get("top_failure_reasons", [])
+        ),
+        "phase1": {
+            "cells_filled": int(p1.get("cells_filled", 0) or 0),
+            "by_status": p1_status,
+            "avg_cost_per_row": p1.get("avg_cost_per_row", 0),
+            "run_id": p1.get("run_id"),
+            "trace_file": p1.get("trace_file"),
+        },
+        "phase2": {
+            "processed": p2.get("processed", 0),
+            "cells_filled": int(p2.get("cells_filled", 0) or 0),
+            "batches_run": p2.get("batches_run", 0),
+            "batches_failed": p2.get("batches_failed", 0),
+            "avg_cost_per_row": p2.get("avg_cost_per_row", 0),
+            "run_id": p2.get("run_id"),
+            "trace_file": p2.get("trace_file"),
+        },
+    }
+    p1_skills = p1.get("skills_applied") or []
+    p2_skills = p2.get("skills_applied") or []
+    if p1_skills or p2_skills:
+        merged["skills_applied"] = sorted(set(list(p1_skills) + list(p2_skills)))
+    # Use phase 2's samples (most recent post-escalation state) when
+    # available; the chat agent's "show a couple sample results" needs
+    # the latest values.
+    if p2.get("samples"):
+        merged["samples"] = p2["samples"]
+    elif p1.get("samples"):
+        merged["samples"] = p1["samples"]
+    return merged
+
+
+async def fill_rows_with_escalation(
+    *,
+    project: Project,
+    target_columns: List[str],
+    where_sql: str,
+    where_params: Dict[str, Any],
+    limit: Optional[int],
+    max_cost: float = 0.30,
+    concurrency: int = _CELL_CONCURRENCY,
+    progress_cb: Optional[ProgressCallback] = None,
+    escalate_via_browser_use: bool = False,
+) -> Tuple[Dict[str, Any], float]:
+    """rows_fill with optional browser_use fallback for still-null rows.
+
+    Phase 1 is the standard per-cell `fill_rows`. If `escalate_via_
+    browser_use` is set AND phase 1's yield is poor (>= 5 still-null
+    rows OR yield < 70%), phase 2 runs `bulk_browser.bulk_fill_rows`
+    over the same where clause — its pre-filter automatically targets
+    only the rows that still have at least one null target column.
+
+    Returns the merged summary. When escalation didn't trigger, the
+    returned shape is identical to plain `fill_rows`. When it did,
+    `escalated: True` plus `phase1` / `phase2` sub-objects appear.
+    """
+    # Phase 1 — cheap per-cell pass.
+    summary, total_cost = await fill_rows(
+        project=project,
+        target_columns=target_columns,
+        where_sql=where_sql,
+        where_params=where_params,
+        limit=limit,
+        max_cost=max_cost,
+        concurrency=concurrency,
+        progress_cb=progress_cb,
+    )
+
+    if not escalate_via_browser_use or summary.get("error"):
+        return (summary, total_cost)
+
+    processed = int(summary.get("processed", 0) or 0)
+    p1_filled = int(summary.get("cells_filled", 0) or 0)
+    still_unfilled = max(0, processed - p1_filled)
+    yield_pct = (p1_filled / processed) if processed else 1.0
+
+    # Skip escalation when phase 1 already covered the work. The bar is
+    # deliberately lenient (>=5 OR <70%) so the LLM doesn't pay for
+    # browser_use on a column where the cheap pass nailed it.
+    if still_unfilled < _ESCALATION_MIN_NULL_ROWS and yield_pct >= _ESCALATION_YIELD_THRESHOLD:
+        summary["escalated"] = False
+        summary["escalation_skipped_reason"] = (
+            f"Phase 1 yield {yield_pct:.0%} with {still_unfilled} rows "
+            f"still null — under the escalation threshold."
+        )
+        return (summary, total_cost)
+
+    # Phase 2 — browser_use bulk fallback over the same where clause.
+    # Lazy import to avoid a circular import at module load.
+    from dsl_worker.chat_api import bulk_browser
+
+    summary2, cost2 = await bulk_browser.bulk_fill_rows(
+        project=project,
+        target_columns=target_columns,
+        where_sql=where_sql,
+        where_params=where_params,
+        limit=limit,
+        progress_cb=progress_cb,
+    )
+    total_cost += cost2
+
+    if summary2.get("error"):
+        # Phase 2 blew up before doing anything useful — surface phase 1
+        # results plus an error breadcrumb so the chat agent can decide
+        # whether to retry or give up.
+        summary["escalated"] = True
+        summary["escalation_error"] = summary2.get("error")
+        return (summary, total_cost)
+
+    return (_merge_fill_summaries(summary, summary2), total_cost)

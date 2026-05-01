@@ -29,7 +29,6 @@ from dsl_api.models.project_version import ProjectVersion
 from dsl_api.models.sample import Sample
 from dsl_api.schemas.chat import AppliedChange
 
-from dsl_worker.chat_api import bulk_browser
 from dsl_worker.chat_api import candidates
 from dsl_worker.chat_api import cell_traces
 from dsl_worker.chat_api import sources
@@ -348,8 +347,11 @@ work like this:
      - One enrichment API call (Apollo person, GMaps detail) or one
        Apify actor: ~2–4 credits/cell
      - Multi-source lookup or FullEnrich email: ~3–5 credits/cell
-     - Heavy (FullEnrich phone, deep browser_use, multi-step
-       research): ~6–10 credits/cell
+     - Heavy (FullEnrich phone, multi-step research): ~6–10 credits/cell
+     - rows_fill with `escalate_via_browser_use=true`: budget for
+       both phases — ~1 credit/cell worst case (~0.5 cheap +
+       ~0.5 browser fallback on missing rows). The cheap pass alone
+       often suffices, so the actual spend is usually less.
 3. **If Y exceeds the soft cap, call `confirm_budget` BEFORE
    rows_fill — do NOT just call rows_fill and hope.** The system
    does NOT auto-defer; it will run all N rows and bill it. If you
@@ -865,14 +867,15 @@ the actual cell-agent tool calls before retrying. Re-running the same
 fill with the same setup almost never lifts the rate — adjust harvest
 source, column phrasing, or skip the column instead.
 
-For columns that need deep web research (X handles, social profiles,
-niche per-person facts) and where rows_fill came back <50% filled,
-escalate to `rows_fill_bulk_browser` on the still-null rows
-(`where={<col>: null}`). It batches 5 rows per browser_use call
-and finds matches per-cell web_search misses. Costs ~3-5
-credits/row — pre-flight estimate required, same as rows_fill. If
-the bulk pass still leaves nulls, re-call on the remaining nulls
-once or twice — cheaper than pushing a single batch with more turns.
+For columns where the cheap per-cell pass typically misses (X handles,
+social profiles, niche per-person facts), pass
+`escalate_via_browser_use=true` on `rows_fill` from the start.
+Phase 1 runs the cheap per-cell pass; if it leaves >=5 rows null OR
+yield <70%, phase 2 batches the still-null rows through browser_use
+(5/batch) automatically — one tool call, both phases handled.
+Expected cost: **~0.5 credits/row cheap + ~0.5 credits/row for browser
+fallback on misses**. Pre-flight estimate covers the worst case
+("~1 credit/row total"); the cheap pass alone often suffices.
 
 **After `cell_traces_inspect`, your TEXT reply MUST state the concrete
 finding before any chips.** Not "I'm checking the trace" — the actual
@@ -1336,59 +1339,23 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
                     ),
                 },
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Max rows to fill in this call. Omit to process all matching rows."},
-            },
-            "required": ["columns"],
-        },
-    },
-    {
-        "type": "function",
-        "name": "rows_fill_bulk_browser",
-        "description": (
-            "Bulk-research enrichment via batched browser_use. Groups "
-            "matching rows into batches (default 5) and dispatches ONE "
-            "browser_use session per batch with a structured task. "
-            "Higher hit rate than rows_fill on hard-to-find data (X "
-            "handles, social profiles, niche facts) — browser_use sees "
-            "patterns across people in the same query that per-cell "
-            "web_search misses.\n\n"
-            "**Cost: ~3-5 credits/row** (much higher than rows_fill's "
-            "~0.3-1). Same PRE-FLIGHT ESTIMATE rule — write a 1-line "
-            "cost note before calling: 'Bulk-browser-filling [columns] "
-            "for [N] rows ≈ ~Y credits (~5 credits/row, [N/5] batches)'. "
-            "If Y exceeds the soft cap, call `confirm_budget` first.\n\n"
-            "**When to use this**: after a regular rows_fill returned "
-            "<50% filled or many `null_legitimate` on a column needing "
-            "deep web research. Pass `where` to target the still-null "
-            "rows specifically. Batches do NOT retry hard on misses — "
-            "if a person doesn't surface in the batch, that's it. "
-            "Re-call with the still-null rows for a 2nd pass; that's "
-            "cheaper than pushing one batch with more turns.\n\n"
-            "**Don't use this as a first move.** rows_fill is much "
-            "cheaper for typical enrichment. Reach for this only after "
-            "rows_fill demonstrates the data isn't surfacing."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "columns": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "One or more column names to fill via batched browser_use.",
-                },
-                "where": {
-                    "type": "object",
+                "escalate_via_browser_use": {
+                    "type": "boolean",
                     "description": (
-                        "Same filter syntax as rows_get. Typical: "
-                        "{<column>: null} to target only unfilled rows."
+                        "Set true for hard columns where the cheap "
+                        "per-cell pass typically misses (X handles, "
+                        "social profiles, niche per-person facts). "
+                        "Phase 1 (cheap per-cell) runs as usual; if "
+                        "it leaves >=5 rows null OR yield <70%, "
+                        "phase 2 automatically batches the still-null "
+                        "rows through browser_use (5/batch). One tool "
+                        "call, both phases handled. Cost: ~0.5 "
+                        "credits/row cheap + ~0.5 credits/row for "
+                        "browser fallback on misses; pre-flight "
+                        "estimate covers both. Default false — don't "
+                        "set for cheap derives or simple lookups."
                     ),
                 },
-                "batch_size": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 10,
-                    "description": "Rows per browser_use call. Default 5 — caps damage if one person has no public presence and the agent over-spends. Larger batches risk one bad apple ballooning cost.",
-                },
-                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Max rows total. Default no cap; stays bounded by `where`."},
             },
             "required": ["columns"],
         },
@@ -2031,12 +1998,6 @@ async def execute_tool(
             db, project, version, args,
             progress_cb=progress_cb,
             effort=effort,
-        )
-        return applied, result, cost
-    if tool_name == "rows_fill_bulk_browser":
-        applied, result, cost = await _tool_rows_fill_bulk_browser(
-            db, project, version, args,
-            progress_cb=progress_cb,
         )
         return applied, result, cost
     if tool_name == "suggest_replies":
@@ -2847,6 +2808,8 @@ async def _tool_rows_fill(
 
     where_sql, where_params = _where_to_sql(where)
 
+    escalate = bool(args.get("escalate_via_browser_use", False))
+
     # Commit the main session before fill_rows opens its own SessionLocal.
     # Otherwise rows just inserted by rows_add / candidates_to_rows in the
     # same turn aren't visible to the new session and the query returns
@@ -2855,7 +2818,11 @@ async def _tool_rows_fill(
     # streaming.py caused event-loop stalls.
     db.commit()
 
-    summary, total_cost = await fill.fill_rows(
+    # When the flag is set, fill_rows_with_escalation runs phase 1
+    # (per-cell) first, then phase 2 (bulk browser_use over still-null
+    # rows) only if phase 1 yield was poor. When the flag is off it
+    # behaves identically to plain fill_rows.
+    summary, total_cost = await fill.fill_rows_with_escalation(
         project=project,
         target_columns=columns,
         where_sql=where_sql,
@@ -2863,51 +2830,7 @@ async def _tool_rows_fill(
         limit=limit,
         max_cost=max_cost,
         progress_cb=progress_cb,
-    )
-    applied = {"rows_filled": summary.get("cells_filled", 0)}
-    return applied, summary, total_cost
-
-
-async def _tool_rows_fill_bulk_browser(
-    db: Session,
-    project: Project,
-    version: ProjectVersion,
-    args: Dict[str, Any],
-    progress_cb: Optional[bulk_browser.ProgressCallback] = None,
-) -> Tuple[Dict[str, Any], Dict[str, Any], float]:
-    """Bulk-research enrichment via batched browser_use sessions.
-
-    Higher-cost / higher-yield alternative to rows_fill. See
-    `bulk_browser.bulk_fill_rows` for batch logic.
-    """
-    columns = args.get("columns") or []
-    if not isinstance(columns, list) or not columns:
-        return {}, {"error": "columns must be a non-empty list of column names"}, 0.0
-
-    where = args.get("where") or {}
-    limit = args.get("limit")
-    if limit is not None:
-        limit = min(int(limit), 100)
-
-    batch_size = args.get("batch_size", 5)
-    try:
-        batch_size = max(1, min(int(batch_size), 10))
-    except (TypeError, ValueError):
-        batch_size = 5
-
-    where_sql, where_params = _where_to_sql(where)
-
-    # Same commit-before-open-new-session pattern as _tool_rows_fill.
-    db.commit()
-
-    summary, total_cost = await bulk_browser.bulk_fill_rows(
-        project=project,
-        target_columns=columns,
-        where_sql=where_sql,
-        where_params=where_params,
-        limit=limit,
-        batch_size=batch_size,
-        progress_cb=progress_cb,
+        escalate_via_browser_use=escalate,
     )
     applied = {"rows_filled": summary.get("cells_filled", 0)}
     return applied, summary, total_cost

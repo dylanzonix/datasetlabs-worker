@@ -428,6 +428,20 @@ async def bulk_fill_rows(
                 continue
             d = dict(sample.row or {})
             for k, v in values.items():
+                # Don't clobber an existing non-null cell with a null
+                # the bulk task returned. The pre-filter lets a row
+                # through if ANY target column is empty, so BU sees
+                # all target columns regardless of which were already
+                # filled per row. If BU returns null for a column that
+                # was already filled (e.g. from an earlier rows_fill
+                # pass), preserve the prior value instead of wiping
+                # it. Without this guard we silently lost cells when
+                # bulk ran a second time over a partially-filled set.
+                existing_v = d.get(k)
+                is_new_null = v is None or v == ""
+                is_existing_filled = existing_v is not None and existing_v != ""
+                if is_new_null and is_existing_filled:
+                    continue
                 d[k] = v
             sample.row = d
             tags = dict(sample.tags or {})
