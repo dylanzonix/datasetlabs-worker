@@ -29,6 +29,7 @@ from dsl_api.models.project_version import ProjectVersion
 from dsl_api.models.sample import Sample
 from dsl_api.schemas.chat import AppliedChange
 
+from dsl_worker.chat_api import bulk_browser
 from dsl_worker.chat_api import candidates
 from dsl_worker.chat_api import cell_traces
 from dsl_worker.chat_api import sources
@@ -118,13 +119,34 @@ this is how you FILTER (see the canonical recipe below).
 These are the patterns that ALWAYS work. Don't try to derive a new
 strategy when one of these fits — pick the recipe, execute it.
 
+**Meta rule (applies to every recipe below): when the user names
+entity X, harvest X.** Don't silently substitute a parent/container
+entity (companies for founders, repos for files, products for SKUs,
+playlists for tracks) and plan to "derive" the requested entity
+later via fills. Substitution doubles cost — you end up paying to
+re-discover what a single direct harvest would have given you — and
+ships rows the user didn't ask for. If the parent is genuinely
+easier to enumerate AND the per-parent enrichment to the requested
+entity is cheap, fine — but state the trade in your reply and ask;
+don't substitute silently.
+
 ## Recipe A — Harvest then enrich (X-of-Y asks)
 User: "find Twitter accounts of a16z Speedrun founders"
-1. HARVEST companies (the listable thing) → rows land with empty
-   Twitter columns.
-2. ENRICH via `rows_fill(columns=["Twitter"])` — per-row
-   mini agents look up each company's twitters.
+1. HARVEST founders directly — ONE browser_use task asking for one
+   record per founder with `founder_name, company_name, cohort,
+   founder_profile_url` (and any other cheap identifiers visible on
+   the source). Don't harvest companies as a stepping stone when
+   the user named founders — that's the substitution trap.
+2. ENRICH via `rows_fill(columns=["X URL"])` — per-row mini agents
+   look up each founder's X handle.
 3. Reply briefly + suggest_replies for refinement.
+
+**If the harvest task returns 0 items**, retry ONCE with a NARROWER
+task asking for the same entity but a smaller field set (e.g. drop
+profile_url, keep only `founder_name + company_name`). Don't fall
+back to a different (less informative) entity. browser_use is flaky
+on broad multi-field tasks; simplifying the field list often
+recovers the same entity at a slightly lower fidelity.
 
 ## Recipe B — Subjective filter via enrich-then-delete
 This is THE pattern for "find people who [subjective intent]" —
@@ -843,6 +865,15 @@ the actual cell-agent tool calls before retrying. Re-running the same
 fill with the same setup almost never lifts the rate — adjust harvest
 source, column phrasing, or skip the column instead.
 
+For columns that need deep web research (X handles, social profiles,
+niche per-person facts) and where rows_fill came back <50% filled,
+escalate to `rows_fill_bulk_browser` on the still-null rows
+(`where={<col>: null}`). It batches 5 rows per browser_use call
+and finds matches per-cell web_search misses. Costs ~3-5
+credits/row — pre-flight estimate required, same as rows_fill. If
+the bulk pass still leaves nulls, re-call on the remaining nulls
+once or twice — cheaper than pushing a single batch with more turns.
+
 **After `cell_traces_inspect`, your TEXT reply MUST state the concrete
 finding before any chips.** Not "I'm checking the trace" — the actual
 verdict: which cells, what their cell agents did, why they failed.
@@ -1305,6 +1336,59 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
                     ),
                 },
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Max rows to fill in this call. Omit to process all matching rows."},
+            },
+            "required": ["columns"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "rows_fill_bulk_browser",
+        "description": (
+            "Bulk-research enrichment via batched browser_use. Groups "
+            "matching rows into batches (default 5) and dispatches ONE "
+            "browser_use session per batch with a structured task. "
+            "Higher hit rate than rows_fill on hard-to-find data (X "
+            "handles, social profiles, niche facts) — browser_use sees "
+            "patterns across people in the same query that per-cell "
+            "web_search misses.\n\n"
+            "**Cost: ~3-5 credits/row** (much higher than rows_fill's "
+            "~0.3-1). Same PRE-FLIGHT ESTIMATE rule — write a 1-line "
+            "cost note before calling: 'Bulk-browser-filling [columns] "
+            "for [N] rows ≈ ~Y credits (~5 credits/row, [N/5] batches)'. "
+            "If Y exceeds the soft cap, call `confirm_budget` first.\n\n"
+            "**When to use this**: after a regular rows_fill returned "
+            "<50% filled or many `null_legitimate` on a column needing "
+            "deep web research. Pass `where` to target the still-null "
+            "rows specifically. Batches do NOT retry hard on misses — "
+            "if a person doesn't surface in the batch, that's it. "
+            "Re-call with the still-null rows for a 2nd pass; that's "
+            "cheaper than pushing one batch with more turns.\n\n"
+            "**Don't use this as a first move.** rows_fill is much "
+            "cheaper for typical enrichment. Reach for this only after "
+            "rows_fill demonstrates the data isn't surfacing."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "columns": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "One or more column names to fill via batched browser_use.",
+                },
+                "where": {
+                    "type": "object",
+                    "description": (
+                        "Same filter syntax as rows_get. Typical: "
+                        "{<column>: null} to target only unfilled rows."
+                    ),
+                },
+                "batch_size": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "description": "Rows per browser_use call. Default 5 — caps damage if one person has no public presence and the agent over-spends. Larger batches risk one bad apple ballooning cost.",
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Max rows total. Default no cap; stays bounded by `where`."},
             },
             "required": ["columns"],
         },
@@ -1947,6 +2031,12 @@ async def execute_tool(
             db, project, version, args,
             progress_cb=progress_cb,
             effort=effort,
+        )
+        return applied, result, cost
+    if tool_name == "rows_fill_bulk_browser":
+        applied, result, cost = await _tool_rows_fill_bulk_browser(
+            db, project, version, args,
+            progress_cb=progress_cb,
         )
         return applied, result, cost
     if tool_name == "suggest_replies":
@@ -2772,6 +2862,51 @@ async def _tool_rows_fill(
         where_params=where_params,
         limit=limit,
         max_cost=max_cost,
+        progress_cb=progress_cb,
+    )
+    applied = {"rows_filled": summary.get("cells_filled", 0)}
+    return applied, summary, total_cost
+
+
+async def _tool_rows_fill_bulk_browser(
+    db: Session,
+    project: Project,
+    version: ProjectVersion,
+    args: Dict[str, Any],
+    progress_cb: Optional[bulk_browser.ProgressCallback] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any], float]:
+    """Bulk-research enrichment via batched browser_use sessions.
+
+    Higher-cost / higher-yield alternative to rows_fill. See
+    `bulk_browser.bulk_fill_rows` for batch logic.
+    """
+    columns = args.get("columns") or []
+    if not isinstance(columns, list) or not columns:
+        return {}, {"error": "columns must be a non-empty list of column names"}, 0.0
+
+    where = args.get("where") or {}
+    limit = args.get("limit")
+    if limit is not None:
+        limit = min(int(limit), 100)
+
+    batch_size = args.get("batch_size", 5)
+    try:
+        batch_size = max(1, min(int(batch_size), 10))
+    except (TypeError, ValueError):
+        batch_size = 5
+
+    where_sql, where_params = _where_to_sql(where)
+
+    # Same commit-before-open-new-session pattern as _tool_rows_fill.
+    db.commit()
+
+    summary, total_cost = await bulk_browser.bulk_fill_rows(
+        project=project,
+        target_columns=columns,
+        where_sql=where_sql,
+        where_params=where_params,
+        limit=limit,
+        batch_size=batch_size,
         progress_cb=progress_cb,
     )
     applied = {"rows_filled": summary.get("cells_filled", 0)}

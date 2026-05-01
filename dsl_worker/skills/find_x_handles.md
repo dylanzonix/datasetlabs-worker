@@ -21,21 +21,23 @@ The same person often shows different names across platforms. "Andy"
 on a directory listing may be "Andrew" on X. Maiden vs. married surnames,
 nicknames, initials, or a handle that drops the last name entirely.
 
-### Hard floor: at least 2 distinct searches before any null
+### Hard floor: at least 4 distinct searches before any null
 
-**You MUST run at least 2 distinct `web_search` queries with materially
-different angles before calling `set_values(null)`.** One pass that
-returns nothing or returns only unverifiable matches is NOT grounds to
-null this cell — it is the signal to widen the search, not to bail.
+**You MUST run at least 4 distinct `web_search` queries with materially
+different angles before calling `set_values(null)`.** One or two passes
+that return nothing or return only unverifiable matches are NOT grounds
+to null this cell — they are the signal to widen the search, not to bail.
 
-A null after only one search is the failure mode this skill exists to
-prevent. The Paul Sawaya regression (real account `@automin`, found by
-the user with one search) happened because the cell agent did exactly
-one query and quit. Don't repeat that.
+Bailing after one or two searches is the failure mode this skill exists
+to prevent. The Paul Sawaya regression (real account `@automin`, found
+by the user with one search) and the Andrew Baran regression (real
+account findable as `Andy Baran`, missed after 2 searches that didn't
+try the variant) both happened because the cell agent quit too early.
+Don't repeat that.
 
-If after 2 distinct searches you still cannot confirm a handle, then
-null is appropriate — but the second search must be MEANINGFULLY
-different from the first (different angle below), not the same query
+If after 4 distinct searches you still cannot confirm a handle, then
+null is appropriate — but each of the 4 searches must be MEANINGFULLY
+different from the others (different angle below), not the same query
 re-typed.
 
 ### Required search angles (cycle through, don't repeat)
@@ -53,17 +55,51 @@ re-typed.
 4. **Direct site query**: `site:x.com "Full Name"` or
    `site:twitter.com "Full Name" Company`.
 
-### Identity confirmation before committing a non-null
+### Identity confirmation — POSITIVE evidence required
 
-- The X bio mentions the company / role / domain you already know.
-  **Name match alone is NOT enough** — confirm via bio text or a linked
-  website. A LinkedIn or company URL on the X profile counts.
-- If the only candidate profile is private / has no bio / no linked
-  URLs, prefer null over a guess.
+When committing a non-null handle, your `reason` field MUST cite the
+SPECIFIC piece of evidence that confirmed identity. Acceptable forms:
+
+- "Bio mentions <Company>" — quote the relevant phrase.
+- "Profile bio links to <company-domain>" — name the URL.
+- "Pinned tweet is about <Company> product."
+- "Linked LinkedIn URL on the profile matches the founder."
+- "The company's official X account interacts with this handle as the
+  founder."
+
+**FORBIDDEN as reasons for committing a non-null handle:**
+
+- "no conflicting evidence found"
+- "consistent with the founder profile"
+- "matched via search results"
+- "no contradicting information"
+- Any phrasing that asserts identity by *absence* of contradiction
+  rather than by *presence* of confirming evidence.
+
+If you cannot write a sentence quoting concrete confirming evidence,
+the answer is null. The Daniel Hussain regression (committed
+`@danialhussain04` for someone whose real handle was
+`@DanialHussain_`) happened because the cell reasoning was "no
+conflicting evidence found" — that's the trap this rule prevents.
+
+Name match alone is NEVER enough. There are many people with the same
+name. If the candidate profile is private / has no bio / no linked
+URLs, prefer null.
+
+### LinkedIn as a name-bridge
+
+If a LinkedIn URL is already in the row (or you find one cheaply during
+your searches), open it conceptually: people often use a different
+first-name form on social platforms than on a directory listing. Andrew
+Baran's LinkedIn says "Andy" — that's the version that appears on X. If
+the LinkedIn first-name differs from the source name, prefer the
+LinkedIn version as the anchor for your X searches. This is the path a
+human would take and it works for the cases where pure-source-name
+search misses.
 
 ### When null IS the right answer
 
-- Two distinct searches above, no candidate whose bio confirms the
+- Four distinct searches above, no candidate whose bio confirms the
   company / role / domain.
 - Multiple plausible profiles and bio info can't disambiguate them.
 
