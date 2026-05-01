@@ -1075,7 +1075,12 @@ cell instead of exploding inside a single agent loop.
 _FILTER_DESC = (
     "Filter dict. Equality: {col: value}. Operators: {col__lt: n} (also __gt, "
     "__lte, __gte), {col__contains: s}, {col__in: [...]}, {col__isnull: true|false}. "
-    "{col: null} → IS NULL. Multiple keys AND together. Empty/missing = all rows."
+    "{col: null} → IS NULL. Multiple keys AND together. Empty/missing = all rows. "
+    "Row-position targeting: use `_seq` for the row's seq number — "
+    "{_seq__gt: 20, _seq__lte: 40} targets rows 21-40 (the 'next batch' "
+    "after you've already done 1-20). Combine with column filters as "
+    "needed: {_seq__gt: 20, '<col>': null} for the next batch's unfilled "
+    "rows only."
 )
 
 
@@ -1334,8 +1339,17 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
                 "where": {
                     "type": "object",
                     "description": (
-                        "Same filter syntax as rows_get. Typical pattern: "
-                        "{<column>: null} to target unfilled cells only."
+                        "Same filter syntax as rows_get. Common idioms:\n"
+                        "  - {<column>: null} → target unfilled cells only\n"
+                        "  - {_seq__gt: 20, _seq__lte: 40} → next batch (rows 21-40)\n"
+                        "  - {_seq__gt: 20, <column>: null} → next batch's unfilled\n"
+                        "**Without a where clause, `limit=N` returns the FIRST N "
+                        "rows by seq, then the system pre-filter drops the ones "
+                        "where the target column is already filled. So calling "
+                        "rows_fill again with no `where` after a successful first "
+                        "batch will only re-process the still-null cells in the "
+                        "ORIGINAL first N — not advance to rows N+1..2N. To do "
+                        "the next batch, pass `_seq__gt: <last_seq>`.**"
                     ),
                 },
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Max rows to fill in this call. Omit to process all matching rows."},
@@ -1814,11 +1828,28 @@ def _sql_param(idx: int) -> str:
     return f":p{idx}"
 
 
+_SEQ_OP_SQL = {
+    "": "=",
+    "__ne": "!=",
+    "__lt": "<",
+    "__gt": ">",
+    "__lte": "<=",
+    "__gte": ">=",
+}
+
+
 def _where_to_sql(where: Optional[Dict[str, Any]]) -> Tuple[str, Dict[str, Any]]:
     """Translate a dict-where into a Postgres SQL fragment + bound params.
 
     Returns ("TRUE", {}) for empty filters so callers can always inline it
     after WHERE.
+
+    Most fields map to `row ->> 'field'` (text from JSONB). Two special
+    metadata keys bypass that and target sample columns directly:
+
+        _seq → samples.seq (native int) — used for "next batch" / row
+               range targeting, e.g. {_seq__gt: 20, _seq__lte: 40}.
+        (more can be added if needed; we kept _seq scope-tight.)
     """
     if not where:
         return "TRUE", {}
@@ -1832,6 +1863,31 @@ def _where_to_sql(where: Optional[Dict[str, Any]]) -> Tuple[str, Dict[str, Any]]
         return f":{key}"
 
     for raw_key, value in where.items():
+        # Special metadata field: _seq targets samples.seq directly so
+        # the chat agent can request row ranges (next batch). Without
+        # this, _seq would fall through to row->>'_seq' which doesn't
+        # exist and silently matches nothing.
+        if raw_key == "_seq" or raw_key.startswith("_seq__"):
+            suffix = raw_key[len("_seq"):]
+            if suffix == "__in":
+                if not isinstance(value, list) or not value:
+                    clauses.append("FALSE")
+                    continue
+                placeholders = [add_param(int(v)) for v in value]
+                clauses.append(f"seq IN ({', '.join(placeholders)})")
+                continue
+            sym = _SEQ_OP_SQL.get(suffix)
+            if sym is None:
+                # Unknown operator — fail loud rather than emit a
+                # surprising clause.
+                raise ValueError(f"Unsupported _seq operator: {raw_key!r}")
+            try:
+                v_int = int(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"_seq filter value must be an int, got {value!r}")
+            clauses.append(f"seq {sym} {add_param(v_int)}")
+            continue
+
         # Operator suffixes
         op = "="
         field = raw_key
