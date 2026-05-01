@@ -176,6 +176,16 @@ def write_candidates(
         "items_count": str(items_count),
         "cost_usd": f"{cost_usd:.6f}",
     }
+    # When the source tool returned an early sample with the underlying
+    # run still going (currently apify_call_actor), embed the run handle
+    # so candidates_to_rows can drain the rest of the dataset live with
+    # the LLM-supplied column_map. Keys are namespaced; legacy callers
+    # see plain blobs as before.
+    extra_meta = extra or {}
+    for k in ("apify_run_id", "apify_dataset_id", "apify_offset", "apify_max_items"):
+        v = extra_meta.get(k)
+        if v is not None:
+            md[k] = str(v)[:128]
     client.upload_blob(buf, overwrite=True, metadata=md)
 
     return CandidatesFileMeta(
@@ -243,6 +253,23 @@ def stream_candidates(project_id, file_name: str) -> Iterator[Dict[str, Any]]:
             yield json.loads(pending.decode("utf-8"))
         except json.JSONDecodeError:
             pass
+
+
+def read_candidates_metadata(project_id, file_name: str) -> Dict[str, str]:
+    """Return the blob metadata dict for a candidates file (or {} if
+    the blob doesn't exist). Used to detect apify-run-in-progress
+    state on a candidates file so candidates_to_rows can drain the
+    rest of the run live."""
+    blob_path = _candidate_blob_path(project_id, file_name)
+    client = get_blob_client(blob_path)
+    try:
+        props = client.get_blob_properties()
+        return dict(props.metadata or {})
+    except ResourceNotFoundError:
+        return {}
+    except Exception:
+        log.exception("read_candidates_metadata failed for %s", file_name)
+        return {}
 
 
 def read_candidates_bytes(project_id, file_name: str) -> bytes:
