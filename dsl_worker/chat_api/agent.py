@@ -1343,13 +1343,7 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
             "showing how many would insert vs merge (with sample collisions "
             "for any merge_key collapses). Re-call with confirm=true to "
             "actually commit. Column_map keys are source-file fields, values "
-            "are project column names.\n\n"
-            "When the candidates file came from an apify_call_actor early "
-            "sample (run still going server-side), this tool ALSO drains "
-            "the rest of the dataset live as the actor produces items — "
-            "each becomes a row in the table immediately. So calling it "
-            "after apify is how Apify rows actually land in the table; you "
-            "don't need any other tool. Set confirm=true to commit."
+            "are project column names."
         ),
         "parameters": {
             "type": "object",
@@ -1862,19 +1856,18 @@ async def execute_tool(
     # Source tools (FullEnrich, etc.) — handled inline since they're async
     # and have their own cost reporting.
     if sources.is_source_tool(tool_name):
-        # web_harvest yields candidates from an internal LLM loop and
-        # the LLM controls which fields go into each yield_candidate
-        # call — auto-mapping every field as a column is fine because
-        # the field set is already curated. Wire an on_candidate
-        # callback that commits each item as a row LIVE — auto-create
-        # columns from first item, emit row_added on each subsequent
-        # one. apify_call_actor takes a different path: it returns a
-        # candidates file with the apify run handle embedded, and
-        # candidates_to_rows handles the live drain (using the LLM-
-        # supplied column_map so we keep clean columns).
+        # For tools that produce rows of candidates (apify_call_actor,
+        # web_harvest), wire an on_candidate callback that commits each
+        # item as a row LIVE — auto-creating columns from the first
+        # item, then inserting + emitting `row_added` events on every
+        # subsequent one. Net: rows appear in the table as the tool
+        # finds them instead of the user staring at nothing for the
+        # full run duration. Other source tools (FullEnrich, Apollo,
+        # GMaps) ignore on_candidate (their batch responses are fast
+        # enough that the LLM can call rows_add itself).
         on_candidate = None
         live_committed_count = 0
-        if tool_name == "web_harvest":
+        if tool_name in ("apify_commit_stream", "web_harvest"):
             stream_version = ensure_chat_version(db, project)
 
             async def _on_candidate(item: Dict[str, Any]) -> None:
@@ -2499,93 +2492,20 @@ async def _tool_candidates_to_rows(
         log.exception("candidates_to_rows failed")
         return {}, {"error": f"{type(e).__name__}: {e}"}
 
-    # If this file came from an apify_call_actor early-return (run still
-    # going server-side), drain the rest of the dataset live with the
-    # same column_map. This is what makes apify "stream" — sample lands
-    # as static rows here, then the rest flow in via apify's dataset
-    # API as the actor produces them, each becoming a row_added event
-    # the FE renders immediately.
-    apify_streamed = 0
-    apify_run_status: Optional[str] = None
-    try:
-        file_md = candidates.read_candidates_metadata(project.id, file_name)
-    except Exception:
-        file_md = {}
-    apify_run_id = file_md.get("apify_run_id")
-    apify_dataset_id = file_md.get("apify_dataset_id")
-    if apify_run_id and apify_dataset_id:
-        try:
-            offset = int(file_md.get("apify_offset") or total_inserted + total_merged + total_skipped_filter)
-        except (TypeError, ValueError):
-            offset = 0
-        apify_max = file_md.get("apify_max_items")
-        try:
-            apify_max = int(apify_max) if apify_max is not None else None
-        except (TypeError, ValueError):
-            apify_max = None
-        # Cap the live drain to whatever cap the LLM passed on this
-        # tool call (if any) — never exceed the original actor max.
-        drain_cap = apify_max
-        # Commit the apify-streamed item via the same _tool_rows_add
-        # path so dedup, sources, and row_added emission all behave
-        # identically to the static-file commits above.
-        async def _on_apify_item(item: Dict[str, Any]) -> None:
-            nonlocal apify_streamed
-            if not isinstance(item, dict):
-                return
-            if not candidates.apply_filter(item, filt):
-                return
-            mapped = {
-                target: item.get(source)
-                for source, target in column_map.items()
-            }
-            if all(v is None for v in mapped.values()):
-                return
-            src = sources.derive_default_source(file_tool, item)
-            if src:
-                mapped["_sources"] = {col: [src] for col in mapped}
-            inner_args = (
-                {"items": [mapped], "merge_key": merge_key}
-                if merge_key else {"items": [mapped]}
-            )
-            await _tool_rows_add(db, project, version, inner_args, progress_cb=progress_cb)
-            apify_streamed += 1
-        try:
-            from dsl_worker.chat_api.sources import _apify
-            apify_client = _apify()
-            if apify_client is not None:
-                drain_result = await apify_client.drain_dataset(
-                    run_id=apify_run_id,
-                    dataset_id=apify_dataset_id,
-                    on_item=_on_apify_item,
-                    offset=offset,
-                    timeout=600,
-                    max_items=drain_cap,
-                )
-                apify_run_status = drain_result.get("status")
-        except Exception:
-            log.exception("apify drain after candidates_to_rows failed")
-
     total_rows = (
         db.query(func.count(Sample.id))
         .filter(Sample.version_id == version.id, Sample.deleted_at.is_(None))
         .scalar() or 0
     )
-    final_inserted = total_inserted + apify_streamed
-    out: Dict[str, Any] = {
-        "ok": True,
-        "inserted": final_inserted,
-        "merged": total_merged,
-        "skipped": total_skipped_filter,
-        "total": total_rows,
-    }
-    if apify_streamed:
-        out["apify_streamed"] = apify_streamed
-        if apify_run_status:
-            out["apify_run_status"] = apify_run_status
     return (
-        {"rows": {"inserted": final_inserted, "merged": total_merged}},
-        out,
+        {"rows": {"inserted": total_inserted, "merged": total_merged}},
+        {
+            "ok": True,
+            "inserted": total_inserted,
+            "merged": total_merged,
+            "skipped": total_skipped_filter,
+            "total": total_rows,
+        },
     )
 
 
