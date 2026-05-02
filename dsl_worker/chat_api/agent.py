@@ -302,21 +302,40 @@ you got, commit the rows, write a one-sentence reply, end.
 count first, show what'll happen, end with `suggest_replies` showing
 proceed/cancel options, then wait for the user.
 
-**EXCEPTION — user already approved.** If the user's CURRENT message
-explicitly approves the destructive op ("Yes, delete the X Handle
-column", "Yes, drop those rows", "Yes, do it") — i.e. they're
-responding to a preview you (or a prior turn) already showed — call
-the tool directly with `confirm=True`. Do NOT re-preview. Re-running
-the preview after the user has already said "yes" makes them say
-"yes" again, which they perceive as the agent ignoring them. The
-preview/confirm two-phase is for FIRST-time destructive intent, not
-for every turn that touches it.
+**EXCEPTION — execute directly when the user is unambiguous.** Run
+the destructive tool with `confirm=True` immediately (no preview)
+when EITHER of these is true:
 
-Concretely: if your previous turn showed a delete preview and ended
-with `suggest_replies(["Yes, drop X", "Keep it"])`, and this turn's
-user message reads as approval of that prior preview, this turn
-should be `columns_delete(confirm=True)` immediately, then a
-one-line "Done — deleted X" reply. Not another preview.
+1. **Clear imperative + named target.** The user's CURRENT message
+   uses a destructive verb ("drop", "delete", "remove", "kill",
+   "trash") AND names the specific target ("the Title columns",
+   "rows 7-12", "all rows where status=cold"). No "maybe" / "I'm
+   thinking" / "consider" hedges. Time-markers like "now" make it
+   even clearer. Examples that should ALWAYS execute directly:
+     - "Drop the three Title columns now."
+     - "Delete the X Handle column."
+     - "Remove rows 12, 14, and 19."
+     - "Kill that column."
+   The risk of accidental data loss is low when the user explicitly
+   named the target — they know what they're asking for. Re-previewing
+   here just makes them say it again.
+
+2. **User is approving a preview you (or a prior turn) just showed.**
+   "Yes, delete X", "Yes, drop those", "Yes, do it", "Confirmed",
+   "Go ahead". Same execute-with-confirm=True path.
+
+Use the preview/confirm two-phase ONLY when the user's intent is
+genuinely vague: "clean up the empty columns", "remove the bad rows",
+"I think we don't need these anymore". For those, count first, show
+what'll happen, end with `suggest_replies` showing proceed/cancel.
+
+**ANTI-PATTERN — re-previewing a destructive op the user already
+issued.** If your previous turn already previewed `columns_delete X`
+and the user's next message says "Drop X now" or "Delete X" or
+"Remove the Title columns", that's the SECOND time they've said it.
+DO NOT preview a third time. Execute with `confirm=True`. The signal
+that they wanted it dropped was already clear; making them repeat
+themselves reads as the agent ignoring them.
 
 # Harvest-then-enrich, never half-and-half
 
@@ -352,6 +371,11 @@ work like this:
        both phases — ~1 credit/cell worst case (~0.5 cheap +
        ~0.5 browser fallback on missing rows). The cheap pass alone
        often suffices, so the actual spend is usually less.
+     - rows_fill with `bulk_first=true` (X handles, social
+       profiles, anything needing visual page evidence): ~1 credit/
+       cell flat — bulk browser_use is the only phase, no per-cell
+       spend. Use for columns where per-cell web_search is
+       empirically poor.
 3. **If Y exceeds the soft cap, call `confirm_budget` BEFORE
    rows_fill — do NOT just call rows_fill and hope.** The system
    does NOT auto-defer; it will run all N rows and bill it. If you
@@ -416,6 +440,17 @@ When to call `confirm_budget` (turn-ending — same idea as
    with chips. Same applies to any single tool you expect to cost
    >50% of the cap (FullEnrich phones at ~5 credits/call, broad
    browser_use sweeps). `reason="projection_exceeds_cap"`.
+
+   **DON'T re-confirm a scope the user just approved.** If the prior
+   turn already said "Filling N rows ≈ X credits" (or asked
+   confirm_budget for a specific scope), and THIS user message is an
+   imperative restating the same scope ("do the first 5 now", "yes,
+   do rows 6-15", "go ahead with that"), execute the fill directly —
+   the budget transparency was met on the prior turn, the user is
+   telling you to act, not asking for a second cost preview. Two
+   confirm_budgets for the same fill is the anti-pattern that makes
+   the user repeat themselves. Only re-confirm if the scope CHANGED
+   (different N, different columns, different where clause).
 
    The system used to do sample-and-project (run 3 cells, measure,
    stop early) for you, but that's gone — too eager, kept stopping
@@ -867,15 +902,29 @@ the actual cell-agent tool calls before retrying. Re-running the same
 fill with the same setup almost never lifts the rate — adjust harvest
 source, column phrasing, or skip the column instead.
 
-For columns where the cheap per-cell pass typically misses (X handles,
-social profiles, niche per-person facts), pass
-`escalate_via_browser_use=true` on `rows_fill` from the start.
-Phase 1 runs the cheap per-cell pass; if it leaves >=5 rows null OR
-yield <70%, phase 2 batches the still-null rows through browser_use
-(5/batch) automatically — one tool call, both phases handled.
-Expected cost: **~0.5 credits/row cheap + ~0.5 credits/row for browser
-fallback on misses**. Pre-flight estimate covers the worst case
-("~1 credit/row total"); the cheap pass alone often suffices.
+For columns where per-cell web_search is empirically poor — **X/Twitter
+handles, niche social profiles, anything that needs visual page
+evidence to verify identity** — pass `bulk_first=true` on `rows_fill`
+from the start. This skips per-cell entirely and runs bulk browser_use
+(5 rows/batch) as the only phase. **Expected cost: ~1 credit/row.**
+Pre-flight estimate uses that figure.
+
+Why not just `escalate_via_browser_use=true`? Empirically, per-cell
+phase 1 on X-handle columns runs 4-8 web_searches per cell and still
+misses 60%+ — paying ~0.8 credits/row to confirm what bulk would also
+miss. `bulk_first=true` saves that wasted phase 1 spend.
+
+For other "hard" columns where per-cell *might* still work (e.g.
+contact info that Apollo/FE could deliver), keep using
+`escalate_via_browser_use=true`: phase 1 is per-cell; if it leaves >=5
+rows null OR yield <70%, phase 2 automatically batches the still-null
+rows through browser_use (5/batch). Expected cost worst case: ~0.5
+credits/row cheap + ~0.5 credits/row browser fallback.
+
+If a recent fill summary returned a `next_call_hint` mentioning
+`bulk_first=true`, follow it — that hint fires when phase 2
+outperformed phase 1 by ≥1.5x per credit, which means future calls on
+the same column should skip phase 1.
 
 **After `cell_traces_inspect`, your TEXT reply MUST state the concrete
 finding before any chips.** Not "I'm checking the trace" — the actual
@@ -1042,7 +1091,8 @@ You (turn 1 — harvest the FULL closed set):
                 their company name, cohort, and Speedrun profile URL")`.
    Goal: pull the FULL roster of founders, not 5.
 2. `columns_add`: Founder Name, Company, Cohort, Speedrun URL,
-   X Handle (empty), X URL (empty).
+   X URL (empty). NOT both "X Handle" and "X URL" — they're the
+   same data; the URL is the useful form (clickable). Single column.
 3. `candidates_to_rows` with the founders.
 4. Text: "Got 50 a16z Speedrun founders. Want their Twitter handles
    filled in next?"
@@ -1052,15 +1102,27 @@ You (turn 1 — harvest the FULL closed set):
 
 User clicks "Yes, fill Twitters":
 
-You (turn 2 — enrich):
-1. `rows_fill(columns=["X Handle", "X URL"], where={"X Handle": null},
-   limit=50)`. 50 cells fan out, each with its own ~$0.20 budget for
-   web_search-driven Twitter discovery.
-2. Text: "Filled Twitter handles for 47 founders; 3 had no clear
-   public match — left null."
+You (turn 2 — enrich first batch):
+1. `rows_fill(columns=["X URL"], start_seq=1, end_seq=20,
+   bulk_first=true)`. Bulk browser_use runs in batches of 5;
+   ~1 credit/row. Per-cell web_search is poor at X-URL discovery
+   (60%+ miss rate, 4-8 searches per cell), so we skip it.
+2. Text: "Filled X URLs for the first 20 founders (16 found, 4 had no
+   confirmable public match — left null)."
 3. `suggest_replies(suggestions=[
-     {label:"Generate 50 more", message:"Generate 50 more rows of similar quality."},
-     {label:"Generate 100 more", message:"Generate 100 more rows of similar quality."}])` for scaling.
+     {label:"Next 20 founders", message:"Fill the next 20 founders."},
+     {label:"All remaining 30", message:"Fill X URLs for all the rest."},
+     {label:"Stop here", message:"That's enough for now."}])`.
+
+User clicks "Next 20 founders":
+
+You (turn 3 — advance the window, NOT retry):
+1. `rows_fill(columns=["X URL"], start_seq=21, end_seq=40,
+   bulk_first=true)`. CRITICAL: `start_seq=21` advances to the next
+   batch. Without it, rows_fill would re-process the original 1-20,
+   skip the 16 already-filled, and retry the 4 already-failed — pure
+   waste (those 4 already came back null_legitimate via bulk_browser
+   and would do so again).
 
 The shape: harvest one job, enrich another. Cost scales linearly per
 cell instead of exploding inside a single agent loop.
@@ -1339,35 +1401,93 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
                 "where": {
                     "type": "object",
                     "description": (
-                        "Same filter syntax as rows_get. Common idioms:\n"
-                        "  - {<column>: null} → target unfilled cells only\n"
-                        "  - {_seq__gt: 20, _seq__lte: 40} → next batch (rows 21-40)\n"
-                        "  - {_seq__gt: 20, <column>: null} → next batch's unfilled\n"
-                        "**Without a where clause, `limit=N` returns the FIRST N "
-                        "rows by seq, then the system pre-filter drops the ones "
-                        "where the target column is already filled. So calling "
-                        "rows_fill again with no `where` after a successful first "
-                        "batch will only re-process the still-null cells in the "
-                        "ORIGINAL first N — not advance to rows N+1..2N. To do "
-                        "the next batch, pass `_seq__gt: <last_seq>`.**"
+                        "Same filter syntax as rows_get. For row-range "
+                        "targeting prefer the dedicated `start_seq` / "
+                        "`end_seq` params below — `where` is for "
+                        "filtering on column values, e.g. "
+                        "`{<column>: null}` to target unfilled cells "
+                        "only."
+                    ),
+                },
+                "start_seq": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": (
+                        "Inclusive lower bound on row position (seq). "
+                        "Use with `end_seq` to target a specific row "
+                        "window — e.g. `start_seq=21, end_seq=40` "
+                        "fills the next batch of 20 after a previous "
+                        "fill on rows 1-20. Without start/end_seq + "
+                        "no where, the system fills the first `limit` "
+                        "rows by seq and skips already-filled cells, "
+                        "which means a second call without "
+                        "start_seq=N will RE-PROCESS the original "
+                        "first N rather than advance."
+                    ),
+                },
+                "end_seq": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": (
+                        "Inclusive upper bound on row position (seq). "
+                        "See `start_seq`."
                     ),
                 },
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Max rows to fill in this call. Omit to process all matching rows."},
+                "retry_failed": {
+                    "type": "boolean",
+                    "description": (
+                        "When false (default), rows whose target "
+                        "column has a `null_legitimate` fill_status "
+                        "from a prior fill (i.e. were already "
+                        "attempted and yielded null) are SKIPPED — "
+                        "retrying them with the same approach burns "
+                        "credits to confirm the same null. The "
+                        "summary surfaces `rows_skipped_prior_fail`. "
+                        "Set true only when you want to retry "
+                        "previously-failed rows AND you've changed "
+                        "approach (different strategy, different "
+                        "column, manual hints). Re-running with the "
+                        "same `bulk_first` value over previously "
+                        "null_legitimate rows is the anti-pattern "
+                        "this default prevents."
+                    ),
+                },
                 "escalate_via_browser_use": {
                     "type": "boolean",
                     "description": (
                         "Set true for hard columns where the cheap "
-                        "per-cell pass typically misses (X handles, "
-                        "social profiles, niche per-person facts). "
+                        "per-cell pass typically misses but you want "
+                        "to keep per-cell as the primary attempt. "
                         "Phase 1 (cheap per-cell) runs as usual; if "
                         "it leaves >=5 rows null OR yield <70%, "
                         "phase 2 automatically batches the still-null "
                         "rows through browser_use (5/batch). One tool "
                         "call, both phases handled. Cost: ~0.5 "
                         "credits/row cheap + ~0.5 credits/row for "
-                        "browser fallback on misses; pre-flight "
-                        "estimate covers both. Default false — don't "
-                        "set for cheap derives or simple lookups."
+                        "browser fallback on misses. Default false. "
+                        "Ignored when `bulk_first=true` (bulk runs as "
+                        "the only phase in that case)."
+                    ),
+                },
+                "bulk_first": {
+                    "type": "boolean",
+                    "description": (
+                        "Skip per-cell entirely and run bulk "
+                        "browser_use as the ONLY phase (5 rows/batch, "
+                        "one BU session per batch, ~1 credit/row). "
+                        "Use when per-cell web_search is empirically "
+                        "poor for the column type — known cases: "
+                        "X/Twitter handles, niche social profiles, "
+                        "anything that needs visual page evidence to "
+                        "verify identity. The cell-trace summary from "
+                        "an earlier fill will recommend this via "
+                        "`next_call_hint` when it observes phase 2 "
+                        "outperforming phase 1 by a wide margin. "
+                        "Default false. When set, no per-cell "
+                        "fallback runs — call rows_fill again with "
+                        "bulk_first=false on the still-null rows if "
+                        "you want a second pass via different sources."
                     ),
                 },
             },
@@ -2838,10 +2958,25 @@ async def _tool_rows_fill(
     if not isinstance(columns, list) or not columns:
         return {}, {"error": "columns must be a non-empty list of column names"}, 0.0
 
-    where = args.get("where") or {}
+    where = dict(args.get("where") or {})
     limit = args.get("limit", 20)
     if limit is not None:
         limit = min(int(limit), 200)
+
+    # Translate start_seq/end_seq into the where-dialect's _seq__gte /
+    # _seq__lte operators. These are user-friendly aliases so the agent
+    # doesn't have to know the filter syntax for the most common case
+    # (target a row window). Conflicts with an explicit _seq__* in
+    # `where` resolve in favor of the explicit filter — start/end_seq
+    # are advisory aliases, not overrides.
+    start_seq = args.get("start_seq")
+    end_seq = args.get("end_seq")
+    if start_seq is not None and "_seq__gte" not in where and "_seq__gt" not in where:
+        where["_seq__gte"] = int(start_seq)
+    if end_seq is not None and "_seq__lte" not in where and "_seq__lt" not in where:
+        where["_seq__lte"] = int(end_seq)
+
+    retry_failed = bool(args.get("retry_failed", False))
 
     # Per-cell budget. The agent can no longer pass max_cost — it was
     # dropped from the schema after observing the agent set it tight
@@ -2865,6 +3000,7 @@ async def _tool_rows_fill(
     where_sql, where_params = _where_to_sql(where)
 
     escalate = bool(args.get("escalate_via_browser_use", False))
+    bulk_first = bool(args.get("bulk_first", False))
 
     # Commit the main session before fill_rows opens its own SessionLocal.
     # Otherwise rows just inserted by rows_add / candidates_to_rows in the
@@ -2874,10 +3010,9 @@ async def _tool_rows_fill(
     # streaming.py caused event-loop stalls.
     db.commit()
 
-    # When the flag is set, fill_rows_with_escalation runs phase 1
-    # (per-cell) first, then phase 2 (bulk browser_use over still-null
-    # rows) only if phase 1 yield was poor. When the flag is off it
-    # behaves identically to plain fill_rows.
+    # bulk_first wins over escalate_via_browser_use — when set, the only
+    # phase that runs is bulk browser_use. fill_rows_with_escalation
+    # branches on this internally so the call site stays uniform.
     summary, total_cost = await fill.fill_rows_with_escalation(
         project=project,
         target_columns=columns,
@@ -2887,6 +3022,8 @@ async def _tool_rows_fill(
         max_cost=max_cost,
         progress_cb=progress_cb,
         escalate_via_browser_use=escalate,
+        bulk_first=bulk_first,
+        retry_failed=retry_failed,
     )
     applied = {"rows_filled": summary.get("cells_filled", 0)}
     return applied, summary, total_cost

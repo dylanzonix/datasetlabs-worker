@@ -25,6 +25,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from sqlalchemy import text as sql_text
 
+from dsl_api.config import settings as _api_settings
 from dsl_api.db import SessionLocal
 from dsl_api.models import Project
 from dsl_api.models.sample import Sample
@@ -108,6 +109,13 @@ def _build_task(
         "    - evidence: one short sentence quoting the specific bio/"
         "profile text that confirmed identity (or 'no match' if null)."
     )
+    lines.append(
+        "    - sources: object mapping each filled column name to a list "
+        "of URL(s) you actually visited that justify the value. Skip the "
+        "key for columns you set to null. The frontend renders these as "
+        "per-cell citations. Don't fabricate URLs — only cite pages you "
+        "really opened."
+    )
     lines.append("")
     lines.append(
         "Critical: a confident null beats a wrong value. If you cannot "
@@ -147,7 +155,12 @@ async def _process_batch(
     skills_applied: List[str],
     timeout_secs: int,
     progress_cb: Optional[ProgressCallback],
-) -> Tuple[List[cell_traces.CellTrace], List[Tuple[Any, Dict[str, Any]]], float]:
+) -> Tuple[
+    List[cell_traces.CellTrace],
+    # (row_id, values, per-cell sources dict)
+    List[Tuple[Any, Dict[str, Any], Dict[str, List[Dict[str, str]]]]],
+    float,
+]:
     """Run one batch through browser_use and produce (traces, writes, cost)."""
     task = _build_task(rows_in_batch, target_columns, target_specs, skills_extra)
 
@@ -194,7 +207,7 @@ async def _process_batch(
             items_by_idx[idx] = it
 
     traces: List[cell_traces.CellTrace] = []
-    row_writes: List[Tuple[Any, Dict[str, Any]]] = []
+    row_writes: List[Tuple[Any, Dict[str, Any], Dict[str, List[Dict[str, str]]]]] = []
 
     for i, (row_id, _row_data) in enumerate(rows_in_batch, start=1):
         tr = cell_traces.new_trace(row_id=str(row_id), columns=list(target_columns))
@@ -221,11 +234,33 @@ async def _process_batch(
             evidence = item.get("evidence") or ""
             values = {col: item.get(col) for col in target_columns}
             non_null = {k: v for k, v in values.items() if v is not None and v != ""}
+            # Per-cell sources: BU returns {col: [url, ...]} in `sources`.
+            # Normalize to the rows_add wire shape so the persist path
+            # below + the FE render can stay uniform with rows_fill.
+            raw_sources = item.get("sources") or {}
+            cell_sources: Dict[str, List[Dict[str, str]]] = {}
+            if isinstance(raw_sources, dict):
+                for col, urls in raw_sources.items():
+                    if col not in target_columns:
+                        continue
+                    if values.get(col) is None or values.get(col) == "":
+                        continue
+                    if isinstance(urls, str):
+                        urls = [urls]
+                    if not isinstance(urls, list):
+                        continue
+                    normed = [
+                        {"type": "url", "value": str(u).strip()}
+                        for u in urls
+                        if isinstance(u, str) and u.strip()
+                    ]
+                    if normed:
+                        cell_sources[col] = normed
             if non_null:
                 tr.status = "filled"
                 tr.values = values
                 tr.reason = evidence or "matched via bulk browser_use"
-                row_writes.append((row_id, values))
+                row_writes.append((row_id, values, cell_sources))
             else:
                 tr.status = "null_legitimate"
                 tr.reason = evidence or "browser_use returned null for all target columns"
@@ -267,6 +302,7 @@ async def bulk_fill_rows(
     concurrency: int = _BATCH_CONCURRENCY,
     timeout_secs: int = _BATCH_TIMEOUT_SECS,
     progress_cb: Optional[ProgressCallback] = None,
+    retry_failed: bool = False,
 ) -> Tuple[Dict[str, Any], float]:
     """Run browser_use in batches over matching rows.
 
@@ -315,7 +351,7 @@ async def bulk_fill_rows(
         if not version_id:
             return ({"error": "project has no version yet"}, 0.0)
         sql = (
-            f"SELECT id, row FROM samples WHERE version_id = :vid "
+            f"SELECT id, row, tags FROM samples WHERE version_id = :vid "
             f"AND deleted_at IS NULL AND ({where_sql}) "
             f"ORDER BY seq"
         )
@@ -335,24 +371,64 @@ async def bulk_fill_rows(
             return True
         return False
 
+    # Pre-filter: skip rows whose target columns are already filled OR
+    # were already attempted via this strategy. The skip-prior-fail
+    # branch fires when retry_failed=False (default) and the row's
+    # tags.fill_status[col].status == 'null_legitimate' — re-running
+    # bulk_browser on rows that already came back null from a prior
+    # bulk pass produces the same null again. The project f34982fd
+    # regression burned $1.03 on exactly this pattern.
     work_items: List[Tuple[Any, Dict[str, Any]]] = []
     rows_skipped_already_filled = 0
-    for row_id, row_data in rows:
+    rows_skipped_prior_fail = 0
+    for row_id, row_data, tags in rows:
         existing = dict(row_data or {})
-        unfilled = any(_is_empty(existing.get(c)) for c in target_columns)
-        if unfilled:
-            work_items.append((row_id, existing))
-        else:
+        fill_status = (tags or {}).get("fill_status") or {}
+        all_filled = True
+        any_unfilled_skippable = False
+        any_unfilled_attemptable = False
+        for c in target_columns:
+            if _is_empty(existing.get(c)):
+                all_filled = False
+                if not retry_failed:
+                    prior = fill_status.get(c) or {}
+                    if isinstance(prior, dict) and prior.get("status") == "null_legitimate":
+                        any_unfilled_skippable = True
+                        continue
+                any_unfilled_attemptable = True
+        if all_filled:
             rows_skipped_already_filled += 1
+        elif any_unfilled_attemptable:
+            work_items.append((row_id, existing))
+        elif any_unfilled_skippable:
+            rows_skipped_prior_fail += 1
 
     if not work_items:
+        if rows_skipped_prior_fail and not rows_skipped_already_filled:
+            note = (
+                "All matched rows have a prior null_legitimate "
+                "fill_status on the target column(s) — already "
+                "attempted via bulk_browser. Skipping retries by "
+                "default. Pass retry_failed=true to retry, or "
+                "start_seq/end_seq to target a fresh row window."
+            )
+        elif rows_skipped_prior_fail:
+            note = (
+                f"{rows_skipped_already_filled} rows already filled; "
+                f"{rows_skipped_prior_fail} skipped due to prior "
+                f"null_legitimate fill_status. Pass retry_failed=true "
+                f"to retry."
+            )
+        else:
+            note = "All matched rows already have values in the target columns."
         return ({
             "matched_rows": len(rows),
             "rows_skipped_already_filled": rows_skipped_already_filled,
+            "rows_skipped_prior_fail": rows_skipped_prior_fail,
             "processed": 0,
             "cells_filled": 0,
             "by_status": {},
-            "note": "All matched rows already have values in the target columns.",
+            "note": note,
         }, 0.0)
 
     bs = max(1, int(batch_size))
@@ -393,8 +469,9 @@ async def bulk_fill_rows(
     )
 
     all_traces: List[cell_traces.CellTrace] = []
-    all_writes: List[Tuple[Any, Dict[str, Any]]] = []
+    all_writes: List[Tuple[Any, Dict[str, Any], Dict[str, List[Dict[str, str]]]]] = []
     total_cost = 0.0
+    voided_cost = 0.0
     batches_failed = 0
     for r in results:
         if isinstance(r, Exception):
@@ -404,7 +481,19 @@ async def bulk_fill_rows(
         traces, writes, cost = r
         all_traces.extend(traces)
         all_writes.extend(writes)
-        total_cost += cost
+        # Billing gate: when waiving, exclude per-row costs of cells
+        # that didn't end "filled" from the returned total. Bulk
+        # batches share one BU session cost evenly across rows in the
+        # batch, so we already have per-row attribution on
+        # tr.cost_usd — sum filled-only and waive the rest.
+        if _api_settings.WAIVE_FAILED_FILL_CHARGES:
+            for tr in traces:
+                if tr.status == "filled":
+                    total_cost += tr.cost_usd
+                else:
+                    voided_cost += tr.cost_usd
+        else:
+            total_cost += cost
 
     failed_cols_by_row: Dict[Any, Dict[str, Dict[str, Any]]] = {}
     for tr in all_traces:
@@ -416,13 +505,17 @@ async def bulk_fill_rows(
                 "status": tr.status,
                 "reason": tr.reason or None,
                 "cost": round(tr.cost_usd, 4),
+                # Strategy tag drives the skip-prior-fail pre-filter on
+                # subsequent calls. fill.py writes "per_cell"; this is
+                # "bulk_browser".
+                "strategy": "bulk_browser",
             }
         failed_cols_by_row[tr.row_id] = per_col
 
     write_db = SessionLocal()
     merged_rows_to_emit: List[Dict[str, Any]] = []
     try:
-        for row_id, values in all_writes:
+        for row_id, values, cell_sources in all_writes:
             sample = write_db.query(Sample).filter(Sample.id == row_id).first()
             if sample is None:
                 continue
@@ -453,6 +546,16 @@ async def bulk_fill_rows(
                 tags["fill_status"] = existing_status
             else:
                 tags.pop("fill_status", None)
+            # Persist per-cell sources (BU-cited URLs) under tags.sources
+            # in the same wire shape rows_add and the new rows_fill path
+            # use, so the FE renders citations uniformly.
+            if cell_sources:
+                existing_sources = dict(tags.get("sources") or {})
+                for col, srcs in cell_sources.items():
+                    if srcs and (values.get(col) is not None and values.get(col) != ""):
+                        existing_sources[col] = srcs
+                if existing_sources:
+                    tags["sources"] = existing_sources
             sample.tags = tags
         for row_id, per_col in failed_cols_by_row.items():
             sample = write_db.query(Sample).filter(Sample.id == row_id).first()
@@ -466,7 +569,7 @@ async def bulk_fill_rows(
         write_db.commit()
 
         if progress_cb:
-            for row_id, _values in all_writes:
+            for row_id, _values, _srcs in all_writes:
                 sample = write_db.query(Sample).filter(Sample.id == row_id).first()
                 if sample is None:
                     continue
@@ -521,6 +624,7 @@ async def bulk_fill_rows(
     summary: Dict[str, Any] = {
         "matched_rows": len(rows),
         "rows_skipped_already_filled": rows_skipped_already_filled,
+        "rows_skipped_prior_fail": rows_skipped_prior_fail,
         "processed": len(all_traces),
         "cells_filled": filled_total,
         "batches_run": len(batches),
@@ -544,5 +648,10 @@ async def bulk_fill_rows(
         summary["trace_file"] = trace_persist_info.get("file")
     if skills_applied_names:
         summary["skills_applied"] = list(skills_applied_names)
+    if voided_cost > 0:
+        # Internal-audit field — compute we ate (didn't bill the user)
+        # because WAIVE_FAILED_FILL_CHARGES is on. Same field name as
+        # fill.fill_rows so summary readers handle both uniformly.
+        summary["voided_cost_usd"] = round(voided_cost, 4)
 
     return (summary, total_cost)

@@ -143,6 +143,20 @@ Critical rules:
   keep paying for retries that won't yield. A clean give_up after 2
   bad turns is better than burning the full per-cell budget producing
   nothing.
+- **Always cite per-cell sources.** When you call set_values, include
+  the `sources` arg mapping each filled column to the URL(s) that
+  justified the value (the web_search result URL, the page
+  browser_use loaded, the Apollo profile URL, etc.). The frontend
+  renders these as audit citations under each cell. Skip sources for
+  columns you set to null. Don't fabricate URLs — only cite ones you
+  actually saw in tool results.
+- **Don't fan out org-level info into per-person columns.** If the
+  Org has a generic phone like "(555) 123-4567" or a generic email
+  like "info@example.com", do NOT paste it into Contact 1 / Contact 2
+  / Contact 3 phone/email slots. Per-person columns require
+  per-person evidence (their name in a bio, a personal email like
+  jane.doe@..., a direct line on a staff page). When in doubt,
+  null > guess.
 - ALWAYS finish by calling either `set_values` or `give_up`. Don't trail
   off.
 """
@@ -152,6 +166,12 @@ Critical rules:
 class CellFillResult:
     row_id: str
     values: Dict[str, Any] = field(default_factory=dict)
+    # Per-column citations. Maps column_name -> list of source dicts in
+    # the same shape rows_add uses: [{"type": "url", "value": "..."}].
+    # Populated from the cell agent's set_values(sources=...) arg and
+    # persisted to sample.tags["sources"][col] so the FE can render
+    # per-cell "where did this come from" tooltips.
+    sources: Dict[str, List[Dict[str, str]]] = field(default_factory=dict)
     # filled — agent committed real values
     # null_legitimate — agent looked, returned null deliberately
     # error — agent crashed / source errored
@@ -190,7 +210,12 @@ def _cell_tools_for_columns(target_columns: List[str]) -> List[Dict[str, Any]]:
         "description": (
             "Commit final values for the cell(s) you were assigned. Pass a "
             "dict of column_name -> value. Use null for legitimate "
-            "no-result cases. After calling this, stop — the run is done."
+            "no-result cases. After calling this, stop — the run is done.\n\n"
+            "**ALSO pass `sources`** — for every non-null value, list the "
+            "URL(s) where you found it (the web_search result, "
+            "browser_use page, Apollo profile, etc.). The frontend "
+            "renders these as per-cell citations so the user can audit "
+            "where each value came from."
         ),
         "parameters": {
             "type": "object",
@@ -199,6 +224,26 @@ def _cell_tools_for_columns(target_columns: List[str]) -> List[Dict[str, Any]]:
                     "type": "object",
                     "properties": {
                         col: {"description": f"Value for the {col!r} column. Use null if you couldn't find a real value."}
+                        for col in target_columns
+                    },
+                    "additionalProperties": True,
+                },
+                "sources": {
+                    "type": "object",
+                    "description": (
+                        "Per-column citations. Map column_name -> list "
+                        "of URLs that justify the value. REQUIRED for "
+                        "every non-null value in `values`. Skip the key "
+                        "for columns set to null. Use only URLs you "
+                        "actually visited or saw in tool results — "
+                        "don't fabricate citations."
+                    ),
+                    "properties": {
+                        col: {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": f"URLs supporting the {col!r} value.",
+                        }
                         for col in target_columns
                     },
                     "additionalProperties": True,
@@ -441,6 +486,28 @@ async def _run_cell_agent(
                 clean = {k: v for k, v in values.items() if k in target_columns}
                 result.values = clean
                 result.reason = fc_args.get("reason") or None
+                # Capture per-cell sources. Agent passes
+                # {column_name: ["url1", "url2", ...]}; normalize to the
+                # rows_add wire shape so persistence is uniform across
+                # rows_fill and rows_add.
+                raw_sources = fc_args.get("sources") or {}
+                if isinstance(raw_sources, dict):
+                    for col, urls in raw_sources.items():
+                        if col not in target_columns:
+                            continue
+                        # Skip sources for columns we set to null —
+                        # storing citations for empty cells is noise.
+                        if clean.get(col) is None or clean.get(col) == "":
+                            continue
+                        if not isinstance(urls, list):
+                            continue
+                        normed = [
+                            {"type": "url", "value": str(u).strip()}
+                            for u in urls
+                            if isinstance(u, str) and u.strip()
+                        ]
+                        if normed:
+                            result.sources[col] = normed
                 # Determine status from values
                 non_null_count = sum(1 for v in clean.values() if v is not None and v != "")
                 result.status = "filled" if non_null_count > 0 else "null_legitimate"
@@ -450,7 +517,11 @@ async def _run_cell_agent(
                     result.trace.add_tool_call(
                         turn=turn_idx + 1,
                         name="set_values",
-                        args={"values": clean, "reason": result.reason},
+                        args={
+                            "values": clean,
+                            "reason": result.reason,
+                            "sources": result.sources or None,
+                        },
                         result="ok",
                     )
 
@@ -556,6 +627,7 @@ async def fill_rows(
     max_cost: float = 0.30,
     concurrency: int = _CELL_CONCURRENCY,
     progress_cb: Optional[ProgressCallback] = None,
+    retry_failed: bool = False,
 ) -> Tuple[Dict[str, Any], float]:
     """Run cell agents over all matching rows.
 
@@ -622,7 +694,7 @@ async def fill_rows(
         if not version_id:
             return ({"error": "project has no version yet"}, 0.0)
         sql = (
-            f"SELECT id, row FROM samples WHERE version_id = :vid "
+            f"SELECT id, row, tags FROM samples WHERE version_id = :vid "
             f"AND deleted_at IS NULL AND ({where_sql}) "
             f"ORDER BY seq"
         )
@@ -644,6 +716,15 @@ async def fill_rows(
     # the model called rows_fill twice with no `where` and re-classified
     # the same first 80 rows (project 051e8704). Lifts state-tracking
     # off the model and into the system.
+    #
+    # Second pre-filter: when retry_failed=False (default), drop columns
+    # whose tags.fill_status[col].status indicates a prior terminal-fail
+    # attempt (null_legitimate). Without this, calling rows_fill twice
+    # over the same window with the same strategy retries the SAME
+    # rows that already failed, producing the SAME nulls — that was
+    # the project f34982fd regression where the second bulk_first call
+    # re-attempted 6 already-failed rows for $1.03 of waste. Allow
+    # retry by setting retry_failed=true (different approach in mind).
     def _is_empty(v: Any) -> bool:
         if v is None:
             return True
@@ -653,29 +734,66 @@ async def fill_rows(
 
     work_items: List[Tuple[Any, Dict[str, Any], List[str]]] = []
     rows_skipped_already_filled = 0
-    for row_id, row_data in rows:
+    rows_skipped_prior_fail = 0
+    for row_id, row_data, tags in rows:
         existing = dict(row_data or {})
-        unfilled = [c for c in target_columns if _is_empty(existing.get(c))]
+        fill_status = (tags or {}).get("fill_status") or {}
+        unfilled: List[str] = []
+        per_row_skipped_fail = 0
+        for c in target_columns:
+            if not _is_empty(existing.get(c)):
+                continue
+            if not retry_failed:
+                prior = fill_status.get(c) or {}
+                if isinstance(prior, dict) and prior.get("status") == "null_legitimate":
+                    per_row_skipped_fail += 1
+                    continue
+            unfilled.append(c)
         if unfilled:
             work_items.append((row_id, existing, unfilled))
+        elif per_row_skipped_fail > 0:
+            rows_skipped_prior_fail += 1
         else:
             rows_skipped_already_filled += 1
 
     if not work_items:
-        # Every matched row was already filled — explicit feedback
-        # so the model knows this and doesn't re-call.
+        # Either every matched row was already filled, or every row was
+        # skipped because of prior-fail markers. Distinct notes — the
+        # model needs to know which so it doesn't re-call.
+        if rows_skipped_prior_fail and not rows_skipped_already_filled:
+            note = (
+                "All matched rows have a prior null_legitimate "
+                "fill_status on the target column(s) — they were "
+                "already attempted and yielded null. Skipping retries "
+                "by default to avoid re-paying for the same null. To "
+                "force a retry (e.g. you've changed approach), call "
+                "with retry_failed=true. To advance to a different "
+                "row window, pass start_seq/end_seq."
+            )
+        elif rows_skipped_prior_fail:
+            note = (
+                f"{rows_skipped_already_filled} matched rows already "
+                f"have values; the remaining "
+                f"{rows_skipped_prior_fail} were skipped because of "
+                f"prior null_legitimate fill_status on the target "
+                f"column(s). Pass retry_failed=true to retry them, "
+                f"or start_seq/end_seq to target a fresh row window."
+            )
+        else:
+            note = (
+                "All matched rows already have values in the target "
+                "columns. To re-fill, clear the existing values first "
+                "(rows_update with the column → null, or "
+                "columns_delete + columns_add)."
+            )
         summary = {
             "matched_rows": len(rows),
             "rows_skipped_already_filled": rows_skipped_already_filled,
+            "rows_skipped_prior_fail": rows_skipped_prior_fail,
             "processed": 0,
             "cells_filled": 0,
             "by_status": {},
-            "note": (
-                "All matched rows already have values in the target "
-                "columns. To re-fill, clear the existing values first "
-                "(rows_update with the column → null, or columns_delete "
-                "+ columns_add)."
-            ),
+            "note": note,
         }
         return (summary, 0.0)
 
@@ -746,6 +864,10 @@ async def fill_rows(
                         "status": res.status,
                         "reason": res.reason or None,
                         "cost": round(res.cost_usd, 4),
+                        # Strategy tag drives the skip-prior-fail
+                        # pre-filter on subsequent calls. "per_cell"
+                        # here; bulk_browser writes "bulk_browser".
+                        "strategy": "per_cell",
                     }
             # Tracks which columns the agent committed real values for —
             # a re-fill that succeeded clears any stale "couldn't fill"
@@ -789,6 +911,25 @@ async def fill_rows(
                             else:
                                 existing_tags.pop("fill_status", None)
                             sample.tags = existing_tags
+                        # Per-cell sources from set_values(sources=...).
+                        # Only write entries for columns the agent
+                        # actually filled this turn; merge with existing
+                        # so a partial re-fill on the same row keeps
+                        # earlier citations intact. Same wire shape as
+                        # rows_add's _sources path:
+                        #   tags["sources"][col] = [{"type":"url","value":"..."}, ...]
+                        if res.sources:
+                            existing_sources = dict(existing_tags.get("sources") or {})
+                            sources_changed = False
+                            for col, srcs in res.sources.items():
+                                if col not in succeeded_cols:
+                                    continue
+                                if srcs:
+                                    existing_sources[col] = srcs
+                                    sources_changed = True
+                            if sources_changed:
+                                existing_tags["sources"] = existing_sources
+                                sample.tags = existing_tags
                         write_db.commit()
                         write_db.refresh(sample)
                         updated_row = {
@@ -805,13 +946,26 @@ async def fill_rows(
                         pass
                 finally:
                     write_db.close()
+            # Billing gate: when WAIVE_FAILED_FILL_CHARGES is on, cells
+            # that didn't end "filled" emit cost=0 in cell_done so
+            # streaming.py's incremental-bill path doesn't charge the
+            # user. The actual cost stays on res.cost_usd / the trace
+            # for audit; only the user-facing meter reading is zeroed.
+            billable_cost = (
+                0.0
+                if (
+                    _api_settings.WAIVE_FAILED_FILL_CHARGES
+                    and res.status != "filled"
+                )
+                else res.cost_usd
+            )
             await _emit({
                 "type": "cell_done",
                 "row_id": str(row_id),
                 "index": idx,
                 "total": len(work_items),
                 "status": res.status,
-                "cost": round(res.cost_usd, 4),
+                "cost": round(billable_cost, 4),
                 "filled": [
                     k for k, v in res.values.items()
                     if v is not None and v != ""
@@ -828,11 +982,22 @@ async def fill_rows(
         for i, (rid, rdata, unfilled) in enumerate(work_items)
     ]
     completed = await asyncio.gather(*tasks, return_exceptions=True)
+    voided_cost = 0.0
     for r in completed:
         if isinstance(r, Exception):
             continue
         results.append(r)
-        total_cost += r.cost_usd
+        # Mirror the cell_done billing gate: when waiving, exclude
+        # non-filled cells from the returned total_cost so streaming's
+        # residual calc doesn't bill them either. Track waived spend
+        # separately for the summary.
+        if (
+            _api_settings.WAIVE_FAILED_FILL_CHARGES
+            and r.status != "filled"
+        ):
+            voided_cost += r.cost_usd
+        else:
+            total_cost += r.cost_usd
 
     # Persist forensic traces — one JSONL line per cell, keyed by run_id.
     # Best-effort: any blob error is logged inside write_traces and the
@@ -878,6 +1043,7 @@ async def fill_rows(
     summary: Dict[str, Any] = {
         "matched_rows": len(rows),
         "rows_skipped_already_filled": rows_skipped_already_filled,
+        "rows_skipped_prior_fail": rows_skipped_prior_fail,
         "processed": len(results),
         "cells_filled": filled_total,
         "by_status": by_status,
@@ -889,6 +1055,12 @@ async def fill_rows(
         "run_id": run_id,
         "top_failure_reasons": top_failures,
     }
+    if voided_cost > 0:
+        # Internal-audit field — surfaces compute we ate (didn't bill
+        # the user) when WAIVE_FAILED_FILL_CHARGES is on. The chat
+        # agent SEES this and can use it to gauge wasted-OpenAI-spend
+        # without changing how it talks about cost to the user.
+        summary["voided_cost_usd"] = round(voided_cost, 4)
     if trace_persist_info and trace_persist_info.get("persisted"):
         summary["trace_file"] = trace_persist_info.get("file")
     if skills_applied_names:
@@ -906,6 +1078,104 @@ async def fill_rows(
 # tunables into the prompt without much benefit.
 _ESCALATION_MIN_NULL_ROWS = 5
 _ESCALATION_YIELD_THRESHOLD = 0.7
+
+# Thresholds for surfacing the "use bulk_first next time" hint. Two
+# independent signals — either is enough to fire the hint:
+#
+#   (A) cost-per-fill: phase 2 produced fills ≥30% cheaper than phase 1.
+#       Phase 1 and phase 2 run on different row slices (phase 2 only
+#       sees still-null rows) so cost-per-row isn't comparable; cost-
+#       per-fill is.
+#
+#   (B) phase 1 yield was poor AND phase 2 still recovered a meaningful
+#       fraction of its slice. Captures the "phase 1 burned web_search
+#       on dead ends" pattern even when its cost-per-fill on the rows
+#       it DID catch was fine. The point isn't that phase 2 was
+#       cheaper, it's that phase 1 spent most of its budget on cells
+#       that ended null.
+#
+# Both signals require phase 2 to have filled enough cells to be a
+# meaningful sample (small wins on 1-2 rows are noise).
+_BULK_FIRST_HINT_COST_PER_FILL_RATIO = 0.7
+_BULK_FIRST_HINT_LOW_P1_YIELD = 0.5
+_BULK_FIRST_HINT_MIN_P2_RECOVERY = 0.3
+_BULK_FIRST_HINT_MIN_P2_FILLS = 3
+
+
+def _bulk_first_hint(
+    p1: Dict[str, Any],
+    p2: Dict[str, Any],
+    target_columns: List[str],
+) -> Optional[str]:
+    """Return a short recommendation string when phase 1 was clearly
+    pulling its weight badly enough to skip next time.
+
+    See thresholds above for the two independent signals. Returns None
+    when phase 2 didn't run, filled too few cells, or phase 1 was
+    already competitive.
+    """
+    p2_filled = int(p2.get("cells_filled", 0) or 0)
+    if p2_filled < _BULK_FIRST_HINT_MIN_P2_FILLS:
+        return None
+    p1_filled = int(p1.get("cells_filled", 0) or 0)
+
+    p1_avg = float(p1.get("avg_cost_per_row", 0) or 0)
+    p2_avg = float(p2.get("avg_cost_per_row", 0) or 0)
+    p1_processed = max(1, int(p1.get("processed", 0) or 0))
+    p2_processed = max(1, int(p2.get("processed", 0) or 0))
+    p1_total = p1_avg * p1_processed
+    p2_total = p2_avg * p2_processed
+
+    p1_yield = p1_filled / p1_processed
+    p2_recovery = p2_filled / p2_processed
+
+    # Signal A — phase 2 cost-per-fill beat phase 1 by ≥30%.
+    cost_signal = False
+    if p1_filled > 0:
+        p1_cpf = p1_total / p1_filled
+        p2_cpf = p2_total / p2_filled
+        cost_signal = p2_cpf < p1_cpf * _BULK_FIRST_HINT_COST_PER_FILL_RATIO
+    else:
+        # Phase 1 filled nothing — fire automatically.
+        cost_signal = True
+
+    # Signal B — phase 1 yield was low AND phase 2 recovered enough.
+    yield_signal = (
+        p1_yield < _BULK_FIRST_HINT_LOW_P1_YIELD
+        and p2_recovery >= _BULK_FIRST_HINT_MIN_P2_RECOVERY
+    )
+
+    if not (cost_signal or yield_signal):
+        return None
+
+    cols = ", ".join(target_columns) if target_columns else "this column"
+    if cost_signal and p1_filled > 0:
+        lead = (
+            f"Bulk browser_use produced fills "
+            f"{(p1_total / p1_filled) / (p2_total / p2_filled):.1f}x "
+            f"cheaper than per-cell"
+        )
+        detail = (
+            f"phase 1: {p1_filled}/{p1_processed} filled at "
+            f"${p1_total / p1_filled:.3f}/fill; "
+            f"phase 2: {p2_filled}/{p2_processed} at "
+            f"${p2_total / p2_filled:.3f}/fill"
+        )
+    else:
+        # Yield-driven hint (or phase-1 zero-fills) — phase 1 didn't
+        # pull its weight even if its cost-per-fill on the rows it
+        # caught was OK.
+        lead = "Per-cell phase 1 was a poor first pass"
+        detail = (
+            f"phase 1 yield {p1_yield:.0%} ({p1_filled}/{p1_processed}); "
+            f"bulk phase 2 recovered {p2_filled}/{p2_processed} of the "
+            f"still-null rows"
+        )
+    return (
+        f"{lead} on '{cols}' in this run ({detail}). For follow-up "
+        f"rows_fill calls on this column, prefer `bulk_first=true` to "
+        f"skip the per-cell phase."
+    )
 
 
 def _merge_fill_summaries(
@@ -982,6 +1252,12 @@ def _merge_fill_summaries(
     p2_skills = p2.get("skills_applied") or []
     if p1_skills or p2_skills:
         merged["skills_applied"] = sorted(set(list(p1_skills) + list(p2_skills)))
+    # Sum voided cost across phases when WAIVE_FAILED_FILL_CHARGES is on.
+    voided = float(p1.get("voided_cost_usd", 0) or 0) + float(
+        p2.get("voided_cost_usd", 0) or 0
+    )
+    if voided > 0:
+        merged["voided_cost_usd"] = round(voided, 4)
     # Use phase 2's samples (most recent post-escalation state) when
     # available; the chat agent's "show a couple sample results" needs
     # the latest values.
@@ -1003,19 +1279,41 @@ async def fill_rows_with_escalation(
     concurrency: int = _CELL_CONCURRENCY,
     progress_cb: Optional[ProgressCallback] = None,
     escalate_via_browser_use: bool = False,
+    bulk_first: bool = False,
+    retry_failed: bool = False,
 ) -> Tuple[Dict[str, Any], float]:
-    """rows_fill with optional browser_use fallback for still-null rows.
+    """rows_fill dispatcher across three strategies:
 
-    Phase 1 is the standard per-cell `fill_rows`. If `escalate_via_
-    browser_use` is set AND phase 1's yield is poor (>= 5 still-null
-    rows OR yield < 70%), phase 2 runs `bulk_browser.bulk_fill_rows`
-    over the same where clause — its pre-filter automatically targets
-    only the rows that still have at least one null target column.
+    - `bulk_first=True`: skip per-cell entirely, run bulk browser_use as
+      the only phase. For columns where per-cell web_search is known to
+      be ineffective (X handles, niche social profiles). No automatic
+      fallback — the chat agent re-calls with `bulk_first=False` on the
+      still-null rows if it wants a per-cell second pass.
+    - `bulk_first=False, escalate_via_browser_use=True`: per-cell is
+      phase 1; bulk is phase 2 if phase 1 yield was poor (>=5 still-null
+      OR <70%).
+    - `bulk_first=False, escalate_via_browser_use=False`: per-cell only.
 
-    Returns the merged summary. When escalation didn't trigger, the
-    returned shape is identical to plain `fill_rows`. When it did,
-    `escalated: True` plus `phase1` / `phase2` sub-objects appear.
+    The summary may include a `next_call_hint` when phase 2 outperformed
+    phase 1 by a wide margin, suggesting the chat agent pass
+    `bulk_first=True` on the next fill of the same column.
     """
+    if bulk_first:
+        from dsl_worker.chat_api import bulk_browser
+
+        summary, total_cost = await bulk_browser.bulk_fill_rows(
+            project=project,
+            target_columns=target_columns,
+            where_sql=where_sql,
+            where_params=where_params,
+            limit=limit,
+            progress_cb=progress_cb,
+            retry_failed=retry_failed,
+        )
+        if not summary.get("error"):
+            summary["strategy"] = "bulk_first"
+        return (summary, total_cost)
+
     # Phase 1 — cheap per-cell pass.
     summary, total_cost = await fill_rows(
         project=project,
@@ -1026,6 +1324,7 @@ async def fill_rows_with_escalation(
         max_cost=max_cost,
         concurrency=concurrency,
         progress_cb=progress_cb,
+        retry_failed=retry_failed,
     )
 
     if not escalate_via_browser_use or summary.get("error"):
@@ -1058,6 +1357,7 @@ async def fill_rows_with_escalation(
         where_params=where_params,
         limit=limit,
         progress_cb=progress_cb,
+        retry_failed=retry_failed,
     )
     total_cost += cost2
 
@@ -1069,4 +1369,8 @@ async def fill_rows_with_escalation(
         summary["escalation_error"] = summary2.get("error")
         return (summary, total_cost)
 
-    return (_merge_fill_summaries(summary, summary2), total_cost)
+    merged = _merge_fill_summaries(summary, summary2)
+    hint = _bulk_first_hint(summary, summary2, target_columns)
+    if hint:
+        merged["next_call_hint"] = hint
+    return (merged, total_cost)

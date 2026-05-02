@@ -21,6 +21,38 @@ The same person often shows different names across platforms. "Andy"
 on a directory listing may be "Andrew" on X. Maiden vs. married surnames,
 nicknames, initials, or a handle that drops the last name entirely.
 
+### One column, not two: X URL is what the user wants
+
+**X Handle and X URL are the same data.** A handle (`@automin`) and a
+URL (`https://x.com/automin`) are trivially convertible — the URL is
+just `https://x.com/` + the handle without the `@`. The user cares
+about the URL because it's clickable; the handle alone is a half-step
+they'd have to manually paste into a browser.
+
+**Rules:**
+- When the user asks for "Twitter handles" / "X handles" / "X
+  accounts" / "their Twitter" / etc., create ONE column named
+  `X URL` with format `https://x.com/... or null`. Do NOT also add
+  an `X Handle` column. Two columns is duplicate data the user has
+  to maintain.
+- If a row already has both `X Handle` and `X URL` columns from an
+  older harvest, fill `X URL` only and leave `X Handle` alone (or
+  ask the user if they want it dropped). Never spend credits filling
+  both.
+- When committing a value, always write the full URL form
+  (`https://x.com/automin`), never the bare handle (`@automin` or
+  `automin`). Even if the column happens to be named `X Handle`,
+  store the URL — it's what's useful downstream.
+
+### Note for the chat agent (column-level routing)
+
+For batch X-URL fills (5+ rows), the empirically best path is
+`rows_fill(..., bulk_first=true)` — bulk browser_use as the only phase,
+~1 credit/row. Per-cell web_search hits ~37% on this column and burns
+0.5-1 credits/row to confirm what bulk would also miss. The rules below
+apply to whichever agent (per-cell or bulk task) is actually doing the
+search, but **prefer bulk_first when scheduling the fill.**
+
 ### Hard floor: at least 4 distinct searches before any null
 
 **You MUST run at least 4 distinct `web_search` queries with materially

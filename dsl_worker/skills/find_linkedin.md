@@ -16,6 +16,23 @@ triggers:
 LinkedIn is high-precision but identity collisions are common. Many
 people share a name; committing the wrong profile is worse than null.
 
+### See also: find_x_handles routing rules
+
+Read `find_x_handles.md` for the column-level routing guidance — the
+"one column, not two" rule and the `bulk_first=true` recommendation
+likely apply here too. LinkedIn URL discovery has the same shape as
+X-URL discovery: a known person, a public profile to verify, and per-
+cell web_search burns multiple billable calls before it can confidently
+null. If FullEnrich/Apollo (the cheap precision sources for LinkedIn)
+return nothing on a batch, prefer `bulk_first=true` over web_search
+loops — bulk browser_use sees patterns across people in the same task
+and avoids the per-cell 4-search hard floor.
+
+LinkedIn-specific caveat: bulk BU sessions sometimes hit LinkedIn
+auth walls / login prompts that web_search results don't. If the bulk
+task fails with auth errors on a batch, fall back to per-cell which
+can use FullEnrich/Apollo first.
+
 **Tool order:**
 1. **FullEnrich** (`fullenrich_search_people` or `fullenrich_enrich_contacts`)
    when you have name + company. Cheapest verified path.
