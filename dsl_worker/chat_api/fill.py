@@ -301,6 +301,9 @@ async def _run_cell_agent(
     max_cost: float,
     extra_system: Optional[str] = None,
     skills_applied: Optional[List[str]] = None,
+    progress_cb: Optional[ProgressCallback] = None,
+    cell_idx: Optional[int] = None,
+    cell_total: Optional[int] = None,
 ) -> CellFillResult:
     """Spawn the bounded subagent for one row and return its CellFillResult.
 
@@ -411,6 +414,22 @@ async def _run_cell_agent(
                         turn=turn_idx + 1,
                         cost_usd=sources.WEB_SEARCH_USD_BY_TIER["low"],
                     )
+                # Surface to the toolLog so the user sees the cell did a
+                # web search this turn. Timing is retroactive — the
+                # built-in already ran inside the OpenAI response — but
+                # most cells web_search before they call set_values, so
+                # this still flashes before the next per-cell event.
+                if progress_cb is not None and cell_idx is not None:
+                    try:
+                        await progress_cb({
+                            "type": "cell_tool",
+                            "row_id": str(row_id),
+                            "index": cell_idx,
+                            "total": cell_total,
+                            "tool": "web_search",
+                        })
+                    except Exception:
+                        log.exception("progress_cb cell_tool (web_search) raised; suppressing")
             elif item.type == "function_call":
                 function_calls.append(item)
 
@@ -550,6 +569,22 @@ async def _run_cell_agent(
                             result="skipped — budget_exhausted",
                         )
                     continue
+                # Surface what the cell agent is about to do — source
+                # tools (apollo_enrich, browser_use, fullenrich) take
+                # 10-60s and would otherwise show as dead air between
+                # cell_start and cell_done. The FE renders this as
+                # "cell N/M → tool_name…" in the toolLog summary.
+                if progress_cb is not None and cell_idx is not None:
+                    try:
+                        await progress_cb({
+                            "type": "cell_tool",
+                            "row_id": str(row_id),
+                            "index": cell_idx,
+                            "total": cell_total,
+                            "tool": fc.name,
+                        })
+                    except Exception:
+                        log.exception("progress_cb cell_tool raised; suppressing")
                 try:
                     out_text, tool_cost = await sources.execute_source_tool(fc.name, fc_args)
                     result.cost_usd += tool_cost
@@ -842,6 +877,9 @@ async def fill_rows(
                 max_cost=max_cost,
                 extra_system=skills_extra_system or None,
                 skills_applied=skills_applied_names or None,
+                progress_cb=progress_cb,
+                cell_idx=idx,
+                cell_total=len(work_items),
             )
             # Persist this cell's values immediately so:
             #  (a) the table updates live as cells fill, not in one
@@ -946,17 +984,14 @@ async def fill_rows(
                         pass
                 finally:
                     write_db.close()
-            # Billing gate: when WAIVE_FAILED_FILL_CHARGES is on, cells
-            # that didn't end "filled" emit cost=0 in cell_done so
-            # streaming.py's incremental-bill path doesn't charge the
-            # user. The actual cost stays on res.cost_usd / the trace
-            # for audit; only the user-facing meter reading is zeroed.
+            # Billing gate: cells that didn't end "filled" are charged
+            # at FAILED_FILL_CHARGE_RATE * cost (default 0.1). Set the
+            # rate to 1.0 for full charge, 0.0 for full waive. The
+            # actual cost stays on res.cost_usd / the trace for audit;
+            # only the user-facing meter reading is scaled.
             billable_cost = (
-                0.0
-                if (
-                    _api_settings.WAIVE_FAILED_FILL_CHARGES
-                    and res.status != "filled"
-                )
+                _api_settings.FAILED_FILL_CHARGE_RATE * res.cost_usd
+                if res.status != "filled"
                 else res.cost_usd
             )
             await _emit({
@@ -987,15 +1022,14 @@ async def fill_rows(
         if isinstance(r, Exception):
             continue
         results.append(r)
-        # Mirror the cell_done billing gate: when waiving, exclude
-        # non-filled cells from the returned total_cost so streaming's
-        # residual calc doesn't bill them either. Track waived spend
-        # separately for the summary.
-        if (
-            _api_settings.WAIVE_FAILED_FILL_CHARGES
-            and r.status != "filled"
-        ):
-            voided_cost += r.cost_usd
+        # Mirror the cell_done billing gate: non-filled cells contribute
+        # only `rate * cost` to total_cost (so streaming's residual calc
+        # doesn't double-bill the waived portion); the (1 - rate) * cost
+        # delta accumulates as voided_cost for the audit summary.
+        if r.status != "filled":
+            charged = _api_settings.FAILED_FILL_CHARGE_RATE * r.cost_usd
+            total_cost += charged
+            voided_cost += r.cost_usd - charged
         else:
             total_cost += r.cost_usd
 
@@ -1057,9 +1091,10 @@ async def fill_rows(
     }
     if voided_cost > 0:
         # Internal-audit field — surfaces compute we ate (didn't bill
-        # the user) when WAIVE_FAILED_FILL_CHARGES is on. The chat
-        # agent SEES this and can use it to gauge wasted-OpenAI-spend
-        # without changing how it talks about cost to the user.
+        # the user) via the (1 - FAILED_FILL_CHARGE_RATE) discount on
+        # non-filled cells. The chat agent SEES this and can use it to
+        # gauge wasted-OpenAI-spend without changing how it talks about
+        # cost to the user.
         summary["voided_cost_usd"] = round(voided_cost, 4)
     if trace_persist_info and trace_persist_info.get("persisted"):
         summary["trace_file"] = trace_persist_info.get("file")
@@ -1252,7 +1287,8 @@ def _merge_fill_summaries(
     p2_skills = p2.get("skills_applied") or []
     if p1_skills or p2_skills:
         merged["skills_applied"] = sorted(set(list(p1_skills) + list(p2_skills)))
-    # Sum voided cost across phases when WAIVE_FAILED_FILL_CHARGES is on.
+    # Sum voided cost across phases (the (1 - FAILED_FILL_CHARGE_RATE)
+    # share of cost on non-filled cells, eaten by us not billed).
     voided = float(p1.get("voided_cost_usd", 0) or 0) + float(
         p2.get("voided_cost_usd", 0) or 0
     )

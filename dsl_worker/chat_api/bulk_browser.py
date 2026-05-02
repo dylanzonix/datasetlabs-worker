@@ -481,19 +481,19 @@ async def bulk_fill_rows(
         traces, writes, cost = r
         all_traces.extend(traces)
         all_writes.extend(writes)
-        # Billing gate: when waiving, exclude per-row costs of cells
-        # that didn't end "filled" from the returned total. Bulk
-        # batches share one BU session cost evenly across rows in the
-        # batch, so we already have per-row attribution on
-        # tr.cost_usd — sum filled-only and waive the rest.
-        if _api_settings.WAIVE_FAILED_FILL_CHARGES:
-            for tr in traces:
-                if tr.status == "filled":
-                    total_cost += tr.cost_usd
-                else:
-                    voided_cost += tr.cost_usd
-        else:
-            total_cost += cost
+        # Billing gate: non-filled cells contribute only `rate * cost`
+        # to the returned total (default rate=0.1 — enough to deter
+        # retry-spam, soft enough to feel like a refund on genuine
+        # misses). Bulk batches share one BU session cost evenly across
+        # rows, so per-row attribution on tr.cost_usd is already correct.
+        rate = _api_settings.FAILED_FILL_CHARGE_RATE
+        for tr in traces:
+            if tr.status == "filled":
+                total_cost += tr.cost_usd
+            else:
+                charged = rate * tr.cost_usd
+                total_cost += charged
+                voided_cost += tr.cost_usd - charged
 
     failed_cols_by_row: Dict[Any, Dict[str, Dict[str, Any]]] = {}
     for tr in all_traces:
@@ -650,8 +650,9 @@ async def bulk_fill_rows(
         summary["skills_applied"] = list(skills_applied_names)
     if voided_cost > 0:
         # Internal-audit field — compute we ate (didn't bill the user)
-        # because WAIVE_FAILED_FILL_CHARGES is on. Same field name as
-        # fill.fill_rows so summary readers handle both uniformly.
+        # via the (1 - FAILED_FILL_CHARGE_RATE) discount on non-filled
+        # cells. Same field name as fill.fill_rows so summary readers
+        # handle both uniformly.
         summary["voided_cost_usd"] = round(voided_cost, 4)
 
     return (summary, total_cost)
