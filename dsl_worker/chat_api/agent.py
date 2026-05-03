@@ -598,6 +598,14 @@ You have flat function tools in three families:
 - **rows_get / rows_count / rows_sample** — read.
 - **rows_update / rows_delete** — modify (always count first before
   delete).
+- **rows_reorder(order=[seq, seq, ...])** — change the display order of
+  existing rows. Pass the existing seqs in the new order. NEVER use
+  delete-and-re-add to reorder rows: `rows_get` does not return the
+  per-cell source citations stored in `samples.tags`, so any rebuild
+  via `rows_add` silently strips the tags from every row. Whenever
+  the user asks to sort, group, rank, or "put X at the top," do
+  `rows_get` for the columns you sort by, decide the order locally,
+  then a single `rows_reorder` call.
 
 Filters are dicts: `{col: v}` for equality, `{col__lt: n}` / `__gt` / `__lte`
 / `__gte`, `{col__contains: s}`, `{col__in: [...]}`, `{col__isnull: true}`,
@@ -1379,6 +1387,39 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
                 },
             },
             "required": ["where"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "rows_reorder",
+        "description": (
+            "Reorder rows in the current version by passing the full new "
+            "order as a list of seq integers. ALWAYS use this when the user "
+            "wants rows reordered/sorted/grouped — never delete-and-re-add "
+            "to reorder. rows_add inserts NEW rows that lose all per-cell "
+            "source citations stored in samples.tags (because rows_get does "
+            "NOT return tags, you have no way to re-emit them in the new "
+            "rows_add items). rows_reorder touches NO row data and NO tags; "
+            "it only rewrites the seq column. To use: rows_get the columns "
+            "you need to sort by, decide the new order locally, then pass "
+            "the existing seqs in the new order. Seqs must exactly match "
+            "the live (non-deleted) rows, include every row exactly once, "
+            "and contain no duplicates."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "order": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": (
+                        "Full ordered list of current row seq integers. The "
+                        "first seq becomes the new top row, etc. Must include "
+                        "every existing live row's seq exactly once."
+                    ),
+                },
+            },
+            "required": ["order"],
         },
     },
     {
@@ -2202,6 +2243,9 @@ async def execute_tool(
         return applied, result, 0.0
     if tool_name == "rows_undelete":
         applied, result = _tool_rows_undelete(db, project, version, args)
+        return applied, result, 0.0
+    if tool_name == "rows_reorder":
+        applied, result = _tool_rows_reorder(db, project, version, args)
         return applied, result, 0.0
     if tool_name == "rows_fill":
         applied, result, cost = await _tool_rows_fill(
@@ -3550,6 +3594,69 @@ def _tool_rows_undelete(
     if restored and version.generated_count is not None:
         version.generated_count = (version.generated_count or 0) + restored
     return {"rows_restored": restored}, {"ok": True, "restored": restored}
+
+
+def _tool_rows_reorder(
+    db: Session, project: Project, version: ProjectVersion, args: Dict[str, Any]
+):
+    """Renumber samples.seq for the live rows of the current version
+    according to the given order. Touches no row data and no tags —
+    just rewrites seq. The first seq in `order` becomes seq=1, etc.
+    """
+    order = args.get("order")
+    if not isinstance(order, list) or not all(isinstance(x, int) for x in order):
+        return {}, {"error": "order must be a list of integers (existing row seqs)"}
+
+    existing = (
+        db.query(Sample.id, Sample.seq)
+        .filter(Sample.version_id == version.id, Sample.deleted_at.is_(None))
+        .all()
+    )
+    existing_seqs = {seq for _, seq in existing}
+    requested = list(order)
+    requested_set = set(requested)
+    unknown = requested_set - existing_seqs
+    missing = existing_seqs - requested_set
+    if unknown:
+        return {}, {
+            "error": f"unknown seq(s): {sorted(unknown)}",
+            "current_seqs": sorted(existing_seqs),
+        }
+    if missing:
+        return {}, {
+            "error": (
+                f"order must include every live row exactly once; "
+                f"missing seqs: {sorted(missing)}"
+            ),
+            "current_seqs": sorted(existing_seqs),
+        }
+    if len(requested) != len(requested_set):
+        dupes = sorted({s for s in requested if requested.count(s) > 1})
+        return {}, {"error": f"duplicate seq(s) in order: {dupes}"}
+
+    by_seq = {seq: sid for sid, seq in existing}
+    from sqlalchemy import text
+
+    # Two-step renumber via a temp range above current max — defensive
+    # against any future unique constraint on (version_id, seq), and
+    # cheap either way.
+    base = max(existing_seqs) + 1000
+    for i, old_seq in enumerate(requested):
+        db.execute(
+            text("UPDATE samples SET seq = :ns WHERE id = :sid"),
+            {"ns": base + i, "sid": by_seq[old_seq]},
+        )
+    db.flush()
+    for i, old_seq in enumerate(requested):
+        db.execute(
+            text("UPDATE samples SET seq = :ns WHERE id = :sid"),
+            {"ns": i + 1, "sid": by_seq[old_seq]},
+        )
+    db.expire_all()
+    return {"rows_reordered": len(requested)}, {
+        "ok": True,
+        "n": len(requested),
+    }
 
 
 # ---------------------------------------------------------------------------
