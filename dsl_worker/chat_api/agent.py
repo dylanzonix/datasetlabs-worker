@@ -587,9 +587,12 @@ You have flat function tools in three families:
 
 ## Table tools — manipulate the project's rows + columns
 
-- **columns_add / columns_list / columns_modify / columns_delete** — define
-  the schema. A column has `name`, optional `format` (e.g. "lowercase email
-  or null", "range string like 10-15") and `description`.
+- **columns_add / columns_list / columns_modify / columns_delete /
+  columns_reorder** — define the schema. A column has `name`, optional
+  `format` (e.g. "lowercase email or null", "range string like 10-15")
+  and `description`. To rearrange the display order use
+  `columns_reorder(order=[...])` — never delete-and-re-add to move
+  columns, since `columns_delete` strips every cell value.
 - **rows_add(items, merge_key)** — insert rows. With `merge_key`, rows
   matching an existing row's value get merged (no overwrite).
 - **rows_get / rows_count / rows_sample** — read.
@@ -1206,6 +1209,34 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
                 },
             },
             "required": ["name"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "columns_reorder",
+        "description": (
+            "Reorder the project's columns by passing the full new order as a "
+            "list of names. ALWAYS use this when the user wants columns moved "
+            "or rearranged — never delete-and-re-add to reorder, since "
+            "columns_delete drops every cell value in that column. "
+            "columns_reorder touches NO row data; it only updates display "
+            "order. Names must exactly match existing columns, the list must "
+            "include every existing column exactly once, and contain no "
+            "duplicates."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "order": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Full ordered list of column names. Must include "
+                        "every existing column exactly once."
+                    ),
+                },
+            },
+            "required": ["order"],
         },
     },
     {
@@ -2145,6 +2176,9 @@ async def execute_tool(
         return applied, result, 0.0
     if tool_name == "columns_delete":
         applied, result = _tool_columns_delete(db, project, args)
+        return applied, result, 0.0
+    if tool_name == "columns_reorder":
+        applied, result = _tool_columns_reorder(db, project, args)
         return applied, result, 0.0
     if tool_name == "rows_add":
         applied, result = await _tool_rows_add(
@@ -3151,6 +3185,43 @@ def _tool_columns_delete(db: Session, project: Project, args: Dict[str, Any]):
     else:
         affected = 0
     return {"columns": new_cols}, {"ok": True, "rows_with_data_dropped": affected}
+
+
+def _tool_columns_reorder(db: Session, project: Project, args: Dict[str, Any]):
+    order = args.get("order")
+    if not isinstance(order, list) or not all(isinstance(x, str) for x in order):
+        return {}, {"error": "order must be a list of column-name strings"}
+    cols = list(project.columns or [])
+    by_name: Dict[str, dict] = {}
+    for c in cols:
+        if isinstance(c, dict) and isinstance(c.get("name"), str):
+            by_name[c["name"]] = c
+    existing = set(by_name.keys())
+    requested = [n.strip() for n in order]
+    requested_set = set(requested)
+    unknown = requested_set - existing
+    missing = existing - requested_set
+    if unknown:
+        return {}, {
+            "error": f"unknown column name(s): {sorted(unknown)}",
+            "current_order": list(by_name.keys()),
+        }
+    if missing:
+        return {}, {
+            "error": (
+                f"order must include every existing column exactly once; "
+                f"missing: {sorted(missing)}"
+            ),
+            "current_order": list(by_name.keys()),
+        }
+    if len(requested) != len(requested_set):
+        dupes = sorted({n for n in requested if requested.count(n) > 1})
+        return {}, {"error": f"duplicate column name(s) in order: {dupes}"}
+    new_cols = [by_name[name] for name in requested]
+    project.columns = new_cols
+    if project.current_version is not None:
+        project.current_version.columns = new_cols
+    return {"columns": new_cols}, {"ok": True, "order": requested}
 
 
 # --- Row tools ---
