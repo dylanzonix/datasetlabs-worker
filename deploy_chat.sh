@@ -25,8 +25,21 @@ yaml_quote() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# ---- Peek for --production early so the right config file is loaded -----
+PRODUCTION_MODE="0"
+for arg in "$@"; do
+  if [[ "$arg" == "--production" ]]; then
+    PRODUCTION_MODE="1"
+    break
+  fi
+done
+
 # ---- Load deploy_chat.config ---------------------------------------------
-if [[ -f deploy_chat.config ]]; then
+if [[ "$PRODUCTION_MODE" == "1" ]] && [[ -f deploy_chat.config.prod ]]; then
+  echo "Loading PRODUCTION configuration from deploy_chat.config.prod..."
+  # shellcheck disable=SC1091
+  source deploy_chat.config.prod
+elif [[ -f deploy_chat.config ]]; then
   echo "Loading configuration from deploy_chat.config..."
   # shellcheck disable=SC1091
   source deploy_chat.config
@@ -50,11 +63,18 @@ CONCURRENT_REQUESTS="${CONCURRENT_REQUESTS:-5}"
 TARGET_PORT="${TARGET_PORT:-8040}"
 ALLOWED_ORIGINS="${ALLOWED_ORIGINS:-http://localhost:8080}"
 
-ENV_FILE=".env"
+ENV_FILE="${ENV_FILE:-.env}"
+# In --production mode default the env file to .env.prod unless the
+# user explicitly passes --env-file. (This is set late so the
+# deploy_chat.config.prod file's ENV_FILE export, if any, wins.)
+if [[ "$PRODUCTION_MODE" == "1" && "$ENV_FILE" == ".env" ]]; then
+  ENV_FILE=".env.prod"
+fi
 
 # ---- CLI args ------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --production) shift ;;  # already handled in the peek-ahead above
     --cpu) CPU="$2"; shift 2 ;;
     --memory) MEMORY="$2"; shift 2 ;;
     --min-replicas) MIN_REPLICAS="$2"; shift 2 ;;
@@ -203,6 +223,11 @@ else
   REGISTRY_PASSWORD="$(az acr credential show --name "$REGISTRY_NAME" --query "passwords[0].value" -o tsv)"
   [[ -n "$REGISTRY_PASSWORD" ]] || die "Could not fetch ACR password (is ACR admin user enabled?)"
 
+  # Create first without --yaml so registry creds are honored — `az
+  # containerapp create --yaml ...` ignores all sibling flags including
+  # --registry-*, which leaves the new app unable to pull from ACR.
+  # Then update with the yaml to apply env vars + scaling. Same
+  # workaround api/deploy.sh uses.
   az containerapp create \
     -g "$RESOURCE_GROUP" -n "$CONTAINER_APP_NAME" \
     --environment "$ENVIRONMENT_NAME" \
@@ -210,6 +235,16 @@ else
     --registry-server "${REGISTRY_NAME}.azurecr.io" \
     --registry-username "$REGISTRY_NAME" \
     --registry-password "$REGISTRY_PASSWORD" \
+    --ingress external \
+    --target-port "$TARGET_PORT" \
+    --min-replicas "$MIN_REPLICAS" \
+    --max-replicas "$MAX_REPLICAS" \
+    --cpu "$CPU" \
+    --memory "$MEMORY" \
+    >/dev/null
+
+  az containerapp update \
+    -g "$RESOURCE_GROUP" -n "$CONTAINER_APP_NAME" \
     --yaml "$TMP_YAML" >/dev/null
 fi
 

@@ -1,0 +1,27 @@
+# deploy_chat.config.prod — production chat-API deployment configuration
+
+# Azure resources (production env in westus2 — matches api-prod / worker-prod)
+RESOURCE_GROUP=datasetlabs-rg
+CONTAINER_APP_NAME=datasetlabs-chat-api-prod
+ENVIRONMENT_NAME=datasetlabs-env-prod
+REGISTRY_NAME=datasetlabsregistry
+IMAGE_NAME=worker
+IMAGE_TAG=prod-$(git rev-parse --short HEAD)-$(date +%H%M%S)
+
+# Container settings (production — bumped from dev defaults since chat is
+# user-facing real-time traffic)
+CPU=1.0
+MEMORY=2.0Gi
+MIN_REPLICAS=1                 # warm — chat cold start is bad UX
+MAX_REPLICAS=10
+
+# HTTP scaler — scale up when concurrent requests per replica exceeds this
+CONCURRENT_REQUESTS=5
+
+# Service exposes HTTP on this port (entrypoint_chat.sh reads $PORT)
+TARGET_PORT=8040
+
+# Origins allowed to call the chat API in prod.
+# `https://datasetlabs.ai` covers the marketing-domain-hosted FE.
+# Add more comma-separated when other FE hosts come online.
+ALLOWED_ORIGINS=https://datasetlabs.ai,https://www.datasetlabs.ai,https://app.datasetlabs.ai

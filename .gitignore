@@ -104,3 +104,8 @@ browser_profiles/
 workspace_*/
 
 a.txt
+
+# Local IDE / agent configs (may contain MCP credentials)
+.gemini/
+.claude/
+.cursor/
