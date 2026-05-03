@@ -12,8 +12,12 @@ IMAGE_TAG=prod-$(git rev-parse --short HEAD)-$(date +%H%M%S)
 CPU=4.0
 MEMORY=8.0Gi
 
-# Scaling: Always keep 1 warm worker for low latency
-MIN_REPLICAS=1
+# Scaling: scale to zero when queue is empty. The chat-api handles
+# user-facing real-time traffic separately (its own container app
+# with HTTP scaling); the queue-worker only needs to wake on Service
+# Bus messages, so MIN_REPLICAS=0 is safe and saves the always-on
+# replica's compute cost.
+MIN_REPLICAS=0
 MAX_REPLICAS=10
 
 # KEDA Scaling (production - aggressive scaling for low latency)
