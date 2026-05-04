@@ -872,7 +872,29 @@ async def run_agent_loop(
             return entry
 
         try:
+            # `running_input` is the local-replay record kept in case the
+            # stream dies mid-round and we need to resume on the next
+            # user message via `resume_input` (manual replay path). It
+            # accumulates every output item and tool result across rounds.
+            #
+            # The LIVE API calls don't read it after round 1 — instead
+            # we pass `previous_response_id` to chain rounds server-side.
+            # That keeps OpenAI's prompt cache warm across the whole
+            # turn (cache TTL is 5 min; long runs blow it repeatedly
+            # under the old "send full input every round" pattern, see
+            # project fafed105 — ~$2.81 of $3.56 went to model+thinking
+            # in a 17-min run because cache evicted ~3 times). With
+            # `previous_response_id`, OpenAI references its own stored
+            # response (cheap) and we send only the new tool results
+            # each round.
             running_input: List[Dict[str, Any]] = list(input_items)
+            # What we send to OpenAI THIS round. Round 1 = the full
+            # initial context (system + history + user). Rounds 2+ =
+            # just the function_call_output items from the prior
+            # round's tool calls. OpenAI fills in the rest from
+            # `previous_response_id`.
+            next_round_input: List[Dict[str, Any]] = list(input_items)
+            previous_response_id: Optional[str] = None
             _effort = _EFFORT_TO_REASONING.get(effective_effort or "") \
                 or _resolve_reasoning_effort(user_content)
             stripper = _CitationStripper()
@@ -905,11 +927,13 @@ async def run_agent_loop(
                 stream_kwargs: Dict[str, Any] = {
                     "model": settings.OPENAI_MODEL,
                     "instructions": agent.SYSTEM_PROMPT,
-                    "input": running_input,
+                    "input": next_round_input,
                     "tools": agent.CHAT_TOOLS,
                     "reasoning": {"effort": _effort, "summary": "auto"},
                     "max_output_tokens": 200000,
                 }
+                if previous_response_id:
+                    stream_kwargs["previous_response_id"] = previous_response_id
 
                 MAX_STREAM_RETRIES = 1
                 final_response = None
@@ -1260,6 +1284,12 @@ async def run_agent_loop(
                     else:
                         running_input.append(out_item.model_dump(exclude_none=True))
 
+                # Round completed cleanly — chain the next round to this
+                # response server-side. `previous_response_id` here points
+                # at the prior response; the next stream call will pass
+                # only the new function_call_output items as input.
+                previous_response_id = final_response.id
+
                 tool_calls = [
                     item for item in final_response.output
                     if item.type == "function_call"
@@ -1440,6 +1470,12 @@ async def run_agent_loop(
                     })
 
                 running_input.extend(tool_result_items)
+                # Next round sends ONLY the new function_call_output items
+                # — OpenAI fills in the rest from `previous_response_id`.
+                # `running_input` keeps the full local copy for the
+                # resume-on-stream-death path; the live API call gets
+                # the small payload.
+                next_round_input = list(tool_result_items)
 
                 if stopped:
                     break
@@ -1573,7 +1609,7 @@ async def run_agent_loop(
             and not full_content.strip()
         ):
             try:
-                wrap_input = list(running_input) + [{
+                wrap_user_msg = {
                     "role": "user",
                     "content": (
                         "(System note — not from the user.) You ran tools "
@@ -1585,13 +1621,23 @@ async def run_agent_loop(
                         "before replying. The user is staring at the "
                         "table waiting."
                     ),
-                }]
-                wrap = await client.responses.create(
-                    model=settings.OPENAI_MODEL,
-                    instructions=agent.SYSTEM_PROMPT,
-                    input=wrap_input,
-                    max_output_tokens=600,
-                )
+                }
+                wrap_kwargs: Dict[str, Any] = {
+                    "model": settings.OPENAI_MODEL,
+                    "instructions": agent.SYSTEM_PROMPT,
+                    "max_output_tokens": 600,
+                }
+                if previous_response_id:
+                    # Chain to the last round's response — only the
+                    # synthetic nudge is new input. Avoids re-sending
+                    # the full conversation just to re-prompt the wrap.
+                    wrap_kwargs["previous_response_id"] = previous_response_id
+                    wrap_kwargs["input"] = [wrap_user_msg]
+                else:
+                    # No prior response (round 1 died or this is a
+                    # cold-start edge case) — fall back to manual replay.
+                    wrap_kwargs["input"] = list(running_input) + [wrap_user_msg]
+                wrap = await client.responses.create(**wrap_kwargs)
                 wrap_cost = _response_cost_usd(wrap)
                 total_cost += wrap_cost
                 billing.add(wrap_cost)

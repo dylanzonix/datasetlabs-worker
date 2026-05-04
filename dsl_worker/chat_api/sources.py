@@ -325,7 +325,11 @@ async def _fe_enrich_contacts(args: Dict[str, Any], *, project_id: Optional[Any]
     if len(contacts) > 25:
         return json.dumps({"error": "max 25 contacts per call; batch into multiple calls"}), 0.0
 
-    fields = args.get("fields") or ["emails", "phones"]
+    # Default emails-only. Phones cost 10 credits each on FE — when both
+    # email and phone enrichment are enabled and a phone is found, the
+    # caller pays ~10x what they would for emails alone. Most fills want
+    # email; phones are an explicit opt-in.
+    fields = args.get("fields") or ["emails"]
     enrich_fields: List[str] = []
     for f in fields:
         f = str(f).lower()
@@ -336,7 +340,7 @@ async def _fe_enrich_contacts(args: Dict[str, Any], *, project_id: Optional[Any]
         if "personal" in f:
             enrich_fields.append("contact.personal_emails")
     if not enrich_fields:
-        enrich_fields = ["contact.emails", "contact.phones"]
+        enrich_fields = ["contact.emails"]
 
     try:
         result = await client.enrich_contacts(
@@ -439,11 +443,10 @@ async def _apollo_enrich_company(args: Dict[str, Any], *, project_id: Optional[A
     if client is None:
         return json.dumps({"error": "APOLLO_API_KEY not configured"}), 0.0
     domain = args.get("domain")
-    name = args.get("name")
-    if not domain and not name:
-        return json.dumps({"error": "provide domain or name"}), 0.0
+    if not domain:
+        return json.dumps({"error": "provide domain (call apollo_search_companies if you only have a name)"}), 0.0
     try:
-        org = await client.enrich_company(domain=domain or None, name=name or None)
+        org = await client.enrich_company(domain=domain)
     except Exception as e:
         return json.dumps({"error": f"{type(e).__name__}: {e}"}), 0.0
     if not org:
@@ -1213,11 +1216,16 @@ SOURCE_TOOLS: List[Dict[str, Any]] = [
         "type": "function",
         "name": "fullenrich_enrich_contacts",
         "description": (
-            "Find verified work emails (and/or phones) for a small batch of "
-            "people. Each contact needs at minimum: linkedin_url OR "
-            "(first_name + last_name + domain). Cost: ~1 credit per email "
-            "found, ~10 credits per phone found. ≤25 contacts per call — "
-            "batch larger lists across multiple calls."
+            "Find verified work emails for a small batch of people. Each "
+            "contact needs at minimum: linkedin_url OR (first_name + "
+            "last_name + domain). Adding linkedin_url improves the match "
+            "rate significantly — pass it when you have one. ≤25 contacts "
+            "per call.\n\n"
+            "Cost: ~1 credit per verified email (~$0.055). Defaults to "
+            "EMAILS ONLY. Phones cost ~10 credits each (~$0.55) — only "
+            "pass `fields=['emails','phones']` when the target column is "
+            "a phone column. Don't enable phones 'just in case' — it "
+            "silently costs 10x."
         ),
         "parameters": {
             "type": "object",
@@ -1238,7 +1246,11 @@ SOURCE_TOOLS: List[Dict[str, Any]] = [
                 "fields": {
                     "type": "array",
                     "items": {"type": "string", "enum": ["emails", "phones", "personal_emails"]},
-                    "description": "Default: ['emails', 'phones'].",
+                    "description": (
+                        "Defaults to ['emails']. Add 'phones' ONLY if "
+                        "the target is a phone column — phone enrichment "
+                        "is ~10x the cost of email enrichment."
+                    ),
                 },
             },
             "required": ["contacts"],
@@ -1296,13 +1308,16 @@ SOURCE_TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "name": "apollo_enrich_company",
-        "description": "Look up a single company in Apollo by domain or name. Free.",
+        "description": (
+            "Look up a single company in Apollo by domain. Free. "
+            "If you only have a name, call apollo_search_companies first to get the domain."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "domain": {"type": "string"},
-                "name": {"type": "string"},
             },
+            "required": ["domain"],
         },
     },
     # ── Apify ────────────────────────────────────────────────────────────

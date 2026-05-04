@@ -192,13 +192,12 @@ def register_apollo_namespace(
 
     async def enrich_company(args: Dict) -> Tuple[str, float]:
         domain = args.get("domain") or None
-        name = args.get("name") or None
 
-        if not domain and not name:
-            return "Error: provide domain or name.", 0.0
+        if not domain:
+            return "Error: provide domain (call search_companies if you only have a name).", 0.0
 
         try:
-            org = await client.enrich_company(domain=domain, name=name)
+            org = await client.enrich_company(domain=domain)
         except Exception as e:
             return f"Apollo enrichment error: {e}", 0.0
 
@@ -385,15 +384,17 @@ def register_apollo_namespace(
         {
             "name": "enrich_company",
             "description": (
-                "Enrich a company via Apollo — get industry, size, revenue, phone, "
-                "location, LinkedIn, founding year. Provide domain or name."
+                "Enrich a company via Apollo by DOMAIN — get industry, size, "
+                "revenue, phone, location, LinkedIn, founding year. If you "
+                "only have a company name, call search_companies first to "
+                "get the domain."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "domain": {"type": "string", "description": "Company domain (e.g. 'stripe.com')"},
-                    "name": {"type": "string", "description": "Company name"},
                 },
+                "required": ["domain"],
             },
         },
         {

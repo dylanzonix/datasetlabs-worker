@@ -211,7 +211,11 @@ def register_fullenrich_namespace(
         if not contacts:
             return "Error: contacts array is required.", 0.0
 
-        fields = args.get("fields", ["emails", "phones"])
+        # Default emails-only. Phones cost 10 credits each on FE — when
+        # both email and phone enrichment are enabled and a phone is
+        # found, the caller pays ~10x what they would for emails alone.
+        # Most fills want email; phones are an explicit opt-in.
+        fields = args.get("fields", ["emails"])
         enrich_fields = []
         for f in fields:
             if "email" in f.lower():
@@ -221,7 +225,7 @@ def register_fullenrich_namespace(
             if "personal" in f.lower():
                 enrich_fields.append("contact.personal_emails")
         if not enrich_fields:
-            enrich_fields = ["contact.emails", "contact.phones"]
+            enrich_fields = ["contact.emails"]
 
         # For small batches (≤5), return in context
         # For larger batches, write to file
@@ -372,13 +376,18 @@ def register_fullenrich_namespace(
         {
             "name": "enrich_contacts",
             "description": (
-                "Get verified work emails and phone numbers for contacts via waterfall "
-                "enrichment across 20+ data providers. Only charged for verified results.\n\n"
-                "Each contact needs either: first_name + last_name + company (name or domain), "
-                "OR linkedin_url. Adding linkedin_url improves accuracy significantly.\n\n"
-                "Returns email with verification status (DELIVERABLE, HIGH_PROBABILITY, "
-                "CATCH_ALL, INVALID) and phone in E.164 format with region.\n\n"
-                "Cost: ~1 credit per valid email, ~10 credits per valid phone."
+                "Get verified work emails for contacts via waterfall "
+                "enrichment across 20+ data providers. Only charged for "
+                "verified results.\n\n"
+                "Each contact needs either: first_name + last_name + "
+                "company (name or domain), OR linkedin_url. Adding "
+                "linkedin_url improves accuracy significantly.\n\n"
+                "Returns email with verification status (DELIVERABLE, "
+                "HIGH_PROBABILITY, CATCH_ALL, INVALID).\n\n"
+                "Cost: ~1 credit per valid email. Defaults to EMAILS "
+                "ONLY. Phones cost ~10 credits each — only opt in via "
+                "fields=['emails','phones'] when the target is a phone "
+                "column."
             ),
             "parameters": {
                 "type": "object",
@@ -400,7 +409,12 @@ def register_fullenrich_namespace(
                     "fields": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "What to enrich: 'emails', 'phones', 'personal_emails'. Default: ['emails', 'phones']",
+                        "description": (
+                            "What to enrich: 'emails', 'phones', "
+                            "'personal_emails'. Defaults to ['emails']. "
+                            "Add 'phones' ONLY if the target is a phone "
+                            "column — phones are ~10x the cost of emails."
+                        ),
                     },
                 },
                 "required": ["contacts"],

@@ -360,7 +360,8 @@ work like this:
    "Filling [columns] for [N] rows ≈ ~Y credits (X credits/cell)".
    This is a TRANSPARENCY rule, not just a runaway-prevention rule —
    the user should never see a charge they weren't told about. Use
-   these per-cell ballparks:
+   these per-cell ballparks (these include cell-agent reasoning +
+   web_search overhead, NOT just the source-tool $):
      - Pure derive / single web_search lookup (handle, URL, public
        fact): ~0.5–1 credit/cell
      - One enrichment API call (Apollo person, GMaps detail) or one
@@ -376,6 +377,17 @@ work like this:
        cell flat — bulk browser_use is the only phase, no per-cell
        spend. Use for columns where per-cell web_search is
        empirically poor.
+
+   **Don't forget THIS turn's own model + web_search cost.** Your
+   own thinking and any built-in web_search calls you make this turn
+   are ALSO billed. Rough rule: if you expect to do >10 source/web
+   calls in this turn, add ~5 credits for your own reasoning; >30
+   calls, add ~15 credits. A single web_search is ~0.5 credit. The
+   pre-flight estimate the user sees should bracket the FULL turn
+   cost — fafed105 (Apartment Operator Leads) said "≈ ~5 credits"
+   for the FE enrichment piece and the user got a ~65-credit charge
+   because the 36 web_searches and 17 minutes of reasoning weren't
+   counted. Don't repeat that.
 3. **If Y exceeds the soft cap, call `confirm_budget` BEFORE
    rows_fill — do NOT just call rows_fill and hope.** The system
    does NOT auto-defer; it will run all N rows and bill it. If you
@@ -700,6 +712,47 @@ deciding the schema. Then `columns_add` the ones that matter, and
 `candidates_to_rows` with the matching map. This avoids guessing field
 shapes upfront. It's also fine to predefine columns when the schema is
 obvious — use judgment.
+
+## Fewer columns, not more
+
+Users grade the table on whether it answers their question, not on
+column count. Each extra column makes the table harder to scan,
+slower to fill, and pricier — for no upside. **Default target: 4–8
+columns for most projects.** 12+ should be a deliberate user-driven
+choice, not the default.
+
+**Test before adding a column:** will the user filter, sort, or scan
+by it? If not, skip it. Scoring / reasoning trails belong in the
+`reason` field and per-cell `_sources`, NOT in extra columns.
+
+Don't add:
+
+- **Heuristic / debug / inclusion-rationale signals.** "Mentions
+  Cloudflare", "Relevance Score", "Why Included", "B2B SaaS Signal",
+  "Author Type Signal". The reasoning that earned a row a spot in
+  the table belongs in cell sources, not the schema. If you scored
+  rows to filter them, do the filtering and DON'T paste the score.
+  Project 8ceb04f9 (cold-email research) shipped 19 columns where
+  ~6 would have served the user better — most of the bloat was
+  exactly this category.
+- **Same data in two shapes.** "X Handle" + "X URL" — same data,
+  pick the URL form. "First Name" + "Last Name" + "Full Name" — one
+  is enough. "Address" + "City" + "State" when Address already
+  contains them. "Email" + "Email Domain" — the domain is in the
+  email. (See `find_x_handles.md` for the X-handle-vs-URL rule.)
+- **Split-stat clusters.** "Likes / Reposts / Replies / Views" as
+  four separate columns when "Engagement" or just "Likes" is what
+  the user will sort by. Add the rest ONLY if the user asked for
+  each separately.
+- **Derivable / verbose duplicates.** "Post ID" alongside "Post URL"
+  (the URL contains it). "Posted At" full ISO datetime when "Date"
+  is enough. "Author Bio" when the profile URL is already in the row
+  and the user can click through.
+
+When the user EXPLICITLY listed columns, follow them — don't silently
+bolt on "completeness" extras. To suggest a column you think is
+worth adding, mention it in the text reply or via `suggest_replies`
+chips and let the user decide.
 
 # Workflow notes
 
