@@ -895,6 +895,15 @@ async def run_agent_loop(
             # `previous_response_id`.
             next_round_input: List[Dict[str, Any]] = list(input_items)
             previous_response_id: Optional[str] = None
+            # Tracks function_call_output items that were computed but
+            # NOT yet submitted to OpenAI. Set when tool outputs are
+            # appended at the end of a round; cleared at the top of the
+            # next iteration once they're sent. If the loop breaks (e.g.
+            # stopped=True) before submission, these need to be passed
+            # along to the wrap-up API call — otherwise OpenAI's chained
+            # `previous_response_id` references a response with
+            # unmatched function_calls and rejects with 400.
+            pending_tool_outputs: List[Dict[str, Any]] = []
             _effort = _EFFORT_TO_REASONING.get(effective_effort or "") \
                 or _resolve_reasoning_effort(user_content)
             stripper = _CitationStripper()
@@ -934,6 +943,9 @@ async def run_agent_loop(
                 }
                 if previous_response_id:
                     stream_kwargs["previous_response_id"] = previous_response_id
+                # About to submit pending tool outputs (if any) — clear
+                # the tracker so the wrap-up doesn't double-include them.
+                pending_tool_outputs = []
 
                 MAX_STREAM_RETRIES = 1
                 final_response = None
@@ -1476,6 +1488,7 @@ async def run_agent_loop(
                 # resume-on-stream-death path; the live API call gets
                 # the small payload.
                 next_round_input = list(tool_result_items)
+                pending_tool_outputs = list(tool_result_items)
 
                 if stopped:
                     break
@@ -1643,8 +1656,14 @@ async def run_agent_loop(
                     # Chain to the last round's response — only the
                     # synthetic nudge is new input. Avoids re-sending
                     # the full conversation just to re-prompt the wrap.
+                    # Include any function_call_output items that were
+                    # computed in the last round but not submitted yet
+                    # (e.g. loop broke on stopped=True after tools ran).
+                    # Without these, OpenAI sees the chained response's
+                    # function_calls have no matching outputs and rejects
+                    # with "No tool output found for function call ...".
                     wrap_kwargs["previous_response_id"] = previous_response_id
-                    wrap_kwargs["input"] = [wrap_user_msg]
+                    wrap_kwargs["input"] = list(pending_tool_outputs) + [wrap_user_msg]
                 else:
                     # No prior response (round 1 died or this is a
                     # cold-start edge case) — fall back to manual replay.
