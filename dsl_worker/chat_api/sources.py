@@ -162,6 +162,54 @@ def _build_range_filter(
 
 
 # ---------------------------------------------------------------------------
+# Apify plumbing-default helper
+# ---------------------------------------------------------------------------
+
+
+_APIFY_PROXY_KEYS = ("proxy", "proxyConfiguration")
+
+
+def _autofill_apify_plumbing(actor_input: Dict[str, Any], input_schema: Dict[str, Any]) -> None:
+    """Auto-fill Apify boilerplate fields the agent shouldn't reason about.
+
+    Mutates actor_input in place. Two cases:
+      1. proxy / proxyConfiguration → {"useApifyProxy": True} when the
+         schema declares it as an object property and the agent didn't
+         supply it. This is the universal Apify proxy plumbing field
+         that 99% of actors require with the same answer.
+      2. Any required field with a `default` in the schema → fill the
+         default. JSON Schema defaults exist for exactly this reason.
+
+    Skips content-driven fields (queries, URLs, locations, etc) — those
+    are real decisions the agent must make.
+    """
+    if not isinstance(actor_input, dict) or not isinstance(input_schema, dict):
+        return
+    properties = input_schema.get("properties") or {}
+    if not isinstance(properties, dict):
+        return
+    required = input_schema.get("required") or []
+    if not isinstance(required, list):
+        required = []
+
+    # 1. Proxy plumbing
+    for key in _APIFY_PROXY_KEYS:
+        if key in actor_input:
+            continue
+        prop = properties.get(key)
+        if isinstance(prop, dict) and prop.get("type") == "object":
+            actor_input[key] = {"useApifyProxy": True}
+
+    # 2. Required fields with declared defaults
+    for field_name in required:
+        if field_name in actor_input:
+            continue
+        prop = properties.get(field_name)
+        if isinstance(prop, dict) and "default" in prop:
+            actor_input[field_name] = prop["default"]
+
+
+# ---------------------------------------------------------------------------
 # Tool handlers — each returns (result_text_for_llm, cost_usd)
 # ---------------------------------------------------------------------------
 
@@ -630,6 +678,11 @@ async def _apify_call_actor(args: Dict[str, Any], *, project_id: Optional[Any] =
         }), 0.0
 
     if input_schema and isinstance(input_schema, dict):
+        # Auto-fill Apify plumbing fields the agent shouldn't have to
+        # care about. Mutates actor_input in place, BEFORE validation,
+        # so the schema check passes if these were the only missing
+        # required fields.
+        _autofill_apify_plumbing(actor_input, input_schema)
         try:
             import jsonschema
             jsonschema.validate(instance=actor_input, schema=input_schema)
