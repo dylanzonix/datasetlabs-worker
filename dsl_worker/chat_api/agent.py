@@ -1085,9 +1085,16 @@ Concretely:
   is the trap. The 9f6f9e17 anti-pattern (40+ identical
   apify_call_actor calls trying to perfect the X-post candidates) is
   the failure mode to avoid.
-- Don't escalate to a different source after one already returned
-  data ("now let me also web_harvest to compare"). One source's
-  results ARE the candidates.
+- When the ask names multiple sources (Reddit + Quora + IndieHackers;
+  LinkedIn + Indeed + careers pages), decide your coverage map up
+  front: which tool covers which source. Each source gets covered
+  ONCE. If Apify already returned Quora results, do NOT also
+  web_harvest Quora to "double-check" — the first successful pull
+  from a source IS that source's coverage, and re-pulling stacks
+  cost and overlap fast.
+- When the ask names ONE source / topic, one source's results ARE
+  the candidates. Don't escalate to a different tool ("now let me
+  also web_harvest to compare") just to feel thorough.
 - Local filtering with `code_exec` is free and fast — use it for
   scoring/dedupe/keyword-narrowing. Re-sourcing to "find better ones"
   is the trap.
