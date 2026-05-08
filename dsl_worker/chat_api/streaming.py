@@ -1495,6 +1495,18 @@ async def run_agent_loop(
                     # next turn's reload reads accurate numbers.
                     applied["budget_check"] = bc
                     round_applied["budget_check"] = bc
+                    # Surface the summary as assistant text when the
+                    # model didn't emit any of its own. Without this
+                    # the user sees chips appear out of nowhere with
+                    # no cost explanation, dismisses them, retries the
+                    # same request — see project 6eb5f061 (Miami) for
+                    # the canonical reproduction. confirm_budget's
+                    # `summary` is server-required to be non-empty, so
+                    # we always have something to show.
+                    summary = (bc.get("summary") or "").strip()
+                    existing_text = (runs._BUS._content.get(str(run.id)) or "").strip()
+                    if summary and not existing_text:
+                        runs.replace_text_content(db, run, summary)
                     runs.emit_event(db, run, "budget_check", bc)
                 if isinstance(round_applied.get("version_label"), dict):
                     vl = round_applied["version_label"]

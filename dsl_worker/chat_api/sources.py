@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from dsl_worker.infra.fullenrich_client import FullEnrichClient
@@ -504,6 +505,104 @@ async def _apify_call_actor(args: Dict[str, Any], *, project_id: Optional[Any] =
     if not actor_id:
         return json.dumps({"error": "actor_id is required"}), 0.0
 
+    # Heuristic warning against the over-perfection failure mode: if the
+    # agent already called apify_call_actor on the SAME actor in this
+    # run AND hasn't committed any rows since, attach a warning to the
+    # result so the agent gets reminded. We let the call proceed (vs
+    # refusing) so legit edge cases — agent has good reason to refetch,
+    # rare patterns we haven't anticipated — aren't broken. Different
+    # actors don't trigger the warning (multi-source harvests are fine).
+    over_iteration_warning: Optional[str] = None
+    if project_id is not None:
+        try:
+            from dsl_api.db import SessionLocal
+            from dsl_api.models import ChatRun, ChatRunEvent
+            from sqlalchemy import desc
+            db = SessionLocal()
+            try:
+                run = (
+                    db.query(ChatRun)
+                    .filter(
+                        ChatRun.project_id == project_id,
+                        ChatRun.status == "running",
+                    )
+                    .order_by(desc(ChatRun.started_at))
+                    .first()
+                )
+                if run is not None:
+                    events = (
+                        db.query(ChatRunEvent)
+                        .filter(ChatRunEvent.run_id == run.id)
+                        .order_by(desc(ChatRunEvent.seq))
+                        .limit(500)
+                        .all()
+                    )
+                    rows_added_since = 0
+                    prior_same_actor_items: Optional[int] = None
+                    prior_same_actor_errored = False
+                    same_actor_call_count = 0
+                    for e in events:
+                        if e.type == "row_added":
+                            rows_added_since += 1
+                            continue
+                        if e.type == "tool_result":
+                            p = e.payload or {}
+                            if p.get("name") == "apify_call_actor":
+                                call_id = p.get("id")
+                                # Search BOTH summary and result_text — summary
+                                # is structured bits ("returned=40, ok") and
+                                # rarely contains actor_id; result_text is the
+                                # full JSON dict (truncated to 4000 chars but
+                                # actor_id is lifted to the top of the dict
+                                # so it survives).
+                                searchable = (p.get("summary") or "") + "\n" + (p.get("result_text") or "")
+                                m_actor = re.search(r'"actor_id":\s*"([^"]+)"', searchable)
+                                prior_actor_id = m_actor.group(1) if m_actor else None
+                                if prior_actor_id is None and call_id:
+                                    matching_call = (
+                                        db.query(ChatRunEvent)
+                                        .filter(
+                                            ChatRunEvent.run_id == run.id,
+                                            ChatRunEvent.type == "tool_call",
+                                        )
+                                        .filter(ChatRunEvent.payload["id"].astext == str(call_id))
+                                        .first()
+                                    )
+                                    if matching_call:
+                                        prior_args = (matching_call.payload or {}).get("args_full") or {}
+                                        prior_actor_id = prior_args.get("actor_id") if isinstance(prior_args, dict) else None
+                                if prior_actor_id == actor_id:
+                                    same_actor_call_count += 1
+                                    m = re.search(r'"items_count":\s*(\d+)', searchable)
+                                    if prior_same_actor_items is None:
+                                        prior_same_actor_items = int(m.group(1)) if m else None
+                                        prior_same_actor_errored = '"ok": false' in searchable or '"error"' in searchable
+                    if (
+                        prior_same_actor_items is not None
+                        and prior_same_actor_items > 0
+                        and not prior_same_actor_errored
+                        and rows_added_since == 0
+                    ):
+                        over_iteration_warning = (
+                            f"You already called this actor ('{actor_id}') "
+                            f"{same_actor_call_count}× in this turn and got "
+                            f"candidates back (most recent: {prior_same_actor_items} "
+                            "items), but no rows have been committed yet. This is "
+                            "the over-perfection pattern — fetching more without "
+                            "committing the previous batch. Strongly consider "
+                            "committing what you already have (candidates_to_rows "
+                            "or code_exec with add_rows, filter inline if needed) "
+                            "before refining the keywords further. Calling a "
+                            "different actor is fine, but refining the same actor's "
+                            "input over and over rarely yields better results than "
+                            "committing the first batch and letting the user steer "
+                            "from there."
+                        )
+            finally:
+                db.close()
+        except Exception:
+            log.exception("apify_call_actor over-iteration check failed; proceeding")
+
     # Validate input BEFORE running. Mirrors apify-mcp-server's behavior:
     # an empty or invalid input typically means the actor falls back to
     # the publisher's placeholder defaults (e.g. query="helloworld" or
@@ -551,12 +650,49 @@ async def _apify_call_actor(args: Dict[str, Any], *, project_id: Optional[Any] =
             log.exception("apify_call_actor: schema validation crashed; proceeding")
 
     # max_items applies a server-side cap when paging the Apify dataset.
-    # None = unbounded; the agent can pull large fetches without truncation
-    # because we land them in a candidates file, not the LLM context.
+    # None = unbounded normally; the agent can pull large fetches because
+    # we land them in a candidates file, not the LLM context.
     max_items = args.get("max_items")
     if max_items is not None:
         max_items = int(max_items)
-    timeout_secs = int(args.get("timeout_secs", 300))
+    timeout_secs = int(args.get("timeout_secs", 600))
+
+    # Small-first cap: when the project has 0 rows committed, force a
+    # tight cap on the first apify_call_actor batch. Prevents the
+    # over-perfection failure mode where the agent fetches 500 candidates
+    # chasing "scope coverage" and never commits anything (saw it in runs
+    # 88328425 and 3fc103bc — 5 calls, 180+ candidates, 0 rows landed).
+    SMALL_FIRST_CAP = 50
+    small_first_clamped = False
+    if project_id is not None:
+        try:
+            from dsl_api.db import SessionLocal
+            from dsl_api.models.sample import Sample
+            from sqlalchemy import func
+            db = SessionLocal()
+            try:
+                n_rows = db.query(func.count(Sample.id)).filter(
+                    Sample.project_id == project_id,
+                    Sample.deleted_at.is_(None),
+                ).scalar() or 0
+            finally:
+                db.close()
+        except Exception:
+            n_rows = 0
+        if n_rows == 0:
+            if max_items is None or max_items > SMALL_FIRST_CAP:
+                max_items = SMALL_FIRST_CAP
+                small_first_clamped = True
+            # Strip the input-level cap too — actors honor their own
+            # input field, not our download-side max_items.
+            for key in ("maxItems", "max_items", "max_results", "maxResults", "limit"):
+                if key in actor_input and (
+                    not isinstance(actor_input[key], int)
+                    or actor_input[key] > SMALL_FIRST_CAP
+                ):
+                    actor_input[key] = SMALL_FIRST_CAP
+                    small_first_clamped = True
+
     try:
         run_info = await client.run_actor(
             actor_id=actor_id,
@@ -579,9 +715,30 @@ async def _apify_call_actor(args: Dict[str, Any], *, project_id: Optional[Any] =
         "stats": run_info.get("stats"),
         "usage": run_info.get("usage"),
     }
-    result = _persist_candidates(
+    raw_result = _persist_candidates(
         project_id, "apify_call_actor", items, cost_usd=cost_usd, extra=extra
     )
+    # Lift actor_id to the TOP of the result so it survives the 4000-char
+    # truncation in agent.format_tool_result and is grep-able by the
+    # over-iteration check on the next call. Python dicts preserve insertion
+    # order, so {actor_id: ..., **raw_result} puts it first.
+    result = {"actor_id": actor_id, **raw_result}
+    if small_first_clamped:
+        # Stamp at top level so the agent reads it before run_metadata
+        # gets any chance to be skipped.
+        result["small_first_clamped"] = True
+        result["next_step_hint"] = (
+            f"FIRST BATCH WAS CAPPED AT {SMALL_FIRST_CAP} (project had 0 "
+            "rows). Your next move is to COMMIT these candidates as rows "
+            "(candidates_to_rows or code_exec with add_rows). Filter "
+            "inline as you commit if needed. Do NOT call apify_call_actor "
+            "again before committing — that's the over-perfection failure "
+            "mode the cap exists to prevent. The user expects to see rows "
+            "land in the table now and refine via follow-up turns; they "
+            "don't expect you to scan the entire search space first."
+        )
+    if over_iteration_warning:
+        result["over_iteration_warning"] = over_iteration_warning
     return json.dumps(result, default=str), cost_usd
 
 
@@ -1386,8 +1543,28 @@ SOURCE_TOOLS: List[Dict[str, Any]] = [
                         "Get the schema from apify_actor_details first."
                     ),
                 },
-                "max_items": {"type": "integer", "minimum": 1, "description": "Cap items returned by the actor. Omit for unbounded."},
-                "timeout_secs": {"type": "integer", "description": "Default 300."},
+                "max_items": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": (
+                        "Hard cap on items downloaded. **ALWAYS pass this.** "
+                        "First call on a new query: 10–25. Going higher "
+                        "requires the user to have given an explicit count "
+                        "('get me 100 X'). Server enforces a max of 50 on "
+                        "first calls when the project has zero rows — "
+                        "fetching more before committing anything is the "
+                        "over-perfection failure mode. Refine via follow-up "
+                        "turns, not bigger first fetches."
+                    ),
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": (
+                        "How long to wait for the actor to finish (default "
+                        "600). On timeout we abort the Apify run so you "
+                        "stop getting billed for it."
+                    ),
+                },
             },
             "required": ["actor_id", "input"],
         },

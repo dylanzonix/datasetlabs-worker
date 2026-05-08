@@ -30,7 +30,7 @@ async def download_apify_results(
     limit: Optional[int] = None,
     fields: Optional[List[str]] = None,
     poll_interval: int = 5,
-    poll_timeout: int = 300,
+    poll_timeout: int = 600,
 ) -> Dict[str, Any]:
     """Download Apify actor results to a JSONL file.
 
@@ -97,21 +97,28 @@ async def download_apify_results(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(body + "\n", encoding="utf-8")
 
-    # Count lines and peek at first item for summary
-    lines = body.split("\n")
-    item_count = len([l for l in lines if l.strip()])
+    # Count lines and peek at first items for summary
+    lines = [l for l in body.split("\n") if l.strip()]
+    item_count = len(lines)
     field_names: List[str] = []
+    sample_rows: List[Dict[str, Any]] = []
     try:
         first = json.loads(lines[0])
-        field_names = sorted(first.keys())[:15]
+        field_names = sorted(first.keys())[:30]
     except (json.JSONDecodeError, IndexError):
         pass
+    for line in lines[:3]:
+        try:
+            sample_rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
 
     return {
         "item_count": item_count,
         "file_path": str(output_path),
         "dataset_id": dataset_id,
         "fields": field_names,
+        "sample_rows": sample_rows,
         "cost_usd": cost,
     }
 
@@ -124,18 +131,39 @@ async def _poll_run(
 ) -> tuple[Optional[str], float, Optional[str]]:
     """Poll an actor run until it finishes.
 
+    Uses Apify's `waitForFinish=N` long-poll: the GET hangs up to N
+    seconds and returns early as soon as the run reaches a terminal
+    status. We loop in case the requested timeout exceeds the per-call
+    cap (Apify caps waitForFinish at 60s).
+
+    On our local timeout, we ABORT the run on Apify's side so the user
+    doesn't keep getting billed for compute we'll never read.
+
     Returns: (dataset_id, cost_usd, error_message)
     """
-    elapsed = 0
-    while elapsed < timeout:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(
-                f"{BASE_URL}/actor-runs/{run_id}",
-                headers=headers,
-            )
+    WAIT_FOR_FINISH_SECS = 60
+    start = asyncio.get_event_loop().time()
+
+    while True:
+        elapsed = asyncio.get_event_loop().time() - start
+        remaining = timeout - elapsed
+        if remaining <= 0:
+            break
+        wait_secs = min(WAIT_FOR_FINISH_SECS, max(1, int(remaining)))
+        try:
+            async with httpx.AsyncClient(timeout=wait_secs + 10.0) as client:
+                resp = await client.get(
+                    f"{BASE_URL}/actor-runs/{run_id}",
+                    headers=headers,
+                    params={"waitForFinish": wait_secs},
+                )
+        except httpx.RequestError:
+            await asyncio.sleep(1)
+            continue
 
         if resp.status_code != 200:
-            return None, 0.0, f"Failed to check run {run_id}: HTTP {resp.status_code}"
+            await asyncio.sleep(1)
+            continue
 
         data = resp.json().get("data", {})
         status = data.get("status", "RUNNING")
@@ -153,7 +181,33 @@ async def _poll_run(
         if status in ("FAILED", "ABORTED", "TIMED-OUT"):
             return None, 0.0, f"Actor run {status}: {run_id}"
 
-        await asyncio.sleep(interval)
-        elapsed += interval
+    # Local timeout — abort the Apify run so it stops billing.
+    await _abort_run(run_id, headers)
+    return None, 0.0, (
+        f"Actor run {run_id} did not finish within {timeout}s "
+        f"(aborted on Apify side to stop billing). The actor may need "
+        f"narrower input (smaller maxResults, fewer keywords) or a "
+        f"longer timeout_secs on the next call."
+    )
 
-    return None, 0.0, f"Timed out waiting for run {run_id} after {timeout}s"
+
+async def _abort_run(run_id: str, headers: Dict[str, str]) -> None:
+    """POST /actor-runs/{id}/abort — stops the run on Apify's side.
+
+    Best-effort: if it fails we just log; the run will eventually
+    time out at Apify's max-runtime cap anyway.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{BASE_URL}/actor-runs/{run_id}/abort",
+                headers=headers,
+            )
+        if resp.status_code in (200, 201):
+            logger.info(f"[apify] Aborted run {run_id} after local timeout")
+        else:
+            logger.warning(
+                f"[apify] Failed to abort run {run_id}: HTTP {resp.status_code}"
+            )
+    except Exception as e:
+        logger.warning(f"[apify] abort run {run_id} raised: {e}")

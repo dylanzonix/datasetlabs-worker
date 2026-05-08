@@ -651,8 +651,19 @@ Filters are dicts: `{col: v}` for equality, `{col__lt: n}` / `__gt` / `__lte`
   invoking. The response includes `input_schema` (a JSON Schema with
   property names, types, descriptions, defaults, and `required`). That
   IS how you build the input — read the schema, map the user's intent
-  to the property names. Don't bail to web_search just because the
-  schema looks unfamiliar; every Apify actor takes structured input.
+  to the property names. Don't bail to web_search, web_harvest, OR
+  browser_use just because the schema looks unfamiliar or the field
+  names don't perfectly mirror the user's request — every Apify actor
+  takes structured input, and most have a generic `searches` /
+  `queries` / `startUrls` field that absolutely returns results you
+  can filter post-hoc. **After `apify_actor_details` on a named-platform
+  query, the next move is ALWAYS `apify_call_actor`** — either with
+  that actor and your best-guess inputs, or with a different actor
+  from the search results. Bailing to browser_use / web_harvest after
+  reading an actor's schema (without ever calling apify_call_actor
+  once) is WRONG. The schema looking imperfect is not a reason to
+  switch tools — try the actor with reasonable inputs first; if that
+  call returns 0 items or errors, then refine.
 - `apify_call_actor(actor_id, input, max_items?)` — run the actor. The
   `input` arg is a JSON object matching the actor's input_schema (e.g.
   `{"query": "scrape data", "sort": "new", "time": "month"}`). Results
@@ -717,9 +728,7 @@ obvious — use judgment.
 
 Users grade the table on whether it answers their question, not on
 column count. Each extra column makes the table harder to scan,
-slower to fill, and pricier — for no upside. **Default target: 4–8
-columns for most projects.** 12+ should be a deliberate user-driven
-choice, not the default.
+slower to fill, and pricier — for no upside.
 
 **Test before adding a column:** will the user filter, sort, or scan
 by it? If not, skip it. Scoring / reasoning trails belong in the
@@ -782,9 +791,13 @@ chips and let the user decide.
     result, article, official docs, scraped page).
   - `{"type": "enrichment", "value": "FullEnrich"}` — data provider
     (`value` is the provider name: "FullEnrich", "Apollo", "Apify",
-    "Google Maps", "Web Harvest", "Browser Use", etc.).
-  - `{"type": "file", "value": "filename.jsonl"}` — uploaded or
-    candidate file by name.
+    "Google Maps", "Web Harvest", "Browser Use", etc.). USE THIS for
+    anything fetched from a source tool — even if the result happens
+    to live in a candidate file. Candidate files are internal scratch,
+    not citations.
+  - `{"type": "file", "value": "filename.jsonl"}` — USER-UPLOADED file
+    (something the user attached in chat). Never cite a candidate file
+    here — those are internal artifacts the user can't see.
 
   Example (web_search-sourced row):
   ```
@@ -919,11 +932,26 @@ public profiles, scraping a site, general research).
   source (e.g. "indie newsletters", "regional craft breweries") →
   `web_harvest`. NOT for "scrape posts from <named site>" — that's
   Apify's job.
-- Last resort: `browser_use` — ONLY when both (a) Apify has no working
-  actor for the site (you tried `apify_search_actors` and the matches
-  don't fit / the actor failed) AND (b) `web_search` can't surface the
-  content (JS-rendered, anti-bot, requires login, etc.). Slow
-  (30–180s) and $0.10–$0.50/call, so don't reach for it casually.
+- Last resort: `browser_use` — ONLY when both (a) Apify genuinely has
+  no working actor for the site AND (b) `web_search` can't surface the
+  content (JS-rendered, anti-bot, requires login, etc.). Slow (30–180s)
+  and $0.10–$0.50/call, so don't reach for it casually.
+
+  **"Apify has no working actor" means a SPECIFIC thing:** either
+  `apify_search_actors` returned no relevant matches at all, OR you
+  actually called `apify_call_actor` on a candidate and it errored /
+  returned 0 items after you refined the input. **It does NOT mean
+  "I read the actor's schema and the field names don't perfectly fit
+  my request."** That kind of bail is the most common Apify failure
+  mode in the logs: the agent inspects an actor's input schema, decides
+  it doesn't have an obvious "subreddit + last_month + keyword" filter,
+  and switches to browser_use without ever calling the actor once. Don't
+  do that. Pick the most popular actor from the search results, pass
+  your best-guess inputs (broad keywords are fine — actors over-deliver),
+  and let post-hoc filtering / `rows_delete` clean up. browser_use on a
+  named platform like Reddit / X / LinkedIn / Upwork is a defect; if
+  you find yourself reaching for it after `apify_actor_details`, stop
+  and call `apify_call_actor` instead.
 
 **When Apify returns 0 items, that's almost never the actor.** Among
 `apify_search_actors` matches, popularity (`total_runs`, `total_users`)
@@ -935,6 +963,48 @@ follow-ups ("100 more", refinements), KEEP the actor that just worked
 web_harvest is NOT an Apify backup; it's for entities scattered across
 small sites with no central source, not for re-trying a named-platform
 scrape that returned 0.
+
+# Query → filter → commit → enrich. NOT query → query → query.
+
+When you're hitting a bulk-harvest tool (Apify, FullEnrich search,
+Apollo search, Google Maps search, web_harvest) for the FIRST time
+on a new query the user just gave you, **start small — around 10
+items**. Commit them, show the user, then scale on confirmation.
+
+The shape of every harvest sequence is:
+
+  1. **Query.** One source call. Get candidates.
+  2. **Filter inline** if there's a programmatic predicate (date
+     range, keyword presence, has-email-or-not). Use code_exec or
+     candidates_inspect's filter dialect — quick and free.
+  3. **Commit.** `candidates_to_rows` or `code_exec` with `add_rows`.
+     Rows land in the table. The user can see something.
+  4. **Enrich (only if needed).** `rows_fill` for missing/derived
+     columns the source didn't supply.
+  5. **Filter post-commit.** SQL via `rows_delete` (or local filter
+     before commit) to drop misses, keep what the user wants.
+
+**You may re-query (back to step 1) ONLY when the query was clearly
+wrong** — 0 items, OR results obviously off-target (wrong language,
+wrong domain, wrong entity type, wrong subreddit returned). "I want
+better matches" or "these aren't perfect for the user's intent" is
+NOT a reason to re-query. That's enrich-and-filter territory.
+
+**Hard rule: after a successful query (≥1 candidate returned), the
+NEXT move must be a commit (or a local filter+commit). Not another
+query.** If you find yourself thinking "let me try a different
+keyword" or "let me hit the actor again with sort=top", stop. Commit
+what you have, then enrich/filter. The agent over-iterating on Apify
+without ever landing rows is exactly the failure mode this rule
+exists to kill — saw it in run 88328425 where 3 apify_call_actor
+calls produced 180 candidates and ZERO rows in the table.
+
+When to scale up the FIRST query immediately (skip "small first"):
+- The user gave a specific count ("get me 50 X").
+- This is a follow-up turn refining a query that already worked
+  ("100 more like these", "now do US-only").
+- The closed set is small and known (a16z Speedrun cohort 5 = 19
+  founders — pull all 19, not 10).
 
 # Don't stop halfway on multi-step asks
 
@@ -1207,6 +1277,22 @@ _FILTER_DESC = (
     "after you've already done 1-20). Combine with column filters as "
     "needed: {_seq__gt: 20, '<col>': null} for the next batch's unfilled "
     "rows only."
+)
+
+_CANDIDATES_FILTER_DESC = (
+    "Filter dict. Equality: {field: value}. Operators: {field__lt: n} (also "
+    "__gt, __lte, __gte), {field__contains: s} (case-sensitive substring), "
+    "{field__icontains: s} (case-insensitive), {field__in: [...]}, "
+    "{field__isnull: true|false}, {field__regex: 'pattern'} (Python "
+    "re.search, case-sensitive), {field__iregex: 'pattern'} "
+    "(case-insensitive). {field: null} → IS NULL. Multiple keys AND "
+    "together.\n\n"
+    "Nested fields: use dot-paths to walk into nested objects "
+    "(`employment.current.title`). When the path crosses a list, the "
+    "predicate matches if ANY list element satisfies it — natural for "
+    "things like 'any of the person's job titles contains \"engineer\"'.\n\n"
+    "Use this BEFORE writing code_exec to inspect a candidate file. "
+    "It's almost always cheaper than dumping the file into Python."
 )
 
 
@@ -1650,7 +1736,7 @@ CHAT_TOOLS: List[Dict[str, Any]] = [
                     "type": "string",
                     "description": "Candidate file name from candidates_list, e.g. 'apify_call_actor_3a91.jsonl'.",
                 },
-                "filter": {"type": "object", "description": _FILTER_DESC},
+                "filter": {"type": "object", "description": _CANDIDATES_FILTER_DESC},
                 "fields": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -2677,6 +2763,70 @@ def _tool_cell_traces_inspect(
 
 _TOOL_FROM_FILE_RE = re.compile(r"^(.+)_[0-9a-f]{8}\.jsonl$")
 
+# Source-tool prefixes that indicate a filename is a CANDIDATE file
+# (internal scratch from a fetch), not a user-uploaded file. Used to
+# scrub bogus `{"type":"file"}` citations the LLM emits when it cites
+# the candidate filename a source tool just wrote to.
+_CANDIDATE_FILE_PREFIXES = (
+    "apify_", "fullenrich_", "apollo_", "google_maps_",
+    "web_harvest_", "browser_use_", "exec_",
+)
+
+# Map candidate-file prefix → human enrichment provider name. Used when
+# scrubbing candidate-file citations to upgrade them to a meaningful
+# enrichment citation instead of just dropping them.
+_CANDIDATE_PREFIX_TO_PROVIDER = {
+    "apify_": "Apify",
+    "fullenrich_": "FullEnrich",
+    "apollo_": "Apollo",
+    "google_maps_": "Google Maps",
+    "web_harvest_": "Web Harvest",
+    "browser_use_": "Browser Use",
+}
+
+
+def _scrub_candidate_file_sources(
+    item_sources: Optional[Dict[str, List[Dict[str, Any]]]],
+) -> Optional[Dict[str, List[Dict[str, Any]]]]:
+    """Drop or rewrite `{type:"file"}` citations pointing at candidate files.
+
+    The LLM sometimes cites the candidate filename a source tool just
+    wrote to (e.g. "fullenrich_search_people_a8c5dc67.jsonl") as a
+    file-type source. Those filenames are internal artifacts the user
+    can't see — citing them is just noise. We rewrite to an enrichment
+    citation when we can recover the provider from the prefix; otherwise
+    drop the entry entirely.
+    """
+    if not item_sources:
+        return item_sources
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for col, vals in item_sources.items():
+        if not isinstance(vals, list):
+            continue
+        scrubbed: List[Dict[str, Any]] = []
+        for v in vals:
+            if not isinstance(v, dict):
+                continue
+            if v.get("type") == "file":
+                fval = str(v.get("value") or "")
+                if any(fval.startswith(p) for p in _CANDIDATE_FILE_PREFIXES):
+                    provider = next(
+                        (
+                            name
+                            for prefix, name in _CANDIDATE_PREFIX_TO_PROVIDER.items()
+                            if fval.startswith(prefix)
+                        ),
+                        None,
+                    )
+                    if provider:
+                        scrubbed.append({"type": "enrichment", "value": provider})
+                    # else: drop entirely
+                    continue
+            scrubbed.append(v)
+        if scrubbed:
+            out[col] = scrubbed
+    return out or None
+
 
 async def _tool_candidates_to_rows(
     db: Session,
@@ -3350,6 +3500,7 @@ async def _tool_rows_add(
                 k: v for k, v in item["_sources"].items()
                 if isinstance(v, list) and v
             }
+        item_sources = _scrub_candidate_file_sources(item_sources)
         item = {k: v for k, v in item.items() if k != "_sources"}
         merged_existing = False
         if merge_key:
@@ -3900,6 +4051,33 @@ def build_context_message(db: Session, project: Project) -> str:
         version_id = project.current_version_id
         n = db.query(func.count(Sample.id)).filter(Sample.version_id == version_id).scalar() or 0
         parts.append(f"Rows: {n}")
+
+        # Per-column fill rate when there are enough rows to be meaningful.
+        # The agent uses this to spot mostly-empty columns (drop them or
+        # commit to filling them) and rows that don't fit the schema (rows
+        # with most cols blank usually mean a heterogeneous-shape problem).
+        col_names = [c.get("name") for c in (cols or []) if isinstance(c, dict) and c.get("name")]
+        if n >= 5 and col_names:
+            all_rows = (
+                db.query(Sample.row)
+                .filter(Sample.version_id == version_id)
+                .all()
+            )
+            fill: Dict[str, int] = {name: 0 for name in col_names}
+            for (row,) in all_rows:
+                if not isinstance(row, dict):
+                    continue
+                for name in col_names:
+                    v = row.get(name)
+                    if v is None or v == "" or v == [] or v == {}:
+                        continue
+                    fill[name] += 1
+            parts.append("Fill rate per column:")
+            for name in col_names:
+                ct = fill[name]
+                pct = (100 * ct) // n if n else 0
+                parts.append(f"  - {name}: {ct}/{n} ({pct}%)")
+
         if n > 0:
             samples = (
                 db.query(Sample)

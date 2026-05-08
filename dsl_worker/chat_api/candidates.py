@@ -260,48 +260,113 @@ def read_candidates_bytes(project_id, file_name: str) -> bytes:
 # ---------------------------------------------------------------------------
 
 
+_FILTER_OPS = {
+    "eq", "lt", "lte", "gt", "gte",
+    "contains", "icontains", "in", "isnull", "regex", "iregex",
+}
+
+
+def _resolve_path(item: Any, path: str) -> Any:
+    """Walk a dot-separated path through nested dicts/lists.
+
+    `path` may use dots for object navigation (`employment.current.title`).
+    On lists, returns a list of resolved values from each element so a
+    predicate can match against any element. Missing keys → None.
+    """
+    if "." not in path:
+        return item.get(path) if isinstance(item, dict) else None
+    parts = path.split(".")
+    return _walk_parts(item, parts)
+
+
+def _walk_parts(cur: Any, parts: List[str]) -> Any:
+    if not parts:
+        return cur
+    if cur is None:
+        return None
+    if isinstance(cur, list):
+        return [_walk_parts(c, parts) for c in cur]
+    if isinstance(cur, dict):
+        return _walk_parts(cur.get(parts[0]), parts[1:])
+    return None
+
+
+def _match_op(item_val: Any, op: str, val: Any) -> bool:
+    """Apply a single op against a (possibly list) item value.
+
+    For list item_vals (from list-fan-out path resolution), the predicate
+    succeeds if ANY element matches — the natural semantics for "the row's
+    employment history contains a title with 'engineer' in it".
+    """
+    if isinstance(item_val, list) and op != "in":
+        return any(_match_op(v, op, val) for v in item_val)
+    try:
+        if op == "eq":
+            if val is None:
+                return item_val is None
+            return item_val == val
+        if op == "lt":
+            return item_val is not None and item_val < val
+        if op == "lte":
+            return item_val is not None and item_val <= val
+        if op == "gt":
+            return item_val is not None and item_val > val
+        if op == "gte":
+            return item_val is not None and item_val >= val
+        if op == "contains":
+            if item_val is None:
+                return False
+            return str(val) in str(item_val)
+        if op == "icontains":
+            if item_val is None:
+                return False
+            return str(val).lower() in str(item_val).lower()
+        if op == "in":
+            if isinstance(val, list):
+                return item_val in val
+            return False
+        if op == "isnull":
+            return (item_val is None) == bool(val)
+        if op == "regex":
+            if item_val is None:
+                return False
+            return re.search(str(val), str(item_val)) is not None
+        if op == "iregex":
+            if item_val is None:
+                return False
+            return re.search(str(val), str(item_val), re.IGNORECASE) is not None
+    except (TypeError, re.error):
+        return False
+    return False
+
+
 def apply_filter(item: Dict[str, Any], filter_dict: Optional[Dict[str, Any]]) -> bool:
-    """Match the rows filter dialect: {col: v} eq, {col__lt/gt/lte/gte: n},
-    {col__contains: s}, {col__in: [...]}, {col__isnull: bool}, {col: null}
-    for IS NULL. Multiple keys AND together.
+    """Filter dialect supporting nested-path keys and regex.
+
+    Keys: `col` for top-level field, `nested.path` for dot-walked nested
+    fields (objects only — list elements get fanned out so any-match
+    succeeds).
+
+    Ops (after `__` suffix on the key):
+      - eq (default), lt, lte, gt, gte
+      - contains (substring), icontains (case-insensitive substring)
+      - in (value in list)
+      - isnull (true/false)
+      - regex (Python re.search, case-sensitive)
+      - iregex (Python re.search, case-insensitive)
+
+    `{col: null}` is shorthand for IS NULL. Multiple keys AND together.
     """
     if not filter_dict:
         return True
     for key, val in filter_dict.items():
         col, op = (key.rsplit("__", 1) if "__" in key else (key, "eq"))
-        item_val = item.get(col)
-        try:
-            if op == "eq":
-                # {col: null} -> IS NULL
-                if val is None:
-                    if item_val is not None:
-                        return False
-                else:
-                    if item_val != val:
-                        return False
-            elif op == "lt":
-                if item_val is None or not (item_val < val):
-                    return False
-            elif op == "lte":
-                if item_val is None or not (item_val <= val):
-                    return False
-            elif op == "gt":
-                if item_val is None or not (item_val > val):
-                    return False
-            elif op == "gte":
-                if item_val is None or not (item_val >= val):
-                    return False
-            elif op == "contains":
-                if item_val is None or str(val) not in str(item_val):
-                    return False
-            elif op == "in":
-                if item_val not in (val or []):
-                    return False
-            elif op == "isnull":
-                if (item_val is None) != bool(val):
-                    return False
-        except TypeError:
-            # Type mismatch (e.g. comparing str to int) — treat as no-match
+        # Treat unknown suffixes as part of the key (e.g. col with a
+        # legitimate "__id" suffix). __ ops only apply if recognized.
+        if op not in _FILTER_OPS:
+            col, op = (key, "eq")
+        item_val = _resolve_path(item, col)
+        if not _match_op(item_val, op, val):
             return False
     return True
 

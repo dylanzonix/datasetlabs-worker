@@ -54,8 +54,9 @@ class ApifyClient:
 
         # Fetch the input schema from the actor's latest build.
         # The build definition contains actorDefinition.input — the full
-        # JSON Schema that the Apify MCP server also uses.
-        input_schema = await self._fetch_input_schema(d)
+        # JSON Schema that the Apify MCP server also uses. We also pull
+        # `storages.dataset.views` when available (output column hints).
+        input_schema, output_views = await self._fetch_build_schemas(d)
         pricing = self._extract_pricing(d.get("pricingInfos", []))
         stats = self._extract_stats(d.get("stats", {}))
 
@@ -75,6 +76,7 @@ class ApifyClient:
             "description": d.get("description", ""),
             "readme_summary": d.get("readmeSummary", ""),
             "input_schema": input_schema,
+            "output_views": output_views,
             "pricing": pricing,
             "stats": stats,
             "url": f"https://apify.com/{actor_id}",
@@ -111,11 +113,25 @@ class ApifyClient:
         return ", ".join(parts) if parts else None
 
     @staticmethod
-    def _extract_pricing(pricing_infos: List[Dict[str, Any]]) -> Optional[str]:
-        """Extract human-readable pricing from the latest pricing entry."""
-        if not pricing_infos:
+    def _extract_pricing(pricing_info: Any) -> Optional[str]:
+        """Extract human-readable pricing.
+
+        Accepts either the full `pricingInfos` list (we use the last entry)
+        or a single `currentPricingInfo` dict (as returned by the store
+        search endpoint). PAY_PER_EVENT actors can charge multiple events
+        with either flat (`eventPriceUsd`) or tiered (`eventTieredPricingUsd`)
+        prices — we render all of them, mark the primary event, and use the
+        FREE tier price (worst case for a no-plan caller) as the headline.
+        """
+        if not pricing_info:
             return None
-        latest = pricing_infos[-1]
+        if isinstance(pricing_info, list):
+            latest = pricing_info[-1] if pricing_info else None
+        else:
+            latest = pricing_info
+        if not latest:
+            return None
+
         model = latest.get("pricingModel", "")
         if model == "PAY_PER_EVENT":
             events = (
@@ -123,11 +139,32 @@ class ApifyClient:
                 .get("actorChargeEvents", {})
             )
             parts = []
+            primary_part = None
             for event_info in events.values():
-                title = event_info.get("eventTitle", "")
-                price = event_info.get("eventPriceUsd", 0)
-                if price:
-                    parts.append(f"${price}/{ title}")
+                title = event_info.get("eventTitle", "") or "event"
+                tiered = event_info.get("eventTieredPricingUsd")
+                if tiered:
+                    free = tiered.get("FREE", {}).get("tieredEventPriceUsd")
+                    price = free if free is not None else next(
+                        (t.get("tieredEventPriceUsd") for t in tiered.values()
+                         if t.get("tieredEventPriceUsd") is not None),
+                        None,
+                    )
+                else:
+                    price = event_info.get("eventPriceUsd")
+                if price is None:
+                    continue
+                # Express per-result events as $/1k for readability
+                if "result" in title.lower() and price < 0.1:
+                    rate = f"${price * 1000:.2f}/1k {title.lower()}"
+                else:
+                    rate = f"${price}/{title}"
+                if event_info.get("isPrimaryEvent"):
+                    primary_part = rate + " (primary)"
+                else:
+                    parts.append(rate)
+            if primary_part:
+                parts.insert(0, primary_part)
             return ", ".join(parts) if parts else None
         elif model == "FLAT_PRICE_PER_MONTH":
             price = latest.get("pricePerUnitUsd", 0)
@@ -135,41 +172,42 @@ class ApifyClient:
         elif model == "PRICE_PER_DATASET_ITEM":
             price = latest.get("pricePerUnitUsd", 0)
             return f"${price}/result"
+        elif model == "FREE":
+            return "Free (compute units only)"
         return None
 
-    async def _fetch_input_schema(
+    async def _fetch_build_schemas(
         self, actor_data: Dict[str, Any]
-    ) -> Optional[Dict[str, Any]]:
-        """Fetch the input JSON Schema from the actor's latest build.
+    ) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """Fetch input schema and output views from the actor's latest build.
 
-        Tries taggedBuilds.latest first, then falls back to the most recent
-        version's build.
+        Returns (input_schema, output_views). Tries taggedBuilds.latest
+        first, then falls back to the most recent version's build.
         """
-        # Strategy 1: taggedBuilds.latest → buildId → build details
-        build_id = (
-            actor_data.get("taggedBuilds", {})
-            .get("latest", {})
-            .get("buildId")
-        )
-        if build_id:
-            schema = await self._get_build_input_schema(build_id)
-            if schema:
-                return schema
-
-        # Strategy 2: walk versions to find one with a buildId
-        for version in actor_data.get("versions", {}).get("items", []):
+        candidates: List[str] = []
+        tagged = actor_data.get("taggedBuilds") or {}
+        latest = (tagged.get("latest") or {}).get("buildId") if isinstance(tagged, dict) else None
+        if latest:
+            candidates.append(latest)
+        versions = actor_data.get("versions") or {}
+        version_items = versions.get("items") if isinstance(versions, dict) else versions
+        for version in version_items or []:
+            if not isinstance(version, dict):
+                continue
             vid = version.get("buildId")
-            if vid:
-                schema = await self._get_build_input_schema(vid)
-                if schema:
-                    return schema
+            if vid and vid not in candidates:
+                candidates.append(vid)
 
-        return None
+        for build_id in candidates:
+            input_schema, views = await self._get_build_schemas(build_id)
+            if input_schema or views:
+                return input_schema, views
+        return None, None
 
-    async def _get_build_input_schema(
+    async def _get_build_schemas(
         self, build_id: str
-    ) -> Optional[Dict[str, Any]]:
-        """Fetch a build by ID and extract its actorDefinition.input schema."""
+    ) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """Fetch a build and pull both input schema and dataset views."""
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.get(
@@ -177,12 +215,20 @@ class ApifyClient:
                     headers=self._headers,
                 )
             if resp.status_code != 200:
-                return None
-            build_data = resp.json().get("data", {})
-            return build_data.get("actorDefinition", {}).get("input")
+                return None, None
+            actor_def = resp.json().get("data", {}).get("actorDefinition", {})
+            if not isinstance(actor_def, dict):
+                return None, None
+            input_schema = actor_def.get("input") if isinstance(actor_def.get("input"), dict) else None
+            storages = actor_def.get("storages") or {}
+            dataset = storages.get("dataset") if isinstance(storages, dict) else None
+            views = dataset.get("views") if isinstance(dataset, dict) else None
+            if not isinstance(views, dict):
+                views = None
+            return input_schema, views
         except Exception:
             logger.debug(f"[Apify] Failed to fetch build {build_id}")
-            return None
+            return None, None
 
     async def search_actors(
         self,
@@ -212,6 +258,10 @@ class ApifyClient:
                 "description": (item.get("description") or "")[:2000],
                 "total_runs": stats.get("totalRuns", 0),
                 "total_users": stats.get("totalUsers", 0),
+                "rating": item.get("actorReviewRating"),
+                "review_count": item.get("actorReviewCount", 0),
+                "creator": item.get("userFullName") or item.get("username", ""),
+                "pricing": self._extract_pricing(item.get("currentPricingInfo")),
                 "url": f"https://apify.com/{item.get('username')}/{item.get('name')}",
             })
 
