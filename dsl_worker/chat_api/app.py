@@ -81,6 +81,10 @@ async def _on_startup() -> None:
     # one interval, so startup isn't slowed by a large initial DELETE.
     import asyncio
     asyncio.create_task(runs.run_ttl_cleanup_loop(), name="chat-events-ttl")
+    # Continuous orphan reaper: marks runs failed within ~30s of their
+    # heartbeat going stale, instead of waiting for the next worker
+    # restart (could be hours).
+    asyncio.create_task(runs.orphan_recovery_loop(), name="chat-orphan-reaper")
 
 
 @app.on_event("shutdown")

@@ -918,3 +918,22 @@ def recover_orphan_runs() -> int:
         return fixed
     finally:
         db.close()
+
+
+async def orphan_recovery_loop(interval_seconds: int = 30) -> None:
+    """Background task: periodically reap orphaned runs.
+
+    Without this, runs orphaned by a worker crash / restart would only
+    be cleaned up when the chat worker process next restarts — which
+    can be hours, leaving the FE showing a phantom spinner. Ran on a
+    30s interval, the worst-case visibility delay is ~30s + the 60s
+    heartbeat threshold inside recover_orphan_runs.
+    """
+    while True:
+        try:
+            n = await asyncio.to_thread(recover_orphan_runs)
+            if n:
+                log.warning("orphan recovery: marked %d run(s) failed", n)
+        except Exception:
+            log.exception("orphan recovery pass failed")
+        await asyncio.sleep(interval_seconds)
