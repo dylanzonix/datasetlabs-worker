@@ -10,13 +10,13 @@ IMAGE_TAG=prod-$(git rev-parse --short HEAD)-$(date +%H%M%S)
 
 # Container settings (production — bumped from dev defaults since chat is
 # user-facing real-time traffic)
-CPU=1.0
-MEMORY=2.0Gi
+CPU=4.0
+MEMORY=8.0Gi
 MIN_REPLICAS=1                 # warm — chat cold start is bad UX
 MAX_REPLICAS=10
 
 # HTTP scaler — scale up when concurrent requests per replica exceeds this
-CONCURRENT_REQUESTS=5
+CONCURRENT_REQUESTS=15
 
 # Service exposes HTTP on this port (entrypoint_chat.sh reads $PORT)
 TARGET_PORT=8040
