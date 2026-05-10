@@ -558,7 +558,40 @@ def _mark_run_failed(run_id: UUID, error: str) -> None:
 
 # ---- Public terminal-marking helpers (called from streaming) -------------
 def mark_run_completed(db: Session, run: ChatRun, payload: Dict[str, Any]) -> None:
+    """Mark a run completed, but only if the reaper hasn't already
+    claimed it as failed/cancelled.
+
+    The orphan reaper runs concurrently with active workers. If a worker
+    legitimately took a long time on a single tool call (browser_use can
+    run 2+ minutes silently), the reaper might wrongly mark the run as
+    failed. If the worker then finishes normally and we blindly set
+    status=completed, we'd produce the inconsistent state
+    `status=completed` + `error="orphaned"` (and the FE has already seen
+    the reaper's `done` event, so silently flipping back to completed
+    is the worse outcome anyway). CAS: only flip if not already terminal.
+    """
     from sqlalchemy.sql import func
+    from sqlalchemy import text as sa_text
+
+    result = db.execute(
+        sa_text(
+            "UPDATE chat_runs SET status=:s, completed_at=now(), current_phase=NULL "
+            "WHERE id=:id AND status NOT IN ('failed', 'cancelled', 'completed')"
+        ),
+        {"s": RUN_STATUS_COMPLETED, "id": str(run.id)},
+    )
+    if result.rowcount == 0:
+        # Reaper or someone else got here first. Don't emit the `done`
+        # event — they emitted their own terminal event already and the
+        # FE has moved on. Just clean up local state.
+        log.warning(
+            "mark_run_completed: run %s was already terminal — skipping",
+            run.id,
+        )
+        _BUS.cleanup_run(run.id)
+        return
+    # Reflect CAS result back into the ORM instance so callers reading
+    # `run.status` see the new value.
     run.status = RUN_STATUS_COMPLETED
     run.completed_at = func.now()
     run.current_phase = None
@@ -862,51 +895,62 @@ def recover_orphan_runs() -> int:
     Returns count fixed. Safe to call on a polling schedule, not just
     at startup.
     """
-    from sqlalchemy.sql import func
-    from sqlalchemy import select
+    from sqlalchemy import text as sa_text
+
+    # Staleness threshold: how long since the last event before we
+    # consider the worker dead. Must comfortably exceed the longest
+    # legitimate gap between events in a healthy run. browser_use
+    # routinely runs 90-150s without emitting intermediate events
+    # (it streams its own state but only writes to chat_run_events
+    # at the boundaries); heavy reasoning rounds + Apify polling can
+    # add to that. 10 min is generous on purpose — false-positive
+    # cost (killing a live run) >> false-negative cost (slow visibility
+    # of a truly dead run).
+    STALE_THRESHOLD = "10 minutes"
+    # Minimum run age: don't even consider a run brand-new (5 min).
+    MIN_AGE = "5 minutes"
 
     db = SessionLocal()
     try:
-        # Candidates: any non-terminal run started > 2 minutes ago.
-        candidates = (
-            db.query(ChatRun)
-            .filter(
-                ChatRun.status.in_([
-                    RUN_STATUS_QUEUED,
-                    RUN_STATUS_RUNNING,
-                    RUN_STATUS_PAUSE_REQUESTED,
-                ]),
-                ChatRun.started_at < func.now() - func.make_interval(0, 0, 0, 0, 0, 2, 0),
-            )
-            .all()
-        )
+        # Atomic CAS: only flip status if the run is STILL non-terminal
+        # AND STILL stale at UPDATE time. If a fresh event landed between
+        # us picking candidates and us updating, the staleness check
+        # re-evaluates inside the UPDATE and the WHERE clause no-ops.
+        # RETURNING gives us the rows we successfully flipped so we know
+        # which ones to emit terminal events for. This is the only safe
+        # path that won't race the worker — never `SELECT then UPDATE`
+        # without re-checking the predicate inside the UPDATE itself.
+        cas_sql = sa_text("""
+            UPDATE chat_runs
+            SET status = 'failed',
+                error = 'Worker process restarted; run was orphaned (no heartbeat).',
+                completed_at = now(),
+                current_phase = NULL
+            WHERE status IN ('queued', 'running', 'pause_requested')
+              AND started_at IS NOT NULL
+              AND started_at < now() - cast(:min_age AS interval)
+              AND COALESCE(
+                    (SELECT max(created_at) FROM chat_run_events WHERE run_id = chat_runs.id),
+                    started_at
+                  ) < now() - cast(:stale AS interval)
+            RETURNING id
+        """)
+        result = db.execute(cas_sql, {"min_age": MIN_AGE, "stale": STALE_THRESHOLD})
+        flipped_ids = [row[0] for row in result.fetchall()]
+        db.commit()
 
+        # Emit terminal events ONLY for runs we actually claimed via
+        # the CAS. If `flipped_ids` is empty, we touched nothing — no
+        # events to emit, no FE state to disturb.
         fixed = 0
-        for run in candidates:
-            # Per-run heartbeat: latest ChatRunEvent timestamp. If
-            # something was emitted in the last 60s, another process
-            # is alive on this run — leave it alone.
-            last_evt_at = (
-                db.query(func.max(ChatRunEvent.created_at))
-                .filter(ChatRunEvent.run_id == run.id)
-                .scalar()
-            )
-            if last_evt_at is not None:
-                # Compare in DB to avoid timezone fudging in Python.
-                stale = db.execute(
-                    select(func.now() - last_evt_at > func.make_interval(0, 0, 0, 0, 0, 1, 0))
-                ).scalar()
-                if not stale:
-                    continue
-            elif run.started_at is None:
+        for run_id in flipped_ids:
+            run = db.query(ChatRun).get(run_id)
+            if run is None:
                 continue
-
-            run.status = RUN_STATUS_FAILED
-            run.error = "Worker process restarted; run was orphaned (no heartbeat)."
-            run.completed_at = func.now()
             try:
                 emit_event(db, run, "error", {"message": run.error})
                 emit_event(db, run, "done", {"stopped": True, "error": run.error})
+                db.commit()
             except Exception:
                 log.exception("orphan recovery: emit failed for run %s", run.id)
                 try:
