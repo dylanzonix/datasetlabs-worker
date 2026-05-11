@@ -13,6 +13,7 @@ Source tools (FullEnrich/Apollo/etc.) are appended at module load. Storage:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -31,6 +32,7 @@ from dsl_api.schemas.chat import AppliedChange
 
 from dsl_worker.chat_api import candidates
 from dsl_worker.chat_api import cell_traces
+from dsl_worker.chat_api import email_verify
 from dsl_worker.chat_api import sources
 from dsl_worker.chat_api import fill
 
@@ -637,6 +639,12 @@ Filters are dicts: `{col: v}` for equality, `{col__lt: n}` / `__gt` / `__lte`
   + `domain`). ≤25 per call.
 
 **Apollo** (alternative + complement to FE; people enrichment is paid):
+- `apollo_search_people(titles, company_domains, ...)` — search Apollo's
+  210M+ contact DB. **FREE** — no credits. Returns name/title/company/
+  LinkedIn/location/seniority but NOT emails. Pair with
+  `apollo_enrich_person` or `fullenrich_enrich_contacts` to get contacts.
+  Often better coverage than FE for engineering rosters at tech
+  companies — try it first when FE returns thin.
 - `apollo_search_companies(keywords, employee_ranges, ...)` — search
   companies. Useful when FE's filters don't match. Free per result.
 - `apollo_enrich_person(linkedin_url, email, name, company, domain, ...)`
@@ -679,7 +687,7 @@ Filters are dicts: `{col: v}` for equality, `{col__lt: n}` / `__gt` / `__lte`
 
 | You want | Reach for |
 |----------|-----------|
-| People at companies (B2B / tech / professional) | `fullenrich_search_people` |
+| People at companies (B2B / tech / professional) | `fullenrich_search_people` OR `apollo_search_people` (often better at tech rosters) |
 | Verified emails for known people | `fullenrich_enrich_contacts` |
 | Companies (any kind) | `fullenrich_search_companies`, fall back to `apollo_search_companies` |
 | Local businesses / orgs / non-LI targets | `google_maps_search_places` |
@@ -3493,6 +3501,21 @@ async def _tool_rows_add(
         return {}, {"error": "items must be a list of objects"}
     merge_key = args.get("merge_key")
 
+    # Email columns get auto-verified via Scrubby after the row commits.
+    # Detection mirrors fill.py — explicit contact_type wins, name-match
+    # is the fallback.
+    project_columns = {
+        c.get("name"): c for c in (project.columns or []) if isinstance(c, dict)
+    }
+    email_columns = {
+        name for name, spec in project_columns.items()
+        if email_verify.is_email_column(spec, name)
+    }
+    # Collected as we insert/merge so we can fire verifications AFTER
+    # the session commits (the verify task opens its own SessionLocal
+    # and would not see rows still in our uncommitted transaction).
+    pending_verify_targets: List[Tuple[str, Dict[str, Any]]] = []
+
     inserted = 0
     merged = 0
     for item in items:
@@ -3542,6 +3565,14 @@ async def _tool_rows_add(
                             sample.tags = existing_tags
                         merged += 1
                         merged_existing = True
+                        if email_columns:
+                            email_vals = {
+                                col: data.get(col)
+                                for col in email_columns
+                                if isinstance(data.get(col), str) and "@" in data.get(col)
+                            }
+                            if email_vals:
+                                pending_verify_targets.append((str(sample.id), email_vals))
                         if progress_cb is not None:
                             try:
                                 await progress_cb({
@@ -3565,6 +3596,14 @@ async def _tool_rows_add(
         db.flush()
         version.generated_count = (version.generated_count or 0) + 1
         inserted += 1
+        if email_columns:
+            email_vals = {
+                col: item.get(col)
+                for col in email_columns
+                if isinstance(item.get(col), str) and "@" in item.get(col)
+            }
+            if email_vals:
+                pending_verify_targets.append((str(sample.id), email_vals))
         if progress_cb is not None:
             try:
                 await progress_cb({
@@ -3579,6 +3618,40 @@ async def _tool_rows_add(
         .filter(Sample.version_id == version.id, Sample.deleted_at.is_(None))
         .scalar() or 0
     )
+
+    # Fire Scrubby verifications for every email we just added/merged.
+    # The verify task opens its own SessionLocal so we MUST commit our
+    # transaction first — otherwise the verify can't see the rows. We
+    # AWAIT the tasks before returning: progress_cb's underlying queue
+    # is only drained while this tool call is in flight, so late
+    # email_verified / row_merged events would vanish if we returned
+    # early (which is exactly what caused the "spinner stuck forever"
+    # bug). Tasks run in parallel across rows (one task per row, each
+    # serializing its own emails); the Scrubby client's 1-RPS submit
+    # lock paces the actual API hits.
+    if pending_verify_targets:
+        try:
+            db.commit()
+        except Exception:
+            log.exception("rows_add commit before verify failed; skipping verifies")
+            pending_verify_targets = []
+        verify_tasks: List[Any] = []
+        for sample_id, email_vals in pending_verify_targets:
+            verify_tasks.extend(email_verify.schedule_verifications(
+                sample_id=sample_id,
+                written_values=email_vals,
+                email_columns=email_columns,
+                # The orchestrator's rows_add has no provenance signal
+                # — it doesn't know which emails came from Apollo / FE
+                # vs. agent-discovered. Verifying everything is the
+                # safe default; the per-cell rows_fill path is the one
+                # that gets the skip benefit.
+                provider_emails=set(),
+                progress_cb=progress_cb,
+            ))
+        if verify_tasks:
+            await asyncio.gather(*verify_tasks, return_exceptions=True)
+
     return (
         {"rows": {"inserted": inserted, "merged": merged}},
         {"ok": True, "inserted": inserted, "merged": merged, "total": total},

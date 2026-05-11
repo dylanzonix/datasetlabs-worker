@@ -37,6 +37,22 @@ from dsl_worker.chat_api import routes_chat, routes_health, runs, tracing
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
+# Silence noisy third-party SDK INFO logs that flood the worker terminal:
+#   • azure.core http policy dumps full request/response headers per blob op
+#     (artifacts module reads/writes a LOT of blobs)
+#   • openai._base_client logs every retry with timing
+#   • httpx logs every outbound request as "HTTP/1.1 200 OK"
+# WARN/ERROR still surface — these only mute the chatty INFO traffic.
+for noisy in (
+    "azure.core.pipeline.policies.http_logging_policy",
+    "azure.identity",
+    "azure.storage",
+    "openai._base_client",
+    "httpx",
+    "httpcore",
+):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
+
 
 def _allowed_origins() -> list[str]:
     raw = os.getenv(

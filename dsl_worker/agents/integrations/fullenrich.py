@@ -127,6 +127,64 @@ def register_fullenrich_namespace(
         if result.get("item_count", 0) == 0:
             return f"No people found matching filters. Total in database: {result.get('total', 0)}. Try broader filters.", 0.0
 
+        # Defensive post-filter. FE's API has been observed to interpret
+        # the wrong field name (e.g. `company_domains` instead of
+        # `current_company_domains`) as OR-across-categories, returning
+        # mixed-company rows. The worker's mapping is correct now but a
+        # post-filter guards against any future regressions: when the
+        # agent asked for specific company_names or company_domains, we
+        # drop saved rows whose current employer doesn't match.
+        wanted_names = [
+            str(v).strip().lower()
+            for v in (args.get("company_names") or [])
+            if isinstance(v, str) and v.strip()
+        ]
+        wanted_domains = [
+            str(v).strip().lower()
+            for v in (args.get("company_domains") or [])
+            if isinstance(v, str) and v.strip()
+        ]
+        filter_dropped = 0
+        if wanted_names or wanted_domains:
+            kept: List[Dict[str, Any]] = []
+            with open(output_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        p = json.loads(line)
+                    except Exception:
+                        continue
+                    cur = (p.get("employment") or {}).get("current") or {}
+                    co = cur.get("company") or {}
+                    cname = (co.get("name") or "").lower()
+                    cdom = (co.get("domain") or "").lower()
+                    matched = (
+                        any(w in cname for w in wanted_names) or
+                        any(w in cdom for w in wanted_domains)
+                    )
+                    if matched:
+                        kept.append(p)
+                    else:
+                        filter_dropped += 1
+            if filter_dropped > 0:
+                logger.info(
+                    "fullenrich.search_people: post-filter dropped %d/%d rows whose company didn't match %s / %s",
+                    filter_dropped, filter_dropped + len(kept),
+                    wanted_names or "(no names)", wanted_domains or "(no domains)",
+                )
+            # Rewrite the file with only matching rows.
+            with open(output_path, "w", encoding="utf-8") as f:
+                for p in kept:
+                    f.write(json.dumps(p, ensure_ascii=False, default=str) + "\n")
+            result["item_count"] = len(kept)
+
+        if result.get("item_count", 0) == 0:
+            return (
+                f"FE returned rows but none matched the requested company "
+                f"({wanted_names or wanted_domains}). FE may be matching on "
+                f"partial fields; try a tighter exact_match or different "
+                f"company name/domain spelling."
+            ), 0.0
+
         if on_file_written:
             on_file_written(output_path)
 
@@ -135,11 +193,19 @@ def register_fullenrich_namespace(
         credits_used = result.get("credits_used", 0)
         cost_usd = credits_used * cost_per_credit
 
+        suffix = ""
+        if filter_dropped > 0:
+            suffix = (
+                f"\n(post-filter dropped {filter_dropped} rows whose current "
+                f"company didn't match the requested filter)"
+            )
+
         return (
             f"Found {result['total']:,} people matching filters.\n"
             f"File: {workspace_path} ({result['item_count']} saved)\n"
             f"Fields: {', '.join(result.get('fields', []))}\n"
-            f"Cost: ${cost_usd:.4f} ({credits_used:.1f} credits)\n\n"
+            f"Cost: ${cost_usd:.4f} ({credits_used:.1f} credits)"
+            f"{suffix}\n\n"
             f"Next: submit_candidates with this file, or inspect with code_exec."
         ), cost_usd
 

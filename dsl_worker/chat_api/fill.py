@@ -20,10 +20,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from sqlalchemy.orm import Session
 
@@ -33,7 +34,7 @@ from dsl_api.models import Project
 from dsl_api.models.sample import Sample
 
 from dsl_worker import skills as skills_loader
-from dsl_worker.chat_api import cell_traces, sources
+from dsl_worker.chat_api import cell_traces, email_verify, sources
 
 ProgressCallback = Callable[[Dict[str, Any]], Awaitable[None]]
 
@@ -89,6 +90,7 @@ _CELL_TOOL_NAMES = {
     "fullenrich_search_people",
     "fullenrich_search_companies",
     "fullenrich_enrich_contacts",
+    "apollo_search_people",
     "apollo_search_companies",
     "apollo_enrich_person",
     "apollo_enrich_company",
@@ -192,6 +194,11 @@ class CellFillResult:
     # blob (cell_traces module). The chat agent never sees the full
     # trace inline; it inspects via cell_traces_inspect on demand.
     trace: Optional[cell_traces.CellTrace] = None
+    # Lower-cased emails the cell agent saw in Apollo / FullEnrich tool
+    # results during this run. If set_values commits a value that's in
+    # this set, we treat it as provider-verified and skip Scrubby —
+    # those vendors already do their own deliverability waterfall.
+    provider_emails: Set[str] = field(default_factory=set)
 
 
 def _cell_tools_for_columns(target_columns: List[str]) -> List[Dict[str, Any]]:
@@ -266,7 +273,12 @@ def _cell_tools_for_columns(target_columns: List[str]) -> List[Dict[str, Any]]:
     return source_tools + builtins + [set_values_schema, give_up_schema]
 
 
-def _row_context(row_data: Dict[str, Any], target_columns: List[str], target_specs: Dict[str, Dict[str, str]]) -> str:
+def _row_context(
+    row_data: Dict[str, Any],
+    target_columns: List[str],
+    target_specs: Dict[str, Dict[str, str]],
+    prior_failures: Optional[Dict[str, List[str]]] = None,
+) -> str:
     """Render the per-cell user message: row fields + column goals."""
     parts = ["# Existing row fields"]
     if not row_data:
@@ -289,6 +301,17 @@ def _row_context(row_data: Dict[str, Any], target_columns: List[str], target_spe
         if spec.get("description"):
             line += f" — {spec['description']}"
         parts.append(line)
+    # Email columns with prior bounced attempts: warn the agent off the
+    # known-bad values so a regen doesn't keep proposing the same
+    # bouncing address (and burning the user's credits on a fresh
+    # Scrubby call to confirm the same Invalid).
+    if prior_failures:
+        relevant = {c: vs for c, vs in prior_failures.items() if c in target_columns and vs}
+        if relevant:
+            parts.append("")
+            parts.append("# Previously bounced — DO NOT propose these values again")
+            for col, vs in relevant.items():
+                parts.append(f"- {col}: {', '.join(vs)}")
     return "\n".join(parts)
 
 
@@ -304,6 +327,7 @@ async def _run_cell_agent(
     progress_cb: Optional[ProgressCallback] = None,
     cell_idx: Optional[int] = None,
     cell_total: Optional[int] = None,
+    prior_failures: Optional[Dict[str, List[str]]] = None,
 ) -> CellFillResult:
     """Spawn the bounded subagent for one row and return its CellFillResult.
 
@@ -334,7 +358,7 @@ async def _run_cell_agent(
             result.trace.ended_at = datetime.now(timezone.utc).isoformat()
         return result
 
-    user_msg = _row_context(row_data, target_columns, target_specs)
+    user_msg = _row_context(row_data, target_columns, target_specs, prior_failures=prior_failures)
     cell_tools = _cell_tools_for_columns(target_columns)
     next_input: Any = [{"role": "user", "content": user_msg}]
     previous_response_id: Optional[str] = None
@@ -590,6 +614,8 @@ async def _run_cell_agent(
                     result.cost_usd += tool_cost
                     tool_outputs.append({"type": "function_call_output", "call_id": fc.call_id, "output": out_text[:6000]})
                     had_productive_source_call = True
+                    if fc.name in email_verify.PROVIDER_ENRICH_TOOLS:
+                        result.provider_emails.update(email_verify.extract_emails(out_text))
                     if result.trace is not None:
                         result.trace.add_tool_call(
                             turn=turn_idx + 1,
@@ -692,12 +718,19 @@ async def fill_rows(
         )
 
     target_specs: Dict[str, Dict[str, str]] = {}
+    # Email columns get auto-verified via Scrubby after the cell commits.
+    # Detection precedence: explicit contact_type=="email" on the column
+    # def, fallback to a name match so email-ish columns added without
+    # the marker still verify.
+    email_columns: Set[str] = set()
     for col in target_columns:
         spec = project_columns.get(col, {}) or {}
         target_specs[col] = {
             "format": spec.get("format") or "",
             "description": spec.get("description") or "",
         }
+        if spec.get("contact_type") == "email" or re.search(r"e[\W_-]*mail", col, re.IGNORECASE):
+            email_columns.add(col)
 
     # Skills matching: once per fill batch (same target columns for every
     # row). Builds the prompt extension and a list of skill names to record
@@ -767,12 +800,17 @@ async def fill_rows(
             return True
         return False
 
-    work_items: List[Tuple[Any, Dict[str, Any], List[str]]] = []
+    # Per-row prior bounced emails (from earlier verify rounds) get
+    # surfaced to the cell agent as a "do not propose these values"
+    # warning — see _row_context. Empty when no prior failures exist
+    # for a row.
+    work_items: List[Tuple[Any, Dict[str, Any], List[str], Dict[str, List[str]]]] = []
     rows_skipped_already_filled = 0
     rows_skipped_prior_fail = 0
     for row_id, row_data, tags in rows:
         existing = dict(row_data or {})
         fill_status = (tags or {}).get("fill_status") or {}
+        failed_emails_for_row = (tags or {}).get("failed_emails") or {}
         unfilled: List[str] = []
         per_row_skipped_fail = 0
         for c in target_columns:
@@ -785,7 +823,7 @@ async def fill_rows(
                     continue
             unfilled.append(c)
         if unfilled:
-            work_items.append((row_id, existing, unfilled))
+            work_items.append((row_id, existing, unfilled, failed_emails_for_row))
         elif per_row_skipped_fail > 0:
             rows_skipped_prior_fail += 1
         else:
@@ -835,6 +873,11 @@ async def fill_rows(
     sem = asyncio.Semaphore(concurrency)
     total_cost = 0.0
     results: List[CellFillResult] = []
+    # Pending Scrubby verification tasks. We await all of these before
+    # fill_rows returns so the worker doesn't get killed mid-verify when
+    # scaled to zero — and so the chat agent's wrap-up turn sees the
+    # final cell state, not the pre-verification snapshot.
+    pending_verifications: List[asyncio.Task[None]] = []
 
     async def _emit(event: Dict[str, Any]) -> None:
         if progress_cb is None:
@@ -852,7 +895,11 @@ async def fill_rows(
         })
 
     async def _process(
-        row_id: Any, row_data: Dict[str, Any], unfilled_cols: List[str], idx: int,
+        row_id: Any,
+        row_data: Dict[str, Any],
+        unfilled_cols: List[str],
+        prior_failed_emails: Dict[str, List[str]],
+        idx: int,
     ) -> CellFillResult:
         async with sem:
             await _emit({
@@ -880,6 +927,7 @@ async def fill_rows(
                 progress_cb=progress_cb,
                 cell_idx=idx,
                 cell_total=len(work_items),
+                prior_failures=prior_failed_emails or None,
             )
             # Persist this cell's values immediately so:
             #  (a) the table updates live as cells fill, not in one
@@ -1010,13 +1058,40 @@ async def fill_rows(
             # in the table immediately, same channel as rows_add uses.
             if updated_row is not None:
                 await _emit({"type": "row_merged", "row": updated_row})
+            # Auto-verify any newly filled email columns via Scrubby —
+            # fire async, await all at the end of fill_rows. Skip values
+            # the cell agent took from a paid provider (Apollo / FE)
+            # since those vendors verify their own waterfall and a second
+            # validation would be a wasted credit.
+            written_emails = {
+                col: res.values.get(col)
+                for col in succeeded_cols
+                if col in email_columns
+            }
+            if written_emails:
+                pending_verifications.extend(
+                    email_verify.schedule_verifications(
+                        sample_id=str(row_id),
+                        written_values=written_emails,
+                        email_columns=email_columns,
+                        provider_emails=res.provider_emails,
+                        progress_cb=progress_cb,
+                    )
+                )
             return res
 
     tasks = [
-        _process(rid, rdata, unfilled, i + 1)
-        for i, (rid, rdata, unfilled) in enumerate(work_items)
+        _process(rid, rdata, unfilled, failed, i + 1)
+        for i, (rid, rdata, unfilled, failed) in enumerate(work_items)
     ]
     completed = await asyncio.gather(*tasks, return_exceptions=True)
+    # Drain Scrubby verifications before returning. Each verify is
+    # fire-and-forget from the cell agent's POV, but the wrap-up summary
+    # to the chat agent should reflect post-verification state (Invalid
+    # emails cleared, badges stamped) — and the worker pod may scale to
+    # zero shortly after fill_rows returns, killing any in-flight tasks.
+    if pending_verifications:
+        await asyncio.gather(*pending_verifications, return_exceptions=True)
     voided_cost = 0.0
     for r in completed:
         if isinstance(r, Exception):

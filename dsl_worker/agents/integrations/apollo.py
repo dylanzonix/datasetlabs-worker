@@ -32,12 +32,33 @@ NAMESPACE_DESCRIPTION = (
 
 
 def _simplify_person(person: dict) -> dict:
-    """Strip raw Apollo person to essential fields."""
+    """Strip raw Apollo person to essential fields.
+
+    Apollo's FREE search_people endpoint returns REDACTED person objects:
+    `name` is None, `last_name` is masked (e.g. "Vo***a"), most org
+    fields are stripped to `has_*` booleans, no LinkedIn URL. We fall
+    back to assembling a display name from `first_name` + obfuscated
+    last so the agent can still surface "Ami V." to the user. To get
+    the unredacted record (full name, email, LinkedIn), the agent must
+    call enrich_person with the Apollo `id`."""
     org = person.get("organization") or {}
     phones = person.get("phone_numbers") or []
+    # Prefer the full name when present; assemble from parts otherwise.
+    name = person.get("name")
+    if not name:
+        first = person.get("first_name") or ""
+        last = (
+            person.get("last_name")
+            or person.get("last_name_obfuscated")
+            or ""
+        )
+        joined = f"{first} {last}".strip()
+        name = joined or None
     return {
         "id": person.get("id"),
-        "name": person.get("name"),
+        "name": name,
+        "first_name": person.get("first_name"),
+        "last_name_obfuscated": person.get("last_name_obfuscated"),
         "title": person.get("title"),
         "email": person.get("email"),
         "email_status": person.get("email_status"),
@@ -46,7 +67,7 @@ def _simplify_person(person: dict) -> dict:
         "location": person.get("city"),
         "seniority": person.get("seniority"),
         "company": org.get("name"),
-        "company_domain": org.get("website_url"),
+        "company_domain": org.get("website_url") or org.get("primary_domain"),
         "company_industry": org.get("industry"),
         "company_size": org.get("estimated_num_employees"),
     }
@@ -98,6 +119,104 @@ def register_apollo_namespace(
         idx = file_counter[0]
         file_counter[0] += 1
         return workspace_dir / "candidates" / f"{prefix}_{idx}.jsonl"
+
+    # ── search_people ────────────────────────────────────────────────
+
+    async def search_people(args: Dict) -> Tuple[str, float]:
+        """Free people search across Apollo's 210M+ contact DB. Returns
+        basic info (name, title, company, LinkedIn, location) — no emails
+        or phones. Pair with enrich_person to get contact data."""
+        page = args.get("page", 1)
+        per_page = args.get("per_page", 25)
+        try:
+            people, total = await client.search_people(
+                person_titles=args.get("titles") or None,
+                person_seniorities=args.get("seniorities") or None,
+                person_locations=args.get("locations") or None,
+                person_names=args.get("names") or None,
+                organization_keywords=args.get("company_keywords") or None,
+                organization_name=args.get("company_name") or None,
+                organization_locations=args.get("company_locations") or None,
+                organization_num_employees_ranges=args.get("company_employee_ranges") or None,
+                organization_domains=args.get("company_domains") or None,
+                organization_revenue_ranges=args.get("company_revenue_ranges") or None,
+                technology_uids=args.get("technologies") or None,
+                q_keywords=args.get("keywords") or None,
+                include_similar_titles=args.get("include_similar_titles"),
+                per_page=per_page,
+                page=page,
+            )
+        except Exception as e:
+            return f"Apollo search_people error: {e}", 0.0
+
+        if not people:
+            return "No people found. Try broader filters.", 0.0
+
+        # Defensive client-side filter on domain — Apollo's
+        # q_organization_domains_list is forgiving, so if the agent
+        # passed a specific domain, drop rows whose current org domain
+        # doesn't substring-match it. Same rationale as the FE post-filter.
+        wanted_domains = [
+            str(d).strip().lower()
+            for d in (args.get("company_domains") or [])
+            if isinstance(d, str) and d.strip()
+        ]
+        filter_dropped = 0
+        if wanted_domains:
+            kept = []
+            for p in people:
+                org = p.get("organization") or {}
+                dom = (org.get("website_url") or org.get("primary_domain") or "").lower()
+                if any(w in dom for w in wanted_domains):
+                    kept.append(p)
+                else:
+                    filter_dropped += 1
+            if filter_dropped > 0:
+                logger.info(
+                    "apollo.search_people: post-filter dropped %d/%d rows by domain %s",
+                    filter_dropped, len(people), wanted_domains,
+                )
+            people = kept
+
+        if not people:
+            return (
+                f"Apollo returned rows but none matched domain {wanted_domains}. "
+                f"Try search_companies first to find the right org, or pass "
+                f"company_name instead of company_domains."
+            ), 0.0
+
+        simplified = [_simplify_person(p) for p in people]
+        output_path = _next_filename("apollo_people")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            for p in simplified:
+                f.write(json.dumps(p, ensure_ascii=False, default=str) + "\n")
+
+        if on_file_written:
+            on_file_written(output_path)
+
+        workspace_path = f"/workspace/candidates/{output_path.name}"
+        total_pages = (total + per_page - 1) // per_page if total else "?"
+        lines = [
+            f"Apollo people search: {total:,} total results (page {page}/{total_pages}).",
+            f"File: {workspace_path} ({len(simplified)} saved)",
+        ]
+        if filter_dropped > 0:
+            lines.append(
+                f"(post-filter dropped {filter_dropped} rows whose org domain didn't match)"
+            )
+        for s in simplified[:3]:
+            lines.append(
+                f"  {s.get('name', '?')} — {s.get('title', '?')} @ "
+                f"{s.get('company', '?')} | {s.get('linkedin', 'no linkedin')}"
+            )
+        if total > per_page:
+            lines.append(f"\nMore: search_people(..., page={page + 1})")
+        lines.append(
+            "\nNote: emails NOT in these results. Pair with enrich_person "
+            "(1 credit/person) or fullenrich_enrich_contacts for contact data."
+        )
+        return "\n".join(lines), 0.0
 
     # ── search_companies ─────────────────────────────────────────────
 
@@ -334,6 +453,40 @@ def register_apollo_namespace(
 
     tools = [
         {
+            "name": "search_people",
+            "description": (
+                "Search Apollo's 210M+ contact database for people. FREE — no "
+                "credits consumed. Returns name, title, company, LinkedIn, "
+                "location, seniority. Does NOT return emails or phones — pair "
+                "with enrich_person (1 credit each) or fullenrich_enrich_contacts.\n\n"
+                "Best practices:\n"
+                "- For 'all engineers at company X' → set `company_domains` "
+                "(or `company_name`) + leave titles broad / use `include_similar_titles=true`\n"
+                "- For 'CTOs in NYC' → titles + locations + seniorities\n"
+                "- Use `q_keywords` for free-text matching when title shape is unknown"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "titles": {"type": "array", "items": {"type": "string"}, "description": "Person job titles (e.g. ['Software Engineer', 'Member of Technical Staff'])"},
+                    "seniorities": {"type": "array", "items": {"type": "string"}, "description": "Seniority levels (e.g. ['c_suite', 'vp', 'director', 'manager', 'senior', 'entry'])"},
+                    "locations": {"type": "array", "items": {"type": "string"}, "description": "Person locations (cities, states, countries)"},
+                    "names": {"type": "array", "items": {"type": "string"}, "description": "Specific person names"},
+                    "company_keywords": {"type": "array", "items": {"type": "string"}, "description": "Industry/keyword filter on the org"},
+                    "company_name": {"type": "string", "description": "Specific company name"},
+                    "company_locations": {"type": "array", "items": {"type": "string"}, "description": "Org locations"},
+                    "company_employee_ranges": {"type": "array", "items": {"type": "string"}, "description": "Org headcount ranges (comma format: ['51,200', '201,500'])"},
+                    "company_domains": {"type": "array", "items": {"type": "string"}, "description": "Org domains (e.g. ['anthropic.com'])"},
+                    "company_revenue_ranges": {"type": "array", "items": {"type": "string"}, "description": "Org revenue ranges"},
+                    "technologies": {"type": "array", "items": {"type": "string"}, "description": "Tech stack the org uses"},
+                    "keywords": {"type": "string", "description": "Free-text keyword search"},
+                    "include_similar_titles": {"type": "boolean", "description": "Expand title matching to semantic neighbors (default false)"},
+                    "per_page": {"type": "integer", "description": "Results per page (default 25, max 100)"},
+                    "page": {"type": "integer", "description": "Page number (default 1)"},
+                },
+            },
+        },
+        {
             "name": "search_companies",
             "description": (
                 "Search Apollo's company database with filters. Returns company profiles "
@@ -440,6 +593,7 @@ def register_apollo_namespace(
     ]
 
     handlers = {
+        "search_people": search_people,
         "search_companies": search_companies,
         "enrich_person": enrich_person,
         "enrich_company": enrich_company,

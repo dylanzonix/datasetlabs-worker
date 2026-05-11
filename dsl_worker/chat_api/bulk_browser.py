@@ -31,7 +31,7 @@ from dsl_api.models import Project
 from dsl_api.models.sample import Sample
 
 from dsl_worker import skills as skills_loader
-from dsl_worker.chat_api import cell_traces, sources
+from dsl_worker.chat_api import cell_traces, email_verify, sources
 
 ProgressCallback = Callable[[Dict[str, Any]], Awaitable[None]]
 log = logging.getLogger(__name__)
@@ -328,6 +328,11 @@ async def bulk_fill_rows(
             "description": spec.get("description") or "",
         }
 
+    email_columns: set = {
+        c for c in target_columns
+        if email_verify.is_email_column(project_columns.get(c) or {}, c)
+    }
+
     skill_columns_for_match = [
         {
             "name": col,
@@ -595,6 +600,26 @@ async def bulk_fill_rows(
             except Exception:
                 log.exception("progress_cb row_merged raised; suppressing")
 
+    # Auto-verify any newly written emails via Scrubby. browser_use is
+    # never a paid-provider source, so provider_emails is empty here —
+    # every email goes through Scrubby. Pending tasks are awaited at the
+    # end of this function (worker may scale to zero shortly after).
+    pending_verifications: List[asyncio.Task] = []
+    if email_columns:
+        for row_id, values, _srcs in all_writes:
+            written = {col: values.get(col) for col in values if col in email_columns}
+            if not written:
+                continue
+            pending_verifications.extend(
+                email_verify.schedule_verifications(
+                    sample_id=str(row_id),
+                    written_values=written,
+                    email_columns=email_columns,
+                    provider_emails=set(),
+                    progress_cb=progress_cb,
+                )
+            )
+
     trace_persist_info: Optional[Dict[str, Any]] = None
     if all_traces:
         try:
@@ -654,5 +679,11 @@ async def bulk_fill_rows(
         # cells. Same field name as fill.fill_rows so summary readers
         # handle both uniformly.
         summary["voided_cost_usd"] = round(voided_cost, 4)
+
+    # Drain Scrubby verifications. Same rationale as fill.fill_rows — the
+    # worker may scale to zero shortly after this returns; in-flight
+    # verifies must complete first or the FE never sees the final badge.
+    if pending_verifications:
+        await asyncio.gather(*pending_verifications, return_exceptions=True)
 
     return (summary, total_cost)

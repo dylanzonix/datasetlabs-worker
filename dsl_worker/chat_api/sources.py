@@ -422,6 +422,99 @@ async def _fe_enrich_contacts(args: Dict[str, Any], *, project_id: Optional[Any]
 # ---------------------------------------------------------------------------
 
 
+async def _apollo_search_people(args: Dict[str, Any], *, project_id: Optional[Any] = None) -> Tuple[str, float]:
+    """Free people search via Apollo (210M+ contacts). Returns basic info —
+    no emails/phones. Pair with apollo_enrich_person or
+    fullenrich_enrich_contacts for contact data."""
+    client = _apollo()
+    if client is None:
+        return json.dumps({"error": "APOLLO_API_KEY not configured"}), 0.0
+
+    page = int(args.get("page", 1))
+    per_page = int(args.get("per_page", 25))
+    try:
+        people, total = await client.search_people(
+            person_titles=args.get("titles") or None,
+            person_seniorities=args.get("seniorities") or None,
+            person_locations=args.get("locations") or None,
+            person_names=args.get("names") or None,
+            organization_keywords=args.get("company_keywords") or None,
+            organization_name=args.get("company_name") or None,
+            organization_locations=args.get("company_locations") or None,
+            organization_num_employees_ranges=args.get("company_employee_ranges") or None,
+            organization_domains=args.get("company_domains") or None,
+            organization_revenue_ranges=args.get("company_revenue_ranges") or None,
+            technology_uids=args.get("technologies") or None,
+            q_keywords=args.get("keywords") or None,
+            include_similar_titles=args.get("include_similar_titles"),
+            per_page=per_page,
+            page=page,
+        )
+    except Exception as e:
+        return json.dumps({"error": f"{type(e).__name__}: {e}"}), 0.0
+
+    # Defensive client-side filter when the agent asked for a specific
+    # company. Apollo's free-tier search returns REDACTED org data —
+    # `website_url` and `primary_domain` are usually None, so we can't
+    # filter on those. Fall back to matching org.name against the domain
+    # root (e.g. "anthropic.com" → match org.name containing "anthropic"),
+    # which is reliably populated. Also honor company_name when given.
+    wanted_domains = [
+        str(d).strip().lower()
+        for d in (args.get("company_domains") or [])
+        if isinstance(d, str) and d.strip()
+    ]
+    wanted_company_name = (args.get("company_name") or "").strip().lower()
+    filter_dropped = 0
+
+    def _domain_root(d: str) -> str:
+        # "anthropic.com" → "anthropic"; "foo.co.uk" → "foo"
+        return d.split(".", 1)[0]
+
+    domain_roots = [_domain_root(d) for d in wanted_domains]
+    if (wanted_domains or wanted_company_name) and people:
+        kept = []
+        for p in people:
+            org = p.get("organization") or {}
+            org_name = (org.get("name") or "").lower()
+            org_dom = (org.get("website_url") or org.get("primary_domain") or "").lower()
+            matched = False
+            if wanted_domains:
+                # Match full domain if Apollo populated it, OR fall back
+                # to the root token matching the org name.
+                matched = any(w in org_dom for w in wanted_domains) or \
+                          any(r in org_name for r in domain_roots)
+            if not matched and wanted_company_name:
+                matched = wanted_company_name in org_name
+            if matched:
+                kept.append(p)
+            else:
+                filter_dropped += 1
+        people = kept
+        if filter_dropped:
+            log.info(
+                "apollo.search_people: post-filter dropped %d rows (wanted %s / %s)",
+                filter_dropped, wanted_domains or "(none)", wanted_company_name or "(none)",
+            )
+
+    simplified = [_simplify_person(p) for p in (people or [])]
+    persisted = _persist_candidates(
+        project_id,
+        "apollo_search_people",
+        simplified,
+        cost_usd=0.0,
+        extra={
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "filter_dropped": filter_dropped,
+            "next_page": page + 1 if total and (page * per_page) < total else None,
+            "note": "emails/phones NOT in these results — pair with enrich_person",
+        },
+    )
+    return json.dumps(persisted, default=str), 0.0
+
+
 async def _apollo_search_companies(args: Dict[str, Any], *, project_id: Optional[Any] = None) -> Tuple[str, float]:
     client = _apollo()
     if client is None:
@@ -1469,6 +1562,45 @@ SOURCE_TOOLS: List[Dict[str, Any]] = [
     # ── Apollo ───────────────────────────────────────────────────────────
     {
         "type": "function",
+        "name": "apollo_search_people",
+        "description": (
+            "Search Apollo's 210M+ contact database for people. FREE — no "
+            "credits consumed. Returns name, title, company, LinkedIn, "
+            "location, seniority. Does NOT return emails or phones — pair "
+            "with apollo_enrich_person (1 credit each) or "
+            "fullenrich_enrich_contacts.\n\n"
+            "Best practices:\n"
+            "- For 'all engineers at company X' → pass company_domains "
+            "(or company_name) + leave titles broad; set "
+            "include_similar_titles=true to widen the title match\n"
+            "- For 'CTOs in NYC' → titles + locations + seniorities\n"
+            "- Apollo has good coverage of tech companies (often better "
+            "than FullEnrich for engineering roster discovery); try it "
+            "first if FE returns thin results"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "titles": {"type": "array", "items": {"type": "string"}, "description": "Person job titles"},
+                "seniorities": {"type": "array", "items": {"type": "string"}, "description": "e.g. ['c_suite','vp','director','manager','senior','entry']"},
+                "locations": {"type": "array", "items": {"type": "string"}, "description": "Person locations"},
+                "names": {"type": "array", "items": {"type": "string"}, "description": "Specific person names"},
+                "company_keywords": {"type": "array", "items": {"type": "string"}, "description": "Industry/keyword filter on the org"},
+                "company_name": {"type": "string", "description": "Specific company name"},
+                "company_locations": {"type": "array", "items": {"type": "string"}},
+                "company_employee_ranges": {"type": "array", "items": {"type": "string"}, "description": "e.g. ['51,200','201,500']"},
+                "company_domains": {"type": "array", "items": {"type": "string"}, "description": "Org domains (e.g. ['anthropic.com'])"},
+                "company_revenue_ranges": {"type": "array", "items": {"type": "string"}},
+                "technologies": {"type": "array", "items": {"type": "string"}},
+                "keywords": {"type": "string", "description": "Free-text keyword search"},
+                "include_similar_titles": {"type": "boolean"},
+                "page": {"type": "integer"},
+                "per_page": {"type": "integer"},
+            },
+        },
+    },
+    {
+        "type": "function",
         "name": "apollo_search_companies",
         "description": (
             "Search Apollo's company DB. Filters: keywords, name, locations, "
@@ -1753,6 +1885,7 @@ _HANDLERS: Dict[str, _HandlerType] = {
     "fullenrich_search_people": _fe_search_people,
     "fullenrich_search_companies": _fe_search_companies,
     "fullenrich_enrich_contacts": _fe_enrich_contacts,
+    "apollo_search_people": _apollo_search_people,
     "apollo_search_companies": _apollo_search_companies,
     "apollo_enrich_person": _apollo_enrich_person,
     "apollo_enrich_company": _apollo_enrich_company,
