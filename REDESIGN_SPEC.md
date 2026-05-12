@@ -55,8 +55,7 @@ Pick by data shape, not a fixed priority list. Rough strengths:
 - **`google_maps`** — local orgs / places with geographic scope.
 - **`apify_actor:<id>`** — vertical scrapers for specific platforms (Reddit, Quora, Indeed, LinkedIn jobs, Twitter, Instagram, etc.). Use `source_search_apify` to discover the right actor — don't assume an actor exists or works without checking.
 - **`web_harvest`** — niche topics with no integration coverage, or fragmented web data. A bounded research subagent on a topic.
-- **`file`** — uploaded tabular files (CSV/XLSX auto-parsed; other formats fall back to `code_exec`).
-- **`manual`** — blank table for implicit-knowledge populating, derived data, or pasted content. Rows added via `code_exec`.
+- **`file`** — uploaded tabular files (CSV/XLSX auto-parsed; other formats fall back to `code_exec` to transform first). Also used for implicit-knowledge or derived data: write a file via `code_exec`, then `table_create` with `source="file"`.
 
 Integrations are preferred over open-web when they cover the data — they're more structured, more thorough at scale, more cost-efficient. But "preferred" isn't "always best." For niche topics with no integration, web is the right call.
 
@@ -431,7 +430,6 @@ apify_actor:<actor_id>     # parameterized; actor_id from source_search_apify
 web_harvest
 browser_use
 file
-manual
 ```
 
 ### Per-source `query_params` shapes
@@ -493,17 +491,11 @@ For larger pulls, agent calls `table_create` with `source="browser_use"` multipl
 
 **`file`**
 ```yaml
-file_id: string                 # from upload
+file_id: string                 # from upload, or written via code_exec
 ```
-Server auto-detects CSV/XLSX, parses, returns rows. Other formats → error with hint to use `code_exec`.
+Server auto-detects CSV/XLSX, parses, returns rows. Other formats → error with hint to use `code_exec` to transform first.
 
-**`manual`**
-```yaml
-columns:
-  - name: string
-    type: ColumnType
-```
-Creates an empty table with declared columns. Agent populates via `code_exec` using `add_rows()`.
+For implicit-knowledge populating, derived data, or pasted content: the agent uses `code_exec` to write a CSV/JSON file in the sandbox, gets back a file_id, then calls `table_create(source="file", query_params={file_id})`. No separate "manual" source needed.
 
 ---
 
