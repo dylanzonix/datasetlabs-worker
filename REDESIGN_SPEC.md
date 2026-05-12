@@ -64,7 +64,11 @@ This source list will grow as new integrations get added.
 
 # Browser use
 
-`browser_use` is a **last resort** invoked only via `code_exec` for specific known sites where (a) no Apify actor works, (b) native HTTP fails (JS rendering, antibot, login wall). Never broad multi-site exploration. Break sessions into small bounded tasks; reliability degrades fast above ~50 items per session.
+`browser_use` is its own source and can also be the underlying tool of an enrichment action. Use cases:
+- As a **source** (`table_create(source="browser_use", ...)`) — scrape a specific known site (a directory page, a listings index) into a table.
+- As an **enrichment action tool** — per-row scraping of a target URL derived from the row (visit the company's site, extract the careers page link).
+
+It is a **last resort** — only when (a) no Apify actor covers the site and (b) native HTTP fails (JS rendering, antibot, login wall). Never use it for broad multi-site exploration. Sessions are bounded: reliability degrades fast above ~50 items per session, so for larger pulls, break into multiple bounded sessions.
 
 # Working with the table
 
@@ -425,6 +429,7 @@ fullenrich_companies
 google_maps
 apify_actor:<actor_id>     # parameterized; actor_id from source_search_apify
 web_harvest
+browser_use
 file
 manual
 ```
@@ -476,6 +481,15 @@ candidate_description: string   # what a successful row looks like
 max_candidates: integer         # default 30
 max_turns: integer?             # how many search/page iterations the subagent gets, default 6
 ```
+
+**`browser_use`**
+```yaml
+url: string                     # the page to start at
+task: string                    # what to extract or navigate to
+candidate_description: string   # what a successful row looks like
+max_candidates: integer         # default 30; reliability cliffs above ~50
+```
+For larger pulls, agent calls `table_create` with `source="browser_use"` multiple times against different starting URLs or sub-pages rather than one huge session.
 
 **`file`**
 ```yaml
