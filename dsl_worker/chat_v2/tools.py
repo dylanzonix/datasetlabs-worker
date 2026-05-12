@@ -134,7 +134,7 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
         # they'll be committed after column_map_set with the agreed mapping.
         ctx.db.execute(
             sa_text(
-                "UPDATE tables SET query_params = jsonb_set(query_params::jsonb, '{_pending_rows}', :pending::jsonb) WHERE id=:id"
+                "UPDATE tables SET query_params = jsonb_set(query_params::jsonb, '{_pending_rows}', CAST(:pending AS jsonb)) WHERE id=:id"
             ),
             {"id": table_id, "pending": json.dumps(res.rows)},
         )
@@ -244,7 +244,7 @@ async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
             SET last_fetch_returned_rows = :rows_n,
                 last_fetch_cost_credits = :cost,
                 last_fetch_at = now(),
-                query_params = jsonb_set(query_params::jsonb, '{_cursor}', :cursor::jsonb)
+                query_params = jsonb_set(query_params::jsonb, '{_cursor}', CAST(:cursor AS jsonb))
             WHERE id = :id
             """
         ),
@@ -303,7 +303,7 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
         # Strip _pending_rows from query_params
         qp.pop("_pending_rows", None)
         ctx.db.execute(
-            sa_text("UPDATE tables SET query_params=:qp::jsonb WHERE id=:id"),
+            sa_text("UPDATE tables SET query_params=CAST(:qp AS jsonb) WHERE id=:id"),
             {"id": table_id, "qp": json.dumps(qp)},
         )
 
@@ -311,7 +311,7 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
         sa_text(
             """
             UPDATE tables
-            SET columns = :cols::jsonb,
+            SET columns = CAST(:cols AS jsonb),
                 dedup_key_column = COALESCE(:dedup, dedup_key_column),
                 fetch_status = CASE WHEN fetch_status = 'pending_mapping' THEN 'complete' ELSE fetch_status END
             WHERE id = :id
@@ -361,7 +361,7 @@ async def filter_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, 
         sa_text(
             """
             INSERT INTO table_filters (id, table_id, column_name, op, value, created_at)
-            VALUES (gen_random_uuid(), :tid, :col, :op, :val::jsonb, now())
+            VALUES (gen_random_uuid(), :tid, :col, :op, CAST(:val AS jsonb), now())
             ON CONFLICT (table_id, column_name) DO UPDATE
             SET op = EXCLUDED.op, value = EXCLUDED.value
             """
@@ -445,12 +445,22 @@ def _commit_rows(db: Session, table_id: str, rows: List[Dict[str, Any]], column_
         {"id": str(pid)},
     ).scalar()
     if not version_id:
-        # Create a version row if the project has none yet.
+        # Create a version row if the project has none yet. Need to fill all
+        # legacy NOT NULL columns (use_internet, files_snapshot, examples_snapshot,
+        # status, generated_count) so we don't trip schema constraints from the
+        # V13-era project_versions table.
         version_id = str(uuid.uuid4())
         db.execute(
             sa_text(
-                "INSERT INTO project_versions (id, project_id, version_number, generation_prompt, "
-                "num_samples, columns, created_at) VALUES (:id, :pid, 1, '', 0, '[]'::jsonb, now())"
+                """
+                INSERT INTO project_versions
+                  (id, project_id, version_number, generation_prompt,
+                   num_samples, columns, use_internet, files_snapshot,
+                   examples_snapshot, status, generated_count, created_at)
+                VALUES
+                  (:id, :pid, 1, '', 0, '[]'::jsonb, false, '[]'::jsonb,
+                   '[]'::jsonb, 'complete', 0, now())
+                """
             ),
             {"id": version_id, "pid": str(pid)},
         )
@@ -478,7 +488,7 @@ def _commit_rows(db: Session, table_id: str, rows: List[Dict[str, Any]], column_
         db.execute(
             sa_text(
                 "INSERT INTO samples (id, project_id, table_id, version_id, seq, row, created_at) "
-                "VALUES (gen_random_uuid(), :pid, :tid, :vid, :seq, :row::jsonb, now())"
+                "VALUES (gen_random_uuid(), :pid, :tid, :vid, :seq, CAST(:row AS jsonb), now())"
             ),
             {
                 "pid": str(pid),

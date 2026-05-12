@@ -71,8 +71,8 @@ async def enrichment_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
                 """
                 UPDATE enrichments
                 SET name = :name,
-                    columns = :cols::jsonb,
-                    action = :action::jsonb,
+                    columns = CAST(:cols AS jsonb),
+                    action = CAST(:action AS jsonb),
                     per_row_credit_cap = :cap
                 WHERE id = :eid
                 """
@@ -91,7 +91,7 @@ async def enrichment_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
             sa_text(
                 """
                 INSERT INTO enrichments (id, table_id, name, columns, action, per_row_credit_cap, created_at)
-                VALUES (:eid, :tid, :name, :cols::jsonb, :action::jsonb, :cap, now())
+                VALUES (:eid, :tid, :name, CAST(:cols AS jsonb), CAST(:action AS jsonb), :cap, now())
                 """
             ),
             {
@@ -243,7 +243,7 @@ async def _run_enrichment_on_rows(
             continue
         merged = {**original_row, **new_fields}
         ctx.db.execute(
-            sa_text("UPDATE samples SET row=:row::jsonb WHERE id=:sid"),
+            sa_text("UPDATE samples SET row=CAST(:row AS jsonb) WHERE id=:sid"),
             {"row": json.dumps(merged), "sid": sample_id},
         )
         filled_count += 1
@@ -384,7 +384,7 @@ def _ensure_columns_on_table(db: Session, table_id: str, enrichment_columns: Lis
         return
     new_cols = existing + to_add
     db.execute(
-        sa_text("UPDATE tables SET columns=:c::jsonb WHERE id=:tid"),
+        sa_text("UPDATE tables SET columns=CAST(:c AS jsonb) WHERE id=:tid"),
         {"tid": table_id, "c": json.dumps(new_cols)},
     )
 
