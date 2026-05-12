@@ -61,13 +61,19 @@ Integrations are preferred over open-web when they cover the data — they're mo
 
 This source list will grow as new integrations get added.
 
-# Browser use
+# Enrichment actions can target any source or tool
 
-`browser_use` is its own source and can also be the underlying tool of an enrichment action. Use cases:
-- As a **source** (`table_create(source="browser_use", ...)`) — scrape a specific known site (a directory page, a listings index) into a table.
-- As an **enrichment action tool** — per-row scraping of a target URL derived from the row (visit the company's site, extract the careers page link).
+An enrichment action runs per-row. The action's `tool` can be any of the platform's integrations — `fullenrich_enrich_contacts`, `google_maps_place_details`, `web_search`, `browser_use`, `code_exec`, etc. Pick the right tool for the column's data shape.
 
-It is a **last resort** — only when (a) no Apify actor covers the site and (b) native HTTP fails (JS rendering, antibot, login wall). Never use it for broad multi-site exploration. Sessions are bounded: reliability degrades fast above ~50 items per session, so for larger pulls, break into multiple bounded sessions.
+For type=`cell_agent` actions, the cell agent has access to the full toolset and decides per-row, with the budget cap as a guardrail.
+
+## Browser use specifically
+
+`browser_use` deserves a stronger caution than the others because of reliability and cost:
+- Use as a **source** (`table_create(source="browser_use", ...)`) only when no Apify actor covers the site and native HTTP fails (JS rendering, antibot, login wall).
+- Use as an **enrichment tool** sparingly — only for per-row scraping of specific known sites where simpler tools fail.
+- Never use for broad multi-site exploration.
+- Sessions are bounded: reliability degrades fast above ~50 items per session. For larger pulls, break into multiple bounded sessions or use a different source.
 
 # Working with the table
 
@@ -194,15 +200,25 @@ approval_required: false
 ```yaml
 description: |
   Pull the next page of candidates from the table's source, appending
-  rows. Server tracks the cursor per-table per-source. Calling twice
-  yields different rows (no duplication). Use when the user wants
-  more rows of the same kind.
+  rows. Server tracks the cursor per-table per-source.
+
+  Pull sources (FullEnrich, Google Maps, Apify actors, etc.):
+    Server advances the cursor automatically. Agent passes no
+    source-specific params — just table_id + n. Each call yields
+    different rows; no overlap risk.
+
+  Web sources (web_harvest, browser_use):
+    No real "next page." Returns {rows_added: 0, exhausted: true}
+    after the initial fetch. If the user wants more web rows, the
+    agent should create a new table with a refined query angle —
+    don't try to "paginate" web sources.
 params:
   table_id:    string
   n:           integer      # default 100
 returns:
   rows_added:  integer
-  preview:     row[]        # last 5 rows added
+  exhausted:   boolean      # true when source has no more pages
+  preview:     row[]        # last 5 rows added (empty if exhausted)
 approval_required: if n > 100
 ```
 
