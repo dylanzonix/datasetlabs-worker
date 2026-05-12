@@ -39,13 +39,45 @@ DEFAULT_COLUMNS = [
 
 
 ALLOWED_PARAMS = {
-    "job_titles", "seniorities", "departments",
-    "person_locations", "company_locations",
-    "company_names", "company_domains",
-    "company_industries", "company_headcounts",
+    # FE-canonical param names (see FE /api/v2/people/search):
+    "current_position_titles",
+    "current_position_seniority_level",
+    "current_position_departments",
+    "person_locations",
+    "current_company_names",
+    "current_company_domains",
+    "current_company_industries",
+    "current_company_headcounts",
+    "current_company_locations",
+    "person_skills",
+    "person_universities",
     "currently_using_any_of_technology_uids",
     "contact_email_status",
     "limit", "offset", "search_after",
+    # Friendly aliases the agent may use — adapter normalizes them:
+    "job_titles", "titles",
+    "seniorities", "seniority", "seniority_levels",
+    "company_names", "company_domains",
+    "company_headcounts", "headcounts",
+    "company_industries", "industries",
+    "departments",
+}
+
+
+# Friendly → canonical param name aliasing so the agent can use either.
+PARAM_ALIASES = {
+    "job_titles": "current_position_titles",
+    "titles": "current_position_titles",
+    "seniorities": "current_position_seniority_level",
+    "seniority": "current_position_seniority_level",
+    "seniority_levels": "current_position_seniority_level",
+    "company_names": "current_company_names",
+    "company_domains": "current_company_domains",
+    "company_industries": "current_company_industries",
+    "industries": "current_company_industries",
+    "company_headcounts": "current_company_headcounts",
+    "headcounts": "current_company_headcounts",
+    "departments": "current_position_departments",
 }
 
 
@@ -69,6 +101,33 @@ class FullEnrichPeopleAdapter(SourceAdapter):
             )
         return None
 
+    @staticmethod
+    def _normalize_filter(value: Any) -> Any:
+        """FE's API wants array filters as [{value, exact_match, exclude}, ...].
+        The agent often sends bare strings like ["VP Sales"]; wrap them.
+
+        For range-typed filters (headcounts), wrap each item as {min, max, exclude}
+        if it's a bare {min, max} dict.
+        """
+        if isinstance(value, list):
+            out = []
+            for item in value:
+                if isinstance(item, str):
+                    out.append({"value": item, "exact_match": False, "exclude": False})
+                elif isinstance(item, dict):
+                    # Could be either a value-wrapper or a range-wrapper; pass through.
+                    if "value" in item or "min" in item or "max" in item:
+                        item.setdefault("exclude", False)
+                        if "value" in item:
+                            item.setdefault("exact_match", False)
+                        out.append(item)
+                    else:
+                        out.append(item)
+                else:
+                    out.append(item)
+            return out
+        return value
+
     async def fetch(
         self,
         query_params: Dict[str, Any],
@@ -86,10 +145,28 @@ class FullEnrichPeopleAdapter(SourceAdapter):
         offset = int((prior_cursor or {}).get("offset", 0))
         all_rows: List[Dict[str, Any]] = []
 
+        # Resolve friendly aliases → canonical FE param names.
+        canonical = {PARAM_ALIASES.get(k, k): v for k, v in query_params.items()}
+
+        # Normalize bare-array filters → FE's {value, exact_match, exclude} shape.
+        NORMALIZE_KEYS = {
+            "current_position_titles", "current_position_seniority_level",
+            "current_position_departments", "person_locations",
+            "current_company_names", "current_company_domains",
+            "current_company_industries", "current_company_headcounts",
+            "current_company_locations",
+            "person_skills", "person_universities",
+            "currently_using_any_of_technology_uids", "contact_email_status",
+        }
+        normalized = {
+            k: (self._normalize_filter(v) if k in NORMALIZE_KEYS else v)
+            for k, v in canonical.items()
+        }
+
         async with httpx.AsyncClient(timeout=30.0) as client:
             while len(all_rows) < n:
                 body: Dict[str, Any] = {
-                    **{k: v for k, v in query_params.items() if k not in ("limit", "offset", "search_after")},
+                    **{k: v for k, v in normalized.items() if k not in ("limit", "offset", "search_after")},
                     "limit": min(page_size, n - len(all_rows)),
                 }
                 if search_after:

@@ -180,13 +180,17 @@ async def code_exec(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, A
 
 async def suggest_replies(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
     """Emits chip suggestions for the user's next move. UI renders these as
-    clickable chips below the assistant's message."""
+    clickable chips below the assistant's message. Tolerates empty/malformed
+    input — agent shouldn't have to retry; just acknowledge."""
     chips = args.get("chips") or []
-    if not isinstance(chips, list) or not chips:
-        return {"error": "chips must be a non-empty list of {label, message}"}, 0.0
-    # The FE consumes these via the run-event stream. For now we just return
-    # them — the streaming loop pulls them out and emits a `suggestions` event.
-    return {"ok": True, "count": len(chips), "chips": chips}, 0.0
+    if not isinstance(chips, list):
+        chips = []
+    # Best-effort filter: keep dict-shape chips with at least a label
+    cleaned = [
+        c for c in chips
+        if isinstance(c, dict) and c.get("label") and c.get("message")
+    ]
+    return {"ok": True, "count": len(cleaned), "chips": cleaned}, 0.0
 
 
 # ---------------------------------------------------------------------------

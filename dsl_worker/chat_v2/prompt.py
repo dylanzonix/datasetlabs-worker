@@ -187,14 +187,23 @@ page: 1, per_page: 100
 ```
 
 ## fullenrich_people
+Send bare arrays of strings — the server auto-wraps to FE's {value, exact_match, exclude} shape. Use either friendly or canonical names; both work.
 ```
-job_titles: ["VP Sales"]
-seniorities: ["c_suite", "vp", "director"]
+current_position_titles: ["VP Sales", "Head of Engineering"]
+                                  # (alias: job_titles, titles)
+current_position_seniority_level: ["c_suite", "vp", "director"]
+                                  # (alias: seniorities)
+current_position_departments: ["engineering", "sales"]
+                                  # (alias: departments)
 person_locations: ["California", "United States"]
-company_names: ["Anthropic"]
-company_domains: [{value: "anthropic.com", exact_match: true, exclude: false}]
-company_industries: ["Software Development"]
-company_headcounts: [{min: 50, max: 500}]
+current_company_names: ["Anthropic"]
+                                  # (alias: company_names)
+current_company_domains: ["anthropic.com"]
+                                  # (alias: company_domains)
+current_company_industries: ["Software Development"]
+                                  # (alias: industries, company_industries)
+current_company_headcounts: [{min: 50, max: 500}]
+                                  # (alias: headcounts, company_headcounts)
 limit: 100
 ```
 

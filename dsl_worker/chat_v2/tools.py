@@ -350,12 +350,17 @@ async def table_delete(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
 
 
 async def filter_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
+    # Accept friendly aliases: column / column_name; op / operator
     table_id = args.get("table_id")
-    column = args.get("column")
-    op = args.get("op")
+    column = args.get("column") or args.get("column_name")
+    op = args.get("op") or args.get("operator")
     value = args.get("value")
     if not (table_id and column and op):
-        return {"error": "table_id, column, op required"}, 0.0
+        return {
+            "error": "filter_set requires table_id, column, op. "
+                     "Example: {table_id, column: 'industry', op: 'contains', value: 'SaaS'}",
+            "got_keys": list(args.keys()),
+        }, 0.0
     # Upsert
     ctx.db.execute(
         sa_text(
