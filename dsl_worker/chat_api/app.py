@@ -76,6 +76,16 @@ app.add_middleware(
 app.include_router(routes_health.router)
 app.include_router(routes_chat.router)
 
+# v-next chat (multi-table redesign) — mounts under /v2
+try:
+    from dsl_worker.chat_v2.routes import router as chat_v2_router
+    from dsl_worker.chat_v2.routes_actions import router as chat_v2_actions_router
+    app.include_router(chat_v2_router)
+    app.include_router(chat_v2_actions_router)
+    log.info("chat_v2 routes mounted under /v2")
+except Exception as e:
+    log.warning("chat_v2 routes not mounted: %s", e)
+
 
 @app.on_event("startup")
 async def _on_startup() -> None:
