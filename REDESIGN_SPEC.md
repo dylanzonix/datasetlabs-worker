@@ -368,6 +368,13 @@ returns: { ok: boolean }
 approval_required: false
 ```
 
+**Flow for unpredictable sources** (apify_actor, web_harvest, browser_use):
+1. `table_create(source, query_params)` → server fetches first ~10 rows synchronously, returns `source_schema_preview` (rows + raw field list). Table is in "schema_pending" state; rows NOT yet committed to the visible table.
+2. Agent inspects the preview, calls `column_map_set` to specify field→column mapping + types + dedup_key.
+3. Server applies mapping to the 10 preview rows + continues fetching the remaining ~90 in the background with mapping applied. Rows stream into the visible table.
+
+**Flow for predictable sources** (apollo_companies, fullenrich_people, google_maps, file with CSV headers): server has a default column map. `table_create` commits all rows immediately with the default map. No `column_map_set` call needed unless the agent wants to rename/retype later.
+
 #### `enrichment_set`
 Define or refine an enrichment. Runs on the table's first 10 unfilled rows.
 
