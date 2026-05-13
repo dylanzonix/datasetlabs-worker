@@ -44,7 +44,7 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
     tool_descriptions = {
         # Tables
         "table_create": "Open a new table for a fresh source-query. Args: source, name (2-5 words, Title Case — required), query_params. Use this only when starting a new angle. If the project already has a table covering the same source/topic and the user wants more rows, use `table_extend` on the existing table — do NOT make another table_create.",
-        "table_extend": "Pull MORE rows into an EXISTING table with a non-overlapping next slice. Args: table_id, query_params (the new slice — e.g. next batch / page / date window — see Extending section for deterministic axes). Reuses the table's existing column map automatically.",
+        "table_extend": "Pull MORE rows into an EXISTING table with a non-overlapping next slice. Args: table_id, query_params (the new slice — e.g. next batch / page / date window). Reuses the table's existing column map automatically.",
         "table_delete": "Delete a table and all its rows + enrichments. Approval-gated.",
         # Apify discovery
         "apify_search_actors": "Discover Apify actors matching a query. Returns lightweight summaries.",

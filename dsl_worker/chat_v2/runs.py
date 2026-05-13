@@ -45,16 +45,15 @@ from dsl_worker.chat_api import runs as legacy_runs
 log = logging.getLogger(__name__)
 
 
-CENTS_PER_CREDIT = 1  # 1 credit = 1 cent. Matches legacy cost_tracker default.
-
-
 _DEFAULT_PROJECT_NAMES = {"New Dataset", "Untitled", "", None}
 
 
 async def _auto_name_project(project_id: UUID, user_content: str) -> None:
-    """One-shot LLM call to generate a 3-5 word project name from the
-    first message. Only runs if the project is still on the default
-    name; idempotent for subsequent turns."""
+    """One-shot mini LLM call to generate a 3-5 word project name from the
+    first message. Subsidized — bypasses TrackedOpenAIClient + balance_ledger
+    on purpose; this isn't user-facing OpenAI usage worth charging for.
+    Only runs if the project is still on the default name; idempotent for
+    subsequent turns."""
     import os
     db = SessionLocal()
     try:
@@ -355,8 +354,10 @@ async def _drive_agent(
         # history endpoint can pair them.
         run.assistant_message_id = assistant_msg.id
 
-        # Charge balance_ledger. cost is USD; ledger amounts are cents
-        # (negative = charge). 1 credit = 1 cent, so we just convert.
+        # Charge balance_ledger. cost is USD; ledger.amount is cents-of-USD
+        # (negative = charge). Credit-to-dollar markup happens upstream when
+        # users top up — we store raw USD-cents and let billing apply its
+        # own pricing.
         spend_cents = int(round(total_cost_usd * 100))
         if spend_cents > 0:
             db.add(BalanceLedger(

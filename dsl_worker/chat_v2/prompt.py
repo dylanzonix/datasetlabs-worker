@@ -72,22 +72,15 @@ Think of step 2 as "pick the columns the user actually wants and rename them to 
 - **Flatten nested data with array paths.** `source_field: "founders[].name"` extracts the `name` from each item in the `founders` array → cell value is a list. Same for `founder_info.email` to dive into a sub-object.
 - **One column per concept.** If the source has both `email` and `email_address`, pick one. If you ran an enrichment that overlaps a source field, drop the source field.
 
-# Pagination — pick a deterministic axis up front
+# Getting more rows
 
-When the user asks for more rows later (and they often do), `table_extend` is the answer — same table, next slice. For that to work cleanly, the **initial** `table_create` should already use a deterministic anchor so extending is just incrementing it. Random non-anchored queries make pagination undeterministic and tempt you toward duplicate tables.
+`table_extend(table_id, query_params)` adds rows to an existing table with a new non-overlapping slice. The table's column map is reused automatically.
 
-**Pick an anchor at table_create:**
-- **Apify actors that expose `batches` / date filters**: pin the most recent slice (`batches: ["Summer 2025"]`). Extend = next batch back.
-- **Apollo / FE / GMaps**: rely on native cursors. They get stored automatically; pass them back via `table_extend`.
-- **Sort + offset / page**: set `page: 1`. Extend = `page: 2`.
-- **Date windows**: bound an explicit window (e.g. last 90 days). Extend = shift the window backward.
-- **Geographic / categorical**: tile by city/subreddit/category. Extend = next tile.
+If a project already has a table covering what the user asked for, **`table_extend` it. Do not `table_create` another one.**
 
-**Wrong move:** call `table_create` again to "get more". The project_state banner lists every table that exists for this project — if a table already covers the user's request, **extend it**, don't duplicate.
+Pick the next-slice query based on what the source supports — next page / next batch / shifted date window / native cursor. Light dedup on the table's `dedup_key_column` catches boundary overlap.
 
-If the source has no deterministic axis (e.g. open-web search), accept it: extending will dedup heavily and yield diminishing returns. Switch to a different source or a refined angle (new `table_create`).
-
-Light dedup on the table's `dedup_key_column` catches accidental boundary overlap.
+For sources that can't paginate cleanly (browser_use, web_harvest one-shot), accept the single fetch result. If the user wants more from that angle, open a new table with a refined query.
 
 # Enrichment
 
