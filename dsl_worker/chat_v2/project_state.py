@@ -29,7 +29,7 @@ def build_project_state(db: Session, project_id: str, max_tables: int = 10) -> s
     tables = db.execute(
         sa_text(
             """
-            SELECT id::text, name, source, query_params, columns, dedup_key_column,
+            SELECT id::text, short_id, name, source, query_params, columns, dedup_key_column,
                    last_fetch_returned_rows, last_fetch_cost_credits, last_fetch_at,
                    fetch_status, fetch_error
             FROM tables
@@ -45,7 +45,7 @@ def build_project_state(db: Session, project_id: str, max_tables: int = 10) -> s
     if not tables:
         parts.append("  (none yet)")
     for t in tables:
-        (tid, name, source, qp, columns, dedup_col,
+        (tid, short_id, name, source, qp, columns, dedup_col,
          last_rows, last_cost, last_at, fetch_status, fetch_err) = t
 
         row_count = db.execute(
@@ -53,7 +53,7 @@ def build_project_state(db: Session, project_id: str, max_tables: int = 10) -> s
             {"tid": tid},
         ).scalar() or 0
 
-        parts.append(f"  - {name} ({row_count} rows, source: {source})")
+        parts.append(f"  - [{short_id}] {name} ({row_count} rows, source: {source})")
         if isinstance(qp, str):
             qp = json.loads(qp)
         # Strip internal _cursor/_pending_rows from display
@@ -111,7 +111,7 @@ def build_project_state(db: Session, project_id: str, max_tables: int = 10) -> s
     enrichments = db.execute(
         sa_text(
             """
-            SELECT e.id::text, e.name, e.table_id::text, t.name AS table_name, e.columns,
+            SELECT e.short_id, e.name, t.short_id AS table_short, t.name AS table_name, e.columns,
                    e.per_row_credit_cap, e.last_run_filled_rows, e.last_run_cost_credits
             FROM enrichments e
             JOIN tables t ON t.id = e.table_id
@@ -124,10 +124,10 @@ def build_project_state(db: Session, project_id: str, max_tables: int = 10) -> s
     ).fetchall()
     if enrichments:
         parts.append("\nEnrichments configured:")
-        for (eid, ename, tid, tname, cols, cap, last_filled, last_cost) in enrichments:
+        for (esid, ename, tsid, tname, cols, cap, last_filled, last_cost) in enrichments:
             cols_list = json.loads(cols) if isinstance(cols, str) else (cols or [])
             col_names = ", ".join(c["name"] for c in cols_list[:6])
-            parts.append(f"  - {ename} (id={eid[:8]}) on table {tname}")
+            parts.append(f"  - [{esid}] {ename} on table [{tsid}] {tname}")
             parts.append(f"      Fills: {col_names}; cap: {cap} cr/row")
             if last_filled is not None:
                 cost_s = f", {float(last_cost):.1f} cr" if last_cost is not None else ""

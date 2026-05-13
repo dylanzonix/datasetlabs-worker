@@ -62,7 +62,7 @@ class FetchMoreBody(BaseModel):
 @router.post("/projects/{project_id}/tables/{table_id}/fetch_more")
 async def post_fetch_more(
     project_id: UUID,
-    table_id: UUID,
+    table_id: str,
     body: FetchMoreBody,
     user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -87,7 +87,7 @@ class RunEnrichmentBody(BaseModel):
 @router.post("/projects/{project_id}/enrichments/{enrichment_id}/run")
 async def post_run_enrichment(
     project_id: UUID,
-    enrichment_id: UUID,
+    enrichment_id: str,
     body: RunEnrichmentBody,
     user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -114,7 +114,7 @@ class FilterBody(BaseModel):
 @router.post("/projects/{project_id}/tables/{table_id}/filters")
 async def post_filter(
     project_id: UUID,
-    table_id: UUID,
+    table_id: str,
     body: FilterBody,
     user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -131,7 +131,7 @@ async def post_filter(
 @router.delete("/projects/{project_id}/tables/{table_id}/filters/{column}")
 async def delete_filter(
     project_id: UUID,
-    table_id: UUID,
+    table_id: str,
     column: str,
     user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),

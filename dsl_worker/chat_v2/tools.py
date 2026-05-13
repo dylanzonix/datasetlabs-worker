@@ -45,6 +45,90 @@ class ToolContext:
     emit_event: Optional[Callable[[str, Dict[str, Any]], None]] = None
 
 
+def resolve_table_id(db: Session, project_id: str, id_or_short: str) -> Optional[str]:
+    """Look up a table's UUID from either its UUID or its short_id (t1, t2…).
+
+    Returns the UUID as a string, or None if not found. The agent uses short_ids
+    in tool args because they're cheap to emit; backend SQL uses UUIDs.
+    """
+    if not id_or_short:
+        return None
+    # Short ids never contain dashes; UUIDs always do.
+    if "-" in id_or_short:
+        row = db.execute(
+            sa_text(
+                "SELECT id::text FROM tables WHERE id=:id AND project_id=:pid AND deleted_at IS NULL"
+            ),
+            {"id": id_or_short, "pid": project_id},
+        ).fetchone()
+    else:
+        row = db.execute(
+            sa_text(
+                "SELECT id::text FROM tables WHERE short_id=:sid AND project_id=:pid AND deleted_at IS NULL"
+            ),
+            {"sid": id_or_short, "pid": project_id},
+        ).fetchone()
+    return row[0] if row else None
+
+
+def resolve_enrichment_id(db: Session, project_id: str, id_or_short: str) -> Optional[str]:
+    """Look up an enrichment's UUID from UUID or short_id (e1, e2…)."""
+    if not id_or_short:
+        return None
+    if "-" in id_or_short:
+        row = db.execute(
+            sa_text(
+                "SELECT e.id::text FROM enrichments e JOIN tables t ON t.id=e.table_id "
+                "WHERE e.id=:id AND t.project_id=:pid AND e.deleted_at IS NULL"
+            ),
+            {"id": id_or_short, "pid": project_id},
+        ).fetchone()
+    else:
+        row = db.execute(
+            sa_text(
+                "SELECT e.id::text FROM enrichments e JOIN tables t ON t.id=e.table_id "
+                "WHERE e.short_id=:sid AND t.project_id=:pid AND e.deleted_at IS NULL"
+            ),
+            {"sid": id_or_short, "pid": project_id},
+        ).fetchone()
+    return row[0] if row else None
+
+
+def _next_short_id(db: Session, project_id: str) -> str:
+    """Return the next free 't<N>' for this project. Caller holds a write lock
+    on the parent (we're inside a transaction that's about to INSERT)."""
+    row = db.execute(
+        sa_text(
+            "SELECT short_id FROM tables WHERE project_id=:pid "
+            "ORDER BY (CASE WHEN short_id ~ '^t[0-9]+$' THEN CAST(substring(short_id, 2) AS int) ELSE 0 END) DESC LIMIT 1"
+        ),
+        {"pid": project_id},
+    ).fetchone()
+    if not row or not row[0] or not row[0].startswith("t"):
+        return "t1"
+    try:
+        return f"t{int(row[0][1:]) + 1}"
+    except (ValueError, IndexError):
+        return "t1"
+
+
+def _next_enrichment_short_id(db: Session, table_id: str) -> str:
+    """Return the next free 'e<N>' for this table."""
+    row = db.execute(
+        sa_text(
+            "SELECT short_id FROM enrichments WHERE table_id=:tid "
+            "ORDER BY (CASE WHEN short_id ~ '^e[0-9]+$' THEN CAST(substring(short_id, 2) AS int) ELSE 0 END) DESC LIMIT 1"
+        ),
+        {"tid": table_id},
+    ).fetchone()
+    if not row or not row[0] or not row[0].startswith("e"):
+        return "e1"
+    try:
+        return f"e{int(row[0][1:]) + 1}"
+    except (ValueError, IndexError):
+        return "e1"
+
+
 # ---------------------------------------------------------------------------
 # Tool: table_create
 # ---------------------------------------------------------------------------
@@ -76,8 +160,10 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
         return {"error": val_err}, 0.0
 
     # Insert table row immediately so the agent has a table_id to reference,
-    # even if the fetch is slow or fails.
+    # even if the fetch is slow or fails. Assign a short_id (t1, t2, ...)
+    # for LLM-friendly handles.
     table_id = str(uuid.uuid4())
+    short_id = _next_short_id(ctx.db, ctx.project_id)
     columns_for_db = []
     if adapter.predictable and adapter.default_columns:
         columns_for_db = [
@@ -88,15 +174,16 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     ctx.db.execute(
         sa_text(
             """
-            INSERT INTO tables (id, project_id, name, source, query_params, columns,
+            INSERT INTO tables (id, project_id, short_id, name, source, query_params, columns,
                                 dedup_key_column, fetch_status, created_at)
-            VALUES (:id, :project_id, :name, :source, :query_params, :columns,
+            VALUES (:id, :project_id, :short_id, :name, :source, :query_params, :columns,
                     :dedup_key_column, :fetch_status, now())
             """
         ),
         {
             "id": table_id,
             "project_id": ctx.project_id,
+            "short_id": short_id,
             "name": name,
             "source": source,
             "query_params": json.dumps(query_params),
@@ -170,7 +257,7 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
         pass
 
     result = {
-        "table_id": table_id,
+        "table_id": short_id,  # LLM-friendly handle; resolved to UUID at tool boundaries
         "name": name,
         "source": source,
         "rows_initial": len(res.rows) if adapter.predictable else 0,
@@ -193,7 +280,7 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
 
 
 async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
-    table_id = args.get("table_id")
+    table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
     new_query_params = args.get("query_params") or {}
     n = int(args.get("n") or 100)
 
@@ -269,7 +356,7 @@ async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
 
 
 async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
-    table_id = args.get("table_id")
+    table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
     mapping = args.get("mapping") or {}  # {source_field: {column_name, type}}
     dedup_key_column = args.get("dedup_key_column")
     if not table_id:
@@ -333,7 +420,7 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
 
 
 async def table_delete(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
-    table_id = args.get("table_id")
+    table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
     if not table_id:
         return {"error": "table_id is required"}, 0.0
     ctx.db.execute(
@@ -351,7 +438,7 @@ async def table_delete(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
 
 async def filter_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
     # Accept friendly aliases: column / column_name; op / operator
-    table_id = args.get("table_id")
+    table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
     column = args.get("column") or args.get("column_name")
     op = args.get("op") or args.get("operator")
     value = args.get("value")
@@ -384,7 +471,7 @@ async def filter_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, 
 
 
 async def filter_clear(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
-    table_id = args.get("table_id")
+    table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
     column = args.get("column")
     if not (table_id and column):
         return {"error": "table_id, column required"}, 0.0
@@ -402,7 +489,7 @@ async def filter_clear(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
 
 
 async def row_inspect(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
-    table_id = args.get("table_id")
+    table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
     n = int(args.get("n") or 10)
     if not table_id:
         return {"error": "table_id is required"}, 0.0
@@ -417,7 +504,7 @@ async def row_inspect(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str,
 
 
 async def row_delete(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
-    table_id = args.get("table_id")
+    table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
     row_ids = args.get("row_ids") or []
     if not (table_id and row_ids):
         return {"error": "table_id and row_ids required"}, 0.0

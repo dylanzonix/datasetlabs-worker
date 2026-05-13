@@ -30,7 +30,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
 
-from dsl_worker.chat_v2.tools import ToolContext
+from dsl_worker.chat_v2.tools import (
+    ToolContext,
+    resolve_enrichment_id,
+    resolve_table_id,
+    _next_enrichment_short_id,
+)
 
 
 log = logging.getLogger(__name__)
@@ -42,8 +47,9 @@ log = logging.getLogger(__name__)
 
 
 async def enrichment_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
-    table_id = args.get("table_id")
-    enrichment_id = args.get("enrichment_id")  # if present, refine existing
+    table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
+    raw_enrichment = args.get("enrichment_id")
+    enrichment_id = resolve_enrichment_id(ctx.db, ctx.project_id, raw_enrichment) if raw_enrichment else None
     name = args.get("name") or "Enrichment"
     columns = args.get("columns") or []
     action = args.get("action") or {}
@@ -98,16 +104,18 @@ async def enrichment_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
         )
     else:
         enrichment_id = str(uuid.uuid4())
+        short_id = _next_enrichment_short_id(db, table_id)
         db.execute(
             sa_text(
                 """
-                INSERT INTO enrichments (id, table_id, name, columns, action, per_row_credit_cap, created_at)
-                VALUES (:eid, :tid, :name, CAST(:cols AS jsonb), CAST(:action AS jsonb), :cap, now())
+                INSERT INTO enrichments (id, table_id, short_id, name, columns, action, per_row_credit_cap, created_at)
+                VALUES (:eid, :tid, :sid, :name, CAST(:cols AS jsonb), CAST(:action AS jsonb), :cap, now())
                 """
             ),
             {
                 "eid": enrichment_id,
                 "tid": table_id,
+                "sid": short_id,
                 "name": name,
                 "cols": json.dumps(columns),
                 "action": json.dumps(action),
@@ -146,8 +154,14 @@ async def enrichment_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
         {"tid": table_id},
     ).fetchall()
 
+    # Return short_id so the agent can reference this enrichment in subsequent calls.
+    public_eid = ctx.db.execute(
+        sa_text("SELECT short_id FROM enrichments WHERE id=:eid"),
+        {"eid": enrichment_id},
+    ).scalar() or enrichment_id
+
     return {
-        "enrichment_id": enrichment_id,
+        "enrichment_id": public_eid,
         "rows_filled": rows_filled,
         "results_preview": [r[0] for r in preview],
     }, cost * 0.10
@@ -159,7 +173,7 @@ async def enrichment_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
 
 
 async def enrichment_run(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
-    enrichment_id = args.get("enrichment_id")
+    enrichment_id = resolve_enrichment_id(ctx.db, ctx.project_id, args.get("enrichment_id"))
     scope = args.get("scope") or {"type": "all_unfilled"}
     overwrite = bool(args.get("overwrite", False))
     if not enrichment_id:

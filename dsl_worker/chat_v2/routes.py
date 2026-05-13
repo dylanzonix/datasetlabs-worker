@@ -195,18 +195,43 @@ async def post_turn_stream(
     )
 
 
+def _resolve_table_uuid(db: Session, project_id: str, id_or_short: str) -> Optional[str]:
+    """Accept either short_id (t1) or UUID at route boundaries; return UUID."""
+    if not id_or_short:
+        return None
+    if "-" in id_or_short:
+        row = db.execute(
+            sa_text(
+                "SELECT id::text FROM tables WHERE id=:x AND project_id=:pid AND deleted_at IS NULL"
+            ),
+            {"x": id_or_short, "pid": project_id},
+        ).fetchone()
+    else:
+        row = db.execute(
+            sa_text(
+                "SELECT id::text FROM tables WHERE short_id=:x AND project_id=:pid AND deleted_at IS NULL"
+            ),
+            {"x": id_or_short, "pid": project_id},
+        ).fetchone()
+    return row[0] if row else None
+
+
 @router.get("/projects/{project_id}/tables")
 def list_tables(
     project_id: UUID,
     user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """List tables in a project (multi-table workspace)."""
+    """List tables in a project (multi-table workspace).
+
+    Response `id` is the short_id (t1, t2, ...) — the FE uses it as the
+    table handle in URLs; routes accept either short_id or UUID.
+    """
     _verify_project(project_id, user.user_id, db)
     rows = db.execute(
         sa_text(
             """
-            SELECT id::text, name, source, columns, dedup_key_column,
+            SELECT id::text, short_id, name, source, columns, dedup_key_column,
                    last_fetch_returned_rows, last_fetch_cost_credits, last_fetch_at,
                    fetch_status, fetch_error, created_at
             FROM tables
@@ -222,20 +247,21 @@ def list_tables(
             sa_text("SELECT COUNT(*) FROM samples WHERE table_id = :tid AND deleted_at IS NULL"),
             {"tid": r[0]},
         ).scalar() or 0
-        cols = r[3] if isinstance(r[3], list) else json.loads(r[3] or "[]")
+        cols = r[4] if isinstance(r[4], list) else json.loads(r[4] or "[]")
         out.append({
-            "id": r[0],
-            "name": r[1],
-            "source": r[2],
+            "id": r[1],  # short_id is the primary public id
+            "uuid": r[0],  # UUID still available for backend-internal callers
+            "name": r[2],
+            "source": r[3],
             "columns": cols,
-            "dedup_key_column": r[4],
+            "dedup_key_column": r[5],
             "row_count": row_count,
-            "last_fetch_returned_rows": r[5],
-            "last_fetch_cost_credits": float(r[6]) if r[6] is not None else None,
-            "last_fetch_at": r[7].isoformat() if r[7] else None,
-            "fetch_status": r[8],
-            "fetch_error": r[9],
-            "created_at": r[10].isoformat() if r[10] else None,
+            "last_fetch_returned_rows": r[6],
+            "last_fetch_cost_credits": float(r[7]) if r[7] is not None else None,
+            "last_fetch_at": r[8].isoformat() if r[8] else None,
+            "fetch_status": r[9],
+            "fetch_error": r[10],
+            "created_at": r[11].isoformat() if r[11] else None,
         })
     return {"tables": out}
 
@@ -243,20 +269,16 @@ def list_tables(
 @router.get("/projects/{project_id}/tables/{table_id}/rows")
 def list_table_rows(
     project_id: UUID,
-    table_id: UUID,
+    table_id: str,
     limit: int = 200,
     offset: int = 0,
     user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Read rows of a table. Includes any active filters."""
+    """Read rows of a table. Accepts short_id or UUID. Includes filters."""
     _verify_project(project_id, user.user_id, db)
-    # Verify table belongs to this project
-    owner_pid = db.execute(
-        sa_text("SELECT project_id::text FROM tables WHERE id = :tid AND deleted_at IS NULL"),
-        {"tid": str(table_id)},
-    ).scalar()
-    if owner_pid != str(project_id):
+    tid = _resolve_table_uuid(db, str(project_id), table_id)
+    if not tid:
         raise HTTPException(404, "Table not found")
     rows = db.execute(
         sa_text(
@@ -264,15 +286,15 @@ def list_table_rows(
             "WHERE table_id = :tid AND deleted_at IS NULL "
             "ORDER BY seq LIMIT :lim OFFSET :off"
         ),
-        {"tid": str(table_id), "lim": limit, "off": offset},
+        {"tid": tid, "lim": limit, "off": offset},
     ).fetchall()
     total = db.execute(
         sa_text("SELECT COUNT(*) FROM samples WHERE table_id = :tid AND deleted_at IS NULL"),
-        {"tid": str(table_id)},
+        {"tid": tid},
     ).scalar() or 0
     filters = db.execute(
         sa_text("SELECT column_name, op, value FROM table_filters WHERE table_id = :tid"),
-        {"tid": str(table_id)},
+        {"tid": tid},
     ).fetchall()
     return {
         "rows": [{"id": r[0], **(r[1] or {})} for r in rows],
@@ -286,22 +308,25 @@ def list_table_rows(
 @router.get("/projects/{project_id}/tables/{table_id}/enrichments")
 def list_enrichments(
     project_id: UUID,
-    table_id: UUID,
+    table_id: str,
     user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     _verify_project(project_id, user.user_id, db)
+    tid = _resolve_table_uuid(db, str(project_id), table_id)
+    if not tid:
+        raise HTTPException(404, "Table not found")
     rows = db.execute(
         sa_text(
             """
-            SELECT id::text, name, columns, action, per_row_credit_cap,
+            SELECT short_id, name, columns, action, per_row_credit_cap,
                    last_run_filled_rows, last_run_cost_credits, last_run_at
             FROM enrichments
             WHERE table_id = :tid AND deleted_at IS NULL
             ORDER BY created_at
             """
         ),
-        {"tid": str(table_id)},
+        {"tid": tid},
     ).fetchall()
     return {
         "enrichments": [
