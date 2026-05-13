@@ -255,7 +255,13 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
 
     table_id = str(uuid.uuid4())
     short_id = _next_short_id(ctx.db, ctx.project_id)
-    initial_status = "complete" if res_exhausted else "streaming"
+    # "streaming" only when there's actually a background drain task
+    # spawning — i.e. apify fetch_stream with more rows coming. For
+    # sync fetches (Apollo, FE, gmaps, web_harvest), the sync call IS
+    # the whole fetch; status goes straight to 'complete' regardless
+    # of whether the adapter happened to report exhausted=False (it
+    # may just mean "more pages exist if you table_extend later").
+    initial_status = "streaming" if (streaming and not res_exhausted) else "complete"
     ctx.db.execute(
         sa_text(
             """

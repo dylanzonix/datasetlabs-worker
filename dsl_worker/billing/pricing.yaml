@@ -38,6 +38,11 @@ models:
     output: 0.000012     # $12.00 / 1M tokens
 
   # GPT 5
+  gpt-5.5:
+    input: 0.0000025      # $2.50 / 1M tokens (provisional — match 5.4 until GA pricing lands)
+    cached_input: 0.00000025  # $0.25 / 1M tokens
+    output: 0.000015      # $15.00 / 1M tokens
+
   gpt-5.4:
     input: 0.0000025      # $2.50 / 1M tokens (short context <272K)
     cached_input: 0.00000025  # $0.25 / 1M tokens
