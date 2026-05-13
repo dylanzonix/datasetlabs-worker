@@ -1,32 +1,32 @@
-"""v-next orchestrator agent — minimal dispatch loop.
+"""v-next orchestrator agent — Responses-API loop with reasoning + real cost.
 
-For v1 this is a non-streaming "run a turn to completion" function. The
-streaming SSE wrapper that surfaces tool calls and progress to the FE is a
-separate layer (see streaming_v2.py — not yet written; for now the chat-api
-routes can call run_turn directly and return when the agent stops).
+Reuses the legacy infra:
+  - TrackedOpenAIClient → real token-level cost + cached-input handling
+  - ResilientClient (inside Tracked*) → retries with backoff
+  - RateLimiter (inside Tracked*) → TPM/RPM throttle
+  - Responses API → reasoning_effort + native web_search + structured items
+  - prompt_cache_key → routing for prompt cache hits
 
-Loop:
-  1. Build system prompt + project state banner (auto-injected as user prefix)
-  2. Append conversation history + the new user message
-  3. Call OpenAI Responses API with the 15-tool surface
-  4. For each tool call: dispatch to HANDLERS, append result back
-  5. Stop when assistant emits text-only (no tool calls) — that's the reply
-  6. Persist messages and return
+We keep custom control over the iteration loop because we need to emit fine-
+grained SSE events (tool_call_start/result, reasoning summaries) into the
+chat stream. The wider agents/base.py:AgentConversation is a great pattern
+for non-streaming flows but doesn't expose mid-turn callbacks at that
+granularity.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
-import uuid
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
 
 from openai import AsyncOpenAI
 from sqlalchemy.orm import Session
-from sqlalchemy import text as sa_text
 
+from dsl_worker.billing.tracked_client import TrackedOpenAIClient
 from dsl_worker.chat_v2 import (
     HANDLERS,
     TOOL_DEFS,
@@ -42,10 +42,34 @@ log = logging.getLogger(__name__)
 MAX_TURN_ITERATIONS = 30  # hard safety cap on tool-call rounds per turn
 
 
-# Event types emitted by the streaming turn runner. The FE renders these
-# as live tool log entries + final message; see ChatSidebar / useChat.
 StreamEvent = Dict[str, Any]
 EventCallback = Optional[Callable[[StreamEvent], Awaitable[None]]]
+
+
+def _flatten_tool_defs() -> List[Dict[str, Any]]:
+    """chat.completions shape {type, function:{name,description,parameters}}
+    → Responses shape {type, name, description, parameters}."""
+    out: List[Dict[str, Any]] = []
+    for t in TOOL_DEFS:
+        if t.get("type") == "function" and "function" in t:
+            fn = t["function"]
+            out.append({
+                "type": "function",
+                "name": fn["name"],
+                "description": fn.get("description", ""),
+                "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
+            })
+        else:
+            out.append(t)
+    return out
+
+
+_TOOLS_PAYLOAD = _flatten_tool_defs()
+
+
+def _build_client() -> TrackedOpenAIClient:
+    raw = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    return TrackedOpenAIClient(raw)
 
 
 async def run_turn(
@@ -57,22 +81,15 @@ async def run_turn(
     history: Optional[List[Dict[str, str]]] = None,
     on_event: EventCallback = None,
 ) -> Dict[str, Any]:
-    """Run one chat turn end-to-end. Returns the assistant's final text +
-    metadata.
+    """Run one chat turn end-to-end via the Responses API.
 
-    Args:
-        db: SQLAlchemy session.
-        project_id: project the turn is for.
-        user_id: user owning the project.
-        run_id: optional chat_run id (for event emission); None = ad-hoc.
-        user_message: the user's input for this turn.
-        history: prior turn pairs as OpenAI messages; None = fresh.
-
-    Returns:
-        {final_message, tool_calls_made, total_cost_usd, iterations}
+    Returns {final_message, tool_calls_made, total_cost_usd, iterations}.
+    Emits via on_event: turn_started, reasoning, tool_call_start,
+    tool_call_result, final_message, turn_complete, error.
     """
-    client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    client = _build_client()
     model = os.getenv("OPENAI_MODEL", "gpt-5.4")
+    effort = os.getenv("CHAT_V2_REASONING_EFFORT", "medium")
 
     ctx = ToolContext(
         db=db, project_id=project_id, user_id=user_id, run_id=run_id, emit_event=None
@@ -81,14 +98,26 @@ async def run_turn(
     system_prompt = build_system_prompt()
     project_state = build_project_state(db, project_id)
 
-    messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": system_prompt},
-    ]
+    # System message stays stable across the turn for prompt cache hits.
+    system_msg: Dict[str, Any] = {"role": "system", "content": system_prompt}
+
+    # Pre-seed history (prior user/assistant text), then volatile
+    # project_state + the new user message.
+    input_items: List[Dict[str, Any]] = []
     if history:
-        messages.extend(history)
-    # Project state injected as a user-visible prefix to the new message —
-    # keeps the agent grounded each turn without polluting history.
-    messages.append({"role": "user", "content": f"{project_state}\n\n{user_message}"})
+        for m in history:
+            role = m.get("role")
+            content = m.get("content", "")
+            if role in ("user", "assistant") and content:
+                input_items.append({"role": role, "content": content})
+    input_items.append({
+        "role": "user",
+        "content": f"{project_state}\n\n{user_message}",
+    })
+
+    # Stable cache key per identical system prompt so requests route to the
+    # same backend → better prompt-cache hit rates.
+    cache_key = hashlib.sha256(system_prompt.encode()).hexdigest()[:32]
 
     tool_calls_made: List[Dict[str, Any]] = []
     total_cost_usd = 0.0
@@ -104,15 +133,17 @@ async def run_turn(
 
     await emit({"type": "turn_started", "project_id": project_id})
 
+    iteration = 0
     for iteration in range(MAX_TURN_ITERATIONS):
         try:
-            resp = await client.chat.completions.create(
+            response, cost = await client.responses_create(
                 model=model,
-                messages=messages,
-                tools=TOOL_DEFS,
-                tool_choice="auto",
-                temperature=0.0,
+                input=[system_msg] + input_items,
+                tools=_TOOLS_PAYLOAD,
+                reasoning={"effort": effort, "summary": "detailed"},
+                prompt_cache_key=cache_key,
             )
+            total_cost_usd += cost.total_cost_usd
         except Exception as e:
             log.exception("LLM call failed: %s", e)
             await emit({"type": "error", "message": str(e)})
@@ -124,69 +155,103 @@ async def run_turn(
                 "error": str(e),
             }
 
-        msg = resp.choices[0].message
-        # No tool calls — assistant is done
-        if not msg.tool_calls:
-            final_text = msg.content or ""
-            messages.append({"role": "assistant", "content": final_text})
+        text_parts: List[str] = []
+        function_calls: List[Any] = []
+
+        for item in response.output:
+            itype = getattr(item, "type", None)
+            if itype == "reasoning":
+                summary_items = list(item.summary) if item.summary else []
+                summary_text = "\n".join(getattr(s, "text", "") for s in summary_items)
+                if summary_text:
+                    await emit({"type": "reasoning", "text": summary_text[:1200]})
+                input_items.append({
+                    "type": "reasoning",
+                    "id": item.id,
+                    "summary": [
+                        {"type": s.type, "text": s.text} for s in summary_items
+                    ],
+                })
+            elif itype == "message":
+                for c in item.content:
+                    if hasattr(c, "text"):
+                        text_parts.append(c.text)
+                input_items.append(item.model_dump(exclude_none=True))
+            elif itype == "function_call":
+                function_calls.append(item)
+                input_items.append(item.model_dump(exclude_none=True))
+            elif itype == "web_search_call":
+                # Server-side tool — already executed. Keep in history to
+                # preserve reasoning-item pairing.
+                input_items.append(item.model_dump(exclude_none=True))
+            else:
+                # Unknown / future item type — keep it in history defensively.
+                try:
+                    input_items.append(item.model_dump(exclude_none=True))
+                except Exception:
+                    log.warning("unknown item type %r, skipping", itype)
+
+        if not function_calls:
+            final_text = "".join(text_parts)
             await emit({"type": "final_message", "text": final_text})
             break
 
-        # Record assistant tool-call message
-        messages.append({
-            "role": "assistant",
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                }
-                for tc in msg.tool_calls
-            ],
-        })
-
-        # Dispatch each tool call
-        for tc in msg.tool_calls:
-            name = tc.function.name
+        # Dispatch each tool call sequentially. Parallel-tool execution is
+        # a follow-up — for now agent rarely emits >1 fn call per turn at
+        # this surface size.
+        for fc in function_calls:
+            name = fc.name
             try:
-                args = json.loads(tc.function.arguments or "{}")
+                args = json.loads(fc.arguments or "{}")
             except json.JSONDecodeError:
                 args = {}
-            await emit({"type": "tool_call_start", "tool_call_id": tc.id, "name": name, "args": args})
+
+            await emit({
+                "type": "tool_call_start",
+                "tool_call_id": fc.call_id,
+                "name": name,
+                "args": args,
+            })
+
             handler = HANDLERS.get(name)
             if not handler:
-                tool_result = {"error": f"unknown tool {name}"}
-                cost = 0.0
+                tool_result: Dict[str, Any] = {"error": f"unknown tool {name}"}
+                h_cost = 0.0
             else:
                 try:
-                    tool_result, cost = await handler(args, ctx)
+                    tool_result, h_cost = await handler(args, ctx)
                 except Exception as e:
                     log.exception("tool %s raised: %s", name, e)
                     tool_result = {"error": str(e)[:300]}
-                    cost = 0.0
+                    h_cost = 0.0
 
             preview = json.dumps(tool_result, default=str)[:300]
             tool_calls_made.append({
                 "name": name,
                 "args": args,
                 "result_preview": preview,
-                "cost_usd": cost,
+                "cost_usd": h_cost,
             })
-            total_cost_usd += cost
+            total_cost_usd += h_cost
+
             await emit({
                 "type": "tool_call_result",
-                "tool_call_id": tc.id,
+                "tool_call_id": fc.call_id,
                 "name": name,
                 "result_preview": preview,
-                "cost_usd": cost,
+                "cost_usd": h_cost,
             })
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": json.dumps(tool_result, default=str)[:8000],
+
+            input_items.append({
+                "type": "function_call_output",
+                "call_id": fc.call_id,
+                "output": json.dumps(tool_result, default=str)[:8000],
             })
     else:
-        log.warning("agent loop hit MAX_TURN_ITERATIONS=%d for project %s", MAX_TURN_ITERATIONS, project_id)
+        log.warning(
+            "agent loop hit MAX_TURN_ITERATIONS=%d for project %s",
+            MAX_TURN_ITERATIONS, project_id,
+        )
 
     await emit({
         "type": "turn_complete",
@@ -228,7 +293,10 @@ async def stream_turn(
                 history=history,
                 on_event=emit,
             )
-            await queue.put({"type": "turn_result", **{k: v for k, v in result.items() if k != "tool_calls_made"}})
+            await queue.put({
+                "type": "turn_result",
+                **{k: v for k, v in result.items() if k != "tool_calls_made"},
+            })
         except Exception as e:
             log.exception("stream_turn runner failed")
             await queue.put({"type": "error", "message": str(e)})

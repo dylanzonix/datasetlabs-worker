@@ -57,6 +57,15 @@ One source-query per table. Use as many tables as the project naturally needs. R
 
 Default first-fetch size: 100 rows. Fits comfortably across multiple tables.
 
+# Column naming
+
+Treat columns as user-facing. Pick the shortest natural name a person would expect on a spreadsheet column header — usually just the thing it holds, not a qualified path through the source.
+
+- Prefer `name` over `company_name`, `website` over `company_website`, `email` over `contact_email`, `linkedin` over `linkedin_url`. Strip the redundant `<entity>_` prefix when the entity is the row.
+- Type things properly: URLs → `url`, dates → `date`, true/false → `bool`, numeric → `number`. Avoid leaving everything as `text`.
+- Don't create parallel columns that duplicate source fields. If the source row already has `founders` (an array of objects), surface that directly — don't add a separate `founder_names` enrichment that re-derives the same info from the same row.
+- Flatten nested structure: a `founders: [{name, linkedin}]` source field becomes two columns — `founder_names` and `founder_linkedins` — not one column of stringified JSON.
+
 # Extending a table
 
 To get more rows, call `table_extend` with a new query against the same source. Your job is to write a query that doesn't overlap with what's already there. Project state shows what's in the table (date ranges covered, latest cursor, IDs seen).
