@@ -16,11 +16,12 @@ Loop:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
 
 from openai import AsyncOpenAI
 from sqlalchemy.orm import Session
@@ -41,6 +42,12 @@ log = logging.getLogger(__name__)
 MAX_TURN_ITERATIONS = 30  # hard safety cap on tool-call rounds per turn
 
 
+# Event types emitted by the streaming turn runner. The FE renders these
+# as live tool log entries + final message; see ChatSidebar / useChat.
+StreamEvent = Dict[str, Any]
+EventCallback = Optional[Callable[[StreamEvent], Awaitable[None]]]
+
+
 async def run_turn(
     db: Session,
     project_id: str,
@@ -48,6 +55,7 @@ async def run_turn(
     run_id: Optional[str],
     user_message: str,
     history: Optional[List[Dict[str, str]]] = None,
+    on_event: EventCallback = None,
 ) -> Dict[str, Any]:
     """Run one chat turn end-to-end. Returns the assistant's final text +
     metadata.
@@ -86,6 +94,16 @@ async def run_turn(
     total_cost_usd = 0.0
     final_text = ""
 
+    async def emit(evt: StreamEvent) -> None:
+        if on_event is None:
+            return
+        try:
+            await on_event(evt)
+        except Exception:
+            log.exception("on_event callback raised; continuing")
+
+    await emit({"type": "turn_started", "project_id": project_id})
+
     for iteration in range(MAX_TURN_ITERATIONS):
         try:
             resp = await client.chat.completions.create(
@@ -97,6 +115,7 @@ async def run_turn(
             )
         except Exception as e:
             log.exception("LLM call failed: %s", e)
+            await emit({"type": "error", "message": str(e)})
             return {
                 "final_message": f"(error: {e})",
                 "tool_calls_made": tool_calls_made,
@@ -110,6 +129,7 @@ async def run_turn(
         if not msg.tool_calls:
             final_text = msg.content or ""
             messages.append({"role": "assistant", "content": final_text})
+            await emit({"type": "final_message", "text": final_text})
             break
 
         # Record assistant tool-call message
@@ -132,6 +152,7 @@ async def run_turn(
                 args = json.loads(tc.function.arguments or "{}")
             except json.JSONDecodeError:
                 args = {}
+            await emit({"type": "tool_call_start", "tool_call_id": tc.id, "name": name, "args": args})
             handler = HANDLERS.get(name)
             if not handler:
                 tool_result = {"error": f"unknown tool {name}"}
@@ -144,13 +165,21 @@ async def run_turn(
                     tool_result = {"error": str(e)[:300]}
                     cost = 0.0
 
+            preview = json.dumps(tool_result, default=str)[:300]
             tool_calls_made.append({
                 "name": name,
                 "args": args,
-                "result_preview": json.dumps(tool_result, default=str)[:300],
+                "result_preview": preview,
                 "cost_usd": cost,
             })
             total_cost_usd += cost
+            await emit({
+                "type": "tool_call_result",
+                "tool_call_id": tc.id,
+                "name": name,
+                "result_preview": preview,
+                "cost_usd": cost,
+            })
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
@@ -159,9 +188,60 @@ async def run_turn(
     else:
         log.warning("agent loop hit MAX_TURN_ITERATIONS=%d for project %s", MAX_TURN_ITERATIONS, project_id)
 
+    await emit({
+        "type": "turn_complete",
+        "total_cost_usd": total_cost_usd,
+        "iterations": iteration + 1,
+    })
+
     return {
         "final_message": final_text,
         "tool_calls_made": tool_calls_made,
         "total_cost_usd": total_cost_usd,
         "iterations": iteration + 1,
     }
+
+
+async def stream_turn(
+    db: Session,
+    project_id: str,
+    user_id: str,
+    run_id: Optional[str],
+    user_message: str,
+    history: Optional[List[Dict[str, str]]] = None,
+) -> AsyncIterator[StreamEvent]:
+    """Run a turn and yield events as they happen. Backs the SSE endpoint."""
+    queue: asyncio.Queue[StreamEvent] = asyncio.Queue()
+    SENTINEL: StreamEvent = {"type": "__end__"}
+
+    async def emit(evt: StreamEvent) -> None:
+        await queue.put(evt)
+
+    async def runner() -> None:
+        try:
+            result = await run_turn(
+                db=db,
+                project_id=project_id,
+                user_id=user_id,
+                run_id=run_id,
+                user_message=user_message,
+                history=history,
+                on_event=emit,
+            )
+            await queue.put({"type": "turn_result", **{k: v for k, v in result.items() if k != "tool_calls_made"}})
+        except Exception as e:
+            log.exception("stream_turn runner failed")
+            await queue.put({"type": "error", "message": str(e)})
+        finally:
+            await queue.put(SENTINEL)
+
+    task = asyncio.create_task(runner())
+    try:
+        while True:
+            evt = await queue.get()
+            if evt is SENTINEL:
+                break
+            yield evt
+    finally:
+        if not task.done():
+            task.cancel()

@@ -14,10 +14,14 @@ or just gets the result back.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
+log = logging.getLogger(__name__)
+
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
@@ -25,7 +29,7 @@ from sqlalchemy.orm import Session
 from dsl_api.auth import CurrentUser, get_current_user
 from dsl_api.db import SessionLocal
 from dsl_api.models import Project
-from dsl_worker.chat_v2.agent import run_turn
+from dsl_worker.chat_v2.agent import run_turn, stream_turn
 
 
 router = APIRouter(prefix="/v2")
@@ -89,6 +93,106 @@ async def post_turn(
         history=body.history,
     )
     return TurnResponse(**result)
+
+
+@router.post("/projects/{project_id}/chat/turns/stream")
+async def post_turn_stream(
+    project_id: UUID,
+    body: TurnRequest,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Run a turn and stream events as SSE.
+
+    Frames are `event: <type>\\ndata: <json>\\n\\n`. The FE renders these
+    as live tool-log entries; on `final_message` it commits the assistant
+    reply; on `turn_complete` it refreshes the table list. User + assistant
+    messages are persisted to chat_messages so refreshing the page restores
+    the conversation.
+    """
+    _verify_project(project_id, user.user_id, db)
+    pid = str(project_id)
+
+    # Persist the user message immediately so a mid-turn disconnect
+    # still leaves it in history.
+    db.execute(
+        sa_text(
+            "INSERT INTO chat_messages (id, project_id, role, content, created_at) "
+            "VALUES (gen_random_uuid(), :pid, 'user', :content, now())"
+        ),
+        {"pid": pid, "content": body.message},
+    )
+    db.commit()
+
+    async def event_stream():
+        final_text = ""
+        tool_log: List[Dict[str, Any]] = []
+        total_cost = 0.0
+        iterations = 0
+        try:
+            async for evt in stream_turn(
+                db=db,
+                project_id=pid,
+                user_id=str(user.user_id),
+                run_id=None,
+                user_message=body.message,
+                history=body.history,
+            ):
+                etype = evt.get("type", "message")
+                if etype == "tool_call_start":
+                    tool_log.append({
+                        "id": evt.get("tool_call_id"),
+                        "name": evt.get("name"),
+                        "args_preview": json.dumps(evt.get("args") or {}, default=str)[:200],
+                    })
+                elif etype == "tool_call_result":
+                    for t in tool_log:
+                        if t.get("id") == evt.get("tool_call_id"):
+                            t["summary"] = evt.get("result_preview")
+                            t["cost"] = evt.get("cost_usd")
+                            break
+                elif etype == "final_message":
+                    final_text = evt.get("text") or ""
+                elif etype == "turn_complete":
+                    total_cost = evt.get("total_cost_usd") or 0.0
+                    iterations = evt.get("iterations") or 0
+                payload = json.dumps(evt, default=str)
+                yield f"event: {etype}\ndata: {payload}\n\n"
+        except Exception as e:
+            yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n"
+
+        # Persist the assistant message + tool trace once the turn finishes.
+        try:
+            db.execute(
+                sa_text(
+                    "INSERT INTO chat_messages (id, project_id, role, content, applied_changes, created_at) "
+                    "VALUES (gen_random_uuid(), :pid, 'assistant', :content, CAST(:ac AS jsonb), now())"
+                ),
+                {
+                    "pid": pid,
+                    "content": final_text,
+                    "ac": json.dumps({
+                        "tool_log": tool_log,
+                        "total_cost_usd": total_cost,
+                        "iterations": iterations,
+                    }, default=str),
+                },
+            )
+            db.commit()
+        except Exception:
+            log.exception("failed to persist assistant message")
+
+        yield "event: done\ndata: {}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/projects/{project_id}/tables")
