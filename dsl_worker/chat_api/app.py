@@ -67,7 +67,7 @@ app = FastAPI(title="DatasetLabs Chat Worker", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins(),
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
     allow_credentials=False,
     expose_headers=["X-Accel-Buffering"],
@@ -80,8 +80,10 @@ app.include_router(routes_chat.router)
 try:
     from dsl_worker.chat_v2.routes import router as chat_v2_router
     from dsl_worker.chat_v2.routes_actions import router as chat_v2_actions_router
+    from dsl_worker.chat_v2.routes_table_edit import router as chat_v2_table_edit_router
     app.include_router(chat_v2_router)
     app.include_router(chat_v2_actions_router)
+    app.include_router(chat_v2_table_edit_router)
     log.info("chat_v2 routes mounted under /v2")
 except Exception as e:
     log.warning("chat_v2 routes not mounted: %s", e)
