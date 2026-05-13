@@ -22,19 +22,26 @@ log = logging.getLogger(__name__)
 FE_BASE = "https://app.fullenrich.com"
 
 
+# FullEnrich's people-search response wraps everything in nested objects:
+#   { id, full_name, first_name, last_name,
+#     location: { country, country_code, city?, region? },
+#     employment: { current: { title, seniority, company: { name, domain, ... } } },
+#     social_profiles: { professional_network: { url } },  # LinkedIn
+#     educations: [...], skills: [...] }
+# These default mappings use dotted paths so the agent (and table_create's
+# row mapper) reach into the nested shape correctly.
 DEFAULT_COLUMNS = [
+    {"source_field": "full_name", "column_name": "full_name", "type": "text"},
     {"source_field": "first_name", "column_name": "first_name", "type": "text"},
     {"source_field": "last_name", "column_name": "last_name", "type": "text"},
-    {"source_field": "title", "column_name": "title", "type": "text"},
-    {"source_field": "headline", "column_name": "headline", "type": "text"},
-    {"source_field": "linkedin_url", "column_name": "linkedin_url", "type": "url"},
-    {"source_field": "company_name", "column_name": "company", "type": "text"},
-    {"source_field": "company_domain", "column_name": "company_domain", "type": "url"},
-    {"source_field": "city", "column_name": "city", "type": "text"},
-    {"source_field": "state", "column_name": "state", "type": "text"},
-    {"source_field": "country", "column_name": "country", "type": "text"},
-    {"source_field": "seniority", "column_name": "seniority", "type": "enum"},
-    {"source_field": "departments", "column_name": "departments", "type": "text"},
+    {"source_field": "employment.current.title", "column_name": "title", "type": "text"},
+    {"source_field": "employment.current.seniority", "column_name": "seniority", "type": "enum"},
+    {"source_field": "employment.current.company.name", "column_name": "company", "type": "text"},
+    {"source_field": "employment.current.company.domain", "column_name": "company_domain", "type": "url"},
+    {"source_field": "social_profiles.professional_network.url", "column_name": "linkedin_url", "type": "url"},
+    {"source_field": "location.city", "column_name": "city", "type": "text"},
+    {"source_field": "location.region", "column_name": "state", "type": "text"},
+    {"source_field": "location.country", "column_name": "country", "type": "text"},
 ]
 
 

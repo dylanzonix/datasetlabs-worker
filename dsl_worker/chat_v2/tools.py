@@ -139,15 +139,14 @@ def _next_enrichment_short_id(db: Session, table_id: str) -> str:
 
 
 async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
-    """Create a table: fetch rows, map them through the agent's columns,
-    commit. Single atomic step — no pending state, no orphans.
+    """Create a table from a source. Atomic: fetches rows, commits in one
+    step. If the fetch fails or returns 0 rows, nothing is written.
 
-    Args: source, query_params, columns (required: [{name, source_field, type}]),
-    name (2-5 word user-facing label).
-
-    If you don't know the source's row shape yet, call source_preview
-    first — it does a read-only fetch and returns the schema. THEN call
-    table_create with your chosen columns.
+    Args: source, query_params, name (2-5 word label). Optionally `columns`
+    ([{name, source_field, type}]) — when omitted, the system commits a
+    raw passthrough (every top-level row key becomes a column). The agent
+    can then call `column_map_set` to rename / flatten nested fields after
+    seeing the actual data.
     """
     name = (args.get("name") or args.get("table_name") or "").strip()
     source = args.get("source")
@@ -159,32 +158,6 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
         return {"error": "source is required"}, 0.0
     if source.split(":", 1)[0] not in list_sources():
         return {"error": f"unknown source {source!r}", "available": list_sources()}, 0.0
-    if not raw_columns:
-        return {
-            "error": (
-                "columns is required — declare the column set you want for this table. "
-                "Each entry: {name, source_field, type}. "
-                "If you don't know the source's row shape yet, call source_preview "
-                "first to inspect, then table_create with your chosen columns."
-            )
-        }, 0.0
-
-    # Normalize columns (accept name/column_name/key aliases, source/from aliases).
-    columns_for_db: List[Dict[str, str]] = []
-    for c in raw_columns:
-        if isinstance(c, str):
-            return {"error": f"columns must be dicts {{name, source_field, type}}, got bare string {c!r}"}, 0.0
-        if not isinstance(c, dict):
-            return {"error": f"columns entry must be a dict, got {type(c).__name__}"}, 0.0
-        cname = c.get("name") or c.get("column_name") or c.get("key") or c.get("field")
-        src_field = c.get("source_field") or c.get("from") or c.get("source")
-        if not cname or not src_field:
-            return {"error": f"columns entry needs name + source_field; got {c!r}"}, 0.0
-        columns_for_db.append({
-            "name": cname,
-            "type": c.get("type") or "text",
-            "source_field": src_field,
-        })
 
     if not name:
         src_label = source.split(":", 1)[0].replace("_", " ").title()
@@ -206,7 +179,7 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     if val_err:
         return {"error": val_err}, 0.0
 
-    # Fetch first, table row only gets inserted after success. No orphans.
+    # Fetch first; if it fails, nothing gets written. No orphans.
     try:
         if source.startswith("apify_actor:"):
             res = await adapter.fetch(query_params, n, prior_cursor=None, source_full=source)
@@ -215,6 +188,43 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     except Exception as e:
         log.exception("table_create fetch failed: %s", e)
         return {"error": f"source fetch failed: {e}"}, 0.0
+
+    if not res.rows:
+        return {"error": "source returned 0 rows; nothing to commit"}, 0.0
+
+    # Columns: agent's choice if provided, otherwise raw passthrough of
+    # whatever the rows contain. Agent can refine via column_map_set
+    # after seeing the actual committed data.
+    columns_for_db: List[Dict[str, str]] = []
+    if raw_columns:
+        for c in raw_columns:
+            if isinstance(c, str):
+                return {"error": f"columns must be dicts {{name, source_field, type}}; got bare string {c!r}"}, 0.0
+            if not isinstance(c, dict):
+                return {"error": f"columns entry must be a dict, got {type(c).__name__}"}, 0.0
+            cname = c.get("name") or c.get("column_name") or c.get("key") or c.get("field")
+            src_field = c.get("source_field") or c.get("from") or c.get("source")
+            if not cname or not src_field:
+                return {"error": f"columns entry needs name + source_field; got {c!r}"}, 0.0
+            columns_for_db.append({
+                "name": cname,
+                "type": c.get("type") or "text",
+                "source_field": src_field,
+            })
+    else:
+        # Raw passthrough: every top-level key in the rows becomes a column.
+        # Names are whatever the source emits (often snake_case); agent can
+        # call column_map_set to clean them up after seeing the data.
+        seen: Dict[str, None] = {}
+        for r in res.rows:
+            if isinstance(r, dict):
+                for k in r.keys():
+                    if k not in seen and not k.startswith("_"):
+                        seen[k] = None
+        columns_for_db = [
+            {"name": k, "type": "text", "source_field": k}
+            for k in seen
+        ]
 
     table_id = str(uuid.uuid4())
     short_id = _next_short_id(ctx.db, ctx.project_id)
@@ -246,10 +256,11 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     )
     ctx.db.commit()
 
-    # Commit rows through the agent-chosen columns. _commit_rows handles
-    # source_field paths (dotted, array fan-out).
-    _commit_rows(ctx.db, table_id, res.rows, columns_for_db)
+    _commit_rows(ctx.db, table_id, res.rows, columns_for_db, store_raw=True)
 
+    # Surface sample rows + the raw field schema so the agent can call
+    # column_map_set in the same turn with clean names / nested paths /
+    # a dedup key, having seen the actual data.
     return {
         "table_id": short_id,
         "name": name,
@@ -257,6 +268,7 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
         "rows_committed": len(res.rows),
         "columns": [c["name"] for c in columns_for_db],
         "exhausted_first_batch": res.exhausted,
+        "sample_for_mapping": _build_schema_preview(res.rows),
     }, res.cost_credits * 0.10
 
 
@@ -447,9 +459,10 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
     else:
         return {"error": f"mapping must be dict or list; got {type(raw_mapping).__name__}"}, 0.0
 
-    # column_map_set is now an "edit columns on an existing table" tool.
-    # table_create commits with its own columns; this is for revising
-    # afterward (renames, adding/dropping columns). No more pending_mapping.
+    # column_map_set rewrites the table's columns AND re-derives every
+    # row's mapped cell values from the stored raw_row. The agent can
+    # rename / add / drop columns and switch source_field paths (e.g.
+    # flatten nested fields) without re-fetching the source.
     table_row = ctx.db.execute(
         sa_text("SELECT 1 FROM tables WHERE id=:id AND deleted_at IS NULL"),
         {"id": table_id},
@@ -472,8 +485,35 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
             "dedup": dedup_key_column,
         },
     )
+
+    # Re-derive every sample's mapped row from raw_row through the new
+    # column set. Pull all in one query to minimize round-trips.
+    sample_rows = ctx.db.execute(
+        sa_text(
+            "SELECT id::text, raw_row FROM samples "
+            "WHERE table_id=:tid AND deleted_at IS NULL AND raw_row IS NOT NULL"
+        ),
+        {"tid": table_id},
+    ).fetchall()
+    rederived = 0
+    for sid, raw in sample_rows:
+        if not isinstance(raw, dict):
+            continue
+        mapped = {
+            c["name"]: _extract_source_value(raw, c["source_field"])
+            for c in columns_for_db
+        }
+        ctx.db.execute(
+            sa_text("UPDATE samples SET row=CAST(:row AS jsonb) WHERE id=:id"),
+            {"row": json.dumps(mapped, default=str), "id": sid},
+        )
+        rederived += 1
     ctx.db.commit()
-    return {"ok": True, "columns_committed": len(columns_for_db)}, 0.0
+    return {
+        "ok": True,
+        "columns_committed": len(columns_for_db),
+        "rows_rederived": rederived,
+    }, 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -596,7 +636,13 @@ async def row_delete(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, 
 # ---------------------------------------------------------------------------
 
 
-def _commit_rows(db: Session, table_id: str, rows: List[Dict[str, Any]], column_map: List[Dict[str, str]]) -> None:
+def _commit_rows(
+    db: Session,
+    table_id: str,
+    rows: List[Dict[str, Any]],
+    column_map: List[Dict[str, str]],
+    store_raw: bool = True,
+) -> None:
     """Commit fetched rows into the samples table with column_map applied."""
     if not rows:
         return
@@ -662,8 +708,8 @@ def _commit_rows(db: Session, table_id: str, rows: List[Dict[str, Any]], column_
             mapped[c["name"]] = _extract_source_value(r, c["source_field"])
         db.execute(
             sa_text(
-                "INSERT INTO samples (id, project_id, table_id, version_id, seq, row, created_at) "
-                "VALUES (gen_random_uuid(), :pid, :tid, :vid, :seq, CAST(:row AS jsonb), now())"
+                "INSERT INTO samples (id, project_id, table_id, version_id, seq, row, raw_row, created_at) "
+                "VALUES (gen_random_uuid(), :pid, :tid, :vid, :seq, CAST(:row AS jsonb), CAST(:raw AS jsonb), now())"
             ),
             {
                 "pid": str(pid),
@@ -671,6 +717,7 @@ def _commit_rows(db: Session, table_id: str, rows: List[Dict[str, Any]], column_
                 "vid": str(version_id),
                 "seq": next_seq,
                 "row": json.dumps(mapped, default=str),
+                "raw": json.dumps(r, default=str) if store_raw else None,
             },
         )
         next_seq += 1

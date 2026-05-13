@@ -43,7 +43,7 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
     """OpenAI function tool definitions for the 15-tool orchestrator surface."""
     tool_descriptions = {
         # Tables
-        "table_create": "Create a table from a source. Atomic: fetches rows, maps them through your columns, commits in one step. If the fetch fails, NOTHING is written — try a different actor/query and call table_create again. No orphans. Args: source, query_params, columns ([{name, source_field, type}] required), name (2-5 words, Title Case).",
+        "table_create": "Create a table from a source. Atomic: fetches rows, system internally picks human-readable columns from the actual row shape + table intent, commits. If the fetch fails or returns 0 rows, nothing is written — try a different actor/query. Args: source, query_params, name (2-5 words, Title Case), intent (optional one-liner describing what the user wants — helps the column picker).",
         "table_extend": "Pull MORE rows into an EXISTING table with a non-overlapping next slice. Args: table_id, query_params (the new slice — e.g. next batch / page / date window). Reuses the table's existing column map automatically.",
         "table_delete": "Delete a table and all its rows + enrichments. Approval-gated.",
         # Apify discovery

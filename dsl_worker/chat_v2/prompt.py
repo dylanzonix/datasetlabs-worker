@@ -57,17 +57,27 @@ One source-query per table. Use as many tables as the project naturally needs. R
 
 Default first-fetch size: 100 rows.
 
-## Creating a table
+## Creating a table — two-call flow, one fetch
 
-`table_create(source, query_params, columns, name)` is **atomic**: it fetches, maps rows through your `columns`, and commits in one step. If the fetch fails (bad actor, wrong query, API error), **nothing is written** — try a different one and call `table_create` again.
+1. **`table_create(source, query_params, name)`** — fetches rows and commits them with a raw passthrough column set (every top-level row key becomes a column, source-named). Returns the table_id, sample rows, and a schema preview. If the fetch fails or returns 0 rows, nothing is written — try a different actor/query.
+2. **`column_map_set(table_id, columns)`** — having SEEN the sample, pick the clean column set: human Title Case names, dotted paths for nested fields, array fan-out for repeated nested items, a `dedup_key_column` if one fits. The system re-derives every cell from the stored raw row through the new mapping — no re-fetch.
 
-`columns` is required. Each entry: `{name, source_field, type}`. Pick the column set the user actually wants for their request — don't passthrough every raw source field.
+In practice, you do both in the same turn:
 
-For unfamiliar apify actors, you have two things to read before calling `table_create`:
-- `apify_actor_details(actor_id)` — gives the actor's input schema, description, and pricing. Often enough to write the column map directly.
-- The output preview embedded in the actor's docs.
+```
+table_create(source="...", query_params={...}, name="YC SaaS Founders")
+  → table_id "t1", sample shows: founders is an array of {name, linkedin, title}
+column_map_set(table_id="t1", columns=[
+  {"name": "Company", "source_field": "name", "type": "text"},
+  {"name": "Founder Names", "source_field": "founders[].name", "type": "text"},
+  {"name": "Founder LinkedIns", "source_field": "founders[].linkedin", "type": "url"},
+  ...
+], dedup_key_column="Company")
+```
 
-If you guess wrong on columns, you'll see it in the resulting rows. `column_map_set(table_id, columns)` can revise the column set on a committed table; you don't need to recreate it.
+If table_create's passthrough columns are already what the user wants, you can skip column_map_set.
+
+`columns` shape: `[{name, source_field, type}, ...]`. Types: `text | number | url | email | date | bool | enum`. source_field paths: plain key (`name`), dotted (`employment.current.title`), array fan-out (`founders[].name`).
 
 ## Picking columns
 
@@ -201,6 +211,8 @@ page: 1, per_page: 100
 
 ## fullenrich_people
 Send bare arrays of strings — the server auto-wraps to FE's {value, exact_match, exclude} shape. Use either friendly or canonical names; both work.
+
+**Input (query_params):**
 ```
 current_position_titles: ["VP Sales", "Head of Engineering"]
                                   # (alias: job_titles, titles)
@@ -219,6 +231,20 @@ current_company_headcounts: [{min: 50, max: 500}]
                                   # (alias: headcounts, company_headcounts)
 limit: 100
 ```
+
+**Output rows are nested.** When writing `columns` for `table_create`, use these source_field paths — not the top-level guess names:
+```
+full_name                                          → "Full Name"
+employment.current.title                           → "Title"
+employment.current.seniority                       → "Seniority"
+employment.current.company.name                    → "Company"
+employment.current.company.domain                  → "Company Domain"
+social_profiles.professional_network.url           → "LinkedIn URL"
+location.city                                      → "City"
+location.region                                    → "State"
+location.country                                   → "Country"
+```
+Top-level `title`, `linkedin_url`, `company_name`, `city` DO NOT EXIST in FE rows. Use the dotted paths above.
 
 ## google_maps
 ```
