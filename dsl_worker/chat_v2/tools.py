@@ -139,26 +139,60 @@ def _next_enrichment_short_id(db: Session, table_id: str) -> str:
 
 
 async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
-    """Create a new table backed by one source query and fetch the first batch.
+    """Create a table: fetch rows, map them through the agent's columns,
+    commit. Single atomic step — no pending state, no orphans.
 
-    Always two-step: fetches + stashes rows + returns schema preview. Agent
-    then calls column_map_set to pick the column set to commit.
+    Args: source, query_params, columns (required: [{name, source_field, type}]),
+    name (2-5 word user-facing label).
+
+    If you don't know the source's row shape yet, call source_preview
+    first — it does a read-only fetch and returns the schema. THEN call
+    table_create with your chosen columns.
     """
     name = (args.get("name") or args.get("table_name") or "").strip()
     source = args.get("source")
     query_params = args.get("query_params") or {}
+    raw_columns = args.get("columns") or []
     n = int(args.get("n") or 100)
 
+    if not source:
+        return {"error": "source is required"}, 0.0
+    if source.split(":", 1)[0] not in list_sources():
+        return {"error": f"unknown source {source!r}", "available": list_sources()}, 0.0
+    if not raw_columns:
+        return {
+            "error": (
+                "columns is required — declare the column set you want for this table. "
+                "Each entry: {name, source_field, type}. "
+                "If you don't know the source's row shape yet, call source_preview "
+                "first to inspect, then table_create with your chosen columns."
+            )
+        }, 0.0
+
+    # Normalize columns (accept name/column_name/key aliases, source/from aliases).
+    columns_for_db: List[Dict[str, str]] = []
+    for c in raw_columns:
+        if isinstance(c, str):
+            return {"error": f"columns must be dicts {{name, source_field, type}}, got bare string {c!r}"}, 0.0
+        if not isinstance(c, dict):
+            return {"error": f"columns entry must be a dict, got {type(c).__name__}"}, 0.0
+        cname = c.get("name") or c.get("column_name") or c.get("key") or c.get("field")
+        src_field = c.get("source_field") or c.get("from") or c.get("source")
+        if not cname or not src_field:
+            return {"error": f"columns entry needs name + source_field; got {c!r}"}, 0.0
+        columns_for_db.append({
+            "name": cname,
+            "type": c.get("type") or "text",
+            "source_field": src_field,
+        })
+
     if not name:
-        # Fall back to a derived name so the table isn't "Untitled" in the
-        # tab bar. Take the source prefix + first non-empty query value.
-        src_label = (source or "table").split(":", 1)[0].replace("_", " ").title()
+        src_label = source.split(":", 1)[0].replace("_", " ").title()
         first_q = next(
             (str(v) for v in query_params.values() if isinstance(v, str) and v),
             None,
         )
         if not first_q:
-            # Try nested apify input
             inp = query_params.get("input") or {}
             if isinstance(inp, dict):
                 first_q = next(
@@ -167,32 +201,34 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
                 )
         name = f"{src_label} — {first_q}" if first_q else src_label
 
-    if not source:
-        return {"error": "source is required"}, 0.0
-    if source.split(":", 1)[0] not in list_sources():
-        return {
-            "error": f"unknown source {source!r}",
-            "available": list_sources(),
-        }, 0.0
-
     adapter = get_adapter(source)
     val_err = adapter.validate_query_params(query_params)
     if val_err:
         return {"error": val_err}, 0.0
 
-    # Insert the table row immediately so the agent has a handle to
-    # reference, even if the fetch is slow or fails. Assign a short_id
-    # (t1, t2, ...) for LLM-friendly references.
+    # Fetch first, table row only gets inserted after success. No orphans.
+    try:
+        if source.startswith("apify_actor:"):
+            res = await adapter.fetch(query_params, n, prior_cursor=None, source_full=source)
+        else:
+            res = await adapter.fetch(query_params, n, prior_cursor=None)
+    except Exception as e:
+        log.exception("table_create fetch failed: %s", e)
+        return {"error": f"source fetch failed: {e}"}, 0.0
+
     table_id = str(uuid.uuid4())
     short_id = _next_short_id(ctx.db, ctx.project_id)
-
     ctx.db.execute(
         sa_text(
             """
             INSERT INTO tables (id, project_id, short_id, name, source, query_params, columns,
-                                dedup_key_column, fetch_status, created_at)
-            VALUES (:id, :project_id, :short_id, :name, :source, :query_params, '[]'::jsonb,
-                    :dedup_key_column, 'fetching', now())
+                                dedup_key_column, fetch_status,
+                                last_fetch_returned_rows, last_fetch_cost_credits, last_fetch_at,
+                                created_at)
+            VALUES (:id, :project_id, :short_id, :name, :source, :query_params, CAST(:cols AS jsonb),
+                    :dedup_key_column, 'complete',
+                    :rows_n, :cost, now(),
+                    now())
             """
         ),
         {
@@ -202,68 +238,25 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
             "name": name,
             "source": source,
             "query_params": json.dumps(query_params),
+            "cols": json.dumps(columns_for_db),
             "dedup_key_column": adapter.default_dedup_key_column,
-        },
-    )
-    ctx.db.commit()
-
-    # Fetch.
-    try:
-        if source.startswith("apify_actor:"):
-            res = await adapter.fetch(
-                query_params, n, prior_cursor=None, source_full=source
-            )
-        else:
-            res = await adapter.fetch(query_params, n, prior_cursor=None)
-    except Exception as e:
-        log.exception("table_create fetch failed: %s", e)
-        ctx.db.execute(
-            sa_text("UPDATE tables SET fetch_status='failed', fetch_error=:err WHERE id=:id"),
-            {"id": table_id, "err": str(e)[:500]},
-        )
-        ctx.db.commit()
-        return {"error": f"source fetch failed: {e}"}, 0.0
-
-    # Stash the raw rows on the table — they'll be mapped + committed
-    # when the agent calls column_map_set. Same flow for every source:
-    # the agent picks the column set from the schema preview, no
-    # source-driven dumping.
-    ctx.db.execute(
-        sa_text(
-            """
-            UPDATE tables
-            SET query_params = jsonb_set(query_params::jsonb, '{_pending_rows}', CAST(:pending AS jsonb)),
-                fetch_status = 'pending_mapping',
-                last_fetch_returned_rows = :rows_n,
-                last_fetch_cost_credits = :cost,
-                last_fetch_at = now(),
-                fetch_error = NULL
-            WHERE id = :id
-            """
-        ),
-        {
-            "id": table_id,
-            "pending": json.dumps(res.rows),
             "rows_n": len(res.rows),
             "cost": res.cost_credits,
         },
     )
     ctx.db.commit()
 
+    # Commit rows through the agent-chosen columns. _commit_rows handles
+    # source_field paths (dotted, array fan-out).
+    _commit_rows(ctx.db, table_id, res.rows, columns_for_db)
+
     return {
         "table_id": short_id,
         "name": name,
         "source": source,
-        "rows_fetched": len(res.rows),
-        "fetch_status": "pending_mapping",
+        "rows_committed": len(res.rows),
+        "columns": [c["name"] for c in columns_for_db],
         "exhausted_first_batch": res.exhausted,
-        "source_schema_preview": _build_schema_preview(res.rows),
-        "next_step": (
-            "Call column_map_set with the columns you want to keep for this table. "
-            "Each entry: {name (human-readable, Title Case OK), source_field (the key in the "
-            "raw row), type (text|number|url|email|date|bool|enum)}. Only the columns you "
-            "list will be kept; the rest is discarded."
-        ),
     }, res.cost_credits * 0.10
 
 
@@ -454,37 +447,22 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
     else:
         return {"error": f"mapping must be dict or list; got {type(raw_mapping).__name__}"}, 0.0
 
-    # Apply mapping retroactively. If table is in pending_mapping state, commit
-    # the stashed rows now under the new mapping.
+    # column_map_set is now an "edit columns on an existing table" tool.
+    # table_create commits with its own columns; this is for revising
+    # afterward (renames, adding/dropping columns). No more pending_mapping.
     table_row = ctx.db.execute(
-        sa_text("SELECT fetch_status, query_params FROM tables WHERE id=:id AND deleted_at IS NULL"),
+        sa_text("SELECT 1 FROM tables WHERE id=:id AND deleted_at IS NULL"),
         {"id": table_id},
     ).fetchone()
     if not table_row:
         return {"error": f"table {table_id} not found"}, 0.0
-
-    fetch_status, qp = table_row
-    qp = qp or {}
-    if isinstance(qp, str):
-        qp = json.loads(qp)
-    pending_rows = qp.get("_pending_rows") or []
-
-    if fetch_status == "pending_mapping" and pending_rows:
-        _commit_rows(ctx.db, table_id, pending_rows, columns_for_db)
-        # Strip _pending_rows from query_params
-        qp.pop("_pending_rows", None)
-        ctx.db.execute(
-            sa_text("UPDATE tables SET query_params=CAST(:qp AS jsonb) WHERE id=:id"),
-            {"id": table_id, "qp": json.dumps(qp)},
-        )
 
     ctx.db.execute(
         sa_text(
             """
             UPDATE tables
             SET columns = CAST(:cols AS jsonb),
-                dedup_key_column = COALESCE(:dedup, dedup_key_column),
-                fetch_status = CASE WHEN fetch_status = 'pending_mapping' THEN 'complete' ELSE fetch_status END
+                dedup_key_column = COALESCE(:dedup, dedup_key_column)
             WHERE id = :id
             """
         ),
@@ -495,7 +473,7 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
         },
     )
     ctx.db.commit()
-    return {"ok": True, "columns_committed": len(columns_for_db), "rows_committed_from_pending": len(pending_rows)}, 0.0
+    return {"ok": True, "columns_committed": len(columns_for_db)}, 0.0
 
 
 # ---------------------------------------------------------------------------

@@ -57,12 +57,17 @@ One source-query per table. Use as many tables as the project naturally needs. R
 
 Default first-fetch size: 100 rows.
 
-## Two-step flow — every source, every time
+## Creating a table
 
-1. **`table_create(source, query_params)`** — runs the fetch and stashes the raw rows. Returns a `source_schema_preview` (top fields by frequency + example values + first few rows). **No columns committed yet.** Table is in `pending_mapping` status.
-2. **`column_map_set(table_id, columns)`** — you declare the column set you want. Each entry is `{name, source_field, type}`. Only those columns are kept; the rest of the source data is discarded.
+`table_create(source, query_params, columns, name)` is **atomic**: it fetches, maps rows through your `columns`, and commits in one step. If the fetch fails (bad actor, wrong query, API error), **nothing is written** — try a different one and call `table_create` again.
 
-Think of step 2 as "pick the columns the user actually wants and rename them to spreadsheet headers." Don't passthrough every raw source field. Don't keep snake_case if the source emits it — rename to clean human form.
+`columns` is required. Each entry: `{name, source_field, type}`. Pick the column set the user actually wants for their request — don't passthrough every raw source field.
+
+For unfamiliar apify actors, you have two things to read before calling `table_create`:
+- `apify_actor_details(actor_id)` — gives the actor's input schema, description, and pricing. Often enough to write the column map directly.
+- The output preview embedded in the actor's docs.
+
+If you guess wrong on columns, you'll see it in the resulting rows. `column_map_set(table_id, columns)` can revise the column set on a committed table; you don't need to recreate it.
 
 ## Picking columns
 

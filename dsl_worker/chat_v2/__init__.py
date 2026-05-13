@@ -43,14 +43,14 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
     """OpenAI function tool definitions for the 15-tool orchestrator surface."""
     tool_descriptions = {
         # Tables
-        "table_create": "Open a new table for a fresh source-query. Args: source, name (2-5 words, Title Case — required), query_params. Use this only when starting a new angle. If the project already has a table covering the same source/topic and the user wants more rows, use `table_extend` on the existing table — do NOT make another table_create.",
+        "table_create": "Create a table from a source. Atomic: fetches rows, maps them through your columns, commits in one step. If the fetch fails, NOTHING is written — try a different actor/query and call table_create again. No orphans. Args: source, query_params, columns ([{name, source_field, type}] required), name (2-5 words, Title Case).",
         "table_extend": "Pull MORE rows into an EXISTING table with a non-overlapping next slice. Args: table_id, query_params (the new slice — e.g. next batch / page / date window). Reuses the table's existing column map automatically.",
         "table_delete": "Delete a table and all its rows + enrichments. Approval-gated.",
         # Apify discovery
         "apify_search_actors": "Discover Apify actors matching a query. Returns lightweight summaries.",
         "apify_actor_details": "Read an actor's full input_schema, output preview, and pricing.",
         # Columns/enrichments
-        "column_map_set": "Commit (or update) the field→column mapping for a table. Required after table_create on unpredictable sources.",
+        "column_map_set": "Edit columns on an existing table — rename a column, add one mapped from another source field, drop one. Args: table_id, columns ([{name, source_field, type}]). table_create already commits with its own columns; only use this to revise after the fact.",
         "enrichment_set": "Define or refine an enrichment. Runs on the first 10 unfilled rows.",
         "enrichment_run": "Extend an enrichment to more rows. Approval-gated.",
         # Filters
