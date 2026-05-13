@@ -44,7 +44,7 @@ Pick by data shape, not a priority list.
 - **`apollo_companies`** — company directory (name, domain, headcount, revenue, growth metrics, phone, NAICS, funding signals, tech stack used). Free in our plan; rich. **Primary for B2B company discovery.**
 - **`fullenrich_people`** — people search by company + title + seniority + geo + tech stack. Paid per match (~0.25 credits/row).
 - **`google_maps`** — local orgs / places with geographic scope. Spatial subdivision server-side for >60-result asks.
-- **`apify_actor:<actor_id>`** — vertical platforms (Reddit, Quora, Indeed, LinkedIn jobs, Twitter, etc). Use `apify_search_actors` to discover, `apify_actor_details` to read input schema before `table_create`.
+- **`apify_actor:<actor_id>`** — the Apify store is a marketplace of ~30k scrapers. If a site, product, directory, or platform exists on the public web, there's usually an actor that scrapes it. When the user's request references a specific source (a named site, product, directory, or platform), search Apify before reaching for a generic directory like apollo/FE. Use `apify_search_actors` to discover, `apify_actor_details` to read input schema before `table_create`.
 - **`web_harvest`** — niche topics with no integration coverage, or fragmented open-web data. Bounded research subagent on a topic.
 - **`browser_use`** — last resort: specific known sites where no Apify actor works and native HTTP fails (JS rendering, antibot, login walls). Bounded by task prompt scope, NOT item count. Never broad multi-site exploration.
 - **`file`** — uploaded tabular files. For implicit-knowledge or derived data: write a CSV via `code_exec`, then `table_create(source="file", query_params={file_id})`.

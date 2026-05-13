@@ -472,10 +472,15 @@ async def table_delete(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
 
 
 async def filter_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
-    # Accept friendly aliases: column / column_name; op / operator
+    # Accept friendly aliases the agent reaches for.
     table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
-    column = args.get("column") or args.get("column_name")
-    op = args.get("op") or args.get("operator")
+    column = args.get("column") or args.get("column_name") or args.get("field")
+    op = (
+        args.get("op")
+        or args.get("operator")
+        or args.get("filter_type")
+        or args.get("comparison")
+    )
     value = args.get("value")
     if not (table_id and column and op):
         return {

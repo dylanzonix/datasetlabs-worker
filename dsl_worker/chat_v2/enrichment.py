@@ -62,13 +62,17 @@ async def enrichment_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
     if not columns:
         return {"error": "columns is required (at least one column to fill)"}, 0.0
 
-    # Normalize columns: accept bare strings, {name} dicts, or {name, type} dicts.
+    # Normalize columns: accept the various shapes the agent reaches for.
+    # Supported: bare strings, {name}, {name, type}, {key, label}, {column, type}.
     norm_cols: List[Dict[str, str]] = []
     for c in columns:
         if isinstance(c, str):
             norm_cols.append({"name": c, "type": "text"})
-        elif isinstance(c, dict) and c.get("name"):
-            norm_cols.append({"name": c["name"], "type": c.get("type") or "text"})
+        elif isinstance(c, dict):
+            n = c.get("name") or c.get("column") or c.get("column_name") or c.get("key") or c.get("field")
+            if not n:
+                return {"error": f"columns entry needs a name (or key/column/field): got {c!r}"}, 0.0
+            norm_cols.append({"name": n, "type": c.get("type") or "text"})
         else:
             return {"error": f"columns entries must be 'col_name' or {{name, type}}; got: {c!r}"}, 0.0
     columns = norm_cols
