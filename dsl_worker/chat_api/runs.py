@@ -33,10 +33,13 @@ from collections import defaultdict
 from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional
 from uuid import UUID
 
+import httpx
+from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
 
+from dsl_api.config import settings as dsl_api_settings
 from dsl_api.db import SessionLocal
-from dsl_api.models import ChatMessage, ChatRun, ChatRunEvent, Project
+from dsl_api.models import Account, ChatMessage, ChatRun, ChatRunEvent, Project
 from dsl_api.models.chat_run import (
     RUN_ACTIVE_STATUSES,
     RUN_STATUS_CANCELLED,
@@ -366,6 +369,13 @@ async def start_run(
         if project.mode != "chat":
             raise ValueError("Project is not in chat mode")
 
+        existing_message_count = (
+            db.query(ChatMessage)
+            .filter(ChatMessage.project_id == project_id)
+            .count()
+        )
+        is_first_message = existing_message_count == 0
+
         run = ChatRun(
             project_id=project_id,
             status=RUN_STATUS_QUEUED,
@@ -386,8 +396,34 @@ async def start_run(
         db.commit()
         db.refresh(run)
         run_id = run.id
+
+        first_message_email: Optional[str] = None
+        if is_first_message:
+            auth_row = db.execute(
+                sa_text("SELECT email FROM auth.users WHERE id = :user_id"),
+                {"user_id": str(user_id)},
+            ).fetchone()
+            if auth_row and auth_row[0]:
+                first_message_email = auth_row[0]
+            else:
+                account = (
+                    db.query(Account)
+                    .filter(Account.user_id == str(user_id))
+                    .first()
+                )
+                first_message_email = account.email if account else None
     finally:
         db.close()
+
+    if is_first_message:
+        asyncio.create_task(
+            _post_first_chat_to_slack(
+                project_id=str(project_id),
+                email=first_message_email,
+                message=user_content,
+            ),
+            name=f"slack-first-msg-{project_id}",
+        )
 
     asyncio.create_task(
         _run_agent_task(
@@ -981,3 +1017,32 @@ async def orphan_recovery_loop(interval_seconds: int = 30) -> None:
         except Exception:
             log.exception("orphan recovery pass failed")
         await asyncio.sleep(interval_seconds)
+
+
+async def _post_first_chat_to_slack(
+    *,
+    project_id: str,
+    email: Optional[str],
+    message: str,
+) -> None:
+    if not dsl_api_settings.SLACK_PROJECTS_WEBHOOK_URL:
+        return
+
+    email_line = email or "_(unknown)_"
+    snippet = message if len(message) <= 1500 else message[:1500] + "…"
+    quoted = "\n".join(f"> {line}" for line in (snippet.splitlines() or [""]))
+    text_msg = (
+        f":sparkles: *New project* — {email_line}\n"
+        f"{quoted}\n"
+        f"• project_id: `{project_id}`"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                dsl_api_settings.SLACK_PROJECTS_WEBHOOK_URL,
+                json={"text": text_msg},
+            )
+            resp.raise_for_status()
+    except Exception:
+        log.exception("Failed to post first-chat notification to Slack for %s", project_id)
