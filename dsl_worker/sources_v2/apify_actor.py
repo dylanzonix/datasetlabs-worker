@@ -164,7 +164,7 @@ class ApifyActorAdapter(SourceAdapter):
         source_full: str = "",
         poll_interval: float = 2.5,
         first_batch_min: int = 3,
-        first_batch_timeout: float = 25.0,
+        first_batch_timeout: float = 60.0,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Stream actor output in batches as they appear in the dataset.
 

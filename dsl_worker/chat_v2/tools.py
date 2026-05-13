@@ -869,6 +869,15 @@ def _commit_rows(
         if c.get("source_field") and (c.get("name") or c.get("column_name"))
     ]
 
+    # Serialize concurrent _commit_rows for the same version (sync first
+    # batch + apify background drain + any other parallel commits) so
+    # MAX(seq)+1 + INSERT pairs don't race on idx_samples_version_seq_unique.
+    # Advisory lock is per-version and released at db.commit().
+    db.execute(
+        sa_text("SELECT pg_advisory_xact_lock(hashtextextended(:vid, 0))"),
+        {"vid": str(version_id)},
+    )
+
     next_seq_row = db.execute(
         sa_text(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM samples WHERE version_id=:vid"
@@ -896,6 +905,8 @@ def _commit_rows(
             },
         )
         next_seq += 1
+    # Commit to release the advisory lock + flush the batch.
+    db.commit()
 
 
 def _extract_source_value(row: Dict[str, Any], path: str) -> Any:
