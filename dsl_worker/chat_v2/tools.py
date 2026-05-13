@@ -141,14 +141,31 @@ def _next_enrichment_short_id(db: Session, table_id: str) -> str:
 async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
     """Create a new table backed by one source query and fetch the first batch.
 
-    For predictable sources: applies default column map, commits all rows.
-    For unpredictable sources: fetches first ~10 rows as preview, leaves
-    table in `pending_mapping` status. Agent must call column_map_set.
+    Always two-step: fetches + stashes rows + returns schema preview. Agent
+    then calls column_map_set to pick the column set to commit.
     """
-    name = args.get("name") or "Untitled"
+    name = (args.get("name") or args.get("table_name") or "").strip()
     source = args.get("source")
     query_params = args.get("query_params") or {}
     n = int(args.get("n") or 100)
+
+    if not name:
+        # Fall back to a derived name so the table isn't "Untitled" in the
+        # tab bar. Take the source prefix + first non-empty query value.
+        src_label = (source or "table").split(":", 1)[0].replace("_", " ").title()
+        first_q = next(
+            (str(v) for v in query_params.values() if isinstance(v, str) and v),
+            None,
+        )
+        if not first_q:
+            # Try nested apify input
+            inp = query_params.get("input") or {}
+            if isinstance(inp, dict):
+                first_q = next(
+                    (str(v) for v in inp.values() if isinstance(v, str) and v),
+                    None,
+                )
+        name = f"{src_label} — {first_q}" if first_q else src_label
 
     if not source:
         return {"error": "source is required"}, 0.0

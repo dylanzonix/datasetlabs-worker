@@ -72,20 +72,20 @@ Think of step 2 as "pick the columns the user actually wants and rename them to 
 - **Flatten nested data with array paths.** `source_field: "founders[].name"` extracts the `name` from each item in the `founders` array → cell value is a list. Same for `founder_info.email` to dive into a sub-object.
 - **One column per concept.** If the source has both `email` and `email_address`, pick one. If you ran an enrichment that overlaps a source field, drop the source field.
 
-# Extending a table
+# Pagination — pick a deterministic axis up front
 
-To get more rows, call `table_extend` with a new query against the same source. Your job is to write a query that doesn't overlap with what's already there. Project state shows what's in the table (date ranges covered, latest cursor, IDs seen).
+When the user asks for more rows later (and they often do), `table_extend` is the answer — same table, next slice. For that to work cleanly, the **initial** `table_create` should already use a deterministic anchor so extending is just incrementing it. Random non-anchored queries make pagination undeterministic and tempt you toward duplicate tables.
 
-**Common patterns:**
+**Pick an anchor at table_create:**
+- **Apify actors that expose `batches` / date filters**: pin the most recent slice (`batches: ["Summer 2025"]`). Extend = next batch back.
+- **Apollo / FE / GMaps**: rely on native cursors. They get stored automatically; pass them back via `table_extend`.
+- **Sort + offset / page**: set `page: 1`. Extend = `page: 2`.
+- **Date windows**: bound an explicit window (e.g. last 90 days). Extend = shift the window backward.
+- **Geographic / categorical**: tile by city/subreddit/category. Extend = next tile.
 
-- **Native cursor** (FE, Apollo, GMaps): the source returned a continuation token. Pass it back in query_params.
-- **Date / time range**: shift the date window backward.
-- **ID range**: pass `max_id` or `since_id` if supported.
-- **Sort + offset**: increment `page` or `offset`.
-- **Geographic / categorical subdivision**: smaller radius, different city, different subreddit.
-- **Different starting URL** (browser_use, web_harvest): a non-overlapping sub-task.
+**Wrong move:** call `table_create` again to "get more". The project_state banner lists every table that exists for this project — if a table already covers the user's request, **extend it**, don't duplicate.
 
-If no axis allows non-overlapping shift, source is exhausted on this query. Make a new table with a refined angle.
+If the source has no deterministic axis (e.g. open-web search), accept it: extending will dedup heavily and yield diminishing returns. Switch to a different source or a refined angle (new `table_create`).
 
 Light dedup on the table's `dedup_key_column` catches accidental boundary overlap.
 

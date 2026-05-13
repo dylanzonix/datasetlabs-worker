@@ -41,7 +41,7 @@ def build_project_state(db: Session, project_id: str, max_tables: int = 10) -> s
         {"pid": project_id, "limit": max_tables},
     ).fetchall()
 
-    parts.append("Tables:")
+    parts.append("Tables (already exist on this project — extend these instead of duplicating):")
     if not tables:
         parts.append("  (none yet)")
     for t in tables:

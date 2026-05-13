@@ -48,6 +48,57 @@ log = logging.getLogger(__name__)
 CENTS_PER_CREDIT = 1  # 1 credit = 1 cent. Matches legacy cost_tracker default.
 
 
+_DEFAULT_PROJECT_NAMES = {"New Dataset", "Untitled", "", None}
+
+
+async def _auto_name_project(project_id: UUID, user_content: str) -> None:
+    """One-shot LLM call to generate a 3-5 word project name from the
+    first message. Only runs if the project is still on the default
+    name; idempotent for subsequent turns."""
+    import os
+    db = SessionLocal()
+    try:
+        proj = db.query(Project).filter(Project.id == project_id).first()
+        if proj is None or proj.name not in _DEFAULT_PROJECT_NAMES:
+            return
+    finally:
+        db.close()
+
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        model = os.getenv("OPENAI_MODEL_MINI", "gpt-5.4-mini")
+        resp = await client.responses.create(
+            model=model,
+            input=(
+                "Generate a 3-5 word project name for this dataset request. "
+                "Title Case. No quotes, no punctuation. Just the name.\n\n"
+                f"Request: {user_content[:400]}"
+            ),
+        )
+        name = (resp.output_text or "").strip().strip('"').strip("'").splitlines()[0][:80]
+        if not name:
+            return
+    except Exception:
+        log.exception("auto-name LLM call failed for project %s", project_id)
+        return
+
+    db = SessionLocal()
+    try:
+        db.execute(
+            sa_text(
+                "UPDATE projects SET name=:n, updated_at=now() "
+                "WHERE id=:p AND name = ANY(:defaults)"
+            ),
+            {"n": name, "p": str(project_id), "defaults": ["New Dataset", "Untitled", ""]},
+        )
+        db.commit()
+    except Exception:
+        log.exception("auto-name UPDATE failed for project %s", project_id)
+    finally:
+        db.close()
+
+
 async def start_v2_run(
     project_id: UUID,
     user_id: UUID,
@@ -98,6 +149,14 @@ async def start_v2_run(
     asyncio.create_task(
         _run_chat_v2_task(run_id, user_id, user_content),
         name=f"chat-v2-run-{run_id}",
+    )
+
+    # Fire-and-forget project naming. Independent of the orchestrator
+    # so a slow LLM here can't block the run. Only names projects that
+    # are still on the default name; subsequent turns won't re-trigger.
+    asyncio.create_task(
+        _auto_name_project(project_id, user_content),
+        name=f"chat-v2-name-{project_id}",
     )
 
     # Re-fetch detached so the caller can read fields without lazy-load.
