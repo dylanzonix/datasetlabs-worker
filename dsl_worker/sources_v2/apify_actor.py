@@ -5,9 +5,15 @@ Source name format: "apify_actor:<actor_id>" where actor_id is e.g.
 fetches the actor's input_schema (auto-fills plumbing fields like
 proxy), runs the actor, and returns rows.
 
-Unpredictable source: each actor's output schema differs. Agent inspects
-the first ~10 rows via `source_schema_preview` and calls `column_map_set`
-to commit the field→column mapping.
+Two run modes:
+
+  fetch(...)        — blocking, single call, returns all rows when actor
+                      completes. Used by table_extend / one-shot reads.
+
+  fetch_stream(...) — async-generator: yields batches of rows as they
+                      arrive in the actor's dataset. Used by table_create
+                      so the UI sees rows as soon as the actor produces
+                      them, not minutes later when it finishes.
 """
 
 from __future__ import annotations
@@ -16,7 +22,7 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
 
@@ -149,6 +155,148 @@ class ApifyActorAdapter(SourceAdapter):
             cursor=None,  # date-window pagination is agent-driven via query_params
             dedup_key_column_hint="id" if "id" in schema_keys else ("url" if "url" in schema_keys else None),
         )
+
+
+    async def fetch_stream(
+        self,
+        query_params: Dict[str, Any],
+        n: int,
+        source_full: str = "",
+        poll_interval: float = 2.5,
+        first_batch_min: int = 3,
+        first_batch_timeout: float = 25.0,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Stream actor output in batches as they appear in the dataset.
+
+        Yields dicts of shape:
+          {"rows": [...], "exhausted": bool, "cost_credits": float}
+
+        The first yield happens as soon as `first_batch_min` rows are
+        available or `first_batch_timeout` elapses, whichever is first —
+        so the caller can show the user something within seconds. Later
+        yields fire each poll interval with whatever new rows showed up.
+        Final yield has exhausted=True.
+        """
+        if not self.api_key:
+            yield {"rows": [], "exhausted": True, "cost_credits": 0.0}
+            return
+
+        actor_id = source_full.split(":", 1)[1] if ":" in source_full else query_params.get("actor_id", "")
+        if not actor_id:
+            yield {"rows": [], "exhausted": True, "cost_credits": 0.0}
+            return
+
+        actor_input = dict(query_params.get("input") or {})
+        max_items = int(query_params.get("maxItems") or n)
+        actor_input.setdefault("maxItems", max_items)
+
+        aid = actor_id.replace("/", "~")
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            schema = await self._get_input_schema(client, actor_id)
+            if schema:
+                self._autofill_plumbing(actor_input, schema)
+
+            # Start the run async.
+            start = await client.post(
+                f"{APIFY_BASE}/acts/{aid}/runs",
+                params={"token": self.api_key},
+                json=actor_input,
+            )
+            if start.status_code >= 400:
+                log.warning("apify_actor start HTTP %s for %s: %s", start.status_code, actor_id, start.text[:200])
+                yield {"rows": [], "exhausted": True, "cost_credits": 0.0}
+                return
+            data = (start.json() or {}).get("data") or {}
+            run_id = data.get("id")
+            dataset_id = data.get("defaultDatasetId")
+            if not run_id or not dataset_id:
+                yield {"rows": [], "exhausted": True, "cost_credits": 0.0}
+                return
+
+            yielded = 0
+            first_yield_done = False
+            t0 = asyncio.get_event_loop().time()
+            terminal = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
+
+            while True:
+                # Pull whatever rows are available beyond what we've yielded.
+                items_resp = await client.get(
+                    f"{APIFY_BASE}/datasets/{dataset_id}/items",
+                    params={
+                        "token": self.api_key,
+                        "format": "json",
+                        "offset": yielded,
+                        "limit": max_items - yielded,
+                    },
+                )
+                new_rows: List[Dict[str, Any]] = []
+                if items_resp.status_code == 200:
+                    try:
+                        body = items_resp.json()
+                        if isinstance(body, list):
+                            new_rows = [r for r in body if isinstance(r, dict)]
+                    except Exception:
+                        pass
+
+                # Check run status.
+                run_resp = await client.get(
+                    f"{APIFY_BASE}/actor-runs/{run_id}",
+                    params={"token": self.api_key},
+                )
+                run_status = "RUNNING"
+                if run_resp.status_code == 200:
+                    run_status = (run_resp.json().get("data") or {}).get("status") or "RUNNING"
+                is_terminal = run_status in terminal
+
+                # Time gate for the first yield: don't sit silent forever
+                # if the actor is slow to produce its first item.
+                elapsed = asyncio.get_event_loop().time() - t0
+                should_first_yield = (
+                    not first_yield_done
+                    and (len(new_rows) >= first_batch_min or is_terminal or elapsed >= first_batch_timeout)
+                )
+
+                if new_rows and (first_yield_done or should_first_yield):
+                    yielded += len(new_rows)
+                    first_yield_done = True
+                    yield {
+                        "rows": new_rows,
+                        "exhausted": is_terminal and yielded >= (max_items if max_items else yielded),
+                        "cost_credits": 0.0,
+                    }
+                elif should_first_yield and not new_rows:
+                    # Time-out first yield with empty rows so caller isn't
+                    # blocked forever on a slow / no-result actor.
+                    first_yield_done = True
+                    yield {"rows": [], "exhausted": is_terminal, "cost_credits": 0.0}
+
+                if is_terminal:
+                    # Drain any final rows that landed between status checks.
+                    drain_resp = await client.get(
+                        f"{APIFY_BASE}/datasets/{dataset_id}/items",
+                        params={
+                            "token": self.api_key,
+                            "format": "json",
+                            "offset": yielded,
+                            "limit": max(0, max_items - yielded),
+                        },
+                    )
+                    final_rows: List[Dict[str, Any]] = []
+                    if drain_resp.status_code == 200:
+                        try:
+                            body = drain_resp.json()
+                            if isinstance(body, list):
+                                final_rows = [r for r in body if isinstance(r, dict)]
+                        except Exception:
+                            pass
+                    yield {"rows": final_rows, "exhausted": True, "cost_credits": 0.0}
+                    return
+
+                if yielded >= max_items:
+                    yield {"rows": [], "exhausted": True, "cost_credits": 0.0}
+                    return
+
+                await asyncio.sleep(poll_interval)
 
 
 register(ApifyActorAdapter())

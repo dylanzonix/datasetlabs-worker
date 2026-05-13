@@ -179,17 +179,39 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     if val_err:
         return {"error": val_err}, 0.0
 
-    # Fetch first; if it fails, nothing gets written. No orphans.
-    try:
-        if source.startswith("apify_actor:"):
-            res = await adapter.fetch(query_params, n, prior_cursor=None, source_full=source)
-        else:
-            res = await adapter.fetch(query_params, n, prior_cursor=None)
-    except Exception as e:
-        log.exception("table_create fetch failed: %s", e)
-        return {"error": f"source fetch failed: {e}"}, 0.0
+    # Fetch first batch. For sources that support streaming (apify
+    # actors), grab the first batch synchronously and let the rest stream
+    # in via a background task — apify can take minutes; the user
+    # shouldn't sit at an empty table that long.
+    streaming = source.startswith("apify_actor:") and hasattr(adapter, "fetch_stream")
+    stream_gen = None
+    res_rows: List[Dict[str, Any]] = []
+    res_exhausted = True
+    res_cost = 0.0
+    if streaming:
+        try:
+            stream_gen = adapter.fetch_stream(query_params, n, source_full=source)
+            first = await stream_gen.__anext__()
+            res_rows = first.get("rows") or []
+            res_exhausted = first.get("exhausted", False)
+            res_cost = first.get("cost_credits", 0.0)
+        except StopAsyncIteration:
+            res_exhausted = True
+        except Exception as e:
+            log.exception("table_create stream-first-batch failed: %s", e)
+            return {"error": f"source fetch failed: {e}"}, 0.0
+    else:
+        try:
+            if source.startswith("apify_actor:"):
+                res = await adapter.fetch(query_params, n, prior_cursor=None, source_full=source)
+            else:
+                res = await adapter.fetch(query_params, n, prior_cursor=None)
+            res_rows, res_exhausted, res_cost = res.rows, res.exhausted, res.cost_credits
+        except Exception as e:
+            log.exception("table_create fetch failed: %s", e)
+            return {"error": f"source fetch failed: {e}"}, 0.0
 
-    if not res.rows:
+    if not res_rows:
         return {"error": "source returned 0 rows; nothing to commit"}, 0.0
 
     # Columns: agent's choice if provided, otherwise raw passthrough of
@@ -216,7 +238,7 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
         # Names are whatever the source emits (often snake_case); agent can
         # call column_map_set to clean them up after seeing the data.
         seen: Dict[str, None] = {}
-        for r in res.rows:
+        for r in res_rows:
             if isinstance(r, dict):
                 for k in r.keys():
                     if k not in seen and not k.startswith("_"):
@@ -226,8 +248,14 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
             for k in seen
         ]
 
+    # Ensure the project has a version row before either the sync or
+    # background commit paths run — eliminates the project_versions
+    # unique-index race between them.
+    _ensure_project_version(ctx.db, ctx.project_id)
+
     table_id = str(uuid.uuid4())
     short_id = _next_short_id(ctx.db, ctx.project_id)
+    initial_status = "complete" if res_exhausted else "streaming"
     ctx.db.execute(
         sa_text(
             """
@@ -236,7 +264,7 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
                                 last_fetch_returned_rows, last_fetch_cost_credits, last_fetch_at,
                                 created_at)
             VALUES (:id, :project_id, :short_id, :name, :source, :query_params, CAST(:cols AS jsonb),
-                    :dedup_key_column, 'complete',
+                    :dedup_key_column, :fetch_status,
                     :rows_n, :cost, now(),
                     now())
             """
@@ -250,13 +278,31 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
             "query_params": json.dumps(query_params),
             "cols": json.dumps(columns_for_db),
             "dedup_key_column": adapter.default_dedup_key_column,
-            "rows_n": len(res.rows),
-            "cost": res.cost_credits,
+            "fetch_status": initial_status,
+            "rows_n": len(res_rows),
+            "cost": res_cost,
         },
     )
     ctx.db.commit()
 
-    _commit_rows(ctx.db, table_id, res.rows, columns_for_db, store_raw=True)
+    _commit_rows(ctx.db, table_id, res_rows, columns_for_db, store_raw=True)
+
+    # If we're streaming, spawn a background task to drain the remaining
+    # rows from the actor. Each new batch reads the table's CURRENT
+    # columns at commit time, so if the agent calls column_map_set in
+    # between, later rows get mapped through the new column set.
+    if streaming and stream_gen is not None and not res_exhausted:
+        asyncio.create_task(
+            _drain_stream_into_table(
+                stream_gen=stream_gen,
+                table_id=table_id,
+                project_id=ctx.project_id,
+                run_id=ctx.run_id,
+                first_yielded=len(res_rows),
+                n_target=n,
+            ),
+            name=f"apify-stream-{short_id}",
+        )
 
     # Surface sample rows + the raw field schema so the agent can call
     # column_map_set in the same turn with clean names / nested paths /
@@ -265,11 +311,115 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
         "table_id": short_id,
         "name": name,
         "source": source,
-        "rows_committed": len(res.rows),
+        "rows_committed": len(res_rows),
         "columns": [c["name"] for c in columns_for_db],
-        "exhausted_first_batch": res.exhausted,
-        "sample_for_mapping": _build_schema_preview(res.rows),
-    }, res.cost_credits * 0.10
+        "fetch_status": initial_status,
+        "streaming_in_background": initial_status == "streaming",
+        "sample_for_mapping": _build_schema_preview(res_rows),
+    }, res_cost * 0.10
+
+
+async def _drain_stream_into_table(
+    stream_gen,
+    table_id: str,
+    project_id: str,
+    run_id: Optional[str],
+    first_yielded: int,
+    n_target: int,
+) -> None:
+    """Background task: pulls remaining batches from the source stream,
+    commits each through the table's CURRENT columns (re-read per batch
+    so column_map_set mid-stream is reflected for later rows), updates
+    last_fetch_returned_rows incrementally, and flips fetch_status to
+    'complete' on exhaustion.
+    """
+    from dsl_api.db import SessionLocal
+    # Late import to avoid circular dep with chat_v2.runs.
+    from dsl_worker.chat_api import runs as legacy_runs
+    from dsl_api.models import ChatRun
+
+    total_committed = first_yielded
+    try:
+        async for batch in stream_gen:
+            new_rows = batch.get("rows") or []
+            if not new_rows:
+                if batch.get("exhausted"):
+                    break
+                continue
+            db = SessionLocal()
+            try:
+                # Re-read columns so a mid-stream column_map_set takes effect
+                # for these later rows.
+                col_row = db.execute(
+                    sa_text("SELECT columns FROM tables WHERE id=:id"),
+                    {"id": table_id},
+                ).fetchone()
+                cols = []
+                if col_row and col_row[0]:
+                    raw = col_row[0]
+                    cols = raw if isinstance(raw, list) else json.loads(raw or "[]")
+                if not cols:
+                    # Fallback: passthrough the keys we see now.
+                    seen: Dict[str, None] = {}
+                    for r in new_rows:
+                        if isinstance(r, dict):
+                            for k in r.keys():
+                                if k not in seen and not k.startswith("_"):
+                                    seen[k] = None
+                    cols = [{"name": k, "type": "text", "source_field": k} for k in seen]
+
+                _commit_rows(db, table_id, new_rows, cols, store_raw=True)
+                total_committed += len(new_rows)
+                db.execute(
+                    sa_text(
+                        "UPDATE tables SET last_fetch_returned_rows=:n, last_fetch_at=now() WHERE id=:id"
+                    ),
+                    {"n": total_committed, "id": table_id},
+                )
+                db.commit()
+
+                # Emit a rows_added event into the chat_run_events stream
+                # so the FE refreshes the table view. Best-effort.
+                if run_id is not None:
+                    try:
+                        run_obj = db.query(ChatRun).filter(ChatRun.id == run_id).first()
+                        if run_obj is not None:
+                            legacy_runs.emit_event(db, run_obj, "rows_added", {
+                                "table_id": table_id,
+                                "added": len(new_rows),
+                                "total": total_committed,
+                            })
+                    except Exception:
+                        log.exception("rows_added emit failed; continuing")
+            finally:
+                db.close()
+            if batch.get("exhausted") or total_committed >= n_target:
+                break
+    except Exception:
+        log.exception("apify stream drain failed for table %s", table_id)
+    finally:
+        # Mark the table complete regardless of how we exited.
+        db = SessionLocal()
+        try:
+            db.execute(
+                sa_text(
+                    "UPDATE tables SET fetch_status='complete' WHERE id=:id AND fetch_status='streaming'"
+                ),
+                {"id": table_id},
+            )
+            db.commit()
+            if run_id is not None:
+                try:
+                    run_obj = db.query(ChatRun).filter(ChatRun.id == run_id).first()
+                    if run_obj is not None:
+                        legacy_runs.emit_event(db, run_obj, "table_stream_complete", {
+                            "table_id": table_id,
+                            "total": total_committed,
+                        })
+                except Exception:
+                    log.exception("table_stream_complete emit failed")
+        finally:
+            db.close()
 
 
 def _build_schema_preview(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -636,6 +786,50 @@ async def row_delete(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, 
 # ---------------------------------------------------------------------------
 
 
+def _ensure_project_version(db: Session, project_id: str) -> str:
+    """Ensure the project has a current_version_id; create one if not.
+    Safe to call concurrently — uses ON CONFLICT on the unique
+    (project_id, version_number) index, then re-reads. Returns the
+    version UUID as a string.
+    """
+    version_id = db.execute(
+        sa_text("SELECT current_version_id::text FROM projects WHERE id=:id"),
+        {"id": str(project_id)},
+    ).scalar()
+    if version_id:
+        return version_id
+    new_id = str(uuid.uuid4())
+    db.execute(
+        sa_text(
+            """
+            INSERT INTO project_versions
+              (id, project_id, version_number, generation_prompt,
+               num_samples, columns, use_internet, files_snapshot,
+               examples_snapshot, status, generated_count, created_at)
+            VALUES
+              (:id, :pid, 1, '', 0, '[]'::jsonb, false, '[]'::jsonb,
+               '[]'::jsonb, 'complete', 0, now())
+            ON CONFLICT (project_id, version_number) DO NOTHING
+            """
+        ),
+        {"id": new_id, "pid": str(project_id)},
+    )
+    db.execute(
+        sa_text(
+            "UPDATE projects SET current_version_id=COALESCE(current_version_id, "
+            "(SELECT id FROM project_versions WHERE project_id=:pid AND version_number=1 LIMIT 1)) "
+            "WHERE id=:pid"
+        ),
+        {"pid": str(project_id)},
+    )
+    db.commit()
+    version_id = db.execute(
+        sa_text("SELECT current_version_id::text FROM projects WHERE id=:id"),
+        {"id": str(project_id)},
+    ).scalar()
+    return version_id
+
+
 def _commit_rows(
     db: Session,
     table_id: str,
@@ -656,29 +850,10 @@ def _commit_rows(
         {"id": str(pid)},
     ).scalar()
     if not version_id:
-        # Create a version row if the project has none yet. Need to fill all
-        # legacy NOT NULL columns (use_internet, files_snapshot, examples_snapshot,
-        # status, generated_count) so we don't trip schema constraints from the
-        # V13-era project_versions table.
-        version_id = str(uuid.uuid4())
-        db.execute(
-            sa_text(
-                """
-                INSERT INTO project_versions
-                  (id, project_id, version_number, generation_prompt,
-                   num_samples, columns, use_internet, files_snapshot,
-                   examples_snapshot, status, generated_count, created_at)
-                VALUES
-                  (:id, :pid, 1, '', 0, '[]'::jsonb, false, '[]'::jsonb,
-                   '[]'::jsonb, 'complete', 0, now())
-                """
-            ),
-            {"id": version_id, "pid": str(pid)},
-        )
-        db.execute(
-            sa_text("UPDATE projects SET current_version_id=:vid WHERE id=:pid"),
-            {"vid": version_id, "pid": str(pid)},
-        )
+        version_id = _ensure_project_version(db, str(pid))
+        if not version_id:
+            log.error("_commit_rows: could not ensure project_version for %s", pid)
+            return
 
     # column_map entries: [{name, source_field, type}]. source_field can be:
     #   - a plain key:           "founders"
