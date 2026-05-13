@@ -117,31 +117,75 @@ async def apify_actor_details(args: Dict[str, Any], ctx: ToolContext) -> Tuple[D
 
 
 async def web_search(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
+    """Web search via OpenAI's native web_search tool (Responses API).
+
+    We had Brave wired in originally but the subscription key is invalid in
+    this environment (HTTP 422 SUBSCRIPTION_TOKEN_INVALID). OpenAI's built-in
+    web_search is included in our plan and returns grounded, cite-able
+    results — sidecar Responses call returns the JSON shape our agent
+    expects so the caller doesn't need to change.
+    """
     query = args.get("query")
     if not query:
         return {"error": "query is required"}, 0.0
-    api_key = os.getenv("BRAVE_API_KEY")
+    api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        return {"error": "BRAVE_API_KEY not configured"}, 0.0
+        return {"error": "OPENAI_API_KEY not configured"}, 0.0
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(
-            "https://api.search.brave.com/res/v1/web/search",
-            params={"q": query, "count": 10},
-            headers={"X-Subscription-Token": api_key, "Accept": "application/json"},
+    from openai import AsyncOpenAI
+    client = AsyncOpenAI(api_key=api_key)
+    model = os.getenv("OPENAI_MODEL_MINI", "gpt-5.4-mini")
+
+    instruction = (
+        "Search the web and return up to 10 results for the query below. "
+        "Respond with ONLY a JSON array of objects with keys "
+        "title (string), url (string), snippet (string up to 300 chars). "
+        "No prose, no markdown, no preamble — just the JSON array."
+        f"\n\nQuery: {query}"
+    )
+    try:
+        resp = await client.responses.create(
+            model=model,
+            input=instruction,
+            tools=[{"type": "web_search"}],
         )
-        if r.status_code != 200:
-            return {"error": f"brave HTTP {r.status_code}"}, 0.0
-        data = r.json() or {}
+    except Exception as e:
+        return {"error": f"web_search failed: {e}"[:200]}, 0.0
 
-    results = []
-    for item in (data.get("web") or {}).get("results", [])[:10]:
-        results.append({
-            "title": item.get("title"),
-            "url": item.get("url"),
-            "snippet": (item.get("description") or "")[:300],
+    text = (resp.output_text or "").strip()
+    # Strip optional ```json fences if the model still emits them.
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+    import json as _json
+    import re as _re
+    results = None
+    try:
+        results = _json.loads(text)
+    except Exception:
+        # The model sometimes appends prose after the array, or wraps it in
+        # an object. Pull out the first JSON array via balanced-bracket scan.
+        m = _re.search(r"\[\s*\{.*\}\s*\]", text, _re.DOTALL)
+        if m:
+            try:
+                results = _json.loads(m.group(0))
+            except Exception:
+                results = None
+    if not isinstance(results, list):
+        log.warning("web_search: model output not parsable as JSON list")
+        return {"results": [], "raw": text[:600]}, 0.0
+
+    cleaned = []
+    for item in results[:10]:
+        if not isinstance(item, dict):
+            continue
+        cleaned.append({
+            "title": str(item.get("title") or ""),
+            "url": str(item.get("url") or ""),
+            "snippet": str(item.get("snippet") or "")[:300],
         })
-    return {"results": results}, 0.0
+    return {"results": cleaned}, 0.0
 
 
 # ---------------------------------------------------------------------------

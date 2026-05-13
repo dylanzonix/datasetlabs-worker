@@ -357,18 +357,53 @@ async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
 
 async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
     table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
-    mapping = args.get("mapping") or {}  # {source_field: {column_name, type}}
+    raw_mapping = args.get("mapping")
+    if raw_mapping is None:
+        raw_mapping = args.get("columns")  # alias the agent reaches for
     dedup_key_column = args.get("dedup_key_column")
     if not table_id:
         return {"error": "table_id is required"}, 0.0
-    if not mapping:
-        return {"error": "mapping is required"}, 0.0
+    if not raw_mapping:
+        return {
+            "error": (
+                "mapping is required. Accepts any of: "
+                "{source_field: column_name}, "
+                "{source_field: {name, type}}, or "
+                "[{source_field, name, type}]"
+            )
+        }, 0.0
 
-    # Build columns array from mapping
-    columns_for_db = [
-        {"name": v.get("column_name", k), "type": v.get("type", "text"), "source_field": k}
-        for k, v in mapping.items()
-    ]
+    # Normalize the three shapes the agent reaches for into a uniform
+    # [{name, type, source_field}, ...] list.
+    columns_for_db: List[Dict[str, str]] = []
+    if isinstance(raw_mapping, dict):
+        for src, v in raw_mapping.items():
+            if isinstance(v, str):
+                columns_for_db.append({"name": v, "type": "text", "source_field": src})
+            elif isinstance(v, dict):
+                name = v.get("name") or v.get("column_name") or src
+                columns_for_db.append({
+                    "name": name,
+                    "type": v.get("type") or "text",
+                    "source_field": src,
+                })
+            else:
+                return {"error": f"mapping[{src!r}] must be a string or {{name, type}}; got {type(v).__name__}"}, 0.0
+    elif isinstance(raw_mapping, list):
+        for item in raw_mapping:
+            if not isinstance(item, dict):
+                return {"error": f"mapping list items must be dicts; got {type(item).__name__}"}, 0.0
+            src = item.get("source_field") or item.get("from") or item.get("source")
+            name = item.get("name") or item.get("column_name") or src
+            if not src or not name:
+                return {"error": f"mapping list entry needs source_field + name; got {item!r}"}, 0.0
+            columns_for_db.append({
+                "name": name,
+                "type": item.get("type") or "text",
+                "source_field": src,
+            })
+    else:
+        return {"error": f"mapping must be dict or list; got {type(raw_mapping).__name__}"}, 0.0
 
     # Apply mapping retroactively. If table is in pending_mapping state, commit
     # the stashed rows now under the new mapping.
@@ -561,8 +596,14 @@ def _commit_rows(db: Session, table_id: str, rows: List[Dict[str, Any]], column_
             {"vid": version_id, "pid": str(pid)},
         )
 
-    # Map source_field → column_name
-    field_to_col = {c["source_field"]: c["column_name"] for c in column_map}
+    # Map source_field → column name. Tolerate either {column_name, source_field}
+    # (the adapter default_columns shape) or {name, source_field} (the normalized
+    # shape coming out of column_map_set).
+    field_to_col = {
+        c["source_field"]: (c.get("name") or c.get("column_name"))
+        for c in column_map
+        if c.get("source_field") and (c.get("name") or c.get("column_name"))
+    }
 
     next_seq_row = db.execute(
         sa_text(

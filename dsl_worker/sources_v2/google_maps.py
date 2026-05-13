@@ -29,6 +29,19 @@ log = logging.getLogger(__name__)
 PLACES_BASE = "https://maps.googleapis.com/maps/api/place"
 
 
+def _looks_like_latlng(s: str) -> bool:
+    """True if 's' is a 'lat,lng' pair (e.g. '37.7,-122.4'), false for city names."""
+    parts = s.split(",")
+    if len(parts) != 2:
+        return False
+    try:
+        float(parts[0].strip())
+        float(parts[1].strip())
+        return True
+    except ValueError:
+        return False
+
+
 DEFAULT_COLUMNS = [
     {"source_field": "place_id", "column_name": "place_id", "type": "text"},
     {"source_field": "name", "column_name": "name", "type": "text"},
@@ -82,10 +95,23 @@ class GoogleMapsAdapter(SourceAdapter):
         radius_m: Optional[int],
         page_token: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-        """One page of Places Text Search. Returns (results, next_page_token)."""
-        params: Dict[str, Any] = {"key": self.api_key, "query": query}
+        """One page of Places Text Search. Returns (results, next_page_token).
+
+        Google's textsearch `location` param expects "lat,lng" — passing a
+        city name silently falls back to IP geolocation, which is why an
+        Austin, TX query was returning Florida results. We fold the location
+        into the query text instead ("dentist in Austin, TX"), which is what
+        the textsearch endpoint is designed for.
+        """
+        composed_query = query
+        if location and _looks_like_latlng(location):
+            pass  # use as location bias param
+        elif location:
+            composed_query = f"{query} in {location}"
+            location = None  # folded into query text
+        params: Dict[str, Any] = {"key": self.api_key, "query": composed_query}
         if location:
-            params["location"] = location
+            params["location"] = location  # lat,lng only
         if radius_m:
             params["radius"] = radius_m
         if page_token:
