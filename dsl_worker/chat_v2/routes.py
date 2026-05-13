@@ -20,15 +20,17 @@ from uuid import UUID
 
 log = logging.getLogger(__name__)
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
 
 from dsl_api.auth import CurrentUser, get_current_user
 from dsl_api.db import SessionLocal
-from dsl_api.models import Project
+from dsl_api.models import ChatRun, Project
+from dsl_worker.chat_api import runs as legacy_runs
+from dsl_worker.chat_v2 import runs as v2_runs
 from dsl_worker.chat_v2.agent import run_turn, stream_turn
 
 
@@ -95,111 +97,74 @@ async def post_turn(
     return TurnResponse(**result)
 
 
-@router.post("/projects/{project_id}/chat/turns/stream")
-async def post_turn_stream(
+class StartRunBody(BaseModel):
+    content: str
+
+
+def _run_to_dict(run: ChatRun) -> Dict[str, Any]:
+    return {
+        "id": str(run.id),
+        "project_id": str(run.project_id),
+        "status": run.status,
+        "current_phase": run.current_phase,
+        "triggering_message_id": str(run.triggering_message_id) if run.triggering_message_id else None,
+        "assistant_message_id": str(run.assistant_message_id) if run.assistant_message_id else None,
+        "error": run.error,
+        "next_event_seq": run.next_event_seq,
+        "created_at": run.created_at.isoformat() if run.created_at else None,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+    }
+
+
+@router.post("/projects/{project_id}/chat/runs")
+async def create_v2_run(
     project_id: UUID,
-    body: TurnRequest,
+    body: StartRunBody,
     user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
-):
-    """Run a turn and stream events as SSE.
-
-    Frames are `event: <type>\\ndata: <json>\\n\\n`. The FE renders these
-    as live tool-log entries; on `final_message` it commits the assistant
-    reply; on `turn_complete` it refreshes the table list. User + assistant
-    messages are persisted to chat_messages so refreshing the page restores
-    the conversation.
-    """
+) -> JSONResponse:
+    """Start a durable chat_v2 run. The agent executes as a background
+    asyncio task; the SSE tail at .../events streams its events. Survives
+    client disconnect — refresh + reattach is supported."""
     _verify_project(project_id, user.user_id, db)
-    pid = str(project_id)
+    try:
+        run = await v2_runs.start_v2_run(
+            project_id=project_id,
+            user_id=user.user_id,
+            user_content=body.content,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return JSONResponse(_run_to_dict(run))
 
-    # Persist the user message immediately so a mid-turn disconnect
-    # still leaves it in history.
-    db.execute(
-        sa_text(
-            "INSERT INTO chat_messages (id, project_id, role, content, created_at) "
-            "VALUES (gen_random_uuid(), :pid, 'user', :content, now())"
-        ),
-        {"pid": pid, "content": body.message},
-    )
-    db.commit()
 
-    async def event_stream():
-        final_text = ""
-        tool_log: List[Dict[str, Any]] = []
-        total_cost = 0.0
-        iterations = 0
-        try:
-            async for evt in stream_turn(
-                db=db,
-                project_id=pid,
-                user_id=str(user.user_id),
-                run_id=None,
-                user_message=body.message,
-                history=body.history,
-            ):
-                etype = evt.get("type", "message")
-                if etype == "tool_call_start":
-                    tool_log.append({
-                        "id": evt.get("tool_call_id"),
-                        "name": evt.get("name"),
-                        "args_preview": json.dumps(evt.get("args") or {}, default=str)[:200],
-                    })
-                elif etype == "tool_call_result":
-                    for t in tool_log:
-                        if t.get("id") == evt.get("tool_call_id"):
-                            t["summary"] = evt.get("result_preview")
-                            t["cost"] = evt.get("cost_usd")
-                            break
-                elif etype == "final_message":
-                    final_text = evt.get("text") or ""
-                elif etype == "turn_complete":
-                    total_cost = evt.get("total_cost_usd") or 0.0
-                    iterations = evt.get("iterations") or 0
-                payload = json.dumps(evt, default=str)
-                yield f"event: {etype}\ndata: {payload}\n\n"
-        except Exception as e:
-            yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n"
+@router.get("/projects/{project_id}/chat/runs/{run_id}/events")
+async def stream_v2_run_events(
+    project_id: UUID,
+    run_id: UUID,
+    request: Request,
+    cursor: int = Query(0, ge=0),
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    """SSE tail of chat_run_events for a chat_v2 run. Supports cursor
+    replay so a reconnecting client picks up exactly where it left off.
+    Reuses legacy tail_events — chat_v2 writes the same event shape."""
+    _verify_project(project_id, user.user_id, db)
+    # Verify run belongs to project.
+    run = db.query(ChatRun).filter(ChatRun.id == run_id, ChatRun.project_id == project_id).first()
+    if run is None:
+        raise HTTPException(404, "Run not found")
 
-        # Persist the assistant message + tool trace once the turn finishes,
-        # and bump the project's cumulative spend so the header chip + usage
-        # views reflect what this turn cost.
-        try:
-            db.execute(
-                sa_text(
-                    "INSERT INTO chat_messages (id, project_id, role, content, applied_changes, created_at) "
-                    "VALUES (gen_random_uuid(), :pid, 'assistant', :content, CAST(:ac AS jsonb), now())"
-                ),
-                {
-                    "pid": pid,
-                    "content": final_text,
-                    "ac": json.dumps({
-                        "tool_log": tool_log,
-                        "total_cost_usd": total_cost,
-                        "iterations": iterations,
-                    }, default=str),
-                },
-            )
-            # cumulative_spend_cents tracks dollars * 100. total_cost is USD;
-            # round to nearest cent so a $0.30 turn shows as 30 credits.
-            spend_cents = max(0, int(round(float(total_cost) * 100)))
-            if spend_cents > 0:
-                db.execute(
-                    sa_text(
-                        "UPDATE projects "
-                        "SET cumulative_spend_cents = COALESCE(cumulative_spend_cents, 0) + :c "
-                        "WHERE id = :pid"
-                    ),
-                    {"pid": pid, "c": spend_cents},
-                )
-            db.commit()
-        except Exception:
-            log.exception("failed to persist assistant message / spend")
-
-        yield "event: done\ndata: {}\n\n"
+    async def _gen():
+        async for event in legacy_runs.tail_events(
+            run_id, cursor=cursor, is_disconnected=request.is_disconnected
+        ):
+            yield f"data: {json.dumps(event, default=str)}\n\n"
 
     return StreamingResponse(
-        event_stream(),
+        _gen(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -207,6 +172,21 @@ async def post_turn_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.get("/projects/{project_id}/chat/active-run")
+async def get_v2_active_run(
+    project_id: UUID,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> JSONResponse:
+    """If there's an in-flight chat_v2 run on this project, return it so
+    the FE can reattach after a refresh."""
+    _verify_project(project_id, user.user_id, db)
+    run = legacy_runs.get_active_run(db, project_id)
+    if run is None:
+        return JSONResponse({"run": None})
+    return JSONResponse({"run": _run_to_dict(run)})
 
 
 def _resolve_table_uuid(db: Session, project_id: str, id_or_short: str) -> Optional[str]:
