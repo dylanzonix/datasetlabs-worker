@@ -125,6 +125,8 @@ action: {
 
 Prefer deterministic when the row maps cleanly to one tool call. Use cell agent when answer requires search, judgment, or chaining.
 
+**Lock the output format in cell_agent prompts.** The prompt runs against many rows; without an explicit format the model drifts (`true` / `false` / `Yes` / `No` mixed). Say it plainly: *"Output literally `true` or `false`."* / *"Output one of: Likely | Possible | Unclear | No."* / *"Phone in E.164 (e.g. +14155551234), or null."*
+
 # Refinement rules
 
 **Refine only when there's a clear problem:**
@@ -212,13 +214,15 @@ page: 1, per_page: 100
 ## fullenrich_people
 Send bare arrays of strings — the server auto-wraps to FE's {value, exact_match, exclude} shape. Use either friendly or canonical names; both work.
 
+**Filtering precision: lead with titles.** `current_position_titles` is FE's most reliable filter. `current_position_departments` is a coarse, dirty classification (people with non-engineering titles are routinely tagged "engineering"). Use departments only as a loose secondary signal; never on its own when you want precision.
+
 **Input (query_params):**
 ```
-current_position_titles: ["VP Sales", "Head of Engineering"]
+current_position_titles: ["VP Sales", "Head of Engineering"]    # MOST RELIABLE
                                   # (alias: job_titles, titles)
 current_position_seniority_level: ["c_suite", "vp", "director"]
                                   # (alias: seniorities)
-current_position_departments: ["engineering", "sales"]
+current_position_departments: ["engineering", "sales"]          # LOOSE — combine with titles
                                   # (alias: departments)
 person_locations: ["California", "United States"]
 current_company_names: ["Anthropic"]
