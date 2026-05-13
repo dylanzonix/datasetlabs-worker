@@ -55,16 +55,22 @@ Integrations are preferred over open-web when they cover the data — more struc
 
 One source-query per table. Use as many tables as the project naturally needs. Reddit + Quora = two tables. LinkedIn people + GitHub issue-openers = two tables. Don't force a unified table just because.
 
-Default first-fetch size: 100 rows. Fits comfortably across multiple tables.
+Default first-fetch size: 100 rows.
 
-# Column naming
+## Two-step flow — every source, every time
 
-Treat columns as user-facing. Pick the shortest natural name a person would expect on a spreadsheet column header — usually just the thing it holds, not a qualified path through the source.
+1. **`table_create(source, query_params)`** — runs the fetch and stashes the raw rows. Returns a `source_schema_preview` (top fields by frequency + example values + first few rows). **No columns committed yet.** Table is in `pending_mapping` status.
+2. **`column_map_set(table_id, columns)`** — you declare the column set you want. Each entry is `{name, source_field, type}`. Only those columns are kept; the rest of the source data is discarded.
 
-- Prefer `name` over `company_name`, `website` over `company_website`, `email` over `contact_email`, `linkedin` over `linkedin_url`. Strip the redundant `<entity>_` prefix when the entity is the row.
-- Type things properly: URLs → `url`, dates → `date`, true/false → `bool`, numeric → `number`. Avoid leaving everything as `text`.
-- Don't create parallel columns that duplicate source fields. If the source row already has `founders` (an array of objects), surface that directly — don't add a separate `founder_names` enrichment that re-derives the same info from the same row.
-- Flatten nested structure: a `founders: [{name, linkedin}]` source field becomes two columns — `founder_names` and `founder_linkedins` — not one column of stringified JSON.
+Think of step 2 as "pick the columns the user actually wants and rename them to spreadsheet headers." Don't passthrough every raw source field. Don't keep snake_case if the source emits it — rename to clean human form.
+
+## Picking columns
+
+- **Pick for the user, not for the source.** "Find YC SaaS founders" wants ~5 columns: Company, Founder Name, Founder Email, Batch, Website. Not 25 columns of every field the actor emits.
+- **Title Case is fine.** `name: "Founder Email"` is preferred over `founder_email`. FE renders both, but the storage name is what shows in exports.
+- **Type properly.** `url`, `email`, `date`, `number`, `bool`, `enum` — not always `text`.
+- **Flatten nested data with array paths.** `source_field: "founders[].name"` extracts the `name` from each item in the `founders` array → cell value is a list. Same for `founder_info.email` to dive into a sub-object.
+- **One column per concept.** If the source has both `email` and `email_address`, pick one. If you ran an enrichment that overlaps a source field, drop the source field.
 
 # Extending a table
 

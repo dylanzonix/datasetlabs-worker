@@ -91,8 +91,17 @@ async def run_turn(
     model = os.getenv("OPENAI_MODEL", "gpt-5.4")
     effort = os.getenv("CHAT_V2_REASONING_EFFORT", "medium")
 
+    async def _emit_progress(msg: str) -> None:
+        if on_event:
+            await emit({"type": "progress", "text": msg})
+
     ctx = ToolContext(
-        db=db, project_id=project_id, user_id=user_id, run_id=run_id, emit_event=None
+        db=db,
+        project_id=project_id,
+        user_id=user_id,
+        run_id=run_id,
+        emit_progress=_emit_progress,
+        emit_event=None,
     )
 
     system_prompt = build_system_prompt()

@@ -40,8 +40,12 @@ class ToolContext:
     project_id: str
     user_id: str
     run_id: Optional[str]
-    # Emitter for in-band events (approval cards, progress, etc.). Optional —
-    # tools that don't emit can pass None.
+    # Optional async progress emitter: tools that loop / poll (apify
+    # actors, web_harvest) call this with a one-line status string so the
+    # FE shimmer reflects "Fetched 23/100 items…" instead of going dark.
+    # Signature: async (message: str) -> None. None = no-op.
+    emit_progress: Optional[Callable[[str], Awaitable[None]]] = None
+    # Reserved for richer in-band events (approval cards, etc.) — wire on demand.
     emit_event: Optional[Callable[[str, Dict[str, Any]], None]] = None
 
 
@@ -159,25 +163,19 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     if val_err:
         return {"error": val_err}, 0.0
 
-    # Insert table row immediately so the agent has a table_id to reference,
-    # even if the fetch is slow or fails. Assign a short_id (t1, t2, ...)
-    # for LLM-friendly handles.
+    # Insert the table row immediately so the agent has a handle to
+    # reference, even if the fetch is slow or fails. Assign a short_id
+    # (t1, t2, ...) for LLM-friendly references.
     table_id = str(uuid.uuid4())
     short_id = _next_short_id(ctx.db, ctx.project_id)
-    columns_for_db = []
-    if adapter.predictable and adapter.default_columns:
-        columns_for_db = [
-            {"name": c["column_name"], "type": c["type"], "source_field": c["source_field"]}
-            for c in adapter.default_columns
-        ]
 
     ctx.db.execute(
         sa_text(
             """
             INSERT INTO tables (id, project_id, short_id, name, source, query_params, columns,
                                 dedup_key_column, fetch_status, created_at)
-            VALUES (:id, :project_id, :short_id, :name, :source, :query_params, :columns,
-                    :dedup_key_column, :fetch_status, now())
+            VALUES (:id, :project_id, :short_id, :name, :source, :query_params, '[]'::jsonb,
+                    :dedup_key_column, 'fetching', now())
             """
         ),
         {
@@ -187,22 +185,19 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
             "name": name,
             "source": source,
             "query_params": json.dumps(query_params),
-            "columns": json.dumps(columns_for_db),
             "dedup_key_column": adapter.default_dedup_key_column,
-            "fetch_status": "fetching",
         },
     )
     ctx.db.commit()
 
-    # Synchronous first fetch
-    fetch_n = 10 if not adapter.predictable else n
+    # Fetch.
     try:
         if source.startswith("apify_actor:"):
             res = await adapter.fetch(
-                query_params, fetch_n, prior_cursor=None, source_full=source
+                query_params, n, prior_cursor=None, source_full=source
             )
         else:
-            res = await adapter.fetch(query_params, fetch_n, prior_cursor=None)
+            res = await adapter.fetch(query_params, n, prior_cursor=None)
     except Exception as e:
         log.exception("table_create fetch failed: %s", e)
         ctx.db.execute(
@@ -212,26 +207,16 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
         ctx.db.commit()
         return {"error": f"source fetch failed: {e}"}, 0.0
 
-    # Commit rows (predictable) OR stash in pending state (unpredictable)
-    if adapter.predictable:
-        _commit_rows(ctx.db, table_id, res.rows, adapter.default_columns)
-        new_status = "complete" if res.exhausted else "idle"
-    else:
-        # Unpredictable: stash raw rows under a holding key in the table state;
-        # they'll be committed after column_map_set with the agreed mapping.
-        ctx.db.execute(
-            sa_text(
-                "UPDATE tables SET query_params = jsonb_set(query_params::jsonb, '{_pending_rows}', CAST(:pending AS jsonb)) WHERE id=:id"
-            ),
-            {"id": table_id, "pending": json.dumps(res.rows)},
-        )
-        new_status = "pending_mapping"
-
+    # Stash the raw rows on the table — they'll be mapped + committed
+    # when the agent calls column_map_set. Same flow for every source:
+    # the agent picks the column set from the schema preview, no
+    # source-driven dumping.
     ctx.db.execute(
         sa_text(
             """
             UPDATE tables
-            SET fetch_status = :status,
+            SET query_params = jsonb_set(query_params::jsonb, '{_pending_rows}', CAST(:pending AS jsonb)),
+                fetch_status = 'pending_mapping',
                 last_fetch_returned_rows = :rows_n,
                 last_fetch_cost_credits = :cost,
                 last_fetch_at = now(),
@@ -241,37 +226,28 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
         ),
         {
             "id": table_id,
-            "status": new_status,
+            "pending": json.dumps(res.rows),
             "rows_n": len(res.rows),
             "cost": res.cost_credits,
         },
     )
     ctx.db.commit()
 
-    # For predictable: kick off background continuation if more rows to fetch
-    if adapter.predictable and not res.exhausted and len(res.rows) < n:
-        # In a real worker, this would enqueue an async job. For v1, we keep
-        # it synchronous-simple — if the agent asked for n=100 and we got 10,
-        # the agent can just call table_extend on the next turn. Predictable
-        # adapters typically return n on the first call anyway (fast APIs).
-        pass
-
-    result = {
-        "table_id": short_id,  # LLM-friendly handle; resolved to UUID at tool boundaries
+    return {
+        "table_id": short_id,
         "name": name,
         "source": source,
-        "rows_initial": len(res.rows) if adapter.predictable else 0,
-        "fetch_status": new_status,
+        "rows_fetched": len(res.rows),
+        "fetch_status": "pending_mapping",
         "exhausted_first_batch": res.exhausted,
-    }
-    if not adapter.predictable:
-        # Preview for agent to inspect before column_map_set. Old version
-        # surfaced an alphabetized field union which biased the agent toward
-        # leading-underscore meta keys and made it hallucinate column names
-        # that weren't in the rows. New version: frequency-ranked fields
-        # with example values, plus a few full sample rows.
-        result["source_schema_preview"] = _build_schema_preview(res.rows)
-    return result, res.cost_credits * 0.10  # credits -> dollars for cost return
+        "source_schema_preview": _build_schema_preview(res.rows),
+        "next_step": (
+            "Call column_map_set with the columns you want to keep for this table. "
+            "Each entry: {name (human-readable, Title Case OK), source_field (the key in the "
+            "raw row), type (text|number|url|email|date|bool|enum)}. Only the columns you "
+            "list will be kept; the rest is discarded."
+        ),
+    }, res.cost_credits * 0.10
 
 
 def _build_schema_preview(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -663,14 +639,19 @@ def _commit_rows(db: Session, table_id: str, rows: List[Dict[str, Any]], column_
             {"vid": version_id, "pid": str(pid)},
         )
 
-    # Map source_field → column name. Tolerate either {column_name, source_field}
-    # (the adapter default_columns shape) or {name, source_field} (the normalized
-    # shape coming out of column_map_set).
-    field_to_col = {
-        c["source_field"]: (c.get("name") or c.get("column_name"))
+    # column_map entries: [{name, source_field, type}]. source_field can be:
+    #   - a plain key:           "founders"
+    #   - a dotted path:         "founder_info.email"
+    #   - an array map:          "founders[].name"   → list of values
+    # Tolerate the legacy "column_name" key from older adapter default_columns.
+    normalized_map = [
+        {
+            "name": (c.get("name") or c.get("column_name")),
+            "source_field": c["source_field"],
+        }
         for c in column_map
         if c.get("source_field") and (c.get("name") or c.get("column_name"))
-    }
+    ]
 
     next_seq_row = db.execute(
         sa_text(
@@ -681,10 +662,9 @@ def _commit_rows(db: Session, table_id: str, rows: List[Dict[str, Any]], column_
     next_seq = int(next_seq_row or 1)
 
     for r in rows:
-        mapped = {field_to_col.get(k, k): v for k, v in r.items() if k in field_to_col}
-        # For unmapped fields, keep the raw value too — agent can decide later.
-        # Actually no — keep clean by ONLY storing mapped fields. Agent can call
-        # column_map_set to add more.
+        mapped: Dict[str, Any] = {}
+        for c in normalized_map:
+            mapped[c["name"]] = _extract_source_value(r, c["source_field"])
         db.execute(
             sa_text(
                 "INSERT INTO samples (id, project_id, table_id, version_id, seq, row, created_at) "
@@ -695,10 +675,46 @@ def _commit_rows(db: Session, table_id: str, rows: List[Dict[str, Any]], column_
                 "tid": table_id,
                 "vid": str(version_id),
                 "seq": next_seq,
-                "row": json.dumps(mapped),
+                "row": json.dumps(mapped, default=str),
             },
         )
         next_seq += 1
+
+
+def _extract_source_value(row: Dict[str, Any], path: str) -> Any:
+    """Resolve a source_field path against a row.
+
+    Supports plain keys (`name`), dotted paths (`founder.email`), and
+    array fan-out (`founders[].name` → list of names). Returns None if
+    any step is missing.
+    """
+    if not path:
+        return None
+    # Plain key fast path.
+    if "." not in path and "[]" not in path:
+        return row.get(path)
+
+    segments = path.split(".")
+    current: Any = row
+    for seg in segments:
+        if current is None:
+            return None
+        if seg.endswith("[]"):
+            key = seg[:-2]
+            if isinstance(current, dict):
+                current = current.get(key)
+            if not isinstance(current, list):
+                return None
+            # The remaining segments apply to each element. Recurse.
+            remaining = ".".join(segments[segments.index(seg) + 1 :])
+            if not remaining:
+                return current
+            return [_extract_source_value(item, remaining) if isinstance(item, dict) else item for item in current]
+        if isinstance(current, dict):
+            current = current.get(seg)
+        else:
+            return None
+    return current
 
 
 def _apply_filter_count_sample(
