@@ -265,13 +265,69 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
         "exhausted_first_batch": res.exhausted,
     }
     if not adapter.predictable:
-        # Preview for agent to inspect before column_map_set
-        result["source_schema_preview"] = {
-            "fields": res.schema,
-            "first_rows": res.rows[:5],
-            "row_count_pending": len(res.rows),
-        }
+        # Preview for agent to inspect before column_map_set. Old version
+        # surfaced an alphabetized field union which biased the agent toward
+        # leading-underscore meta keys and made it hallucinate column names
+        # that weren't in the rows. New version: frequency-ranked fields
+        # with example values, plus a few full sample rows.
+        result["source_schema_preview"] = _build_schema_preview(res.rows)
     return result, res.cost_credits * 0.10  # credits -> dollars for cost return
+
+
+def _build_schema_preview(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return a frequency-ranked field summary with example values.
+
+    Shape:
+      {
+        row_count_pending: int,
+        fields: [
+          {name, present_in_rows, example_values: [v1, v2, v3]},
+          ...  # ranked by frequency, top 30
+        ],
+        first_rows: [first 3 raw rows],
+      }
+    """
+    from collections import Counter
+    if not rows:
+        return {"row_count_pending": 0, "fields": [], "first_rows": []}
+    freq: Counter = Counter()
+    examples: Dict[str, List[Any]] = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        for k, v in r.items():
+            if v is None or v == "":
+                continue
+            freq[k] += 1
+            if len(examples.setdefault(k, [])) < 3:
+                examples[k].append(_truncate_for_preview(v))
+    ranked = []
+    for name, n in freq.most_common(30):
+        ranked.append({
+            "name": name,
+            "present_in_rows": n,
+            "example_values": examples.get(name, []),
+        })
+    return {
+        "row_count_pending": len(rows),
+        "fields": ranked,
+        "first_rows": [
+            {k: _truncate_for_preview(v) for k, v in r.items()}
+            for r in rows[:3] if isinstance(r, dict)
+        ],
+    }
+
+
+def _truncate_for_preview(v: Any) -> Any:
+    """Compact a value for the schema preview so the agent sees the shape
+    without us blowing context on long bodies."""
+    if isinstance(v, str):
+        return v[:120]
+    if isinstance(v, list):
+        return [_truncate_for_preview(x) for x in v[:3]]
+    if isinstance(v, dict):
+        return {k: _truncate_for_preview(vv) for k, vv in list(v.items())[:5]}
+    return v
 
 
 # ---------------------------------------------------------------------------
@@ -472,16 +528,22 @@ async def table_delete(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
 
 
 async def filter_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
-    # Accept friendly aliases the agent reaches for.
+    # Accept friendly aliases the agent reaches for, plus the nested
+    # {filter: {op, value}} shape it sometimes emits.
     table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
+    nested = args.get("filter")
+    if isinstance(nested, dict):
+        op = nested.get("op") or nested.get("operator") or nested.get("filter_type")
+        value = nested.get("value")
+    else:
+        op = (
+            args.get("op")
+            or args.get("operator")
+            or args.get("filter_type")
+            or args.get("comparison")
+        )
+        value = args.get("value")
     column = args.get("column") or args.get("column_name") or args.get("field")
-    op = (
-        args.get("op")
-        or args.get("operator")
-        or args.get("filter_type")
-        or args.get("comparison")
-    )
-    value = args.get("value")
     if not (table_id and column and op):
         return {
             "error": "filter_set requires table_id, column, op. "

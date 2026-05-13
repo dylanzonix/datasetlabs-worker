@@ -161,7 +161,9 @@ async def post_turn_stream(
         except Exception as e:
             yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n"
 
-        # Persist the assistant message + tool trace once the turn finishes.
+        # Persist the assistant message + tool trace once the turn finishes,
+        # and bump the project's cumulative spend so the header chip + usage
+        # views reflect what this turn cost.
         try:
             db.execute(
                 sa_text(
@@ -178,9 +180,21 @@ async def post_turn_stream(
                     }, default=str),
                 },
             )
+            # cumulative_spend_cents tracks dollars * 100. total_cost is USD;
+            # round to nearest cent so a $0.30 turn shows as 30 credits.
+            spend_cents = max(0, int(round(float(total_cost) * 100)))
+            if spend_cents > 0:
+                db.execute(
+                    sa_text(
+                        "UPDATE projects "
+                        "SET cumulative_spend_cents = COALESCE(cumulative_spend_cents, 0) + :c "
+                        "WHERE id = :pid"
+                    ),
+                    {"pid": pid, "c": spend_cents},
+                )
             db.commit()
         except Exception:
-            log.exception("failed to persist assistant message")
+            log.exception("failed to persist assistant message / spend")
 
         yield "event: done\ndata: {}\n\n"
 
