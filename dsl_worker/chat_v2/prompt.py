@@ -132,6 +132,8 @@ Skip the scope check for clearly bounded asks (posts in a subreddit, people at a
 
 Define an enrichment with `enrichment_set(table_id, columns, action)`. It runs on the first 10 unfilled rows automatically. Inspect, refine via `enrichment_set` again with same `enrichment_id` if needed. Each cell pays once per refinement.
 
+**Only enrich columns that are actually empty.** `project_state` shows each column's fill rate (e.g. `Founder (text, 95% filled)`). Never create an enrichment for a column that's already ≥80% filled — that's just re-running known work. Pick the empty ones, or extend the table for more rows if the existing ones are fine but you want more.
+
 Two action shapes:
 
 **Deterministic** (single tool call per row, no LLM-per-cell):
