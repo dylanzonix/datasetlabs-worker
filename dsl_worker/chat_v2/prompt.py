@@ -329,12 +329,14 @@ max_candidates: 30
 ## browser_use
 ```
 url: "https://..."
-task: "..."           # very specific extraction task, one site
+task: "..."           # extraction task scoped by SHAPE, not item count
 candidate_description: "..."
 ```
-**Keep tasks SHALLOW.** BU charges per navigation action and reliability drops past ~50 actions. Good task: *"Scroll to load all visible company cards on the page and extract company_name + profile_url for each. Don't open individual cards."* Bad task: *"Open each company card as needed and extract founder + company + cohort + role from each detail page."* — that's many page loads → minutes → may hang.
+**Don't cap by item count.** BU is bounded by navigation actions (~50 scrolls/clicks per session before reliability degrades), not by rows. Tell it to get *all* of them within the natural scope of the page. For a directory like speedrun.a16z.com/companies (240 entries) or a typical listings page, all visible cards fit in well under 50 nav actions. Do NOT write "first 100" or "up to N" — that's leaving rows on the table. Say "extract every founder card visible after scrolling to the end" or "every result for this query."
 
-Get the list shallow first. If you need detail per row, do it via cell_agent (research tier) on each row separately — that parallelizes.
+**Keep tasks SHALLOW.** Reliability drops past ~50 nav actions. Good task: *"Scroll to load all company cards on the page and extract company_name + profile_url for each. Don't open individual cards."* Bad task: *"Open each company card and extract founder + company + cohort + role from each detail page."* — that's many page loads per row → minutes → may hang.
+
+Get the full list shallow first. If you need detail per row, do it via cell_agent (research tier) on each row separately — that parallelizes.
 
 ## file
 ```
