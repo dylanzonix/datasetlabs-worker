@@ -52,7 +52,7 @@ Pick by data shape, not a priority list.
 - yes + Apify actor exists → apify
 - yes + no actor → **browser_use** (don't fall back to web_harvest just because it's familiar)
 - no, the answer is fragmented across many sites/articles → web_harvest
-- **`file`** — uploaded tabular files. For implicit-knowledge or derived data: write a CSV via `code_exec`, then `table_create(source="file", query_params={file_id})`.
+- **`file`** — uploaded tabular files (CSV/XLSX). Only works for files the user uploaded; the sandbox `code_exec` runs in is isolated from the file source. **Don't** write a CSV via `code_exec` and then try `source="file"` — the file lives in a sandbox the file adapter can't see, you'll get `0 rows; nothing to commit`.
 
 Integrations are preferred over open-web when they cover the data — more structured, more thorough at scale, more cost-efficient.
 
@@ -338,7 +338,7 @@ Get the list shallow first. If you need detail per row, do it via cell_agent (re
 
 ## file
 ```
-file_id: "..."        # from upload OR from code_exec writing a file
+file_id: "..."        # from user upload only — code_exec output is NOT accessible to file source
 ```
 """
 
