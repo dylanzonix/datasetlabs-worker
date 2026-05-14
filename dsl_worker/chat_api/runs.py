@@ -933,17 +933,15 @@ def recover_orphan_runs() -> int:
     """
     from sqlalchemy import text as sa_text
 
-    # Staleness threshold: how long since the last event before we
-    # consider the worker dead. Must comfortably exceed the longest
-    # legitimate gap between events in a healthy run. browser_use
-    # routinely runs 90-150s without emitting intermediate events
-    # (it streams its own state but only writes to chat_run_events
-    # at the boundaries); heavy reasoning rounds + Apify polling can
-    # add to that. 10 min is generous on purpose — false-positive
-    # cost (killing a live run) >> false-negative cost (slow visibility
-    # of a truly dead run).
-    STALE_THRESHOLD = "10 minutes"
-    # Minimum run age: don't even consider a run brand-new (5 min).
+    # Staleness threshold: chat_v2 emits a heartbeat event every 30s
+    # while the run is alive (see chat_v2.runs._heartbeat_loop). A
+    # missed-heartbeat window of 30 minutes is FAR longer than any
+    # legitimate gap — if we don't see ANY event for half an hour
+    # we can be confident the worker actually died. The sweeper exists
+    # to clean up zombies, NOT to police long-running tasks; killing
+    # a live run is much worse than slow visibility on a dead one.
+    STALE_THRESHOLD = "30 minutes"
+    # Minimum run age: don't even consider a run brand-new.
     MIN_AGE = "5 minutes"
 
     db = SessionLocal()
@@ -959,7 +957,7 @@ def recover_orphan_runs() -> int:
         cas_sql = sa_text("""
             UPDATE chat_runs
             SET status = 'failed',
-                error = 'Worker process restarted; run was orphaned (no heartbeat).',
+                error = 'Worker process appears dead — no heartbeat in 30+ minutes.',
                 completed_at = now(),
                 current_phase = NULL
             WHERE status IN ('queued', 'running', 'pause_requested')

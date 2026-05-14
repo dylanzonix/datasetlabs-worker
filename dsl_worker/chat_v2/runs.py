@@ -205,11 +205,43 @@ async def _run_chat_v2_task(
             finally:
                 db.close()
 
+            heartbeat = asyncio.create_task(
+                _heartbeat_loop(run_id),
+                name=f"chat-v2-heartbeat-{run_id}",
+            )
             try:
                 await _drive_agent(run_id, user_id, project_id, user_content)
             except Exception as e:
                 log.exception("v2 run %s crashed", run_id)
                 legacy_runs._mark_run_failed(run_id, str(e)[:500])
+            finally:
+                heartbeat.cancel()
+                try:
+                    await heartbeat
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+
+async def _heartbeat_loop(run_id: UUID) -> None:
+    """Emit a heartbeat event every 30s so the staleness sweeper never
+    false-positives an actively-running task. Cancelled by the caller
+    when the run finishes — until then, this is the proof of life."""
+    while True:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            return
+        db = SessionLocal()
+        try:
+            run = db.query(ChatRun).filter(ChatRun.id == run_id).first()
+            if run is None or run.status in RUN_TERMINAL_STATUSES:
+                return
+            legacy_runs.emit_event(db, run, "heartbeat", {})
+            db.commit()
+        except Exception:
+            log.debug("heartbeat emit failed; continuing", exc_info=True)
+        finally:
+            db.close()
 
 
 async def _drive_agent(
