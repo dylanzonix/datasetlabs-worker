@@ -63,7 +63,35 @@ def build_project_state(db: Session, project_id: str, max_tables: int = 10) -> s
 
         cols = json.loads(columns) if isinstance(columns, str) else (columns or [])
         if cols:
-            col_summary = ", ".join(f"{c['name']} ({c['type']})" for c in cols[:12])
+            # Per-column fill rate so the agent knows which columns are
+            # actually empty vs already populated. Caps at 500 rows scanned.
+            fill_rates: Dict[str, int] = {}
+            if row_count > 0:
+                row_iter = db.execute(
+                    sa_text(
+                        "SELECT row FROM samples WHERE table_id=:tid AND deleted_at IS NULL LIMIT 500"
+                    ),
+                    {"tid": tid},
+                ).fetchall()
+                sample_n = len(row_iter)
+                for c in cols:
+                    cname = c.get("name")
+                    if not cname:
+                        continue
+                    filled = sum(
+                        1 for (r,) in row_iter
+                        if isinstance(r, dict) and r.get(cname) not in (None, "", [], {})
+                    )
+                    if sample_n > 0:
+                        fill_rates[cname] = int(round(100 * filled / sample_n))
+
+            def _col_label(c: Dict[str, Any]) -> str:
+                pct = fill_rates.get(c["name"])
+                if pct is None:
+                    return f"{c['name']} ({c['type']})"
+                return f"{c['name']} ({c['type']}, {pct}% filled)"
+
+            col_summary = ", ".join(_col_label(c) for c in cols[:12])
             if len(cols) > 12:
                 col_summary += f", +{len(cols) - 12} more"
             parts.append(f"      Columns: {col_summary}")
