@@ -264,7 +264,8 @@ async def _run_enrichment_on_rows(
         *[run_one(sid, rd) for sid, rd in rows], return_exceptions=True
     )
 
-    # Apply outputs back to samples.row
+    # Apply outputs back to samples.row. Commit per row so partial progress
+    # survives a crash / cancel mid-enrichment.
     for (sample_id, original_row), result in zip(rows, results):
         if isinstance(result, Exception):
             log.warning("cell op raised: %s", result)
@@ -273,12 +274,6 @@ async def _run_enrichment_on_rows(
         total_cost += cost
         if not new_fields:
             continue
-        # Defensive: psycopg2 occasionally returns a JSONB column as a
-        # JSON string instead of a dict (postgres adapter quirk on
-        # certain Python versions / connection states). And new_fields
-        # ought to be a dict but some cell-agent paths have returned a
-        # bare string. Coerce both so a single misbehaving row doesn't
-        # crash the whole batch.
         if isinstance(original_row, str):
             try:
                 original_row = json.loads(original_row)
@@ -290,13 +285,17 @@ async def _run_enrichment_on_rows(
             log.warning("cell op returned non-dict new_fields: %r", new_fields)
             continue
         merged = {**original_row, **new_fields}
-        ctx.db.execute(
-            sa_text("UPDATE samples SET row=CAST(:row AS jsonb) WHERE id=:sid"),
-            {"row": json.dumps(merged), "sid": sample_id},
-        )
-        filled_count += 1
+        try:
+            ctx.db.execute(
+                sa_text("UPDATE samples SET row=CAST(:row AS jsonb) WHERE id=:sid"),
+                {"row": json.dumps(merged), "sid": sample_id},
+            )
+            ctx.db.commit()
+            filled_count += 1
+        except Exception as e:
+            log.warning("enrichment row commit failed for %s: %s", sample_id, e)
+            ctx.db.rollback()
 
-    ctx.db.commit()
     return filled_count, total_cost
 
 
