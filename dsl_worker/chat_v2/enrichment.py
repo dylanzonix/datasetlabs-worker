@@ -250,51 +250,75 @@ async def _run_enrichment_on_rows(
     # Concurrency cap for parallel cell ops
     sem = asyncio.Semaphore(4)
 
-    async def run_one(sample_id: str, row_data: Dict[str, Any]) -> Tuple[Dict[str, Any], float]:
+    async def run_one(sample_id: str, row_data: Dict[str, Any]):
         async with sem:
-            return await _execute_action(
+            new_fields, cost = await _execute_action(
                 action, row_data, per_row_cap, columns, ctx,
                 enrichment_id=enrichment_id, sample_id=sample_id,
             )
+        return sample_id, row_data, new_fields, cost
 
     if not rows:
         return 0, 0.0
 
-    results = await asyncio.gather(
-        *[run_one(sid, rd) for sid, rd in rows], return_exceptions=True
-    )
+    tasks = [asyncio.create_task(run_one(sid, rd)) for sid, rd in rows]
+    total = len(tasks)
+    completed = 0
 
-    # Apply outputs back to samples.row. Commit per row so partial progress
-    # survives a crash / cancel mid-enrichment.
-    for (sample_id, original_row), result in zip(rows, results):
-        if isinstance(result, Exception):
-            log.warning("cell op raised: %s", result)
-            continue
-        new_fields, cost = result
-        total_cost += cost
-        if not new_fields:
-            continue
-        if isinstance(original_row, str):
-            try:
-                original_row = json.loads(original_row)
-            except Exception:
-                original_row = {}
-        if not isinstance(original_row, dict):
-            original_row = {}
-        if not isinstance(new_fields, dict):
-            log.warning("cell op returned non-dict new_fields: %r", new_fields)
-            continue
-        merged = {**original_row, **new_fields}
+    # Each cell commits + emits an event as soon as it finishes. Keeps the
+    # heartbeat fresh (chat_run staleness sweeper triggers at 10 min idle)
+    # and means partial progress survives a worker restart.
+    for fut in asyncio.as_completed(tasks):
         try:
-            ctx.db.execute(
-                sa_text("UPDATE samples SET row=CAST(:row AS jsonb) WHERE id=:sid"),
-                {"row": json.dumps(merged), "sid": sample_id},
-            )
-            ctx.db.commit()
-            filled_count += 1
+            sample_id, original_row, new_fields, cost = await fut
         except Exception as e:
-            log.warning("enrichment row commit failed for %s: %s", sample_id, e)
-            ctx.db.rollback()
+            log.warning("cell op raised: %s", e)
+            completed += 1
+            continue
+
+        total_cost += cost
+        completed += 1
+
+        if new_fields:
+            if isinstance(original_row, str):
+                try:
+                    original_row = json.loads(original_row)
+                except Exception:
+                    original_row = {}
+            if not isinstance(original_row, dict):
+                original_row = {}
+            if isinstance(new_fields, dict):
+                merged = {**original_row, **new_fields}
+                try:
+                    ctx.db.execute(
+                        sa_text("UPDATE samples SET row=CAST(:row AS jsonb) WHERE id=:sid"),
+                        {"row": json.dumps(merged), "sid": sample_id},
+                    )
+                    ctx.db.commit()
+                    filled_count += 1
+                except Exception as e:
+                    log.warning("enrichment row commit failed for %s: %s", sample_id, e)
+                    ctx.db.rollback()
+            else:
+                log.warning("cell op returned non-dict new_fields: %r", new_fields)
+
+        # Heartbeat: every cell completion writes a chat_run_event so the
+        # staleness sweeper (10-min idle) doesn't reap us mid-enrichment.
+        run_id = getattr(ctx, "run_id", None)
+        if run_id:
+            try:
+                from dsl_worker.chat_api import runs as legacy_runs
+                from dsl_api.models import ChatRun
+                run_obj = ctx.db.query(ChatRun).filter(ChatRun.id == run_id).first()
+                if run_obj is not None:
+                    legacy_runs.emit_event(ctx.db, run_obj, "cell_filled", {
+                        "enrichment_id": enrichment_id,
+                        "sample_id": sample_id,
+                        "completed": completed,
+                        "total": total,
+                    })
+            except Exception:
+                log.debug("cell_filled emit failed; continuing", exc_info=True)
 
     return filled_count, total_cost
 
