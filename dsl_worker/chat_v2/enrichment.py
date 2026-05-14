@@ -250,18 +250,19 @@ async def _run_enrichment_on_rows(
     # Concurrency cap for parallel cell ops
     sem = asyncio.Semaphore(4)
 
-    async def run_one(sample_id: str, row_data: Dict[str, Any]):
+    async def run_one(sample_id: str, row_data: Dict[str, Any], raw_row: Dict[str, Any]):
         async with sem:
             new_fields, cost = await _execute_action(
                 action, row_data, per_row_cap, columns, ctx,
                 enrichment_id=enrichment_id, sample_id=sample_id,
+                raw_row=raw_row,
             )
         return sample_id, row_data, new_fields, cost
 
     if not rows:
         return 0, 0.0
 
-    tasks = [asyncio.create_task(run_one(sid, rd)) for sid, rd in rows]
+    tasks = [asyncio.create_task(run_one(sid, rd, raw)) for sid, rd, raw in rows]
     total = len(tasks)
     completed = 0
 
@@ -329,9 +330,13 @@ def _resolve_scope_rows(
     scope: Dict[str, Any],
     enrichment_columns: List[Dict[str, str]],
     overwrite: bool,
-) -> List[Tuple[str, Dict[str, Any]]]:
-    """Return [(sample_id, row_dict), ...] matching the scope."""
-    base_sql = "SELECT id::text, row FROM samples WHERE table_id=:tid AND deleted_at IS NULL"
+) -> List[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
+    """Return [(sample_id, row_dict, raw_row_dict), ...] matching the scope.
+
+    raw_row is the unmapped source payload — cell agent sees both so it
+    has the same context the orchestrator had at column_map_set time.
+    """
+    base_sql = "SELECT id::text, row, raw_row FROM samples WHERE table_id=:tid AND deleted_at IS NULL"
     params: Dict[str, Any] = {"tid": table_id}
     scope_type = scope.get("type", "all_unfilled")
 
@@ -358,16 +363,18 @@ def _resolve_scope_rows(
     # Filter to unfilled (unless overwrite) — a row is "unfilled" if any of the
     # enrichment's target columns has no value.
     target_cols = [c["name"] for c in enrichment_columns]
-    out: List[Tuple[str, Dict[str, Any]]] = []
-    for sid, row_data in rows:
+    out: List[Tuple[str, Dict[str, Any], Dict[str, Any]]] = []
+    for sid, row_data, raw_row in rows:
         if not isinstance(row_data, dict):
             row_data = {}
+        if not isinstance(raw_row, dict):
+            raw_row = {}
         if overwrite:
-            out.append((sid, row_data))
+            out.append((sid, row_data, raw_row))
         else:
             any_unfilled = any(not row_data.get(c) for c in target_cols)
             if any_unfilled:
-                out.append((sid, row_data))
+                out.append((sid, row_data, raw_row))
     return out
 
 
@@ -380,6 +387,7 @@ async def _execute_action(
     *,
     enrichment_id: Optional[str] = None,
     sample_id: Optional[str] = None,
+    raw_row: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], float]:
     """Run one enrichment action against one row. Returns (new_fields_dict, cost_credits)."""
     action_type = action.get("type")
@@ -390,6 +398,7 @@ async def _execute_action(
         return await run_cell_agent(
             action, row_data, per_row_cap, columns, ctx,
             enrichment_id=enrichment_id, sample_id=sample_id,
+            raw_row=raw_row,
         )
     return {}, 0.0
 

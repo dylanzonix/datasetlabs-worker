@@ -298,8 +298,13 @@ CELL_TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any], ToolContext], Awaitable[
 
 CELL_SYSTEM_PROMPT_BASE = """You are a cell agent: fill specific columns for ONE row of a table.
 
-Inputs you'll receive:
-  - current_row: the row's already-filled fields
+Inputs you'll receive (JSON):
+  - row_visible_to_user: the row's already-filled fields as shown in the user's table
+  - row_hidden_source_fields (optional): fields the source returned but the
+    orchestrator didn't surface as columns. Use these as additional context
+    when reasoning, but never invent. If a column you need is hiding here,
+    return its value via final_result for the columns_to_fill — the visible
+    row will be updated. You cannot create new columns; only the orchestrator can.
   - columns_to_fill: column names you must produce values for
   - instruction: what to find or compute
   - budget_credits_remaining: when this nears zero, stop and emit final_result
@@ -310,6 +315,9 @@ Rules:
   - Don't fabricate. If nothing was found, return null.
   - Output format obeys the instruction exactly (e.g. literal `true`/`false`,
     one of an enum). Don't invent variants like "Yes"/"True"/"yes".
+  - For URL-typed columns: only commit a URL you actually visited and verified.
+    Don't construct URLs from name slugs or guess identifiers; if you didn't
+    open and read the page, return null.
 """
 
 
@@ -317,6 +325,15 @@ CELL_SYSTEM_PROMPT_CLASSIFY = """You are a cell agent for CLASSIFICATION / SCORI
 
 Your job: read text already present in the row and emit a label or score.
 You have NO external tools — call `final_result` directly with your answer.
+
+Inputs (JSON):
+  - row_visible_to_user: shown fields
+  - row_hidden_source_fields (optional): unmapped source fields you can also read
+  - columns_to_fill, instruction, budget_credits_remaining
+
+Use ALL the text available (visible + hidden) when judging. The user's mapped
+columns are often a subset and may have truncated values; the hidden fields
+usually carry the full source content.
 
 Output format obeys the instruction exactly. Don't invent variants.
 e.g. if asked for true/false, emit literal `true` or `false`, not "Yes"/"True".
@@ -438,6 +455,7 @@ async def run_cell_agent(
     *,
     enrichment_id: Optional[str] = None,
     sample_id: Optional[str] = None,
+    raw_row: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], float]:
     """Per-row Responses-API loop with tier-based model + reasoning routing.
 
@@ -455,12 +473,32 @@ async def run_cell_agent(
         else CELL_SYSTEM_PROMPT_BASE
     )
 
-    user_payload = {
-        "current_row": row_data,
+    # Build a hidden-fields view: source data that isn't currently shown
+    # as a visible column. The cell agent gets to see everything the
+    # source returned, with a clear marker of what's visible-to-user vs
+    # hidden-but-available.
+    hidden_fields: Dict[str, Any] = {}
+    if isinstance(raw_row, dict):
+        visible_keys = set(row_data.keys()) if isinstance(row_data, dict) else set()
+        for k, v in raw_row.items():
+            if k not in visible_keys:
+                hidden_fields[k] = v
+
+    user_payload: Dict[str, Any] = {
+        "row_visible_to_user": row_data,
         "columns_to_fill": columns_to_fill,
         "instruction": prompt,
         "budget_credits_remaining": tier_cfg["cap"],
     }
+    if hidden_fields:
+        user_payload["row_hidden_source_fields"] = hidden_fields
+        user_payload["note"] = (
+            "row_visible_to_user is what's shown in the user's table. "
+            "row_hidden_source_fields are extra fields the source returned "
+            "that aren't currently mapped to a column — you can read these "
+            "as additional context for reasoning, but you can't return them "
+            "as values without the orchestrator adding columns."
+        )
 
     input_items: List[Dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
