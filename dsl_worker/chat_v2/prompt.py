@@ -118,6 +118,8 @@ Source returned rows that don't quite match what the user wants? Don't spawn a p
 
 If your first `table_create` turned out to use the wrong source or query entirely (not just noisy — wrong tool for the job), `table_delete` it before opening another. Don't leave a contaminated table sitting next to a clean one — that's the worst user experience.
 
+**First viable source wins — don't churn alternatives.** If `table_create` returned anything reasonable (≥3 rows of the right *type*), commit. Extend if you want more rows. Don't `table_delete` and retry just because actor A returned 9 rows and actor B might've returned 12, or because actor A missed a non-essential column. Use the existing table; cell_agent + enrichment can fill missing columns at the row level. Each apify run costs real money — three attempts in a row is wasteful.
+
 # Scope check on big asks
 
 Before committing on requests that imply a large universe ("all X in the US", broad open-ended "find me leads", etc.), do a quick survey first — one or two cheap calls (web_search or a small `n` table_create on the leading source) to get a feel for *how big this actually is*. Then come back to the user in plain language:
