@@ -369,7 +369,15 @@ async def bu_extract_rows(
     if candidate_description:
         parts.append(f"Each item should look like: {candidate_description}")
     composed_task = " ".join(parts)
-    client = BUClient()
+    import os
+    api_key = os.getenv("BROWSER_USE_API_KEY")
+    if not api_key:
+        logger.warning("BROWSER_USE_API_KEY not set — bu_extract_rows returning empty")
+        return [], 0.0
+    client = BUClient(
+        api_key=api_key,
+        proxy_country=os.getenv("BROWSER_USE_PROXY_COUNTRY", "us"),
+    )
     try:
         items, cost, _sid, _summary = await client.extract(composed_task)
         return list(items or []), float(cost or 0.0)

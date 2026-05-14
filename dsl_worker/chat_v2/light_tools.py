@@ -203,15 +203,26 @@ async def code_exec(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, A
     except ImportError:
         return {"error": "sandbox_service not available"}, 0.0
 
-    sandbox = SandboxClient(os.getenv("SANDBOX_SERVICE_URL", ""))
+    url = os.getenv("SANDBOX_SERVICE_URL", "")
+    if not url:
+        return {"error": "SANDBOX_SERVICE_URL not configured"}, 0.0
     try:
-        result = await sandbox.exec_python(code, files=files)
-        return {
-            "ok": result.get("ok", False),
-            "stdout": (result.get("stdout") or "")[:8000],
-            "stderr": (result.get("stderr") or "")[:2000],
-            "duration_ms": result.get("duration_ms"),
-        }, 0.0
+        async with SandboxClient(url, timeout=90) as pool:
+            session = await pool.create_session()
+            for fn in files:
+                try:
+                    from dsl_worker.infra import candidates
+                    blob_bytes = candidates.read_candidates_bytes(ctx.project_id, fn)
+                    await session.upload_content(blob_bytes, fn)
+                except Exception as e:
+                    log.warning("code_exec file upload %s failed: %s", fn, e)
+            result = await session.exec_python(code, timeout=60)
+            return {
+                "ok": bool(getattr(result, "success", False)),
+                "stdout": (getattr(result, "stdout", "") or "")[:8000],
+                "stderr": (getattr(result, "stderr", "") or "")[:2000],
+                "exit_code": getattr(result, "exit_code", None),
+            }, 0.0
     except Exception as e:
         log.exception("code_exec failed: %s", e)
         return {"error": str(e)[:300]}, 0.0

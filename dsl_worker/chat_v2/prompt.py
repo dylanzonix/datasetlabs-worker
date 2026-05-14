@@ -143,13 +143,28 @@ action: {
 ```
 action: {
   type: "cell_agent",
+  tier: "classify" | "lookup" | "research",
   prompt: "Find this person's Twitter URL via search; return null if they don't have one.",
   columns_to_fill: ["twitter_url"],
-  per_row_credit_cap: 5
+  per_row_credit_cap: 5  // optional — defaults from tier
 }
 ```
 
 Prefer deterministic when the row maps cleanly to one tool call. Use cell agent when answer requires search, judgment, or chaining.
+
+**Pick the right tier — this controls the model + budget per row:**
+
+- `classify` → tiny model (nano), reasoning minimal, NO external tools. ~0.3-0.5 credits/row.
+  Use when the answer comes purely from text already in the row.
+  Examples: "is this post complaining about Clay (true/false)", "apartment or house", "positive / neutral / negative sentiment of bio", "score this listing 1-5 on relevance".
+- `lookup` → mini model, full tools, ~3 credits/row. **Default.**
+  Use for well-defined "call a tool to find X" tasks. The agent knows which tool, the row has clear identifiers.
+  Examples: "find verified email" (FE), "get current_technologies for this domain" (Apollo), "phone number from Google Place" (gmaps).
+- `research` → smart model (gpt-5.5), full tools + web_search, reasoning medium, ~10 credits/row.
+  Use ONLY when the answer requires actual research / chaining / judgment.
+  Examples: "is this company actively hiring engineering leadership and what's the role URL", "find this founder's Twitter handle (try website → about page → linkedin → search)".
+
+**If you're unsure, lookup is fine.** Don't over-spend on research for things mini can handle.
 
 **Lock the output format in cell_agent prompts.** The prompt runs against many rows; without an explicit format the model drifts (`true` / `false` / `Yes` / `No` mixed). Say it plainly: *"Output literally `true` or `false`."* / *"Output one of: Likely | Possible | Unclear | No."* / *"Phone in E.164 (e.g. +14155551234), or null."*
 
