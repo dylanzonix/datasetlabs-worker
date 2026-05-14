@@ -568,7 +568,6 @@ async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
 
     return {
         "rows_added": len(res.rows),
-        "exhausted": res.exhausted,
     }, res.cost_credits * 0.10
 
 
