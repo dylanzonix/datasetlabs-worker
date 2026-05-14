@@ -330,7 +330,9 @@ url: "https://..."
 task: "..."           # very specific extraction task, one site
 candidate_description: "..."
 ```
-No item cap — bound by task scope. ~50 navigation actions per session before reliability degrades.
+**Keep tasks SHALLOW.** BU charges per navigation action and reliability drops past ~50 actions. Good task: *"Scroll to load all visible company cards on the page and extract company_name + profile_url for each. Don't open individual cards."* Bad task: *"Open each company card as needed and extract founder + company + cohort + role from each detail page."* — that's many page loads → minutes → may hang.
+
+Get the list shallow first. If you need detail per row, do it via cell_agent (research tier) on each row separately — that parallelizes.
 
 ## file
 ```
