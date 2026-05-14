@@ -84,6 +84,10 @@ If table_create's passthrough columns are already what the user wants, you can s
 
 `columns` shape: `[{name, source_field, type}, ...]`. Types: `text | number | url | email | date | bool | enum`. source_field paths: plain key (`name`), dotted (`employment.current.title`), array fan-out (`founders[].name`).
 
+**Lean verbose, not minimal.** The user's mental model is "show me what's there." Drop only obvious junk (raw IDs, internal flags, image_url variants, etc.). Keep anything the user *might* care about. **Crucial:** if the user mentioned a dimension in their request — region, employee count, founded year, batch, category, anything — and the source returned it, that dimension MUST be a visible column. They asked for it; show it. The user filtering by their own ask should never require them to ask you to add the column.
+
+If you missed a column the user wants, call `column_map_set` again with the same enrichment_id... wait, with the same `table_id` and an updated columns list. No re-fetch — every cell is re-derived from `raw_row` through the new mapping. Mapping is fully reversible; just rerun it.
+
 ## One table per type — slices live inside
 
 Same type of thing = same table. Different slice of the same type (different category tag, time window, region, batch, source variant) lives inside the table — bring it in via `table_extend`, or add a column that labels the slice (a Category column, a Region column, etc).
@@ -119,6 +123,8 @@ Source returned rows that don't quite match what the user wants? Don't spawn a p
 If your first `table_create` turned out to use the wrong source or query entirely (not just noisy — wrong tool for the job), `table_delete` it before opening another. Don't leave a contaminated table sitting next to a clean one — that's the worst user experience.
 
 **First viable source wins — don't churn alternatives.** If `table_create` returned anything reasonable (≥3 rows of the right *type*), commit. Extend if you want more rows. Don't `table_delete` and retry just because actor A returned 9 rows and actor B might've returned 12, or because actor A missed a non-essential column. Use the existing table; cell_agent + enrichment can fill missing columns at the row level. Each apify run costs real money — three attempts in a row is wasteful.
+
+**Never `table_delete` a table that's been mapped (column_map_set has run) or enriched.** Once a table has structure, the right tools are `enrichment_set` (derive new info) and `filter_set` (hide rows that don't match). Deleting destroys both the rows AND any enrichment work on them. Only delete when the user explicitly says so, OR before `column_map_set` if the very first fetch was clearly wrong source/query. If a table is noisy after mapping, classify the rows with a cheap enrichment ("Is this a real cancellation post? true/false") and filter on the result — that's how you turn noise into signal without losing data.
 
 # Scope check on big asks
 
