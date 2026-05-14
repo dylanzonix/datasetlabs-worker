@@ -346,3 +346,32 @@ class BUClient:
             await self._client.close()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Module-level wrapper for chat_v2 source adapter
+# ---------------------------------------------------------------------------
+
+
+async def bu_extract_rows(
+    url: str,
+    task: str,
+    candidate_description: str = "",
+) -> Tuple[List[Dict[str, Any]], float]:
+    """Convenience wrapper used by `sources_v2/browser_use.py`.
+
+    BU's native `extract` takes one composite task; this folds the
+    starting URL and a candidate-description into the task so the
+    caller only thinks about (url, task, candidate_description).
+    Returns (rows, cost_usd).
+    """
+    parts = [f"Navigate to {url}.", task.strip()]
+    if candidate_description:
+        parts.append(f"Each item should look like: {candidate_description}")
+    composed_task = " ".join(parts)
+    client = BUClient()
+    try:
+        items, cost, _sid, _summary = await client.extract(composed_task)
+        return list(items or []), float(cost or 0.0)
+    finally:
+        await client.close()
