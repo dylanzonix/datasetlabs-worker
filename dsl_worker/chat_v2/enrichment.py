@@ -270,6 +270,22 @@ async def _run_enrichment_on_rows(
         total_cost += cost
         if not new_fields:
             continue
+        # Defensive: psycopg2 occasionally returns a JSONB column as a
+        # JSON string instead of a dict (postgres adapter quirk on
+        # certain Python versions / connection states). And new_fields
+        # ought to be a dict but some cell-agent paths have returned a
+        # bare string. Coerce both so a single misbehaving row doesn't
+        # crash the whole batch.
+        if isinstance(original_row, str):
+            try:
+                original_row = json.loads(original_row)
+            except Exception:
+                original_row = {}
+        if not isinstance(original_row, dict):
+            original_row = {}
+        if not isinstance(new_fields, dict):
+            log.warning("cell op returned non-dict new_fields: %r", new_fields)
+            continue
         merged = {**original_row, **new_fields}
         ctx.db.execute(
             sa_text("UPDATE samples SET row=CAST(:row AS jsonb) WHERE id=:sid"),

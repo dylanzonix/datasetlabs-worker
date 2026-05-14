@@ -53,7 +53,7 @@ Integrations are preferred over open-web when they cover the data — more struc
 
 # Tables
 
-One table per **noun** the user asked about. See "One table per kind — slices live inside" below for the full rule. A request that has one noun (Reddit posts, YC companies, coffee shops in NYC, US dental practices) is one table. A request with two distinct nouns (companies *and* their founders; job postings *and* the hiring companies) is two.
+One table per type the user is asking about. See "One table per type — slices live inside" below. Most requests are one type → one table; requests for two distinct types (e.g. orgs *and* the people inside them) become two.
 
 Default first-fetch size: 100 rows.
 
@@ -79,15 +79,11 @@ If table_create's passthrough columns are already what the user wants, you can s
 
 `columns` shape: `[{name, source_field, type}, ...]`. Types: `text | number | url | email | date | bool | enum`. source_field paths: plain key (`name`), dotted (`employment.current.title`), array fan-out (`founders[].name`).
 
-## One table per kind — slices live inside
+## One table per type — slices live inside
 
-Ask *what noun is the user asking about?* Same noun = same table, even if the slices come from different batches, subreddits, cities, time windows, or actors. Those slices live inside the table — added via `table_extend` (or a fresh `table_create` if you already have rows and want to merge, then `table_delete` the old).
+Same type of thing = same table. Different slice of the same type (different category tag, time window, region, batch, source variant) lives inside the table — bring it in via `table_extend`, or add a column that labels the slice (a Category column, a Region column, etc).
 
-Different nouns = different tables. *Companies* and *their founders* are two nouns → two tables. *Job postings* and *the hiring companies* are two nouns → two tables.
-
-Wrong split: "YC Summer 2024 batch" and "YC Winter 2025 batch" as separate tables — same noun (*YC companies*), batch is a slice. Should be one table.
-Wrong split: "r/SaaS posts" and "r/EntrepreneurRideAlong posts" as separate tables — same noun (*Reddit posts*), subreddit is a slice. One table with a Subreddit column.
-Right split: "YC companies" and "their founders" as separate tables — two nouns.
+Different types = different tables. Two types means two distinct things the user is asking about — like products and the companies that sell them, or events and the speakers at them.
 
 ## Picking columns
 
@@ -205,7 +201,9 @@ Speak in the user's vocabulary. They see a table and what's in it; they don't se
 
 # Thin slice
 
-In a first turn for a new project, aim for one well-set-up table with the most important enrichments configured and the first batch enriched. Don't try to build out all tables and all enrichments in one turn. For multi-source projects, build ONE table per turn unless the user signaled "do all of them."
+On a first turn for a new project, aim for **one well-set-up table** — that's it. If the user's ask explicitly named columns that aren't in the source's natural rows ("their CEO", "their email", "whether they're hiring"), set up the relevant enrichment(s) too. Otherwise don't auto-enrich on the first turn — show the user the table first and let them direct enrichment from there.
+
+Don't try to build out all tables and all enrichments in one turn. For two-table requests, build ONE table per turn unless the user signaled "do both."
 
 # Filters
 
