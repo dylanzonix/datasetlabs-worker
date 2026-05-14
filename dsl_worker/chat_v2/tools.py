@@ -495,6 +495,14 @@ def _truncate_for_preview(v: Any) -> Any:
 
 
 async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
+    """Fetch more rows into an existing table.
+
+    The LLM constructs the full query_params for each call — including any
+    pagination fields (offset, page, etc.) the source requires. The server
+    does NOT track cursors or merge with prior params; the most recent
+    query_params is stored on the table purely as a historical record the
+    LLM can reference via project_state when deciding the next query.
+    """
     table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
     new_query_params = args.get("query_params") or {}
     n = int(args.get("n") or 100)
@@ -503,39 +511,23 @@ async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
         return {"error": "table_id is required"}, 0.0
 
     row = ctx.db.execute(
-        sa_text("SELECT source, query_params, columns FROM tables WHERE id=:id AND deleted_at IS NULL"),
+        sa_text("SELECT source, columns FROM tables WHERE id=:id AND deleted_at IS NULL"),
         {"id": table_id},
     ).fetchone()
     if not row:
         return {"error": f"table {table_id} not found"}, 0.0
-    source, base_params, columns = row[0], row[1], row[2]
+    source, columns = row[0], row[1]
 
     adapter = get_adapter(source)
-    # Strip internal state keys ( _cursor, _pending_rows, ...) before
-    # merging into the user-facing params. They live ON the table for
-    # the adapter to inspect via `prior_cursor`, not as fetch params.
-    # (Project 9aa596b2: leaving _cursor in poisoned every subsequent
-    # extend with "unknown google_maps params: ['_cursor']".)
-    if isinstance(base_params, str):
-        base_params = json.loads(base_params)
-    user_base = {k: v for k, v in (base_params or {}).items() if not k.startswith("_")}
-    merged = {**user_base, **(new_query_params or {})}
-    val_err = adapter.validate_query_params(merged)
+    val_err = adapter.validate_query_params(new_query_params)
     if val_err:
         return {"error": val_err}, 0.0
 
-    # Read prior cursor from table state if any
-    cursor_row = ctx.db.execute(
-        sa_text("SELECT (query_params::jsonb)->'_cursor' AS cursor FROM tables WHERE id=:id"),
-        {"id": table_id},
-    ).fetchone()
-    prior_cursor = cursor_row[0] if cursor_row else None
-
     try:
         if source.startswith("apify_actor:"):
-            res = await adapter.fetch(merged, n, prior_cursor=prior_cursor, source_full=source)
+            res = await adapter.fetch(new_query_params, n, prior_cursor=None, source_full=source)
         else:
-            res = await adapter.fetch(merged, n, prior_cursor=prior_cursor)
+            res = await adapter.fetch(new_query_params, n, prior_cursor=None)
     except Exception as e:
         log.exception("table_extend fetch failed: %s", e)
         return {"error": f"source fetch failed: {e}"}, 0.0
@@ -545,7 +537,10 @@ async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     column_map = [{"source_field": c.get("source_field") or c["name"], "column_name": c["name"], "type": c["type"]} for c in cols]
     _commit_rows(ctx.db, table_id, res.rows, column_map)
 
-    # Update last_fetch_* + cursor
+    # Overwrite query_params with the LLM's exact params (no merge, no
+    # cursor). project_state shows this back to the LLM so the next
+    # "more" call sees what it just ran and can construct the appropriate
+    # delta (e.g. bump offset, change page).
     ctx.db.execute(
         sa_text(
             """
@@ -553,7 +548,7 @@ async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
             SET last_fetch_returned_rows = :rows_n,
                 last_fetch_cost_credits = :cost,
                 last_fetch_at = now(),
-                query_params = jsonb_set(query_params::jsonb, '{_cursor}', CAST(:cursor AS jsonb))
+                query_params = CAST(:qp AS jsonb)
             WHERE id = :id
             """
         ),
@@ -561,7 +556,7 @@ async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
             "id": table_id,
             "rows_n": len(res.rows),
             "cost": res.cost_credits,
-            "cursor": json.dumps(res.cursor) if res.cursor else "null",
+            "qp": json.dumps(new_query_params),
         },
     )
     ctx.db.commit()

@@ -104,13 +104,24 @@ Different types = different tables. Two types means two distinct things the user
 
 # Getting more rows
 
-`table_extend(table_id, query_params)` adds rows to an existing table with a new non-overlapping slice. The table's column map is reused automatically.
+`table_extend(table_id, query_params)` adds rows to an existing table. The table's column map is reused automatically. There is no server-side cursor — **you construct the full query each time, including any pagination parameter** (offset, page, page_token, start_after, etc. — whatever the source uses). `project_state` shows the most recent `query_params` for the table; use that to decide what's next.
+
+When the user says "more" or "give me more" or "keep going", treat that as: construct the next slice of the same query. Common moves:
+
+- **Apify actor with `offset`**: bump offset by the previous batch's row count (`offset: 0` → `offset: 30` → `offset: 60`)
+- **Apollo (paged)**: bump `page` (`page: 1` → `page: 2`)
+- **Google Maps**: if the prior result included a `next_page_token` in the surfaced sample, pass it as the new `page_token`
+- **Reddit / search-style**: increase `time_range` or shift to a different sort (`new` → `top`) — pagination cursors here are often noisy
+
+For non-paginatable sources (browser_use, web_harvest), "more" usually means: tighten or broaden the query (different keywords, different geo, different date window) — there's no mechanical "next page" to advance to. Tell the user plainly if you can't keep going.
 
 If a project already has a table covering what the user asked for, **`table_extend` it. Do not `table_create` another one.**
 
-Pick the next-slice query based on what the source supports — next page / next batch / shifted date window / native cursor. Light dedup on the table's `dedup_key_column` catches boundary overlap.
+Light dedup on the table's `dedup_key_column` catches boundary overlap.
 
-For sources that can't paginate cleanly (browser_use, web_harvest one-shot), accept the single fetch result. If the user wants more from that angle, open a new table with a refined query.
+# Suggesting next-page chips
+
+After every `table_create` or `table_extend`, emit 1-2 `suggest_replies` framed as concrete next queries the user might want. Phrase them like things the user would actually say — "Get the next 30", "Pull more posts from r/Entrepreneur", "Show me ones from 2024 too". Keep them tied to what just happened so clicking one feels like a natural continuation. The FE renders these as clickable chips that come back through the chat exactly as if the user typed them.
 
 # Noise hierarchy — handle on the same table
 
