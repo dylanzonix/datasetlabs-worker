@@ -29,9 +29,12 @@ import hashlib
 import json
 import logging
 import os
+import time
+import uuid
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from openai import AsyncOpenAI
+from sqlalchemy import text as sa_text
 
 from dsl_worker.billing.tracked_client import TrackedOpenAIClient
 from dsl_worker.chat_v2.tools import ToolContext
@@ -381,18 +384,67 @@ def _get_client() -> TrackedOpenAIClient:
     return _cell_client
 
 
+def _persist_cell_trace(
+    ctx: ToolContext,
+    enrichment_id: Optional[str],
+    sample_id: Optional[str],
+    tier: str,
+    model: str,
+    tool_calls: List[Dict[str, Any]],
+    final_values: Optional[Dict[str, Any]],
+    error: Optional[str],
+    cost_credits: float,
+    duration_ms: int,
+) -> None:
+    """Write a cell_traces row. Best-effort — never raises into the caller."""
+    if not (enrichment_id and sample_id and getattr(ctx, "db", None)):
+        return
+    try:
+        ctx.db.execute(
+            sa_text(
+                """
+                INSERT INTO cell_traces
+                  (id, enrichment_id, sample_id, tier, model, tool_calls,
+                   final_values, error, cost_credits, duration_ms, created_at)
+                VALUES
+                  (:id, :eid, :sid, :tier, :model, CAST(:tc AS jsonb),
+                   CAST(:fv AS jsonb), :err, :cost, :dur, now())
+                """
+            ),
+            {
+                "id": str(uuid.uuid4()),
+                "eid": enrichment_id,
+                "sid": sample_id,
+                "tier": tier,
+                "model": model,
+                "tc": json.dumps(tool_calls, default=str),
+                "fv": json.dumps(final_values, default=str) if final_values is not None else None,
+                "err": error,
+                "cost": cost_credits,
+                "dur": duration_ms,
+            },
+        )
+        ctx.db.commit()
+    except Exception as e:
+        log.warning("cell trace persist failed: %s", e)
+
+
 async def run_cell_agent(
     action: Dict[str, Any],
     row_data: Dict[str, Any],
     per_row_cap: float,
     columns: List[Dict[str, str]],
     ctx: ToolContext,
+    *,
+    enrichment_id: Optional[str] = None,
+    sample_id: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], float]:
     """Per-row Responses-API loop with tier-based model + reasoning routing.
 
     Returns (new_fields_dict, total_cost_credits).
 
     Cost is the only termination signal; no iteration cap.
+    If enrichment_id + sample_id are supplied, writes a cell_traces row.
     """
     prompt = action.get("prompt", "")
     columns_to_fill = action.get("columns_to_fill") or [c["name"] for c in columns]
@@ -417,113 +469,142 @@ async def run_cell_agent(
     tool_defs = _tool_defs_for_tier(tier_cfg)
     total_cost = 0.0
     final_values: Dict[str, Any] = {}
+    tool_calls_log: List[Dict[str, Any]] = []
+    error_str: Optional[str] = None
+    t0 = time.monotonic()
 
     client = _get_client()
     cache_key = hashlib.sha256(
         f"{tier_cfg['name']}::{system_prompt}".encode()
     ).hexdigest()[:32]
 
-    # Safety guard: cell agent shouldn't run unbounded if it never finishes —
-    # very high cap on raw API turns. Real stop is the credit budget.
     HARD_TURN_LIMIT = 40
     iteration = 0
-    while iteration < HARD_TURN_LIMIT:
-        iteration += 1
+    try:
+        while iteration < HARD_TURN_LIMIT:
+            iteration += 1
 
-        try:
-            response, cost = await client.responses_create(
-                model=tier_cfg["model"],
-                input=input_items,
-                tools=tool_defs,
-                reasoning={"effort": tier_cfg["effort"]},
-                prompt_cache_key=cache_key,
-            )
-            total_cost += cost.total_cost_usd
-        except Exception as e:
-            log.warning("cell agent LLM call failed (tier=%s): %s", tier_cfg["name"], e)
-            return final_values, total_cost
-
-        function_calls: List[Any] = []
-        text_parts: List[str] = []
-        for item in response.output:
-            itype = getattr(item, "type", None)
-            if itype == "function_call":
-                function_calls.append(item)
-                input_items.append(item.model_dump(exclude_none=True))
-            elif itype == "reasoning":
-                input_items.append(item.model_dump(exclude_none=True))
-            elif itype == "message":
-                for c in item.content:
-                    if hasattr(c, "text"):
-                        text_parts.append(c.text)
-                input_items.append(item.model_dump(exclude_none=True))
-            else:
-                try:
-                    input_items.append(item.model_dump(exclude_none=True))
-                except Exception:
-                    pass
-
-        if not function_calls:
-            # No tool call — try to parse JSON from the message as final result.
-            content = "".join(text_parts).strip()
-            if content:
-                try:
-                    data = json.loads(content)
-                    if isinstance(data, dict) and "values" in data:
-                        return data["values"], total_cost
-                    if isinstance(data, dict):
-                        return data, total_cost
-                except json.JSONDecodeError:
-                    pass
-            return final_values, total_cost
-
-        for fc in function_calls:
-            name = fc.name
             try:
-                args = json.loads(fc.arguments or "{}")
-            except json.JSONDecodeError:
-                args = {}
-
-            if name == "final_result":
-                # Strict shape is {values: {col: val, ...}} but small models
-                # sometimes flatten to {col: val} directly. Accept either.
-                if isinstance(args.get("values"), dict):
-                    final_values = args["values"]
-                elif isinstance(args, dict) and args:
-                    final_values = args
-                else:
-                    final_values = {}
-                return final_values, total_cost
-
-            handler = CELL_TOOL_HANDLERS.get(name)
-            if not handler:
-                tool_result: Dict[str, Any] = {"error": f"unknown tool {name}"}
-                tool_cost = 0.0
-            else:
-                try:
-                    tool_result, tool_cost = await handler(args, ctx)
-                except Exception as e:
-                    log.exception("cell tool %s raised: %s", name, e)
-                    tool_result = {"error": str(e)[:300]}
-                    tool_cost = 0.0
-
-            total_cost += tool_cost
-            input_items.append({
-                "type": "function_call_output",
-                "call_id": fc.call_id,
-                "output": json.dumps(tool_result, default=str)[:8000],
-            })
-
-            # Only the credit budget terminates the loop.
-            if total_cost >= tier_cfg["cap"]:
-                log.info(
-                    "cell agent budget hit (tier=%s cost=%.2f cap=%.2f) — stopping",
-                    tier_cfg["name"], total_cost, tier_cfg["cap"],
+                response, cost = await client.responses_create(
+                    model=tier_cfg["model"],
+                    input=input_items,
+                    tools=tool_defs,
+                    reasoning={"effort": tier_cfg["effort"]},
+                    prompt_cache_key=cache_key,
                 )
+                total_cost += cost.total_cost_usd
+            except Exception as e:
+                error_str = f"LLM call failed: {e}"[:500]
+                log.warning("cell agent LLM call failed (tier=%s): %s", tier_cfg["name"], e)
                 return final_values, total_cost
 
-    log.warning(
-        "cell agent hit HARD_TURN_LIMIT=%d (tier=%s) — emergency stop",
-        HARD_TURN_LIMIT, tier_cfg["name"],
-    )
-    return final_values, total_cost
+            function_calls: List[Any] = []
+            text_parts: List[str] = []
+            for item in response.output:
+                itype = getattr(item, "type", None)
+                if itype == "function_call":
+                    function_calls.append(item)
+                    input_items.append(item.model_dump(exclude_none=True))
+                elif itype == "reasoning":
+                    input_items.append(item.model_dump(exclude_none=True))
+                elif itype == "message":
+                    for c in item.content:
+                        if hasattr(c, "text"):
+                            text_parts.append(c.text)
+                    input_items.append(item.model_dump(exclude_none=True))
+                else:
+                    try:
+                        input_items.append(item.model_dump(exclude_none=True))
+                    except Exception:
+                        pass
+
+            if not function_calls:
+                content = "".join(text_parts).strip()
+                if content:
+                    try:
+                        data = json.loads(content)
+                        if isinstance(data, dict) and "values" in data:
+                            final_values = data["values"]
+                            return final_values, total_cost
+                        if isinstance(data, dict):
+                            final_values = data
+                            return final_values, total_cost
+                    except json.JSONDecodeError:
+                        pass
+                error_str = error_str or "no function call and no parseable message"
+                return final_values, total_cost
+
+            for fc in function_calls:
+                name = fc.name
+                try:
+                    args = json.loads(fc.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+
+                if name == "final_result":
+                    if isinstance(args.get("values"), dict):
+                        final_values = args["values"]
+                    elif isinstance(args, dict) and args:
+                        final_values = args
+                    else:
+                        final_values = {}
+                    tool_calls_log.append({
+                        "name": "final_result",
+                        "args": args,
+                        "cost": 0.0,
+                    })
+                    return final_values, total_cost
+
+                handler = CELL_TOOL_HANDLERS.get(name)
+                if not handler:
+                    tool_result: Dict[str, Any] = {"error": f"unknown tool {name}"}
+                    tool_cost = 0.0
+                else:
+                    try:
+                        tool_result, tool_cost = await handler(args, ctx)
+                    except Exception as e:
+                        log.exception("cell tool %s raised: %s", name, e)
+                        tool_result = {"error": str(e)[:300]}
+                        tool_cost = 0.0
+
+                total_cost += tool_cost
+                tool_calls_log.append({
+                    "name": name,
+                    "args": args,
+                    "result_preview": json.dumps(tool_result, default=str)[:400],
+                    "cost": tool_cost,
+                })
+                input_items.append({
+                    "type": "function_call_output",
+                    "call_id": fc.call_id,
+                    "output": json.dumps(tool_result, default=str)[:8000],
+                })
+
+                if total_cost >= tier_cfg["cap"]:
+                    error_str = "budget cap reached before final_result"
+                    log.info(
+                        "cell agent budget hit (tier=%s cost=%.2f cap=%.2f) — stopping",
+                        tier_cfg["name"], total_cost, tier_cfg["cap"],
+                    )
+                    return final_values, total_cost
+
+        error_str = f"hit HARD_TURN_LIMIT={HARD_TURN_LIMIT}"
+        log.warning(
+            "cell agent hit HARD_TURN_LIMIT=%d (tier=%s) — emergency stop",
+            HARD_TURN_LIMIT, tier_cfg["name"],
+        )
+        return final_values, total_cost
+    finally:
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        _persist_cell_trace(
+            ctx,
+            enrichment_id,
+            sample_id,
+            tier_cfg["name"],
+            tier_cfg["model"],
+            tool_calls_log,
+            final_values if final_values else None,
+            error_str,
+            total_cost,
+            duration_ms,
+        )

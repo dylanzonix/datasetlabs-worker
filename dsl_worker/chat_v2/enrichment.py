@@ -252,7 +252,10 @@ async def _run_enrichment_on_rows(
 
     async def run_one(sample_id: str, row_data: Dict[str, Any]) -> Tuple[Dict[str, Any], float]:
         async with sem:
-            return await _execute_action(action, row_data, per_row_cap, columns, ctx)
+            return await _execute_action(
+                action, row_data, per_row_cap, columns, ctx,
+                enrichment_id=enrichment_id, sample_id=sample_id,
+            )
 
     if not rows:
         return 0, 0.0
@@ -351,6 +354,9 @@ async def _execute_action(
     per_row_cap: int,
     columns: List[Dict[str, str]],
     ctx: ToolContext,
+    *,
+    enrichment_id: Optional[str] = None,
+    sample_id: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], float]:
     """Run one enrichment action against one row. Returns (new_fields_dict, cost_credits)."""
     action_type = action.get("type")
@@ -358,7 +364,10 @@ async def _execute_action(
         return await _execute_tool_action(action, row_data, columns, ctx)
     if action_type == "cell_agent":
         from dsl_worker.chat_v2.cell_agent import run_cell_agent
-        return await run_cell_agent(action, row_data, per_row_cap, columns, ctx)
+        return await run_cell_agent(
+            action, row_data, per_row_cap, columns, ctx,
+            enrichment_id=enrichment_id, sample_id=sample_id,
+        )
     return {}, 0.0
 
 
