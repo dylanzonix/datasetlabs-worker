@@ -179,6 +179,11 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     if val_err:
         return {"error": val_err}, 0.0
 
+    # File source needs project_id to find files in the candidate store.
+    # Underscore-prefixed keys are stripped before storing in table.query_params.
+    if source == "file" and ctx.project_id:
+        query_params = {**query_params, "_project_id": str(ctx.project_id)}
+
     # Fetch first batch. For sources that support streaming (apify
     # actors), grab the first batch synchronously and let the rest stream
     # in via a background task — apify can take minutes; the user

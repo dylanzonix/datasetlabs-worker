@@ -66,14 +66,32 @@ class FileAdapter(SourceAdapter):
         prior_cursor: Optional[Dict[str, Any]] = None,
     ) -> FetchResult:
         file_id = query_params["file_id"]
-        # In real prod, file_id resolves through ProjectFile + Azure Blob.
-        # For the test path / sandbox files written by code_exec, accept
-        # a local path directly when file_id starts with "/" or "./".
         path = Path(file_id)
+        # If not on disk, try the candidate store (files written by
+        # code_exec are uploaded there).
         if not path.exists():
-            return FetchResult(
-                rows=[], schema=[], cost_credits=0.0, exhausted=True,
-            )
+            project_id = query_params.get("_project_id")
+            if project_id:
+                try:
+                    from dsl_worker.chat_api.candidates import read_candidates_bytes
+                    blob_bytes = read_candidates_bytes(project_id, file_id)
+                    import tempfile
+                    suffix = Path(file_id).suffix or ".csv"
+                    tmp = tempfile.NamedTemporaryFile(
+                        delete=False, suffix=suffix, mode="wb",
+                    )
+                    tmp.write(blob_bytes)
+                    tmp.close()
+                    path = Path(tmp.name)
+                except Exception as e:
+                    log.info("file source: candidate lookup for %s failed: %s", file_id, e)
+                    return FetchResult(
+                        rows=[], schema=[], cost_credits=0.0, exhausted=True,
+                    )
+            else:
+                return FetchResult(
+                    rows=[], schema=[], cost_credits=0.0, exhausted=True,
+                )
 
         rows: List[Dict[str, Any]] = []
         if path.suffix.lower() == ".csv":

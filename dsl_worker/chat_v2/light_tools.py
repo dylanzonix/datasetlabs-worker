@@ -207,21 +207,67 @@ async def code_exec(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, A
     if not url:
         return {"error": "SANDBOX_SERVICE_URL not configured"}, 0.0
     try:
+        from dsl_worker.chat_api import candidates
+    except Exception:
+        candidates = None
+    try:
         async with SandboxClient(url, timeout=90) as pool:
             session = await pool.create_session()
+            # Pre-existing files (so we can detect newly written ones after exec)
+            try:
+                pre = {f.name for f in (await session.list_files())}
+            except Exception:
+                pre = set()
             for fn in files:
+                if not candidates or not ctx.project_id:
+                    continue
                 try:
-                    from dsl_worker.infra import candidates
                     blob_bytes = candidates.read_candidates_bytes(ctx.project_id, fn)
                     await session.upload_content(blob_bytes, fn)
                 except Exception as e:
                     log.warning("code_exec file upload %s failed: %s", fn, e)
             result = await session.exec_python(code, timeout=60)
+
+            # Capture newly-written files and stash them in the candidate
+            # store so `table_create(source="file", file_id=<name>)` works.
+            captured: List[str] = []
+            if candidates and ctx.project_id:
+                try:
+                    post = await session.list_files()
+                    for f in post:
+                        name = f.name
+                        if name in pre or name.startswith("_") or name.endswith(".py"):
+                            continue
+                        try:
+                            data = await session.download_file(name)
+                            blob = getattr(data, "content", None) or data
+                            if isinstance(blob, bytes):
+                                # Upload bytes directly as one JSONL row (it's
+                                # not really jsonl but write_candidates wants
+                                # an iterable of dicts; bypass by writing raw)
+                                from dsl_worker.chat_api.candidates import (
+                                    _candidate_blob_path,
+                                )
+                                from dsl_api.azure.blob import get_blob_client
+                                blob_path = _candidate_blob_path(ctx.project_id, name)
+                                client = get_blob_client(blob_path)
+                                import io
+                                client.upload_blob(
+                                    io.BytesIO(blob), overwrite=True,
+                                    metadata={"tool": "code_exec", "items_count": "0"},
+                                )
+                                captured.append(name)
+                        except Exception as e:
+                            log.warning("code_exec capture %s failed: %s", name, e)
+                except Exception as e:
+                    log.warning("code_exec post-list failed: %s", e)
+
             return {
                 "ok": bool(getattr(result, "success", False)),
                 "stdout": (getattr(result, "stdout", "") or "")[:8000],
                 "stderr": (getattr(result, "stderr", "") or "")[:2000],
                 "exit_code": getattr(result, "exit_code", None),
+                "files_captured": captured,
             }, 0.0
     except Exception as e:
         log.exception("code_exec failed: %s", e)
