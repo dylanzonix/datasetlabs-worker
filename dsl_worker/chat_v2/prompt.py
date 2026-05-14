@@ -152,19 +152,22 @@ action: {
 
 Prefer deterministic when the row maps cleanly to one tool call. Use cell agent when answer requires search, judgment, or chaining.
 
-**Pick the right tier — this controls the model + budget per row:**
+**Pick the right tier — this controls the model + budget per row. The tier is REQUIRED.**
 
-- `classify` → tiny model (nano), reasoning minimal, NO external tools. ~0.3-0.5 credits/row.
-  Use when the answer comes purely from text already in the row.
-  Examples: "is this post complaining about Clay (true/false)", "apartment or house", "positive / neutral / negative sentiment of bio", "score this listing 1-5 on relevance".
-- `lookup` → mini model, full tools, ~3 credits/row. **Default.**
-  Use for well-defined "call a tool to find X" tasks. The agent knows which tool, the row has clear identifiers.
-  Examples: "find verified email" (FE), "get current_technologies for this domain" (Apollo), "phone number from Google Place" (gmaps).
-- `research` → smart model (gpt-5.5), full tools + web_search, reasoning medium, ~10 credits/row.
-  Use ONLY when the answer requires actual research / chaining / judgment.
-  Examples: "is this company actively hiring engineering leadership and what's the role URL", "find this founder's Twitter handle (try website → about page → linkedin → search)".
+- `classify` → nano model, NO external tools. Cheapest (~$0.0001/row).
+  Use when the answer is derived purely from text/values already in the row — no lookup, no search.
+  Pattern: read row → emit label.
+  Examples: "is this post complaining about Clay (true/false)", "apartment or house", "positive / neutral / negative sentiment of bio", "score this listing 1-5 on relevance based on its description".
 
-**If you're unsure, lookup is fine.** Don't over-spend on research for things mini can handle.
+- `lookup` → mini model, full tools. ~3 credits/row. Use ONLY when a single direct API call with row-level inputs returns the answer.
+  Pattern: row identifier → one tool call → mapped field.
+  Examples: "verified email" via FE (needs first_name + last_name + domain), "current_technologies" via Apollo org_enrich (needs domain), "phone" via gmaps place_details (needs place_id).
+
+- `research` → gpt-5.5 + web_search + judgment. ~10 credits/row. Use for ANY task that requires web search, multi-step chaining, or fuzzy matching.
+  Pattern: row → search → read → judge → answer (or null).
+  Examples: "find this founder's Twitter/X handle" (no single API has this — must search + verify), "is this company hiring engineering leadership + role URL" (chain: company → careers page → relevant role), "find the LinkedIn URL for this person" (search + verify match), "categorize what this company sells in 2 words" (read website + judge).
+
+**Heuristic:** if you'd need to *search the open web* or *visit a page to verify*, it's research, not lookup. Lookup is for `row → known_tool(row_data) → answer`, period.
 
 **Lock the output format in cell_agent prompts.** The prompt runs against many rows; without an explicit format the model drifts (`true` / `false` / `Yes` / `No` mixed). Say it plainly: *"Output literally `true` or `false`."* / *"Output one of: Likely | Possible | Unclear | No."* / *"Phone in E.164 (e.g. +14155551234), or null."*
 
