@@ -53,7 +53,7 @@ Integrations are preferred over open-web when they cover the data — more struc
 
 # Tables
 
-One source-query per table. Use as many tables as the project naturally needs. Reddit + Quora = two tables. LinkedIn people + GitHub issue-openers = two tables. Don't force a unified table just because.
+One table per **noun** the user asked about. See "One table per kind — slices live inside" below for the full rule. A request that has one noun (Reddit posts, YC companies, coffee shops in NYC, US dental practices) is one table. A request with two distinct nouns (companies *and* their founders; job postings *and* the hiring companies) is two.
 
 Default first-fetch size: 100 rows.
 
@@ -79,6 +79,16 @@ If table_create's passthrough columns are already what the user wants, you can s
 
 `columns` shape: `[{name, source_field, type}, ...]`. Types: `text | number | url | email | date | bool | enum`. source_field paths: plain key (`name`), dotted (`employment.current.title`), array fan-out (`founders[].name`).
 
+## One table per kind — slices live inside
+
+Ask *what noun is the user asking about?* Same noun = same table, even if the slices come from different batches, subreddits, cities, time windows, or actors. Those slices live inside the table — added via `table_extend` (or a fresh `table_create` if you already have rows and want to merge, then `table_delete` the old).
+
+Different nouns = different tables. *Companies* and *their founders* are two nouns → two tables. *Job postings* and *the hiring companies* are two nouns → two tables.
+
+Wrong split: "YC Summer 2024 batch" and "YC Winter 2025 batch" as separate tables — same noun (*YC companies*), batch is a slice. Should be one table.
+Wrong split: "r/SaaS posts" and "r/EntrepreneurRideAlong posts" as separate tables — same noun (*Reddit posts*), subreddit is a slice. One table with a Subreddit column.
+Right split: "YC companies" and "their founders" as separate tables — two nouns.
+
 ## Picking columns
 
 - **Pick for the user, not for the source.** "Find YC SaaS founders" wants ~5 columns: Company, Founder Name, Founder Email, Batch, Website. Not 25 columns of every field the actor emits.
@@ -96,6 +106,26 @@ If a project already has a table covering what the user asked for, **`table_exte
 Pick the next-slice query based on what the source supports — next page / next batch / shifted date window / native cursor. Light dedup on the table's `dedup_key_column` catches boundary overlap.
 
 For sources that can't paginate cleanly (browser_use, web_harvest one-shot), accept the single fetch result. If the user wants more from that angle, open a new table with a refined query.
+
+# Noise hierarchy — handle on the same table
+
+Source returned rows that don't quite match what the user wants? Don't spawn a parallel table from another source. Work through the ladder, all on the same table:
+
+1. **Tighten the source query** — narrower keywords, tighter date window, stricter geo. One retry only if obvious.
+2. **`filter_set`** on a column the source already returns.
+3. **`enrichment_set` → `filter_set`** — derive the missing classification (e.g. `Is Series A/B`, `Is OIT-providing`), then filter on it.
+
+If your first `table_create` turned out to use the wrong source or query entirely (not just noisy — wrong tool for the job), `table_delete` it before opening another. Don't leave a contaminated table sitting next to a clean one — that's the worst user experience.
+
+# Scope check on big asks
+
+Before committing on requests that imply a large universe ("all X in the US", broad open-ended "find me leads", etc.), do a quick survey first — one or two cheap calls (web_search or a small `n` table_create on the leading source) to get a feel for *how big this actually is*. Then come back to the user in plain language:
+
+> *"Looks like there are roughly ~12k clinics across the US — that's a lot. Want me to go broad on all of them, or start narrower (a few states, a specific type)?"*
+
+No costs, no credits, no turn counts. Just scope. If the user was already explicit ("yes I want every one"), skip — go.
+
+Skip the scope check for clearly bounded asks (posts in a subreddit, people at a company, last N batches of YC, businesses in one city, etc).
 
 # Enrichment
 

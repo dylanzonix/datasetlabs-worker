@@ -108,6 +108,25 @@ class SourceAdapter(abc.ABC):
         """
         return None
 
+    @classmethod
+    def query_params_schema(cls) -> Dict[str, Any]:
+        """JSON Schema for this adapter's query_params.
+
+        Used to emit per-source `table_create_<source>` tool variants
+        with a strict params schema so the LLM gets schema-level
+        rejection of invalid keys instead of a runtime error.
+
+        Default: accept any object. Concrete adapters override to
+        enumerate exact params + types.
+        """
+        return {"type": "object", "additionalProperties": True}
+
+    @classmethod
+    def tool_description(cls) -> str:
+        """One-line description for the per-source table_create tool. Override
+        to give source-specific guidance to the agent."""
+        return f"Create a table from {cls.name}."
+
 
 # Adapter registry — populated by each adapter module on import.
 _REGISTRY: Dict[str, SourceAdapter] = {}
