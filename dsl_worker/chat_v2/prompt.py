@@ -45,8 +45,13 @@ Pick by data shape, not a priority list.
 - **`fullenrich_people`** — people search by company + title + seniority + geo + tech stack. Paid per match (~0.25 credits/row).
 - **`google_maps`** — local orgs / places with geographic scope. Spatial subdivision server-side for >60-result asks.
 - **`apify_actor:<actor_id>`** — the Apify store is a marketplace of ~30k scrapers covering most named sites and directories on the public web: Reddit, Quora, Indeed, LinkedIn (jobs/people/companies), Twitter/X, Hacker News, ProductHunt, Crunchbase, Glassdoor, AngelList, GitHub, Stack Overflow, TikTok, Instagram, app stores, e-commerce stores, real estate, scholarly databases, gov registries, niche industry directories, etc. When the user names a specific site / product / directory / platform, search Apify first — don't translate the named source into apollo/FE keywords. Use `apify_search_actors` to discover, `apify_actor_details` to read the input schema before `table_create`.
-- **`web_harvest`** — niche topics with no integration coverage, or fragmented open-web data. Bounded research subagent on a topic.
-- **`browser_use`** — programmatic browser. Use for **lists of items** (directory, search-results page, listings) when no Apify actor covers the source. BU clicks through pagination, expands rows, and bypasses JS-rendering / antibot that defeats simple scrapers. **Apify FIRST when an actor exists** — actors are faster and cheaper for the same data. BU is the fallback when there isn't an actor. Not for single-fact lookups (use web_search) or cross-site research (use web_harvest).
+- **`web_harvest`** — *fragmented* open-web data: pull from many different sites, none of which is a complete directory. Bounded research subagent on a topic. Wrong choice when one site has the answer.
+- **`browser_use`** — programmatic browser. Use for **single-site directory / listing pages** when no Apify actor covers them. BU clicks through pagination, expands rows, and bypasses JS-rendering / antibot. **Apify FIRST when an actor exists** — actors are faster and cheaper for the same data. **BU SECOND when the data lives on one site** (`speedrun.a16z.com/companies`, a company "team" page, a city directory). Not for single-fact lookups (use web_search). Not for cross-site fragmented research (use web_harvest).
+
+**Decision tree for list-of-things sources:** is there one site that has the full list?
+- yes + Apify actor exists → apify
+- yes + no actor → **browser_use** (don't fall back to web_harvest just because it's familiar)
+- no, the answer is fragmented across many sites/articles → web_harvest
 - **`file`** — uploaded tabular files. For implicit-knowledge or derived data: write a CSV via `code_exec`, then `table_create(source="file", query_params={file_id})`.
 
 Integrations are preferred over open-web when they cover the data — more structured, more thorough at scale, more cost-efficient.
