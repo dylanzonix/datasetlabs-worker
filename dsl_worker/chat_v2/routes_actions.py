@@ -144,6 +144,66 @@ async def delete_filter(
     return result
 
 
+# ---- Cell traces (debug) --------------------------------------------------
+
+
+@router.get("/projects/{project_id}/enrichments/{enrichment_id}/traces")
+def list_cell_traces(
+    project_id: UUID,
+    enrichment_id: str,
+    limit: int = 50,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Recent per-cell traces for an enrichment — tier, model, tool calls,
+    final values, error, cost, duration. Read-only debug view."""
+    _verify(project_id, user.user_id, db)
+    # Resolve enrichment_id (accepts short_id like "e1" or uuid)
+    eid_row = db.execute(
+        sa_text(
+            "SELECT e.id::text FROM enrichments e JOIN tables t ON t.id=e.table_id "
+            "WHERE t.project_id=:p AND (e.id::text=:eid OR e.short_id=:eid) "
+            "AND e.deleted_at IS NULL LIMIT 1"
+        ),
+        {"p": str(project_id), "eid": enrichment_id},
+    ).fetchone()
+    if not eid_row:
+        raise HTTPException(404, "enrichment not found")
+    eid = eid_row[0]
+    rows = db.execute(
+        sa_text(
+            """
+            SELECT ct.id::text, ct.sample_id::text, ct.tier, ct.model,
+                   ct.tool_calls, ct.final_values, ct.error,
+                   ct.cost_credits, ct.duration_ms, ct.created_at
+            FROM cell_traces ct
+            WHERE ct.enrichment_id=:eid
+            ORDER BY ct.created_at DESC
+            LIMIT :lim
+            """
+        ),
+        {"eid": eid, "lim": limit},
+    ).fetchall()
+    return {
+        "enrichment_id": enrichment_id,
+        "traces": [
+            {
+                "id": r[0],
+                "sample_id": r[1],
+                "tier": r[2],
+                "model": r[3],
+                "tool_calls": r[4],
+                "final_values": r[5],
+                "error": r[6],
+                "cost_credits": r[7],
+                "duration_ms": r[8],
+                "created_at": r[9].isoformat() if r[9] else None,
+            }
+            for r in rows
+        ],
+    }
+
+
 # ---- Approvals (minimal v1) -----------------------------------------------
 # For v1 the approval mechanism is server-pause-then-resume via in-memory
 # event. The agent loop is synchronous, so approvals don't come into play
