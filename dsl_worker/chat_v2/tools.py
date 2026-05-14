@@ -506,8 +506,15 @@ async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     source, base_params, columns = row[0], row[1], row[2]
 
     adapter = get_adapter(source)
-    # Merge: new_query_params overrides base table query_params field-by-field
-    merged = {**(base_params or {}), **(new_query_params or {})}
+    # Strip internal state keys ( _cursor, _pending_rows, ...) before
+    # merging into the user-facing params. They live ON the table for
+    # the adapter to inspect via `prior_cursor`, not as fetch params.
+    # (Project 9aa596b2: leaving _cursor in poisoned every subsequent
+    # extend with "unknown google_maps params: ['_cursor']".)
+    if isinstance(base_params, str):
+        base_params = json.loads(base_params)
+    user_base = {k: v for k, v in (base_params or {}).items() if not k.startswith("_")}
+    merged = {**user_base, **(new_query_params or {})}
     val_err = adapter.validate_query_params(merged)
     if val_err:
         return {"error": val_err}, 0.0
