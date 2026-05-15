@@ -271,73 +271,198 @@ def list_table_rows(
     user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Read rows of a table. Accepts short_id or UUID. Includes filters + sort."""
+    """Read rows of a table. Accepts short_id or UUID. Applies stored filters
+    + sort. Returns the matched slice + total (the filtered total)."""
     _verify_project(project_id, user.user_id, db)
     tid = _resolve_table_uuid(db, str(project_id), table_id)
     if not tid:
         raise HTTPException(404, "Table not found")
-    # Read sort from the table row so we can ORDER BY the JSONB key
+    # Read sort + filters
     tinfo = db.execute(
         sa_text("SELECT sort_column, sort_direction FROM tables WHERE id=:tid"),
         {"tid": tid},
     ).fetchone()
     sort_col = tinfo[0] if tinfo else None
     sort_dir = (tinfo[1] if tinfo else None) or "desc"
-    if sort_col:
-        # Try numeric sort first via NULLIF + cast; fall back to text. Sorting
-        # missing values last regardless of direction.
-        direction_sql = "ASC" if sort_dir.lower() == "asc" else "DESC"
-        order_clause = (
-            f"(row->>'{sort_col}' IS NULL) ASC, "
-            f"NULLIF(row->>'{sort_col}', '')::numeric {direction_sql} NULLS LAST, "
-            f"row->>'{sort_col}' {direction_sql} NULLS LAST, "
-            f"seq"
-        )
-        sql_text = (
-            f"SELECT id::text, row FROM samples "
-            f"WHERE table_id = :tid AND deleted_at IS NULL "
-            f"ORDER BY {order_clause} LIMIT :lim OFFSET :off"
-        )
-    else:
-        sql_text = (
-            "SELECT id::text, row FROM samples "
-            "WHERE table_id = :tid AND deleted_at IS NULL "
-            "ORDER BY seq LIMIT :lim OFFSET :off"
-        )
-    # Try the typed sort. If the sort column has any non-numeric value the
-    # ::numeric cast errors — fall back to plain text sort in that case.
-    try:
-        rows = db.execute(sa_text(sql_text), {"tid": tid, "lim": limit, "off": offset}).fetchall()
-    except Exception:
-        if sort_col:
-            db.rollback()
-            direction_sql = "ASC" if sort_dir.lower() == "asc" else "DESC"
-            fallback_sql = (
-                f"SELECT id::text, row FROM samples "
-                f"WHERE table_id = :tid AND deleted_at IS NULL "
-                f"ORDER BY (row->>'{sort_col}' IS NULL) ASC, "
-                f"row->>'{sort_col}' {direction_sql} NULLS LAST, seq "
-                f"LIMIT :lim OFFSET :off"
-            )
-            rows = db.execute(sa_text(fallback_sql), {"tid": tid, "lim": limit, "off": offset}).fetchall()
-        else:
-            raise
-    total = db.execute(
-        sa_text("SELECT COUNT(*) FROM samples WHERE table_id = :tid AND deleted_at IS NULL"),
-        {"tid": tid},
-    ).scalar() or 0
     filters = db.execute(
         sa_text("SELECT column_name, op, value FROM table_filters WHERE table_id = :tid"),
         {"tid": tid},
     ).fetchall()
+
+    # Build WHERE fragments from active filters. Each filter writes its
+    # JSONB-key predicate + adds bound parameters.
+    filter_fragments, filter_params = _filters_to_where_sql(filters)
+    where_extra = (" AND " + " AND ".join(filter_fragments)) if filter_fragments else ""
+
+    if sort_col:
+        # Try numeric sort first via NULLIF + cast; fall back to text. Sorting
+        # missing values last regardless of direction.
+        sort_col_esc = sort_col.replace("'", "''")
+        direction_sql = "ASC" if sort_dir.lower() == "asc" else "DESC"
+        order_clause = (
+            f"(row->>'{sort_col_esc}' IS NULL) ASC, "
+            f"NULLIF(row->>'{sort_col_esc}', '')::numeric {direction_sql} NULLS LAST, "
+            f"row->>'{sort_col_esc}' {direction_sql} NULLS LAST, "
+            f"seq"
+        )
+        sql_text = (
+            f"SELECT id::text, row FROM samples "
+            f"WHERE table_id = :tid AND deleted_at IS NULL{where_extra} "
+            f"ORDER BY {order_clause} LIMIT :lim OFFSET :off"
+        )
+    else:
+        sql_text = (
+            f"SELECT id::text, row FROM samples "
+            f"WHERE table_id = :tid AND deleted_at IS NULL{where_extra} "
+            f"ORDER BY seq LIMIT :lim OFFSET :off"
+        )
+    base_params = {"tid": tid, "lim": limit, "off": offset, **filter_params}
+    # Try the typed sort. If the sort column has any non-numeric value the
+    # ::numeric cast errors — fall back to plain text sort in that case.
+    try:
+        rows = db.execute(sa_text(sql_text), base_params).fetchall()
+    except Exception:
+        if sort_col:
+            db.rollback()
+            sort_col_esc = sort_col.replace("'", "''")
+            direction_sql = "ASC" if sort_dir.lower() == "asc" else "DESC"
+            fallback_sql = (
+                f"SELECT id::text, row FROM samples "
+                f"WHERE table_id = :tid AND deleted_at IS NULL{where_extra} "
+                f"ORDER BY (row->>'{sort_col_esc}' IS NULL) ASC, "
+                f"row->>'{sort_col_esc}' {direction_sql} NULLS LAST, seq "
+                f"LIMIT :lim OFFSET :off"
+            )
+            rows = db.execute(sa_text(fallback_sql), base_params).fetchall()
+        else:
+            raise
+    # Total = filtered count (so the FE pagination matches what user sees).
+    # Unfiltered count exposed separately for context.
+    total_sql = (
+        f"SELECT COUNT(*) FROM samples "
+        f"WHERE table_id = :tid AND deleted_at IS NULL{where_extra}"
+    )
+    total = db.execute(sa_text(total_sql), {"tid": tid, **filter_params}).scalar() or 0
+    unfiltered_total = db.execute(
+        sa_text("SELECT COUNT(*) FROM samples WHERE table_id = :tid AND deleted_at IS NULL"),
+        {"tid": tid},
+    ).scalar() or 0
     return {
         "rows": [{"id": r[0], **(r[1] or {})} for r in rows],
         "total": total,
+        "unfiltered_total": unfiltered_total,
         "limit": limit,
         "offset": offset,
         "filters": [{"column": f[0], "op": f[1], "value": f[2]} for f in filters],
         "sort": {"column": sort_col, "direction": sort_dir} if sort_col else None,
     }
+
+
+def _filters_to_where_sql(filters):
+    """Translate stored (column_name, op, value) tuples into SQL fragments
+    against the samples.row JSONB column. Returns (list[str], dict).
+
+    Values are always bound via :param; column names are escaped against
+    single quotes (JSONB keys are arbitrary strings).
+    """
+    import re as _re
+    fragments = []
+    params = {}
+    for i, (col, op, val) in enumerate(filters):
+        if not col:
+            continue
+        col_esc = col.replace("'", "''")
+        json_text = f"row->>'{col_esc}'"
+        p = f"f{i}"
+        op_lower = (op or "").lower()
+        if op_lower in ("equals", "eq", "="):
+            fragments.append(f"{json_text} = :{p}")
+            params[p] = str(val) if val is not None else None
+        elif op_lower in ("not_equals", "neq", "!="):
+            fragments.append(f"({json_text} IS DISTINCT FROM :{p})")
+            params[p] = str(val) if val is not None else None
+        elif op_lower == "contains":
+            fragments.append(f"{json_text} ILIKE :{p}")
+            params[p] = f"%{val}%"
+        elif op_lower in ("is_any_of", "in", "any_of"):
+            arr = val if isinstance(val, list) else [val]
+            arr = [str(v) for v in arr]
+            fragments.append(f"{json_text} = ANY(:{p})")
+            params[p] = arr
+        elif op_lower in ("not_in", "is_none_of"):
+            arr = val if isinstance(val, list) else [val]
+            arr = [str(v) for v in arr]
+            fragments.append(f"({json_text} IS NULL OR NOT ({json_text} = ANY(:{p})))")
+            params[p] = arr
+        elif op_lower in (">=", "gte"):
+            try:
+                fragments.append(f"NULLIF({json_text},'')::numeric >= :{p}")
+                params[p] = float(val)
+            except (TypeError, ValueError):
+                # Fall back to lexical (works for ISO dates too)
+                fragments.append(f"{json_text} >= :{p}")
+                params[p] = str(val)
+        elif op_lower in ("<=", "lte"):
+            try:
+                fragments.append(f"NULLIF({json_text},'')::numeric <= :{p}")
+                params[p] = float(val)
+            except (TypeError, ValueError):
+                fragments.append(f"{json_text} <= :{p}")
+                params[p] = str(val)
+        elif op_lower in (">", "gt"):
+            try:
+                fragments.append(f"NULLIF({json_text},'')::numeric > :{p}")
+                params[p] = float(val)
+            except (TypeError, ValueError):
+                fragments.append(f"{json_text} > :{p}")
+                params[p] = str(val)
+        elif op_lower in ("<", "lt"):
+            try:
+                fragments.append(f"NULLIF({json_text},'')::numeric < :{p}")
+                params[p] = float(val)
+            except (TypeError, ValueError):
+                fragments.append(f"{json_text} < :{p}")
+                params[p] = str(val)
+        elif op_lower == "between" and isinstance(val, list) and len(val) == 2:
+            lo, hi = val
+            # If both look numeric → numeric range. Otherwise lexical (handles
+            # ISO date strings naturally).
+            try:
+                lof = float(lo) if lo is not None else None
+                hif = float(hi) if hi is not None else None
+                p_lo, p_hi = f"{p}_lo", f"{p}_hi"
+                if lof is not None and hif is not None:
+                    fragments.append(
+                        f"NULLIF({json_text},'')::numeric BETWEEN :{p_lo} AND :{p_hi}"
+                    )
+                    params[p_lo] = lof
+                    params[p_hi] = hif
+                elif lof is not None:
+                    fragments.append(f"NULLIF({json_text},'')::numeric >= :{p_lo}")
+                    params[p_lo] = lof
+                elif hif is not None:
+                    fragments.append(f"NULLIF({json_text},'')::numeric <= :{p_hi}")
+                    params[p_hi] = hif
+            except (TypeError, ValueError):
+                p_lo, p_hi = f"{p}_lo", f"{p}_hi"
+                if lo is not None and hi is not None:
+                    fragments.append(f"{json_text} BETWEEN :{p_lo} AND :{p_hi}")
+                    params[p_lo] = str(lo)
+                    params[p_hi] = str(hi)
+                elif lo is not None:
+                    fragments.append(f"{json_text} >= :{p_lo}")
+                    params[p_lo] = str(lo)
+                elif hi is not None:
+                    fragments.append(f"{json_text} <= :{p_hi}")
+                    params[p_hi] = str(hi)
+        elif op_lower in ("is_null", "empty"):
+            fragments.append(f"({json_text} IS NULL OR {json_text} = '')")
+        elif op_lower in ("is_not_null", "not_empty"):
+            fragments.append(f"({json_text} IS NOT NULL AND {json_text} != '')")
+        else:
+            # Unknown op — skip rather than fail the whole query
+            continue
+    return fragments, params
 
 
 @router.get("/projects/{project_id}/tables/{table_id}/enrichments")
