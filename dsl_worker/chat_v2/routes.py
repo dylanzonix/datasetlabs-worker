@@ -227,7 +227,7 @@ def list_tables(
             """
             SELECT id::text, short_id, name, source, columns, dedup_key_column,
                    last_fetch_returned_rows, last_fetch_cost_credits, last_fetch_at,
-                   fetch_status, fetch_error, created_at
+                   fetch_status, fetch_error, created_at, sort_column, sort_direction
             FROM tables
             WHERE project_id = :pid AND deleted_at IS NULL
             ORDER BY created_at
@@ -242,6 +242,7 @@ def list_tables(
             {"tid": r[0]},
         ).scalar() or 0
         cols = r[4] if isinstance(r[4], list) else json.loads(r[4] or "[]")
+        sort_obj = {"column": r[12], "direction": r[13] or "desc"} if r[12] else None
         out.append({
             "id": r[1],  # short_id is the primary public id
             "uuid": r[0],  # UUID still available for backend-internal callers
@@ -256,6 +257,7 @@ def list_tables(
             "fetch_status": r[9],
             "fetch_error": r[10],
             "created_at": r[11].isoformat() if r[11] else None,
+            "sort": sort_obj,
         })
     return {"tables": out}
 

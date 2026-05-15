@@ -127,7 +127,7 @@ async def enrichment_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
             },
         )
         # Add the enrichment columns to the table's column list if not already present.
-        _ensure_columns_on_table(db, table_id, columns)
+        _ensure_columns_on_table(db, table_id, columns, enrichment_id=enrichment_id)
     db.commit()
 
     # Run on the first 10 unfilled rows
@@ -455,8 +455,17 @@ def _template_args(template: Dict[str, Any], row: Dict[str, Any]) -> Dict[str, A
     return out
 
 
-def _ensure_columns_on_table(db: Session, table_id: str, enrichment_columns: List[Dict[str, str]]) -> None:
-    """Append enrichment columns to the table's columns array if not present."""
+def _ensure_columns_on_table(
+    db: Session,
+    table_id: str,
+    enrichment_columns: List[Dict[str, str]],
+    enrichment_id: Optional[str] = None,
+) -> None:
+    """Append enrichment columns to the table's columns array if not present.
+
+    Each appended column carries `enrichment_id` so the FE can render
+    grouped headers + per-cell rerun buttons for enrichment columns.
+    """
     row = db.execute(
         sa_text("SELECT columns FROM tables WHERE id=:tid"),
         {"tid": table_id},
@@ -465,7 +474,14 @@ def _ensure_columns_on_table(db: Session, table_id: str, enrichment_columns: Lis
         return
     existing = row[0] if isinstance(row[0], list) else json.loads(row[0] or "[]")
     existing_names = {c["name"] for c in existing}
-    to_add = [c for c in enrichment_columns if c["name"] not in existing_names]
+    to_add = []
+    for c in enrichment_columns:
+        if c["name"] in existing_names:
+            continue
+        cnew = dict(c)
+        if enrichment_id:
+            cnew["enrichment_id"] = enrichment_id
+        to_add.append(cnew)
     if not to_add:
         return
     new_cols = existing + to_add
