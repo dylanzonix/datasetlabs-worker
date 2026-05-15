@@ -243,24 +243,47 @@ async def _apify_call_actor(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dic
     if actor_input.get("maxItems", 0) > 5:
         actor_input["maxItems"] = 5
     aid = actor_id.replace("/", "~")
+    import asyncio as _asyncio
     async with httpx.AsyncClient(timeout=180) as client:
-        r = await client.post(
-            f"https://api.apify.com/v2/acts/{aid}/run-sync-get-dataset-items",
-            params={"token": api_key, "format": "json"},
+        # Async pattern: POST /runs → poll until terminal → fetch items +
+        # cost. The /run-sync-get-dataset-items endpoint doesn't expose
+        # run ID; this is the only path that gives us real billing.
+        start = await client.post(
+            f"https://api.apify.com/v2/acts/{aid}/runs",
+            params={"token": api_key},
             json=actor_input,
         )
-        if r.status_code != 200:
-            return {"error": f"apify HTTP {r.status_code}"}, 0.0
-        items = r.json() or []
-        # Real cost from apify's run object (1 credit = $0.10 of compute)
-        run_id = r.headers.get("x-apify-actor-run-id") or r.headers.get("X-Apify-Actor-Run-Id")
+        if start.status_code >= 400:
+            return {"error": f"apify start HTTP {start.status_code}"}, 0.0
+        run_data = (start.json() or {}).get("data") or {}
+        run_id = run_data.get("id")
+        dataset_id = run_data.get("defaultDatasetId")
+        if not (run_id and dataset_id):
+            return {"error": "apify: no run id"}, 0.0
         cost_usd = 0.0
-        if run_id:
-            try:
-                from dsl_worker.sources_v2.apify_actor import _fetch_run_cost_usd
-                cost_usd = await _fetch_run_cost_usd(client, run_id, api_key)
-            except Exception as e:
-                log.debug("cell apify cost lookup failed: %s", e)
+        terminal = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
+        t0 = _asyncio.get_event_loop().time()
+        while True:
+            if _asyncio.get_event_loop().time() - t0 > 150:
+                break
+            rr = await client.get(
+                f"https://api.apify.com/v2/actor-runs/{run_id}",
+                params={"token": api_key},
+            )
+            if rr.status_code == 200:
+                rd = (rr.json() or {}).get("data") or {}
+                if rd.get("status") in terminal:
+                    from dsl_worker.sources_v2.apify_actor import _apify_run_cost_usd_from_data
+                    cost_usd = _apify_run_cost_usd_from_data(rd)
+                    break
+            await _asyncio.sleep(2.0)
+        items = []
+        items_resp = await client.get(
+            f"https://api.apify.com/v2/datasets/{dataset_id}/items",
+            params={"token": api_key, "format": "json", "limit": 5},
+        )
+        if items_resp.status_code == 200:
+            items = items_resp.json() or []
     return {"items": items[:5]}, cost_usd * 10.0
 
 

@@ -35,31 +35,26 @@ APIFY_BASE = "https://api.apify.com/v2"
 APIFY_PROXY_KEYS = ("proxy", "proxyConfiguration")
 
 
-async def _fetch_run_cost_usd(client: httpx.AsyncClient, run_id: str, api_key: str) -> float:
-    """Fetch the real USD cost of an actor run from apify's API.
+def _apify_run_cost_usd_from_data(data: Dict[str, Any]) -> float:
+    """Compute real USD cost of a finished apify run.
 
-    Reads `data.usageTotalUsd` from /actor-runs/{runId}. Returns 0.0 on any
-    failure — we'd rather lose tracking on one run than fail the entire fetch.
+    Apify exposes `data.usageTotalUsd` directly but it's 0 for free /
+    community actors. `data.stats.computeUnits` is always populated and
+    is the actual resource we pay apify for. Convert at the platform's
+    CU rate (env-configurable, default $0.40 / CU which matches apify's
+    starter plan).
+
+    Note: this misses proxy and dataset-write surcharges for some actors.
+    Good enough for v1; can be sharpened to sum `usage.*USD` keys when
+    apify populates them.
     """
-    try:
-        r = await client.get(
-            f"{APIFY_BASE}/actor-runs/{run_id}",
-            params={"token": api_key},
-            timeout=10.0,
-        )
-        if r.status_code != 200:
-            log.warning("apify run cost lookup HTTP %s for run %s", r.status_code, run_id)
-            return 0.0
-        data = (r.json() or {}).get("data") or {}
-        usd = data.get("usageTotalUsd")
-        if usd is None:
-            # Fallback: compute from usage breakdown if present
-            usage = data.get("usage") or {}
-            usd = usage.get("ACTOR_COMPUTE_UNITS_USD") or usage.get("totalUsd") or 0.0
-        return float(usd or 0.0)
-    except Exception as e:
-        log.warning("apify run cost lookup failed for %s: %s", run_id, e)
-        return 0.0
+    usd = data.get("usageTotalUsd")
+    if usd is not None and float(usd) > 0:
+        return float(usd)
+    stats = data.get("stats") or {}
+    cu = float(stats.get("computeUnits") or 0.0)
+    rate = float(os.getenv("APIFY_USD_PER_CU", "0.40"))
+    return cu * rate
 
 
 class ApifyActorAdapter(SourceAdapter):
@@ -148,35 +143,58 @@ class ApifyActorAdapter(SourceAdapter):
                 self._autofill_plumbing(actor_input, schema)
 
             aid = actor_id.replace("/", "~")
-            resp = await client.post(
-                f"{APIFY_BASE}/acts/{aid}/run-sync-get-dataset-items",
-                params={"token": self.api_key, "format": "json"},
+            # POST /runs starts the actor async, returning the run object
+            # immediately with id + defaultDatasetId. We poll the run until
+            # terminal, then fetch items + read usageTotalUsd. Two-step
+            # pattern (mirror of fetch_stream) — the only way to get cost.
+            start = await client.post(
+                f"{APIFY_BASE}/acts/{aid}/runs",
+                params={"token": self.api_key},
                 json=actor_input,
-                timeout=300.0,
             )
-            if resp.status_code >= 400:
-                log.warning("apify_actor HTTP %s for %s: %s", resp.status_code, actor_id, resp.text[:200])
+            if start.status_code >= 400:
+                log.warning("apify_actor start HTTP %s for %s: %s", start.status_code, actor_id, start.text[:200])
+                return FetchResult(rows=[], schema=[], cost_credits=0.0, exhausted=True)
+            run_data = (start.json() or {}).get("data") or {}
+            run_id = run_data.get("id")
+            dataset_id = run_data.get("defaultDatasetId")
+            if not (run_id and dataset_id):
+                log.warning("apify_actor: no run id/dataset id from start for %s", actor_id)
                 return FetchResult(rows=[], schema=[], cost_credits=0.0, exhausted=True)
 
-            try:
-                rows = resp.json()
-            except Exception:
-                rows = []
-            if not isinstance(rows, list):
-                rows = []
-
-            # Apify run-sync endpoints set this header with the run ID.
-            # Follow up with /actor-runs/{id} to read the real usage cost
-            # so we charge the user what apify actually billed us.
-            run_id = (
-                resp.headers.get("x-apify-actor-run-id")
-                or resp.headers.get("X-Apify-Actor-Run-Id")
-            )
+            terminal = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
+            t0 = asyncio.get_event_loop().time()
             cost_usd = 0.0
-            if run_id:
-                cost_usd = await _fetch_run_cost_usd(client, run_id, self.api_key)
-            else:
-                log.warning("apify_actor: no run id header in response — cost not tracked for %s", actor_id)
+            while True:
+                if asyncio.get_event_loop().time() - t0 > 280:
+                    log.warning("apify_actor poll timeout for run %s", run_id)
+                    break
+                run_resp = await client.get(
+                    f"{APIFY_BASE}/actor-runs/{run_id}",
+                    params={"token": self.api_key},
+                )
+                if run_resp.status_code != 200:
+                    await asyncio.sleep(2)
+                    continue
+                rd = (run_resp.json() or {}).get("data") or {}
+                if rd.get("status") in terminal:
+                    cost_usd = _apify_run_cost_usd_from_data(rd)
+                    break
+                await asyncio.sleep(2.5)
+
+            rows: List[Dict[str, Any]] = []
+            items_resp = await client.get(
+                f"{APIFY_BASE}/datasets/{dataset_id}/items",
+                params={"token": self.api_key, "format": "json", "limit": max_items},
+                timeout=60.0,
+            )
+            if items_resp.status_code == 200:
+                try:
+                    body = items_resp.json()
+                    if isinstance(body, list):
+                        rows = [r for r in body if isinstance(r, dict)]
+                except Exception:
+                    pass
 
         # Convention: 1 credit covers $0.10 of compute. Convert real USD → credits.
         cost = cost_usd * 10.0
@@ -327,7 +345,14 @@ class ApifyActorAdapter(SourceAdapter):
                         except Exception:
                             pass
                     # Fetch real run cost from apify's API and bill it.
-                    cost_usd = await _fetch_run_cost_usd(client, run_id, self.api_key)
+                    final_run_resp = await client.get(
+                        f"{APIFY_BASE}/actor-runs/{run_id}",
+                        params={"token": self.api_key},
+                    )
+                    cost_usd = 0.0
+                    if final_run_resp.status_code == 200:
+                        rd = (final_run_resp.json() or {}).get("data") or {}
+                        cost_usd = _apify_run_cost_usd_from_data(rd)
                     yield {
                         "rows": final_rows,
                         "exhausted": True,
