@@ -759,6 +759,52 @@ async def filter_clear(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
 
 
 # ---------------------------------------------------------------------------
+# Tool: sort_set / sort_clear
+# ---------------------------------------------------------------------------
+
+
+async def sort_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
+    """Set the active sort on a table. Single sort per table for v1.
+
+    Args:
+      table_id: required.
+      column: required — the column name to sort by.
+      direction: "asc" or "desc". Defaults to "desc".
+    """
+    table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
+    column = args.get("column") or args.get("column_name")
+    direction = (args.get("direction") or args.get("dir") or "desc").lower()
+    if direction not in ("asc", "desc"):
+        return {"error": f"direction must be 'asc' or 'desc'; got {direction!r}"}, 0.0
+    if not (table_id and column):
+        return {"error": "sort_set requires table_id and column"}, 0.0
+    ctx.db.execute(
+        sa_text(
+            "UPDATE tables SET sort_column = :col, sort_direction = :dir "
+            "WHERE id = :tid"
+        ),
+        {"tid": table_id, "col": column, "dir": direction},
+    )
+    ctx.db.commit()
+    return {"ok": True, "column": column, "direction": direction}, 0.0
+
+
+async def sort_clear(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
+    """Remove the active sort on a table."""
+    table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
+    if not table_id:
+        return {"error": "table_id required"}, 0.0
+    ctx.db.execute(
+        sa_text(
+            "UPDATE tables SET sort_column = NULL, sort_direction = NULL WHERE id = :tid"
+        ),
+        {"tid": table_id},
+    )
+    ctx.db.commit()
+    return {"ok": True}, 0.0
+
+
+# ---------------------------------------------------------------------------
 # Tool: row_inspect / row_delete
 # ---------------------------------------------------------------------------
 
@@ -1041,6 +1087,8 @@ HANDLERS: Dict[str, Callable[[Dict[str, Any], ToolContext], Awaitable[Tuple[Dict
     "table_delete": table_delete,
     "filter_set": filter_set,
     "filter_clear": filter_clear,
+    "sort_set": sort_set,
+    "sort_clear": sort_clear,
     "row_inspect": row_inspect,
     "row_delete": row_delete,
     # enrichment_set, enrichment_run, code_exec, web_search, suggest_replies,

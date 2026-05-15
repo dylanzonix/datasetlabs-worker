@@ -56,6 +56,8 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
         # Filters
         "filter_set": "Apply a non-destructive filter to a column. Returns matched count + sample.",
         "filter_clear": "Remove a filter from a column.",
+        "sort_set": "Set the active sort on a table. Args: table_id, column, direction (asc|desc, default desc). Single sort per table.",
+        "sort_clear": "Remove the active sort on a table.",
         # Rows
         "row_inspect": "Read-only peek at rows.",
         "row_delete": "Delete rows by id. Approval-gated.",

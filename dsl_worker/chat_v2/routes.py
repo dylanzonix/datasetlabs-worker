@@ -269,19 +269,57 @@ def list_table_rows(
     user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Read rows of a table. Accepts short_id or UUID. Includes filters."""
+    """Read rows of a table. Accepts short_id or UUID. Includes filters + sort."""
     _verify_project(project_id, user.user_id, db)
     tid = _resolve_table_uuid(db, str(project_id), table_id)
     if not tid:
         raise HTTPException(404, "Table not found")
-    rows = db.execute(
-        sa_text(
+    # Read sort from the table row so we can ORDER BY the JSONB key
+    tinfo = db.execute(
+        sa_text("SELECT sort_column, sort_direction FROM tables WHERE id=:tid"),
+        {"tid": tid},
+    ).fetchone()
+    sort_col = tinfo[0] if tinfo else None
+    sort_dir = (tinfo[1] if tinfo else None) or "desc"
+    if sort_col:
+        # Try numeric sort first via NULLIF + cast; fall back to text. Sorting
+        # missing values last regardless of direction.
+        direction_sql = "ASC" if sort_dir.lower() == "asc" else "DESC"
+        order_clause = (
+            f"(row->>'{sort_col}' IS NULL) ASC, "
+            f"NULLIF(row->>'{sort_col}', '')::numeric {direction_sql} NULLS LAST, "
+            f"row->>'{sort_col}' {direction_sql} NULLS LAST, "
+            f"seq"
+        )
+        sql_text = (
+            f"SELECT id::text, row FROM samples "
+            f"WHERE table_id = :tid AND deleted_at IS NULL "
+            f"ORDER BY {order_clause} LIMIT :lim OFFSET :off"
+        )
+    else:
+        sql_text = (
             "SELECT id::text, row FROM samples "
             "WHERE table_id = :tid AND deleted_at IS NULL "
             "ORDER BY seq LIMIT :lim OFFSET :off"
-        ),
-        {"tid": tid, "lim": limit, "off": offset},
-    ).fetchall()
+        )
+    # Try the typed sort. If the sort column has any non-numeric value the
+    # ::numeric cast errors — fall back to plain text sort in that case.
+    try:
+        rows = db.execute(sa_text(sql_text), {"tid": tid, "lim": limit, "off": offset}).fetchall()
+    except Exception:
+        if sort_col:
+            db.rollback()
+            direction_sql = "ASC" if sort_dir.lower() == "asc" else "DESC"
+            fallback_sql = (
+                f"SELECT id::text, row FROM samples "
+                f"WHERE table_id = :tid AND deleted_at IS NULL "
+                f"ORDER BY (row->>'{sort_col}' IS NULL) ASC, "
+                f"row->>'{sort_col}' {direction_sql} NULLS LAST, seq "
+                f"LIMIT :lim OFFSET :off"
+            )
+            rows = db.execute(sa_text(fallback_sql), {"tid": tid, "lim": limit, "off": offset}).fetchall()
+        else:
+            raise
     total = db.execute(
         sa_text("SELECT COUNT(*) FROM samples WHERE table_id = :tid AND deleted_at IS NULL"),
         {"tid": tid},
@@ -296,6 +334,7 @@ def list_table_rows(
         "limit": limit,
         "offset": offset,
         "filters": [{"column": f[0], "op": f[1], "value": f[2]} for f in filters],
+        "sort": {"column": sort_col, "direction": sort_dir} if sort_col else None,
     }
 
 

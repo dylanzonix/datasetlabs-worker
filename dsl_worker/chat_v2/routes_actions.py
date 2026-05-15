@@ -144,6 +144,43 @@ async def delete_filter(
     return result
 
 
+class SortBody(BaseModel):
+    column: str
+    direction: str = "desc"
+
+
+@router.post("/projects/{project_id}/tables/{table_id}/sort")
+async def post_sort(
+    project_id: UUID,
+    table_id: str,
+    body: SortBody,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _verify(project_id, user.user_id, db)
+    from dsl_worker.chat_v2.tools import sort_set as _sort_set
+    ctx = ToolContext(db=db, project_id=str(project_id), user_id=str(user.user_id), run_id=None)
+    result, _ = await _sort_set(
+        {"table_id": str(table_id), "column": body.column, "direction": body.direction},
+        ctx,
+    )
+    return result
+
+
+@router.delete("/projects/{project_id}/tables/{table_id}/sort")
+async def delete_sort(
+    project_id: UUID,
+    table_id: str,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _verify(project_id, user.user_id, db)
+    from dsl_worker.chat_v2.tools import sort_clear as _sort_clear
+    ctx = ToolContext(db=db, project_id=str(project_id), user_id=str(user.user_id), run_id=None)
+    result, _ = await _sort_clear({"table_id": str(table_id)}, ctx)
+    return result
+
+
 # ---- Cell traces (debug) --------------------------------------------------
 
 
