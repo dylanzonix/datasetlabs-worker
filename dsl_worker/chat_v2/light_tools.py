@@ -132,8 +132,9 @@ async def web_search(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, 
     if not api_key:
         return {"error": "OPENAI_API_KEY not configured"}, 0.0
 
+    from dsl_worker.billing.tracked_client import TrackedOpenAIClient
     from openai import AsyncOpenAI
-    client = AsyncOpenAI(api_key=api_key)
+    client = TrackedOpenAIClient(AsyncOpenAI(api_key=api_key))
     model = os.getenv("OPENAI_MODEL_MINI", "gpt-5.4-mini")
 
     instruction = (
@@ -143,12 +144,14 @@ async def web_search(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, 
         "No prose, no markdown, no preamble — just the JSON array."
         f"\n\nQuery: {query}"
     )
+    llm_cost_usd = 0.0
     try:
-        resp = await client.responses.create(
+        resp, usage_cost = await client.responses_create(
             model=model,
-            input=instruction,
+            input=[{"role": "user", "content": instruction}],
             tools=[{"type": "web_search"}],
         )
+        llm_cost_usd = float(getattr(usage_cost, "total_cost_usd", 0.0) or 0.0)
     except Exception as e:
         return {"error": f"web_search failed: {e}"[:200]}, 0.0
 
@@ -174,7 +177,7 @@ async def web_search(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, 
                 results = None
     if not isinstance(results, list):
         log.warning("web_search: model output not parsable as JSON list")
-        return {"results": [], "raw": text[:600]}, 0.0
+        return {"results": [], "raw": text[:600]}, llm_cost_usd
 
     cleaned = []
     for item in results[:10]:
@@ -185,7 +188,10 @@ async def web_search(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, 
             "url": str(item.get("url") or ""),
             "snippet": str(item.get("snippet") or "")[:300],
         })
-    return {"results": cleaned}, 0.0
+    # Return the real LLM USD cost. Caller (agent.run_turn) accumulates
+    # this directly into total_cost_usd, no × 10 conversion needed since
+    # this is already in USD.
+    return {"results": cleaned}, llm_cost_usd
 
 
 # ---------------------------------------------------------------------------
