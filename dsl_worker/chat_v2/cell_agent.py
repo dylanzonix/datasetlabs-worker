@@ -252,7 +252,16 @@ async def _apify_call_actor(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dic
         if r.status_code != 200:
             return {"error": f"apify HTTP {r.status_code}"}, 0.0
         items = r.json() or []
-    return {"items": items[:5]}, 1.0
+        # Real cost from apify's run object (1 credit = $0.10 of compute)
+        run_id = r.headers.get("x-apify-actor-run-id") or r.headers.get("X-Apify-Actor-Run-Id")
+        cost_usd = 0.0
+        if run_id:
+            try:
+                from dsl_worker.sources_v2.apify_actor import _fetch_run_cost_usd
+                cost_usd = await _fetch_run_cost_usd(client, run_id, api_key)
+            except Exception as e:
+                log.debug("cell apify cost lookup failed: %s", e)
+    return {"items": items[:5]}, cost_usd * 10.0
 
 
 from dsl_worker.chat_v2.light_tools import (
