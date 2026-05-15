@@ -203,8 +203,12 @@ class FullEnrichPeopleAdapter(SourceAdapter):
                 if len(people) < body["limit"]:
                     break
 
-        # Cost: 0.25 credit per match in search
-        cost_credits = 0.25 * len(all_rows)
+        # FE charges per match. Their published pricing varies by plan
+        # (~$0.01-0.05/match for people-search). Use env-tunable per-match
+        # USD; default $0.025/match. 1 our-credit = $0.10 of compute, so
+        # $0.025 → 0.25 credits/match (matches the historical estimate).
+        cost_per_match_usd = float(os.getenv("FULLENRICH_COST_USD_PER_MATCH", "0.025"))
+        cost_credits = len(all_rows) * cost_per_match_usd * 10.0
         return FetchResult(
             rows=all_rows[:n],
             schema=sorted({k for r in all_rows for k in r.keys()})[:60],

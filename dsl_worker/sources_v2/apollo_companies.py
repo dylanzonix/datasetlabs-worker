@@ -106,7 +106,6 @@ class ApolloCompaniesAdapter(SourceAdapter):
 
         all_rows: List[Dict[str, Any]] = []
         total_entries: Optional[int] = None
-        last_status_cost = 0.0
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             while len(all_rows) < target:
@@ -128,12 +127,6 @@ class ApolloCompaniesAdapter(SourceAdapter):
                 if not orgs:
                     break
                 all_rows.extend(orgs)
-                # Cost estimate: 1 credit per ~25 returned items, derived
-                # empirically. Apollo doesn't return cost in the response;
-                # the table's last_fetch_cost_credits gets updated by the
-                # orchestrator from balance-ledger deltas, but we surface
-                # a reasonable estimate here for synchronous cost previews.
-                last_status_cost += max(1, len(orgs) // 25)
                 pagination = data.get("pagination") or {}
                 total_entries = pagination.get("total_entries")
                 page += 1
@@ -152,10 +145,18 @@ class ApolloCompaniesAdapter(SourceAdapter):
             total_entries is not None and len(all_rows) + ((prior_cursor or {}).get("seen", 0)) >= total_entries
         )
 
+        # Cost: Apollo doesn't include per-call cost in the response.
+        # Estimate from plan economics: typical Apollo plan ~$0.05/org returned
+        # (mixed_companies_search consumes ~1 Apollo-credit per org;
+        # Apollo plans range $0.03-0.07/credit). 1 our-credit = $0.10 of
+        # compute, so 0.05/org → 0.5 our-credit per org. Override via env.
+        cost_per_org_usd = float(os.getenv("APOLLO_COST_USD_PER_ORG", "0.05"))
+        cost_credits = len(all_rows) * cost_per_org_usd * 10.0
+
         return FetchResult(
             rows=all_rows,
             schema=sorted({k for r in all_rows for k in r.keys()})[:60],
-            cost_credits=float(last_status_cost),
+            cost_credits=cost_credits,
             exhausted=exhausted,
             cursor={"page": page, "seen": ((prior_cursor or {}).get("seen", 0)) + len(all_rows)},
             dedup_key_column_hint="domain",

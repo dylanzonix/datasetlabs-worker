@@ -42,7 +42,7 @@ class BrowserUseAdapter(SourceAdapter):
             return FetchResult(rows=[], schema=[], cost_credits=0.0, exhausted=True)
 
         try:
-            rows, cost = await bu_extract_rows(
+            rows, cost_usd = await bu_extract_rows(
                 url=query_params["url"],
                 task=query_params["task"],
                 candidate_description=query_params.get("candidate_description", ""),
@@ -52,10 +52,12 @@ class BrowserUseAdapter(SourceAdapter):
             return FetchResult(rows=[], schema=[], cost_credits=0.0, exhausted=True)
 
         schema_keys = sorted({k for r in rows for k in r.keys()}) if rows else []
+        # bu_extract_rows returns the BU SDK's real USD session cost.
+        # Convert to credits at 1 credit = $0.10 of compute.
         return FetchResult(
             rows=rows,
             schema=schema_keys,
-            cost_credits=cost,
+            cost_credits=cost_usd * 10.0,
             exhausted=True,  # one-shot per session
             cursor=None,
             dedup_key_column_hint="url" if "url" in schema_keys else None,

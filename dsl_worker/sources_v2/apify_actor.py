@@ -35,6 +35,33 @@ APIFY_BASE = "https://api.apify.com/v2"
 APIFY_PROXY_KEYS = ("proxy", "proxyConfiguration")
 
 
+async def _fetch_run_cost_usd(client: httpx.AsyncClient, run_id: str, api_key: str) -> float:
+    """Fetch the real USD cost of an actor run from apify's API.
+
+    Reads `data.usageTotalUsd` from /actor-runs/{runId}. Returns 0.0 on any
+    failure — we'd rather lose tracking on one run than fail the entire fetch.
+    """
+    try:
+        r = await client.get(
+            f"{APIFY_BASE}/actor-runs/{run_id}",
+            params={"token": api_key},
+            timeout=10.0,
+        )
+        if r.status_code != 200:
+            log.warning("apify run cost lookup HTTP %s for run %s", r.status_code, run_id)
+            return 0.0
+        data = (r.json() or {}).get("data") or {}
+        usd = data.get("usageTotalUsd")
+        if usd is None:
+            # Fallback: compute from usage breakdown if present
+            usage = data.get("usage") or {}
+            usd = usage.get("ACTOR_COMPUTE_UNITS_USD") or usage.get("totalUsd") or 0.0
+        return float(usd or 0.0)
+    except Exception as e:
+        log.warning("apify run cost lookup failed for %s: %s", run_id, e)
+        return 0.0
+
+
 class ApifyActorAdapter(SourceAdapter):
     name = "apify_actor"
     predictable = False  # output schema is actor-specific
@@ -138,11 +165,21 @@ class ApifyActorAdapter(SourceAdapter):
             if not isinstance(rows, list):
                 rows = []
 
-        # Cost: best estimate from actor metadata; not always available at fetch
-        # time. Caller updates tables.last_fetch_cost_credits from balance ledger
-        # if we hook up cost accounting. For preview-card empirics, 0 here is OK
-        # — the next-fetch estimate uses the actual recorded value.
-        cost = 0.0
+            # Apify run-sync endpoints set this header with the run ID.
+            # Follow up with /actor-runs/{id} to read the real usage cost
+            # so we charge the user what apify actually billed us.
+            run_id = (
+                resp.headers.get("x-apify-actor-run-id")
+                or resp.headers.get("X-Apify-Actor-Run-Id")
+            )
+            cost_usd = 0.0
+            if run_id:
+                cost_usd = await _fetch_run_cost_usd(client, run_id, self.api_key)
+            else:
+                log.warning("apify_actor: no run id header in response — cost not tracked for %s", actor_id)
+
+        # Convention: 1 credit covers $0.10 of compute. Convert real USD → credits.
+        cost = cost_usd * 10.0
 
         # Schema: union of keys across returned rows.
         schema_keys = sorted({k for r in rows for k in r.keys()}) if rows else []
@@ -289,7 +326,13 @@ class ApifyActorAdapter(SourceAdapter):
                                 final_rows = [r for r in body if isinstance(r, dict)]
                         except Exception:
                             pass
-                    yield {"rows": final_rows, "exhausted": True, "cost_credits": 0.0}
+                    # Fetch real run cost from apify's API and bill it.
+                    cost_usd = await _fetch_run_cost_usd(client, run_id, self.api_key)
+                    yield {
+                        "rows": final_rows,
+                        "exhausted": True,
+                        "cost_credits": cost_usd * 10.0,
+                    }
                     return
 
                 if yielded >= max_items:

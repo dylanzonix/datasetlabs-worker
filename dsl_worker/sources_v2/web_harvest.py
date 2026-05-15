@@ -48,8 +48,9 @@ class WebHarvestAdapter(SourceAdapter):
         max_candidates = int(query_params.get("max_candidates", min(n, 30)))
         continuation_hint = query_params.get("continuation_hint")
 
+        from dsl_worker.billing.tracked_client import TrackedOpenAIClient
         from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=api_key)
+        client = TrackedOpenAIClient(AsyncOpenAI(api_key=api_key))
         model = os.getenv("OPENAI_MODEL_MINI", "gpt-5.4-mini")
 
         prompt_parts = [
@@ -65,11 +66,12 @@ class WebHarvestAdapter(SourceAdapter):
         prompt = "\n".join(prompt_parts)
 
         try:
-            resp = await client.responses.create(
+            resp, usage_cost = await client.responses_create(
                 model=model,
-                input=prompt,
+                input=[{"role": "user", "content": prompt}],
                 tools=[{"type": "web_search"}],
             )
+            llm_cost_usd = float(getattr(usage_cost, "total_cost_usd", 0.0) or 0.0)
         except Exception as e:
             log.exception("web_harvest LLM call failed: %s", e)
             return FetchResult(rows=[], schema=[], cost_credits=0.0, exhausted=True)
@@ -99,13 +101,13 @@ class WebHarvestAdapter(SourceAdapter):
             log.warning("web_harvest: no parsable rows from model output")
 
         schema_keys = sorted({k for r in rows for k in r.keys()})[:40]
-        # Cost: rough estimate. Responses + web_search runs ~$0.01-0.05/call;
-        # we don't have token-level accounting at the adapter layer here.
-        cost_credits = 1.5  # 1.5 credits ≈ $0.015 per call as a flat estimate
+        # Real cost from TrackedOpenAIClient: token-priced LLM usage from
+        # the responses call. Web_search tool is free server-side. Convert
+        # USD → credits at 1 credit = $0.10 of compute.
         return FetchResult(
             rows=rows[:n],
             schema=schema_keys,
-            cost_credits=cost_credits,
+            cost_credits=llm_cost_usd * 10.0,
             exhausted=True,  # one-shot; agent passes a fresh continuation_hint for more
             cursor=None,
             dedup_key_column_hint="url" if "url" in schema_keys else None,

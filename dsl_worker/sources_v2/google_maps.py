@@ -187,7 +187,11 @@ class GoogleMapsAdapter(SourceAdapter):
                 )
                 cursor = {"next_page_token": next_tok} if next_tok else None
                 exhausted = next_tok is None
-                cost = 0.17 * len(results)
+                # Google Places textsearch is $0.032 per request, up to 20
+                # results per page. Estimate request count from result count.
+                # (1 cr = $0.10 of compute → 0.32 cr per request.)
+                num_requests = max(1, math.ceil(len(results) / 20)) if results else 0
+                cost = num_requests * 0.32
                 return FetchResult(
                     rows=results[:n],
                     schema=sorted({k for r in results for k in r.keys()})[:30],
@@ -207,7 +211,10 @@ class GoogleMapsAdapter(SourceAdapter):
                 self._single_query(client, query, sub_loc, sub_radius_m)
                 for sub_loc, sub_radius_m in sub_queries
             ]
+            sub_request_count = 0
             for sub_results, _next_tok in await asyncio.gather(*sub_tasks, return_exceptions=False):
+                # Each sub_query walked up to 3 pages; count pages by results
+                sub_request_count += max(1, math.ceil(len(sub_results) / 20)) if sub_results else 1
                 for r in sub_results:
                     pid = r.get("place_id")
                     if pid and pid not in seen_place_ids:
@@ -216,7 +223,7 @@ class GoogleMapsAdapter(SourceAdapter):
                 if len(all_results) >= n:
                     break
 
-        cost = 0.17 * len(all_results)
+        cost = sub_request_count * 0.32
         return FetchResult(
             rows=all_results[:n],
             schema=sorted({k for r in all_results for k in r.keys()})[:30],
