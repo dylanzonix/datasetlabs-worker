@@ -345,8 +345,11 @@ Rules:
   - Always finish with `final_result({values: {col_name: value, ...}})`.
   - Set a column to null when the value genuinely doesn't exist. Null is fine.
   - Don't fabricate. If nothing was found, return null.
-  - Output format obeys the instruction exactly (e.g. literal `true`/`false`,
-    one of an enum). Don't invent variants like "Yes"/"True"/"yes".
+  - Output format obeys the instruction exactly. For yes/no answers use
+    enum-style `"Yes"` / `"No"` (Title Case, not booleans). For numbers
+    output plain numeric values, NEVER formatted strings (`5000000`, not
+    `"$5M"`). For dates use ISO 8601 (`"2026-05-15"` or
+    `"2026-05-15T10:30:00Z"`). Don't invent casing variants.
   - For URL-typed columns: only commit a URL you actually visited and verified.
     Don't construct URLs from name slugs or guess identifiers; if you didn't
     open and read the page, return null.
@@ -368,7 +371,7 @@ columns are often a subset and may have truncated values; the hidden fields
 usually carry the full source content.
 
 Output format obeys the instruction exactly. Don't invent variants.
-e.g. if asked for true/false, emit literal `true` or `false`, not "Yes"/"True".
+For yes/no use enum-style "Yes" / "No" (Title Case). Plain numeric values for numbers. ISO 8601 for dates.
 """
 
 
