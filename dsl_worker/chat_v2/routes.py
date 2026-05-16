@@ -384,6 +384,32 @@ def _filters_to_where_sql(filters):
         elif op_lower == "contains":
             fragments.append(f"{json_text} ILIKE :{p}")
             params[p] = f"%{val}%"
+        elif op_lower in ("not_contains", "does_not_contain"):
+            fragments.append(f"({json_text} IS NULL OR {json_text} NOT ILIKE :{p})")
+            params[p] = f"%{val}%"
+        elif op_lower in ("starts_with", "startswith"):
+            fragments.append(f"{json_text} ILIKE :{p}")
+            params[p] = f"{val}%"
+        elif op_lower in ("ends_with", "endswith"):
+            fragments.append(f"{json_text} ILIKE :{p}")
+            params[p] = f"%{val}"
+        elif op_lower in ("contains_any", "contains_all", "not_contains_any", "not_contains_all"):
+            # Multi-term contains. value is list of strings.
+            arr = val if isinstance(val, list) else [val]
+            arr = [str(v) for v in arr if v is not None and str(v) != ""]
+            if not arr:
+                continue
+            per_term = []
+            for j, term in enumerate(arr):
+                pj = f"{p}_{j}"
+                per_term.append(f"{json_text} ILIKE :{pj}")
+                params[pj] = f"%{term}%"
+            joiner = " OR " if op_lower in ("contains_any", "not_contains_all") else " AND "
+            inner = "(" + joiner.join(per_term) + ")"
+            if op_lower.startswith("not_"):
+                fragments.append(f"({json_text} IS NULL OR NOT {inner})")
+            else:
+                fragments.append(inner)
         elif op_lower in ("is_any_of", "in", "any_of"):
             arr = val if isinstance(val, list) else [val]
             arr = [str(v) for v in arr]
@@ -463,6 +489,48 @@ def _filters_to_where_sql(filters):
             # Unknown op — skip rather than fail the whole query
             continue
     return fragments, params
+
+
+@router.get("/projects/{project_id}/tables/{table_id}/distinct")
+def table_column_distinct(
+    project_id: UUID,
+    table_id: str,
+    column: str = Query(..., min_length=1),
+    limit: int = 200,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Distinct values + counts for one column across the *unfiltered* table.
+    Used by the filter UI so that a value the user just filtered out still
+    appears in the checkbox list (and shows its count)."""
+    _verify_project(project_id, user.user_id, db)
+    tid = _resolve_table_uuid(db, str(project_id), table_id)
+    if not tid:
+        raise HTTPException(404, "Table not found")
+    col_esc = column.replace("'", "''")
+    rows = db.execute(
+        sa_text(
+            f"SELECT row->>'{col_esc}' AS v, COUNT(*) AS c "
+            f"FROM samples WHERE table_id = :tid AND deleted_at IS NULL "
+            f"GROUP BY v ORDER BY c DESC, v ASC LIMIT :lim"
+        ),
+        {"tid": tid, "lim": limit},
+    ).fetchall()
+    values = []
+    empty_count = 0
+    total = 0
+    for v, c in rows:
+        total += c
+        if v is None or v == "":
+            empty_count += c
+        else:
+            values.append({"value": v, "count": c})
+    return {
+        "column": column,
+        "values": values,
+        "empty_count": empty_count,
+        "total": total,
+    }
 
 
 @router.get("/projects/{project_id}/tables/{table_id}/enrichments")
