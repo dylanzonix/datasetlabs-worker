@@ -410,6 +410,37 @@ def _filters_to_where_sql(filters):
                 fragments.append(f"({json_text} IS NULL OR NOT {inner})")
             else:
                 fragments.append(inner)
+        elif op_lower in ("text_inc_exc", "text_include_exclude"):
+            # Apollo-style include/exclude on a text column. value is
+            # {include: [...], exclude: [...]}. Both are OR-ed within
+            # themselves; the two clauses are AND-ed together.
+            if not isinstance(val, dict):
+                continue
+            include = val.get("include") or val.get("i") or []
+            exclude = val.get("exclude") or val.get("e") or []
+            if isinstance(include, str): include = [include]
+            if isinstance(exclude, str): exclude = [exclude]
+            include = [str(t) for t in include if t is not None and str(t) != ""]
+            exclude = [str(t) for t in exclude if t is not None and str(t) != ""]
+            parts = []
+            if include:
+                inc_parts = []
+                for j, term in enumerate(include):
+                    pj = f"{p}_in_{j}"
+                    inc_parts.append(f"{json_text} ILIKE :{pj}")
+                    params[pj] = f"%{term}%"
+                parts.append("(" + " OR ".join(inc_parts) + ")")
+            if exclude:
+                exc_parts = []
+                for j, term in enumerate(exclude):
+                    pj = f"{p}_ex_{j}"
+                    exc_parts.append(f"{json_text} ILIKE :{pj}")
+                    params[pj] = f"%{term}%"
+                parts.append(
+                    f"({json_text} IS NULL OR NOT (" + " OR ".join(exc_parts) + "))"
+                )
+            if parts:
+                fragments.append("(" + " AND ".join(parts) + ")")
         elif op_lower in ("is_any_of", "in", "any_of"):
             arr = val if isinstance(val, list) else [val]
             arr = [str(v) for v in arr]
