@@ -130,6 +130,16 @@ async def enrichment_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
         _ensure_columns_on_table(db, table_id, columns, enrichment_id=enrichment_id)
     db.commit()
 
+    # Seed an agent comment per column the enrichment fills. Only on first
+    # creation — refinements append commentary explicitly via comment_on_column.
+    if not is_refinement:
+        from dsl_worker.chat_v2.comments import seed_column_comment
+        body = _format_enrichment_seed_body(name, action)
+        for col in columns:
+            cname = col.get("name") if isinstance(col, dict) else None
+            if cname:
+                seed_column_comment(db, ctx.project_id, table_id, cname, body)
+
     # Run on the first 10 unfilled rows
     rows_filled, cost = await _run_enrichment_on_rows(
         ctx, table_id, enrichment_id, scope={"type": "first_n", "first_n": 10}, overwrite=is_refinement
@@ -169,6 +179,21 @@ async def enrichment_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
         "rows_filled": rows_filled,
         "results_preview": [r[0] for r in preview],
     }, cost * 0.10
+
+
+def _format_enrichment_seed_body(name: str, action: Dict[str, Any]) -> str:
+    """One-paragraph description of an enrichment's action for the column
+    comment thread. Action shape is either tool-call or cell-agent."""
+    t = (action or {}).get("type")
+    if t == "tool":
+        tool_name = action.get("tool") or "tool"
+        return f"**Enrichment:** {name}\n\nFilled by `{tool_name}` per row."
+    if t == "cell_agent":
+        prompt = (action.get("prompt") or "").strip()
+        if len(prompt) > 400:
+            prompt = prompt[:400] + "…"
+        return f"**Enrichment:** {name}\n\nFilled by cell-agent per row:\n\n> {prompt}"
+    return f"**Enrichment:** {name}"
 
 
 # ---------------------------------------------------------------------------
@@ -269,9 +294,12 @@ async def _run_enrichment_on_rows(
     # Each cell commits + emits an event as soon as it finishes. Keeps the
     # heartbeat fresh (chat_run staleness sweeper triggers at 10 min idle)
     # and means partial progress survives a worker restart.
-    for fut in asyncio.as_completed(tasks):
+    try:
+      for fut in asyncio.as_completed(tasks):
         try:
             sample_id, original_row, new_fields, cost = await fut
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             log.warning("cell op raised: %s", e)
             completed += 1
@@ -320,6 +348,27 @@ async def _run_enrichment_on_rows(
                     })
             except Exception:
                 log.debug("cell_filled emit failed; continuing", exc_info=True)
+    except asyncio.CancelledError:
+        # User cancelled mid-fill. Cancel any still-running cell
+        # tasks so they don't keep racking up external API spend
+        # (apollo / fullenrich / browser_use calls per cell). The
+        # cost already accumulated in total_cost (cells that finished
+        # before the cancel landed) gets surfaced via ctx.partial_cost_usd
+        # so agent.py's CancelledError handler attributes it to the
+        # turn ledger. asyncio.shield around the gather prevents
+        # the cleanup itself from being cancelled mid-shutdown.
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        try:
+            await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
+        except Exception:
+            pass
+        try:
+            ctx.partial_cost_usd += float(total_cost)
+        except Exception:
+            pass
+        raise
 
     return filled_count, total_cost
 

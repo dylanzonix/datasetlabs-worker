@@ -80,12 +80,21 @@ async def run_turn(
     user_message: str,
     history: Optional[List[Dict[str, str]]] = None,
     on_event: EventCallback = None,
+    drain_injections: Optional[Callable[[], List[Dict[str, str]]]] = None,
 ) -> Dict[str, Any]:
     """Run one chat turn end-to-end via the Responses API.
 
     Returns {final_message, tool_calls_made, total_cost_usd, iterations}.
     Emits via on_event: turn_started, reasoning, tool_call_start,
     tool_call_result, final_message, turn_complete, error.
+
+    drain_injections, if provided, is called at the top of each model
+    iteration (before the LLM call) to pull any user messages that
+    were posted via the inject endpoint since the last iteration. The
+    items are prepended as user-role input items so the model sees the
+    new content on its next inference. Long-running tools are not
+    interrupted — injections are only consumed between major model
+    decisions, matching the Claude Code behavior.
     """
     client = _build_client()
     model = os.getenv("OPENAI_MODEL", "gpt-5.4")
@@ -144,6 +153,32 @@ async def run_turn(
 
     iteration = 0
     for iteration in range(MAX_TURN_ITERATIONS):
+        # Mid-turn user-message drain. Anything the user typed while
+        # this turn was thinking lands in input_items as a regular
+        # user-role message — same shape as the initial user_message
+        # so the model has no special-case to learn. Echoes back via
+        # on_event so any connected SSE subscriber can render the
+        # inline balloon for tabs that didn't post the inject themselves.
+        if drain_injections is not None:
+            try:
+                pending = drain_injections()
+            except Exception:
+                log.exception("drain_injections raised; continuing with empty drain")
+                pending = []
+            for inj in pending:
+                inj_content = (inj.get("content") or "").strip()
+                if not inj_content:
+                    continue
+                input_items.append({
+                    "role": "user",
+                    "content": inj_content,
+                })
+                await emit({
+                    "type": "user_injection",
+                    "id": inj.get("id") or "",
+                    "content": inj_content,
+                })
+
         try:
             response, cost = await client.responses_create(
                 model=model,
@@ -153,6 +188,14 @@ async def run_turn(
                 prompt_cache_key=cache_key,
             )
             total_cost_usd += cost.total_cost_usd
+            # Emit running total after each LLM call so the FE can show
+            # live cost growth AND so a mid-turn cancellation has the
+            # latest charge captured server-side. Without this, the
+            # per-turn ledger entry on cancel would miss everything past
+            # the last completed tool call.
+            await emit({"type": "cost_update", "total_cost_usd": total_cost_usd})
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             log.exception("LLM call failed: %s", e)
             await emit({"type": "error", "message": str(e)})
@@ -205,6 +248,20 @@ async def run_turn(
             await emit({"type": "final_message", "text": final_text})
             break
 
+        # Mid-iteration text: the model produced a message AND function
+        # calls in the same response. Emit it as a `text_segment` event
+        # so the FE renders it as its own segment between tool batches
+        # (tool — text — tool — text — final). Previously this text
+        # was silently dropped because we only emit on `final_message`
+        # when no tools are called.
+        mid_text = "".join(text_parts).strip()
+        if mid_text:
+            await emit({
+                "type": "text_segment",
+                "iteration": iteration,
+                "text": mid_text,
+            })
+
         # Dispatch each tool call sequentially. Parallel-tool execution is
         # a follow-up — for now agent rarely emits >1 fn call per turn at
         # this surface size.
@@ -227,8 +284,25 @@ async def run_turn(
                 tool_result: Dict[str, Any] = {"error": f"unknown tool {name}"}
                 h_cost = 0.0
             else:
+                # Long-running tools (apify) bump ctx.partial_cost_usd
+                # as external cost is incurred. Reset to 0 before each
+                # handler call so the running tally is per-call. On
+                # CancelledError, we sum partial_cost_usd into the
+                # turn total below before re-raising.
+                ctx.partial_cost_usd = 0.0
                 try:
                     tool_result, h_cost = await handler(args, ctx)
+                except asyncio.CancelledError:
+                    # User cancelled while this tool was in flight.
+                    # Capture any partial external cost the tool
+                    # accumulated (e.g. apify aborted mid-run still
+                    # bills for compute units burned) into the turn
+                    # total + emit a cost_update so _drive_agent's
+                    # cancel handler flushes the right amount to the
+                    # balance ledger.
+                    total_cost_usd += ctx.partial_cost_usd
+                    await emit({"type": "cost_update", "total_cost_usd": total_cost_usd})
+                    raise
                 except Exception as e:
                     log.exception("tool %s raised: %s", name, e)
                     tool_result = {"error": str(e)[:300]}
@@ -250,6 +324,9 @@ async def run_turn(
                 "result_preview": preview,
                 "cost_usd": h_cost,
             })
+            # Same running-total emit as after the LLM call — keeps the
+            # cancellation safety net up-to-date as tools accumulate cost.
+            await emit({"type": "cost_update", "total_cost_usd": total_cost_usd})
 
             input_items.append({
                 "type": "function_call_output",

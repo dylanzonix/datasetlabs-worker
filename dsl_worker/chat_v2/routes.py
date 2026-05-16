@@ -189,6 +189,66 @@ async def get_v2_active_run(
     return JSONResponse({"run": _run_to_dict(run)})
 
 
+@router.post("/projects/{project_id}/chat/runs/{run_id}/cancel")
+async def cancel_v2_run_endpoint(
+    project_id: UUID,
+    run_id: UUID,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> JSONResponse:
+    """Instantaneous cancel for a chat_v2 run. Sends CancelledError into
+    the running asyncio.Task; the agent's CancelledError handler flushes
+    partial cost to the balance ledger and persists a partial assistant
+    message before exiting. Returns immediately — no need to wait for
+    the agent to finish unwinding."""
+    _verify_project(project_id, user.user_id, db)
+    run = (
+        db.query(ChatRun)
+        .filter(ChatRun.id == run_id, ChatRun.project_id == project_id)
+        .first()
+    )
+    if run is None:
+        raise HTTPException(404, "Run not found")
+    accepted = v2_runs.cancel_v2_run(run_id)
+    return JSONResponse({"accepted": accepted})
+
+
+class InjectBody(BaseModel):
+    content: str
+
+
+@router.post("/projects/{project_id}/chat/runs/{run_id}/inject")
+async def inject_v2_run_endpoint(
+    project_id: UUID,
+    run_id: UUID,
+    body: InjectBody,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> JSONResponse:
+    """Inject a user message mid-turn. The agent consumes it at the
+    next iteration boundary (before its next LLM call); long-running
+    tools are not interrupted. Returns the persisted message id so the
+    submitting client can dedupe its optimistic balloon against the
+    SSE echo."""
+    _verify_project(project_id, user.user_id, db)
+    run = (
+        db.query(ChatRun)
+        .filter(ChatRun.id == run_id, ChatRun.project_id == project_id)
+        .first()
+    )
+    if run is None:
+        raise HTTPException(404, "Run not found")
+    msg_id = v2_runs.inject_message(
+        run_id=run_id,
+        project_id=project_id,
+        user_id=user.user_id,
+        content=body.content,
+    )
+    if msg_id is None:
+        return JSONResponse({"accepted": False, "id": ""})
+    return JSONResponse({"accepted": True, "id": msg_id})
+
+
 def _resolve_table_uuid(db: Session, project_id: str, id_or_short: str) -> Optional[str]:
     """Accept either short_id (t1) or UUID at route boundaries; return UUID."""
     if not id_or_short:
@@ -236,6 +296,10 @@ def list_tables(
         {"pid": str(project_id)},
     ).fetchall()
     out = []
+    # Need query_params for describe_source. Pulled in the loop to avoid
+    # joining (the row count subquery already costs more than the JSONB
+    # read).
+    from dsl_worker.sources_v2 import describe_source
     for r in rows:
         row_count = db.execute(
             sa_text("SELECT COUNT(*) FROM samples WHERE table_id = :tid AND deleted_at IS NULL"),
@@ -243,6 +307,26 @@ def list_tables(
         ).scalar() or 0
         cols = r[4] if isinstance(r[4], list) else json.loads(r[4] or "[]")
         sort_obj = {"column": r[12], "direction": r[13] or "desc"} if r[12] else None
+        # Render the table's source as a human-readable description for the
+        # detail panel. Includes label / query_text / details / favicon.
+        try:
+            qp_row = db.execute(
+                sa_text("SELECT query_params FROM tables WHERE id=:tid"),
+                {"tid": r[0]},
+            ).fetchone()
+            qp = (qp_row[0] if qp_row else {}) or {}
+            if isinstance(qp, str):
+                qp = json.loads(qp or "{}")
+            d = describe_source(r[3], qp)
+            source_description = {
+                "kind": d.kind,
+                "label": d.label,
+                "query_text": d.query_text,
+                "details": d.details,
+                "favicon_url": d.favicon_url,
+            }
+        except Exception:
+            source_description = None
         out.append({
             "id": r[1],  # short_id is the primary public id
             "uuid": r[0],  # UUID still available for backend-internal callers
@@ -258,6 +342,7 @@ def list_tables(
             "fetch_error": r[10],
             "created_at": r[11].isoformat() if r[11] else None,
             "sort": sort_obj,
+            "source_description": source_description,
         })
     return {"tables": out}
 

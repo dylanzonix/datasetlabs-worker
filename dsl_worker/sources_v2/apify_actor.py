@@ -22,11 +22,11 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 import httpx
 
-from dsl_worker.sources_v2.base import FetchResult, SourceAdapter, register
+from dsl_worker.sources_v2.base import FetchResult, SourceAdapter, SourceDescription, register
 
 
 log = logging.getLogger(__name__)
@@ -57,14 +57,104 @@ def _apify_run_cost_usd_from_data(data: Dict[str, Any]) -> float:
     return cu * rate
 
 
+async def _abort_apify_run_and_get_cost(
+    client: httpx.AsyncClient,
+    api_key: str,
+    run_id: str,
+) -> float:
+    """Abort a running apify actor + fetch its final usage cost.
+
+    Called from the CancelledError path of fetch/fetch_stream so the
+    actor stops consuming compute units (we pay per-CU). Apify bills
+    for whatever was used BEFORE the abort lands — we capture that and
+    report it back via the on_cost callback so the chat turn's ledger
+    entry includes the spend. Without this, a user cancel during a
+    minute-long Apify run would abandon the cost (the agent's
+    CancelledError catch only sees what was already returned).
+
+    Returns the USD billed by apify; 0.0 on any failure (abort already
+    fired, run already terminal, network blip during the GET).
+    """
+    try:
+        # Best-effort abort. 4xx is fine — typically means already
+        # terminal. The follow-up GET still returns the final cost.
+        await client.post(
+            f"{APIFY_BASE}/actor-runs/{run_id}/abort",
+            params={"token": api_key},
+            timeout=10.0,
+        )
+    except Exception:
+        log.debug("apify abort POST failed for run %s; continuing to fetch cost", run_id, exc_info=True)
+    try:
+        final = await client.get(
+            f"{APIFY_BASE}/actor-runs/{run_id}",
+            params={"token": api_key},
+            timeout=10.0,
+        )
+        if final.status_code == 200:
+            rd = (final.json() or {}).get("data") or {}
+            return _apify_run_cost_usd_from_data(rd)
+    except Exception:
+        log.debug("apify cost GET failed for run %s after abort", run_id, exc_info=True)
+    return 0.0
+
+
 class ApifyActorAdapter(SourceAdapter):
     name = "apify_actor"
+    label = "Apify"
+    favicon_url = "https://www.google.com/s2/favicons?domain=apify.com&sz=32"
     predictable = False  # output schema is actor-specific
 
     def __init__(self) -> None:
         self.api_key = os.getenv("APIFY_API_KEY")
         if not self.api_key:
             log.warning("APIFY_API_KEY not set — apify_actor adapter inert")
+
+    def describe(
+        self,
+        query_params: Dict[str, Any],
+        source: Optional[str] = None,
+    ) -> SourceDescription:
+        actor_id = ""
+        if source and ":" in source:
+            actor_id = source.split(":", 1)[1]
+        actor_id = actor_id or (query_params or {}).get("actor_id", "")
+        label = f"Apify — {actor_id}" if actor_id else "Apify actor"
+        # Headline = a one-liner pulled from common input keys (search query,
+        # URLs, subreddit, etc). Falls back to the actor id.
+        actor_input = (query_params or {}).get("input") or {}
+        headline_keys = ("query", "search", "searches", "searchQuery", "queries", "startUrls", "subreddits", "subreddit", "domain", "url", "username", "usernames")
+        headline_val: Optional[str] = None
+        for k in headline_keys:
+            v = actor_input.get(k)
+            if v:
+                if isinstance(v, list):
+                    headline_val = ", ".join(str(x) for x in v[:3])
+                else:
+                    headline_val = str(v)
+                break
+        headline = f"{actor_id}: {headline_val}" if headline_val else (actor_id or "Apify actor run")
+
+        # Details: full actor input (truncated values for readability).
+        detail_lines: List[str] = []
+        for k, v in (actor_input or {}).items():
+            if isinstance(v, (list, dict)):
+                import json
+                s = json.dumps(v, separators=(", ", ": "))
+            else:
+                s = str(v)
+            if len(s) > 200:
+                s = s[:200] + "…"
+            detail_lines.append(f"- **{k}:** {s}")
+        if "maxItems" in (query_params or {}) and "maxItems" not in (actor_input or {}):
+            detail_lines.append(f"- **maxItems:** {query_params['maxItems']}")
+        return SourceDescription(
+            kind=self.name,
+            label=label,
+            query_text=headline,
+            details="\n".join(detail_lines),
+            favicon_url=self.favicon_url,
+        )
 
     async def _get_input_schema(self, client: httpx.AsyncClient, actor_id: str) -> Optional[Dict[str, Any]]:
         """Fetch latest build's input schema. Cheap, used for plumbing autofill."""
@@ -120,8 +210,15 @@ class ApifyActorAdapter(SourceAdapter):
         n: int,
         prior_cursor: Optional[Dict[str, Any]] = None,
         source_full: str = "",
+        on_cost: Optional[Callable[[float], None]] = None,
     ) -> FetchResult:
-        """source_full is the colon-suffix form 'apify_actor:<actor_id>'."""
+        """source_full is the colon-suffix form 'apify_actor:<actor_id>'.
+
+        on_cost: optional callback invoked with the actor run's billed
+        cost in USD whenever it's captured (including the cancel path).
+        Lets the agent loop's CancelledError handler attribute the
+        spend to the turn's balance ledger even if this function never
+        returns its FetchResult."""
         if not self.api_key:
             return FetchResult(rows=[], schema=[], cost_credits=0.0, exhausted=True)
 
@@ -165,22 +262,41 @@ class ApifyActorAdapter(SourceAdapter):
             terminal = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
             t0 = asyncio.get_event_loop().time()
             cost_usd = 0.0
-            while True:
-                if asyncio.get_event_loop().time() - t0 > 280:
-                    log.warning("apify_actor poll timeout for run %s", run_id)
-                    break
-                run_resp = await client.get(
-                    f"{APIFY_BASE}/actor-runs/{run_id}",
-                    params={"token": self.api_key},
-                )
-                if run_resp.status_code != 200:
-                    await asyncio.sleep(2)
-                    continue
-                rd = (run_resp.json() or {}).get("data") or {}
-                if rd.get("status") in terminal:
-                    cost_usd = _apify_run_cost_usd_from_data(rd)
-                    break
-                await asyncio.sleep(2.5)
+            try:
+                while True:
+                    if asyncio.get_event_loop().time() - t0 > 280:
+                        log.warning("apify_actor poll timeout for run %s", run_id)
+                        break
+                    run_resp = await client.get(
+                        f"{APIFY_BASE}/actor-runs/{run_id}",
+                        params={"token": self.api_key},
+                    )
+                    if run_resp.status_code != 200:
+                        await asyncio.sleep(2)
+                        continue
+                    rd = (run_resp.json() or {}).get("data") or {}
+                    if rd.get("status") in terminal:
+                        cost_usd = _apify_run_cost_usd_from_data(rd)
+                        break
+                    await asyncio.sleep(2.5)
+            except asyncio.CancelledError:
+                # User cancelled mid-poll. Abort the actor (stops
+                # further compute-unit spend) + read whatever was
+                # already billed; surface that cost up through on_cost
+                # so the run's ledger entry is correct. asyncio.shield
+                # ensures the abort completes even though we're being
+                # cancelled — without it, the await inside abort would
+                # immediately re-raise CancelledError and the actor
+                # would keep running on Apify's side.
+                try:
+                    aborted_usd = await asyncio.shield(
+                        _abort_apify_run_and_get_cost(client, self.api_key, run_id)
+                    )
+                    if on_cost and aborted_usd > 0:
+                        on_cost(aborted_usd * 10.0)
+                except Exception:
+                    log.exception("apify abort-on-cancel cleanup failed for run %s", run_id)
+                raise
 
             rows: List[Dict[str, Any]] = []
             items_resp = await client.get(
@@ -198,6 +314,8 @@ class ApifyActorAdapter(SourceAdapter):
 
         # Convention: 1 credit covers $0.10 of compute. Convert real USD → credits.
         cost = cost_usd * 10.0
+        if on_cost and cost > 0:
+            on_cost(cost)
 
         # Schema: union of keys across returned rows.
         schema_keys = sorted({k for r in rows for k in r.keys()}) if rows else []
@@ -220,6 +338,7 @@ class ApifyActorAdapter(SourceAdapter):
         poll_interval: float = 2.5,
         first_batch_min: int = 3,
         first_batch_timeout: float = 60.0,
+        on_cost: Optional[Callable[[float], None]] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Stream actor output in batches as they appear in the dataset.
 
@@ -273,7 +392,8 @@ class ApifyActorAdapter(SourceAdapter):
             t0 = asyncio.get_event_loop().time()
             terminal = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
 
-            while True:
+            try:
+              while True:
                 # Pull whatever rows are available beyond what we've yielded.
                 items_resp = await client.get(
                     f"{APIFY_BASE}/datasets/{dataset_id}/items",
@@ -365,6 +485,22 @@ class ApifyActorAdapter(SourceAdapter):
                     return
 
                 await asyncio.sleep(poll_interval)
+            except asyncio.CancelledError:
+                # User cancelled mid-poll. Mirror the abort + cost
+                # capture from fetch(): stop the actor on Apify's side
+                # (no more billable CU) and report whatever it already
+                # cost via on_cost so the run's ledger entry stays
+                # accurate. asyncio.shield protects the cleanup from
+                # the cancel that's already propagating.
+                try:
+                    aborted_usd = await asyncio.shield(
+                        _abort_apify_run_and_get_cost(client, self.api_key, run_id)
+                    )
+                    if on_cost and aborted_usd > 0:
+                        on_cost(aborted_usd * 10.0)
+                except Exception:
+                    log.exception("apify abort-on-cancel cleanup failed for run %s", run_id)
+                raise
 
 
 register(ApifyActorAdapter())

@@ -22,7 +22,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 from sqlalchemy import text as sa_text
 
-from dsl_worker.sources_v2 import get_adapter, list_sources
+from dsl_worker.sources_v2 import describe_source, get_adapter, list_sources
 
 
 log = logging.getLogger(__name__)
@@ -47,6 +47,19 @@ class ToolContext:
     emit_progress: Optional[Callable[[str], Awaitable[None]]] = None
     # Reserved for richer in-band events (approval cards, etc.) — wire on demand.
     emit_event: Optional[Callable[[str, Dict[str, Any]], None]] = None
+    # Cooperative-cancel hook. Set to an asyncio.Event by the agent loop
+    # so long-running tools (apify polling, cell-agent rows_fill) can
+    # short-circuit gracefully on user cancel and capture their partial
+    # cost before raising. task.cancel() still works as a backstop —
+    # this just gives well-behaved tools a chance to abort external
+    # work (e.g. apify_client.run.abort()) and report the cost so far.
+    cancel_event: Optional[asyncio.Event] = None
+    # Running tally of cost incurred by the current handler that hasn't
+    # been returned yet. Long-running tools update this so the agent
+    # loop's CancelledError handler can still attribute the spend to
+    # the turn even though the handler never returned its tuple. Reset
+    # to 0 by agent.py before each handler invocation.
+    partial_cost_usd: float = 0.0
 
 
 def resolve_table_id(db: Session, project_id: str, id_or_short: str) -> Optional[str]:
@@ -193,25 +206,51 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     res_rows: List[Dict[str, Any]] = []
     res_exhausted = True
     res_cost = 0.0
+    # Closure that bumps the handler's accumulated cost up to ctx so
+    # the agent loop's CancelledError catch can attribute spend that
+    # happened AFTER the last completed tool but BEFORE the cancel
+    # landed (e.g. an apify actor that was aborted mid-poll — Apify
+    # bills for whatever compute units were burned). Cost is in
+    # credits at this layer (1 credit = $0.10), so divide by 10 before
+    # adding to the USD-denominated partial_cost_usd.
+    def _track_partial_cost(cost_credits: float) -> None:
+        try:
+            ctx.partial_cost_usd += float(cost_credits) / 10.0
+        except Exception:
+            pass
+
     if streaming:
         try:
-            stream_gen = adapter.fetch_stream(query_params, n, source_full=source)
+            stream_gen = adapter.fetch_stream(
+                query_params, n, source_full=source, on_cost=_track_partial_cost,
+            )
             first = await stream_gen.__anext__()
             res_rows = first.get("rows") or []
             res_exhausted = first.get("exhausted", False)
             res_cost = first.get("cost_credits", 0.0)
         except StopAsyncIteration:
             res_exhausted = True
+        except asyncio.CancelledError:
+            # Adapter already invoked on_cost in its CancelledError
+            # path before re-raising — ctx.partial_cost_usd is up to
+            # date. Let the cancel propagate so the agent loop's catch
+            # flushes the turn ledger with the right amount.
+            raise
         except Exception as e:
             log.exception("table_create stream-first-batch failed: %s", e)
             return {"error": f"source fetch failed: {e}"}, 0.0
     else:
         try:
             if source.startswith("apify_actor:"):
-                res = await adapter.fetch(query_params, n, prior_cursor=None, source_full=source)
+                res = await adapter.fetch(
+                    query_params, n, prior_cursor=None, source_full=source,
+                    on_cost=_track_partial_cost,
+                )
             else:
                 res = await adapter.fetch(query_params, n, prior_cursor=None)
             res_rows, res_exhausted, res_cost = res.rows, res.exhausted, res.cost_credits
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             log.exception("table_create fetch failed: %s", e)
             return {"error": f"source fetch failed: {e}"}, 0.0
@@ -297,6 +336,46 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     ctx.db.commit()
 
     _commit_rows(ctx.db, table_id, res_rows, columns_for_db, store_raw=True)
+
+    # Seed the table's comment thread with the agent's "initial description"
+    # — what this table represents, rendered from the source adapter. The
+    # description is visible in the table detail panel and surfaces in the
+    # chat "table created" chip.
+    table_desc = None
+    try:
+        table_desc = describe_source(source, query_params)
+        body_parts = [f"**{table_desc.label}** — {table_desc.query_text}"]
+        if table_desc.details:
+            body_parts.append(table_desc.details)
+        from dsl_worker.chat_v2.comments import seed_table_comment
+        seed_table_comment(ctx.db, ctx.project_id, table_id, "\n\n".join(body_parts))
+    except Exception:
+        log.exception("table_create comment seed failed; continuing")
+
+    # Emit a table_card_added SSE event so the chat sidebar can render the
+    # "table created" chip inline next to the assistant message. The chip
+    # shows favicon + label + query_text and expands to reveal details +
+    # enrichments. FE collects these into message.table_cards (parallel to
+    # message.sources, already on the message model).
+    if ctx.run_id is not None and table_desc is not None:
+        try:
+            from dsl_worker.chat_api import runs as legacy_runs
+            from dsl_api.models import ChatRun
+            run_obj = ctx.db.query(ChatRun).filter(ChatRun.id == ctx.run_id).first()
+            if run_obj is not None:
+                legacy_runs.emit_event(ctx.db, run_obj, "table_card_added", {
+                    "table_id": short_id,
+                    "table_uuid": table_id,
+                    "name": name,
+                    "source": source,
+                    "kind": table_desc.kind,
+                    "label": table_desc.label,
+                    "query_text": table_desc.query_text,
+                    "details": table_desc.details,
+                    "favicon_url": table_desc.favicon_url,
+                })
+        except Exception:
+            log.exception("table_card_added emit failed; continuing")
 
     # If we're streaming, spawn a background task to drain the remaining
     # rows from the actor. Each new batch reads the table's CURRENT
