@@ -69,13 +69,13 @@ TOOL_COST_ESTIMATES = {
 TIER_CONFIG = {
     "classify": {
         "model": "gpt-5.4-nano",
-        "effort": "none",
+        "effort": "medium",
         "default_cap": 0.5,
         "tools": [],  # only final_result
     },
     "lookup": {
         "model": "gpt-5.4-mini",
-        "effort": "low",
+        "effort": "medium",
         "default_cap": 3.0,
         "tools": "all",
     },
