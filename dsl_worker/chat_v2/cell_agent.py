@@ -342,7 +342,9 @@ Inputs you'll receive (JSON):
   - budget_credits_remaining: when this nears zero, stop and emit final_result
 
 Rules:
-  - Always finish with `final_result({values: {col_name: value, ...}})`.
+  - Always finish with `final_result({values: {col_name: value, ...}})`
+    where col_name is the EXACT column name from columns_to_fill — do NOT
+    invent your own keys like "label", "value", "answer", "result".
   - Set a column to null when the value genuinely doesn't exist. Null is fine.
   - Don't fabricate. If nothing was found, return null.
   - Output format obeys the instruction exactly. For yes/no answers use
@@ -434,6 +436,74 @@ def _get_client() -> TrackedOpenAIClient:
         raw = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         _cell_client = TrackedOpenAIClient(raw)
     return _cell_client
+
+
+_GENERIC_VALUE_KEYS = {"value", "label", "answer", "result", "output", "v"}
+
+
+def _coerce_value_keys(
+    raw: Dict[str, Any],
+    columns_to_fill: List[str],
+) -> Dict[str, Any]:
+    """Map raw final_result keys onto the columns_to_fill names.
+
+    Small models (especially nano) often emit {label: X} or {value: X} or
+    {answer: X} instead of using the actual column name. Without this map,
+    enrichment.py merges those bogus keys into samples.row and the user's
+    actual column stays empty — looks like the cell agent "ran and
+    returned nothing." Returns the cleaned dict.
+    """
+    if not isinstance(raw, dict) or not raw:
+        return {}
+    if not columns_to_fill:
+        return raw
+    # Exact-match keys → keep as-is. Anything else is a candidate for remap.
+    exact = {k: v for k, v in raw.items() if k in columns_to_fill}
+    leftovers = {k: v for k, v in raw.items() if k not in columns_to_fill}
+
+    # Case: model returned generic key(s) and there's exactly one column to
+    # fill (the most common nano failure mode). Use the leftover value.
+    if not exact and leftovers and len(columns_to_fill) == 1:
+        target = columns_to_fill[0]
+        # Prefer a generic-named key if present; otherwise take the first.
+        for k in _GENERIC_VALUE_KEYS:
+            if k in leftovers:
+                return {target: leftovers[k]}
+        # Fallback: first value
+        first_val = next(iter(leftovers.values()))
+        return {target: first_val}
+
+    # Case: model returned positional keys matching a sensible order
+    # (label/value, etc.) for multi-column. Best-effort: if leftover count
+    # equals missing-column count and leftover keys are all generic, fill
+    # in column order.
+    missing = [c for c in columns_to_fill if c not in exact]
+    if leftovers and len(leftovers) == len(missing) and all(
+        k in _GENERIC_VALUE_KEYS or k.lower() in _GENERIC_VALUE_KEYS
+        for k in leftovers.keys()
+    ):
+        for col, val in zip(missing, leftovers.values()):
+            exact[col] = val
+        return exact
+
+    # Case-insensitive / underscore-collapsed match: e.g. column "Founder Email"
+    # and model returned "founder_email" or "founderEmail".
+    def _normalize(s: str) -> str:
+        return "".join(ch for ch in s.lower() if ch.isalnum())
+    cols_norm = {_normalize(c): c for c in columns_to_fill if c not in exact}
+    for k, v in leftovers.items():
+        nk = _normalize(k)
+        if nk in cols_norm:
+            exact[cols_norm[nk]] = v
+
+    # Anything that still didn't map gets dropped (logged).
+    unmapped = [k for k in leftovers.keys() if k not in exact and _normalize(k) not in cols_norm]
+    if unmapped:
+        log.warning(
+            "cell_agent: dropped unmapped keys %s; columns_to_fill=%s",
+            unmapped, columns_to_fill,
+        )
+    return exact
 
 
 def _persist_cell_trace(
@@ -616,14 +686,21 @@ async def run_cell_agent(
 
                 if name == "final_result":
                     if isinstance(args.get("values"), dict):
-                        final_values = args["values"]
+                        raw_values = args["values"]
                     elif isinstance(args, dict) and args:
-                        final_values = args
+                        raw_values = args
                     else:
-                        final_values = {}
+                        raw_values = {}
+                    # Coerce keys to match columns_to_fill — small models
+                    # often invent sensible labels like {label, value, answer,
+                    # result} instead of using the actual column name. This
+                    # used to silently drop the value (the row would never
+                    # fill because the key didn't match any column).
+                    final_values = _coerce_value_keys(raw_values, columns_to_fill)
                     tool_calls_log.append({
                         "name": "final_result",
                         "args": args,
+                        "coerced_values": final_values,
                         "cost": 0.0,
                     })
                     return final_values, total_cost
