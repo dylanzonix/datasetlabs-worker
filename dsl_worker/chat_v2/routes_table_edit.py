@@ -170,6 +170,83 @@ async def create_table_from_file(
     return result
 
 
+@router.delete("/projects/{project_id}/tables/{table_id}")
+def delete_table(
+    project_id: UUID,
+    table_id: str,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Soft-delete a table (sets deleted_at). The samples are kept
+    intact (each has its own deleted_at logic in the sample query),
+    but the table no longer surfaces via list_tables / project_state.
+    Idempotent — returns ok=true even if the table was already gone."""
+    _verify(project_id, user.user_id, db)
+    tid = _resolve_table_uuid(db, str(project_id), table_id)
+    if not tid:
+        raise HTTPException(404, "Table not found")
+    db.execute(
+        sa_text(
+            "UPDATE tables SET deleted_at = now() "
+            "WHERE id=:tid AND project_id=:pid AND deleted_at IS NULL"
+        ),
+        {"tid": tid, "pid": str(project_id)},
+    )
+    db.commit()
+    return {"ok": True, "id": table_id, "uuid": tid}
+
+
+class ReorderTablesBody(BaseModel):
+    # Ordered list of table short_ids (or UUIDs). Tables not in the list
+    # are appended to the end in their original order.
+    table_ids: list[str]
+
+
+@router.post("/projects/{project_id}/tables/reorder")
+def reorder_tables(
+    project_id: UUID,
+    body: ReorderTablesBody,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Reorder tables by rewriting their created_at timestamps in the
+    given order. We sort tables by created_at on read, so spacing them
+    by 1ms in the requested sequence gives us the new tab order.
+    Cheap, no migration needed for a sort_order column."""
+    _verify(project_id, user.user_id, db)
+    if not body.table_ids:
+        return {"ok": True}
+    # Resolve every id to a uuid, in order.
+    uuids: list[str] = []
+    for raw in body.table_ids:
+        u = _resolve_table_uuid(db, str(project_id), raw)
+        if u:
+            uuids.append(u)
+    if not uuids:
+        return {"ok": True}
+    # Anchor 1 hour ago so a concurrent insert (server clock = now)
+    # doesn't end up earlier than our reordered set.
+    db.execute(
+        sa_text(
+            """
+            WITH new_order AS (
+              SELECT unnest(CAST(:ids AS uuid[])) AS id,
+                     generate_series(0, cardinality(CAST(:ids AS uuid[])) - 1) AS pos
+            )
+            UPDATE tables t
+            SET created_at = (now() - INTERVAL '1 hour') + (new_order.pos * INTERVAL '1 millisecond')
+            FROM new_order
+            WHERE t.id = new_order.id
+              AND t.project_id = :pid
+              AND t.deleted_at IS NULL
+            """
+        ),
+        {"ids": uuids, "pid": str(project_id)},
+    )
+    db.commit()
+    return {"ok": True, "order": uuids}
+
+
 @router.post("/projects/{project_id}/tables")
 def create_table(
     project_id: UUID,
