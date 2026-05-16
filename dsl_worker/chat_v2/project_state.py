@@ -135,6 +135,30 @@ def build_project_state(db: Session, project_id: str, max_tables: int = 10) -> s
             if last_rows == 0:
                 parts.append("        (returned 0 — source may be tapped out for this query)")
 
+    # Uploaded files — agent uses these via source="file" + file_id.
+    # Without surfacing them here the agent has no idea any file exists,
+    # which reads as "files aren't hooked up" even when the user
+    # successfully uploaded.
+    files = db.execute(
+        sa_text(
+            """
+            SELECT id::text, filename, content_type, size_bytes, status
+            FROM project_files
+            WHERE project_id = :pid AND deleted_at IS NULL
+            ORDER BY created_at
+            LIMIT 50
+            """
+        ),
+        {"pid": project_id},
+    ).fetchall()
+    uploaded = [f for f in files if (f[4] or "").lower() == "uploaded"]
+    if uploaded:
+        parts.append("\nUploaded files (reference by file_id with source=\"file\"):")
+        for (fid, fname, ctype, size, _status) in uploaded:
+            size_str = _human_size(size)
+            type_str = f" {ctype}" if ctype else ""
+            parts.append(f"  - {fname} ({size_str}{type_str}) — file_id: {fid}")
+
     # Enrichments configured
     enrichments = db.execute(
         sa_text(
@@ -163,6 +187,18 @@ def build_project_state(db: Session, project_id: str, max_tables: int = 10) -> s
 
     body = "\n".join(parts)
     return f"<project_state>\n{body}\n</project_state>"
+
+
+def _human_size(n: int | None) -> str:
+    if not n:
+        return "?"
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    if n < 1024 * 1024 * 1024:
+        return f"{n / (1024 * 1024):.1f} MB"
+    return f"{n / (1024 * 1024 * 1024):.1f} GB"
 
 
 def _human_ago(seconds: float) -> str:
