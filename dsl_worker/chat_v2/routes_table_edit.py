@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 from dsl_api.auth import CurrentUser, get_current_user
 from dsl_api.db import SessionLocal
 from dsl_api.models import Project
+from dsl_api.models.entity_comment import EntityComment
 
 
 router = APIRouter(prefix="/v2")
@@ -205,6 +206,175 @@ def create_table(
         "source": "manual",
         "columns": [],
         "row_count": 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Patch table (rename) / delete / duplicate
+# ---------------------------------------------------------------------------
+
+
+class PatchTableBody(BaseModel):
+    name: Optional[str] = None
+
+
+@router.patch("/projects/{project_id}/tables/{table_id}")
+def patch_table(
+    project_id: UUID,
+    table_id: str,
+    body: PatchTableBody,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Rename the table. Currently only `name` is patchable from the UI;
+    other fields (source/query_params/columns) are agent-managed."""
+    _verify(project_id, user.user_id, db)
+    tid = _resolve_table_uuid(db, str(project_id), table_id)
+    if not tid:
+        raise HTTPException(404, "Table not found")
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(400, "name is required")
+    db.execute(
+        sa_text("UPDATE tables SET name = :name WHERE id = :id"),
+        {"name": name, "id": tid},
+    )
+    db.commit()
+    return {"id": table_id, "uuid": tid, "name": name}
+
+
+@router.delete("/projects/{project_id}/tables/{table_id}")
+def delete_table(
+    project_id: UUID,
+    table_id: str,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Soft-delete a table. Rows / enrichments / filters remain in the DB
+    via the CASCADE-on-tables-deletion FKs but are filtered out of FE
+    queries by the `deleted_at IS NULL` predicate."""
+    _verify(project_id, user.user_id, db)
+    tid = _resolve_table_uuid(db, str(project_id), table_id)
+    if not tid:
+        raise HTTPException(404, "Table not found")
+    db.execute(
+        sa_text("UPDATE tables SET deleted_at = now() WHERE id = :id"),
+        {"id": tid},
+    )
+    db.commit()
+    return {"ok": True, "id": table_id, "uuid": tid}
+
+
+@router.post("/projects/{project_id}/tables/{table_id}/duplicate")
+def duplicate_table(
+    project_id: UUID,
+    table_id: str,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Clone a table — copies the Table row (name + " (copy)"), all
+    samples (rows), and any enrichments. Filters and the active
+    sort/cursor are intentionally NOT copied (they're view state, not
+    intrinsic to the dataset). Re-running fetches against the copy is
+    a separate user action."""
+    _verify(project_id, user.user_id, db)
+    src_tid = _resolve_table_uuid(db, str(project_id), table_id)
+    if not src_tid:
+        raise HTTPException(404, "Table not found")
+    src = db.execute(
+        sa_text(
+            """
+            SELECT name, source, query_params, columns, dedup_key_column,
+                   fetch_status
+            FROM tables WHERE id = :id
+            """
+        ),
+        {"id": src_tid},
+    ).fetchone()
+    if not src:
+        raise HTTPException(404, "Table not found")
+    new_id = str(uuid.uuid4())
+    new_short = _next_table_short_id(db, str(project_id))
+    new_name = f"{src[0]} (copy)"
+    # `fetch_status` defaults to 'complete' on the copy — no in-flight
+    # background job was inherited.
+    db.execute(
+        sa_text(
+            """
+            INSERT INTO tables
+              (id, project_id, short_id, name, source, query_params, columns,
+               dedup_key_column, fetch_status, created_at)
+            VALUES
+              (:id, :pid, :sid, :name, :source,
+               CAST(:qp AS jsonb), CAST(:cols AS jsonb),
+               :dedup, 'complete', now())
+            """
+        ),
+        {
+            "id": new_id,
+            "pid": str(project_id),
+            "sid": new_short,
+            "name": new_name,
+            "source": src[1],
+            "qp": json.dumps(src[2] if isinstance(src[2], (dict, list)) else (src[2] or {})),
+            "cols": json.dumps(src[3] if isinstance(src[3], (dict, list)) else (src[3] or [])),
+            "dedup": src[4],
+        },
+    )
+    # Copy samples in one SQL statement — preserve seq order so the
+    # copied table renders identically.
+    db.execute(
+        sa_text(
+            """
+            INSERT INTO samples
+              (id, project_id, table_id, seq, row, raw_row, tags,
+               enrichment_data, created_at, version_id)
+            SELECT
+              gen_random_uuid(), project_id, :new_tid, seq, row, raw_row,
+              tags, enrichment_data, now(), version_id
+            FROM samples
+            WHERE table_id = :src_tid AND deleted_at IS NULL
+            """
+        ),
+        {"new_tid": new_id, "src_tid": src_tid},
+    )
+    # Copy enrichments (each gets a fresh id + short_id; per-row run
+    # state is left empty so the user can re-run on the copy).
+    enrichments = db.execute(
+        sa_text(
+            "SELECT name, columns, action, per_row_credit_cap FROM enrichments "
+            "WHERE table_id = :tid AND deleted_at IS NULL ORDER BY created_at"
+        ),
+        {"tid": src_tid},
+    ).fetchall()
+    for i, e in enumerate(enrichments, start=1):
+        db.execute(
+            sa_text(
+                """
+                INSERT INTO enrichments
+                  (id, table_id, short_id, name, columns, action,
+                   per_row_credit_cap, created_at)
+                VALUES
+                  (gen_random_uuid(), :tid, :sid, :name,
+                   CAST(:cols AS jsonb), CAST(:action AS jsonb),
+                   :cap, now())
+                """
+            ),
+            {
+                "tid": new_id,
+                "sid": f"e{i}",
+                "name": e[0],
+                "cols": json.dumps(e[1] if isinstance(e[1], (dict, list)) else (e[1] or [])),
+                "action": json.dumps(e[2] if isinstance(e[2], (dict, list)) else (e[2] or {})),
+                "cap": e[3],
+            },
+        )
+    db.commit()
+    return {
+        "id": new_short,
+        "uuid": new_id,
+        "name": new_name,
+        "source": src[1],
     }
 
 
@@ -672,3 +842,92 @@ def patch_column(
     )
     db.commit()
     return {"columns": cols}
+
+
+# ---------------------------------------------------------------------------
+# Entity comments — description thread per table / column
+# ---------------------------------------------------------------------------
+
+
+class EntityCommentCreate(BaseModel):
+    body: str
+
+
+def _comment_to_dict(c: EntityComment) -> Dict[str, Any]:
+    return {
+        "id": str(c.id),
+        "project_id": str(c.project_id),
+        "table_id": str(c.table_id),
+        "column_name": c.column_name,
+        "author": c.author,
+        "body": c.body,
+        "created_by": str(c.created_by) if c.created_by else None,
+        "created_at": c.created_at.isoformat() if c.created_at else None,
+    }
+
+
+@router.get("/projects/{project_id}/entity_comments")
+def list_entity_comments(
+    project_id: UUID,
+    table_id: str,
+    column_name: Optional[str] = None,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """List the comment thread on a table (column_name omitted) or one
+    of its columns (column_name set). Oldest first."""
+    _verify(project_id, user.user_id, db)
+    tid = _resolve_table_uuid(db, str(project_id), table_id)
+    if not tid:
+        raise HTTPException(404, "Table not found")
+    q = db.query(EntityComment).filter(
+        EntityComment.project_id == project_id,
+        EntityComment.table_id == tid,
+    )
+    if column_name is None:
+        q = q.filter(EntityComment.column_name.is_(None))
+    else:
+        q = q.filter(EntityComment.column_name == column_name)
+    return [_comment_to_dict(c) for c in q.order_by(EntityComment.created_at.asc()).all()]
+
+
+@router.post("/projects/{project_id}/entity_comments")
+def create_entity_comment(
+    project_id: UUID,
+    body: EntityCommentCreate,
+    table_id: str,
+    column_name: Optional[str] = None,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Append a user-authored comment to a table or column thread."""
+    _verify(project_id, user.user_id, db)
+    tid = _resolve_table_uuid(db, str(project_id), table_id)
+    if not tid:
+        raise HTTPException(404, "Table not found")
+    text = (body.body or "").strip()
+    if not text:
+        raise HTTPException(400, "body is required")
+    if column_name is not None:
+        row = db.execute(
+            sa_text("SELECT columns FROM tables WHERE id=:id"),
+            {"id": tid},
+        ).fetchone()
+        cols = row[0] if (row and row[0]) else []
+        if isinstance(cols, str):
+            cols = json.loads(cols)
+        names = {c.get("name") for c in cols if isinstance(c, dict)}
+        if column_name not in names:
+            raise HTTPException(404, "Column not found on table")
+    c = EntityComment(
+        project_id=project_id,
+        table_id=tid,
+        column_name=column_name,
+        author="user",
+        body=text,
+        created_by=user.user_id,
+    )
+    db.add(c)
+    db.commit()
+    db.refresh(c)
+    return _comment_to_dict(c)

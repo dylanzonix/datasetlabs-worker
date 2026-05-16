@@ -17,6 +17,7 @@ from typing import Any, Dict, List
 from dsl_worker.chat_v2.tools import HANDLERS as _table_handlers, ToolContext
 from dsl_worker.chat_v2.light_tools import HANDLERS as _light_handlers
 from dsl_worker.chat_v2.enrichment import HANDLERS as _enrichment_handlers
+from dsl_worker.chat_v2.comments import HANDLERS as _comment_handlers
 from dsl_worker.chat_v2.prompt import build_system_prompt
 from dsl_worker.chat_v2.project_state import build_project_state
 
@@ -25,6 +26,7 @@ HANDLERS = {
     **_table_handlers,
     **_light_handlers,
     **_enrichment_handlers,
+    **_comment_handlers,
 }
 
 
@@ -65,6 +67,9 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
         "code_exec": "Execute a Python snippet in the sandbox.",
         "web_search": "Quick web search — for scouting, not row-building. Use web_harvest source for table-building from web.",
         "suggest_replies": "Emit chip suggestions for the user's next move. Call at end of turn.",
+        # Comments — the description thread visible in the table/column detail panel.
+        "comment_on_table": "Append a short agent note to a table's description thread (visible in the table detail panel). Use sparingly — for non-obvious decisions or material changes the user should see ('Switched to Apollo because Google Maps capped at 60 results'). Args: table_id, body (markdown ok).",
+        "comment_on_column": "Append a short agent note to a column's description thread. Args: table_id, column (name on the table), body.",
     }
     return [
         {
