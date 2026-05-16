@@ -333,6 +333,9 @@ async def _run_enrichment_on_rows(
 
         # Heartbeat: every cell completion writes a chat_run_event so the
         # staleness sweeper (10-min idle) doesn't reap us mid-enrichment.
+        # The new_fields payload lets the FE patch the row in place
+        # without re-fetching, so the user sees cells fill as they
+        # complete instead of all-at-once at end of turn.
         run_id = getattr(ctx, "run_id", None)
         if run_id:
             try:
@@ -345,6 +348,7 @@ async def _run_enrichment_on_rows(
                         "sample_id": sample_id,
                         "completed": completed,
                         "total": total,
+                        "new_fields": new_fields if isinstance(new_fields, dict) else None,
                     })
             except Exception:
                 log.debug("cell_filled emit failed; continuing", exc_info=True)
