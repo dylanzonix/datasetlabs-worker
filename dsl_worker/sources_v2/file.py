@@ -67,31 +67,59 @@ class FileAdapter(SourceAdapter):
     ) -> FetchResult:
         file_id = query_params["file_id"]
         path = Path(file_id)
-        # If not on disk, try the candidate store (files written by
-        # code_exec are uploaded there).
+        # 1) Already a real disk path → use it.
+        # 2) Looks like a UUID → it's a project_files row; read from Azure Blob.
+        # 3) Otherwise fall back to the candidate store (code_exec output).
         if not path.exists():
             project_id = query_params.get("_project_id")
-            if project_id:
+            blob_bytes: Optional[bytes] = None
+            blob_filename: Optional[str] = None
+            uuid_re = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+            if uuid_re.match(file_id):
+                try:
+                    from dsl_api.db import SessionLocal
+                    from sqlalchemy import text as sa_text
+                    db = SessionLocal()
+                    try:
+                        row = db.execute(
+                            sa_text(
+                                "SELECT blob_path, filename FROM project_files "
+                                "WHERE id=:fid AND deleted_at IS NULL AND status='uploaded'"
+                            ),
+                            {"fid": file_id},
+                        ).fetchone()
+                    finally:
+                        db.close()
+                    if row and row[0]:
+                        from dsl_api.azure.blob import get_blob_client
+                        blob_client = get_blob_client(row[0])
+                        blob_bytes = blob_client.download_blob().readall()
+                        blob_filename = row[1]
+                except Exception as e:
+                    log.info("file source: blob lookup for %s failed: %s", file_id, e)
+
+            if blob_bytes is None and project_id:
                 try:
                     from dsl_worker.chat_api.candidates import read_candidates_bytes
                     blob_bytes = read_candidates_bytes(project_id, file_id)
-                    import tempfile
-                    suffix = Path(file_id).suffix or ".csv"
-                    tmp = tempfile.NamedTemporaryFile(
-                        delete=False, suffix=suffix, mode="wb",
-                    )
-                    tmp.write(blob_bytes)
-                    tmp.close()
-                    path = Path(tmp.name)
+                    blob_filename = file_id
                 except Exception as e:
                     log.info("file source: candidate lookup for %s failed: %s", file_id, e)
-                    return FetchResult(
-                        rows=[], schema=[], cost_credits=0.0, exhausted=True,
-                    )
-            else:
+
+            if blob_bytes is None:
                 return FetchResult(
                     rows=[], schema=[], cost_credits=0.0, exhausted=True,
                 )
+
+            import tempfile
+            suffix = Path(blob_filename or file_id).suffix or ".csv"
+            tmp = tempfile.NamedTemporaryFile(
+                delete=False, suffix=suffix, mode="wb",
+            )
+            tmp.write(blob_bytes)
+            tmp.close()
+            path = Path(tmp.name)
 
         rows: List[Dict[str, Any]] = []
         if path.suffix.lower() == ".csv":
