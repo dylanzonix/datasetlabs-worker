@@ -105,6 +105,70 @@ class CreateTableBody(BaseModel):
     name: Optional[str] = None
 
 
+class CreateTableFromFileBody(BaseModel):
+    file_id: str
+    name: Optional[str] = None
+
+
+@router.post("/projects/{project_id}/tables/from-file")
+async def create_table_from_file(
+    project_id: UUID,
+    body: CreateTableFromFileBody,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Create a new table directly from an already-uploaded file
+    (project_files.id). Skips the LLM — calls the same `table_create`
+    helper the agent does, but driven from the FE for a one-click
+    "New table from file" flow.
+
+    Body: { file_id, name? }
+    """
+    _verify(project_id, user.user_id, db)
+
+    # Confirm the file belongs to the project and is uploaded.
+    row = db.execute(
+        sa_text(
+            """
+            SELECT filename FROM project_files
+            WHERE id=:fid AND project_id=:pid AND deleted_at IS NULL
+              AND status='uploaded'
+            """
+        ),
+        {"fid": body.file_id, "pid": str(project_id)},
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "File not found")
+    filename = row[0]
+
+    # Default the table name to the file's base name (without extension).
+    name = (body.name or "").strip()
+    if not name:
+        stem = filename
+        if "." in stem:
+            stem = stem.rsplit(".", 1)[0]
+        name = stem or "New table"
+
+    from dsl_worker.chat_v2.tools import table_create, ToolContext
+    ctx = ToolContext(
+        db=db,
+        project_id=str(project_id),
+        user_id=str(user.user_id),
+        run_id=None,
+    )
+    result, _cost = await table_create(
+        {
+            "source": "file",
+            "query_params": {"file_id": body.file_id},
+            "name": name,
+        },
+        ctx,
+    )
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return result
+
+
 @router.post("/projects/{project_id}/tables")
 def create_table(
     project_id: UUID,
