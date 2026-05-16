@@ -13,6 +13,7 @@ directly on tables/enrichments.
 
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
@@ -82,6 +83,58 @@ class RunEnrichmentBody(BaseModel):
     first_n: Optional[int] = None
     row_ids: Optional[List[str]] = None
     overwrite: bool = False
+
+
+class PatchEnrichmentBody(BaseModel):
+    tier: Optional[str] = None  # "classify" | "lookup" | "research"
+    per_row_credit_cap: Optional[float] = None
+
+
+@router.patch("/projects/{project_id}/enrichments/{enrichment_id}")
+def patch_enrichment(
+    project_id: UUID,
+    enrichment_id: str,
+    body: PatchEnrichmentBody,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Update tier (writes action.tier) and/or per_row_credit_cap.
+
+    Tier only applies to cell_agent actions — for `type: "tool"` enrichments
+    tier is meaningless and is ignored.
+    """
+    _verify(project_id, user.user_id, db)
+    # Resolve short_id → uuid.
+    row = db.execute(
+        sa_text(
+            "SELECT id::text, action, per_row_credit_cap FROM enrichments "
+            "WHERE (short_id = :eid OR id::text = :eid) AND deleted_at IS NULL"
+        ),
+        {"eid": enrichment_id},
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "Enrichment not found")
+    eid_uuid = row[0]
+    action = row[1] if isinstance(row[1], dict) else json.loads(row[1] or "{}")
+    cap = row[2]
+
+    if body.tier is not None:
+        if body.tier not in ("classify", "lookup", "research"):
+            raise HTTPException(400, "tier must be classify | lookup | research")
+        if action.get("type") == "cell_agent":
+            action["tier"] = body.tier
+    if body.per_row_credit_cap is not None:
+        cap = body.per_row_credit_cap
+
+    db.execute(
+        sa_text(
+            "UPDATE enrichments SET action = CAST(:a AS jsonb), "
+            "per_row_credit_cap = :cap WHERE id = :id"
+        ),
+        {"a": json.dumps(action), "cap": cap, "id": eid_uuid},
+    )
+    db.commit()
+    return {"ok": True, "tier": action.get("tier"), "per_row_credit_cap": cap}
 
 
 @router.post("/projects/{project_id}/enrichments/{enrichment_id}/run")
