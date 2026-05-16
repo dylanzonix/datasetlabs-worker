@@ -766,11 +766,37 @@ async def table_delete(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
     if not table_id:
         return {"error": "table_id is required"}, 0.0
+    # Read short_id before delete so the emitted event matches what the
+    # FE has cached (it keys tables by short_id, not uuid).
+    short_id_row = ctx.db.execute(
+        sa_text("SELECT short_id FROM tables WHERE id=:id"),
+        {"id": table_id},
+    ).fetchone()
+    short_id = short_id_row[0] if short_id_row else None
     ctx.db.execute(
         sa_text("UPDATE tables SET deleted_at=now() WHERE id=:id AND project_id=:pid"),
         {"id": table_id, "pid": ctx.project_id},
     )
     ctx.db.commit()
+
+    # Emit a table_card_removed event so the FE drops the deleted table
+    # from the tabs bar immediately. Without this, the deleted table
+    # lingers in the tabs until SOME other event (rows_added on a new
+    # table) triggers a tables refresh — which is the exact "deleted
+    # table stayed visible until the new one finished" bug.
+    if ctx.run_id is not None:
+        try:
+            from dsl_worker.chat_api import runs as legacy_runs
+            from dsl_api.models import ChatRun
+            run_obj = ctx.db.query(ChatRun).filter(ChatRun.id == ctx.run_id).first()
+            if run_obj is not None:
+                legacy_runs.emit_event(ctx.db, run_obj, "table_card_removed", {
+                    "table_id": short_id,
+                    "table_uuid": table_id,
+                })
+        except Exception:
+            log.exception("table_card_removed emit failed; continuing")
+
     return {"ok": True}, 0.0
 
 
