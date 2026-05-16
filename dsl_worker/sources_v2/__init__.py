@@ -12,6 +12,8 @@ from dsl_worker.sources_v2.base import (
     ColumnDef,
     FetchResult,
     SourceAdapter,
+    SourceDescription,
+    describe_source,
     get_adapter,
     list_sources,
 )
@@ -30,6 +32,8 @@ __all__ = [
     "ColumnDef",
     "FetchResult",
     "SourceAdapter",
+    "SourceDescription",
+    "describe_source",
     "get_adapter",
     "list_sources",
 ]

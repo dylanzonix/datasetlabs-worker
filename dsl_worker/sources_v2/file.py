@@ -19,7 +19,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from dsl_worker.sources_v2.base import FetchResult, SourceAdapter, register
+from dsl_worker.sources_v2.base import FetchResult, SourceAdapter, SourceDescription, register
 
 
 log = logging.getLogger(__name__)
@@ -52,7 +52,49 @@ def _sniff_type(samples: List[str]) -> str:
 
 class FileAdapter(SourceAdapter):
     name = "file"
+    label = "Uploaded files"
+    favicon_url = None  # frontend renders a generic file icon
     predictable = True  # CSV headers ARE the schema
+
+    def describe(
+        self,
+        query_params: Dict[str, Any],
+        source: Optional[str] = None,
+    ) -> SourceDescription:
+        qp = query_params or {}
+        # `file_id` may be a single id or a list when multiple files are
+        # processed as one source. Filenames are resolved by chat_v2 before
+        # this is rendered; here we just show the raw ids if filenames
+        # aren't attached.
+        files = qp.get("files") or qp.get("file_ids") or qp.get("file_id")
+        if isinstance(files, str):
+            files_list: List[str] = [files]
+        elif isinstance(files, list):
+            files_list = [str(f) for f in files]
+        else:
+            files_list = []
+        n = len(files_list)
+        headline = (
+            "1 attached file" if n == 1
+            else f"{n} attached files" if n > 1
+            else "Attached files"
+        )
+        # `query` here is the iteration semantic — same query applies to all
+        # attached files. This is the field the user wrote in chat / panel.
+        if qp.get("query"):
+            headline = f"{headline} — {qp['query']}"
+        detail_lines = []
+        if files_list:
+            detail_lines.append("**Files:** " + ", ".join(files_list))
+        if qp.get("description"):
+            detail_lines.append(qp["description"])
+        return SourceDescription(
+            kind=self.name,
+            label=self.label,
+            query_text=headline,
+            details="\n\n".join(detail_lines),
+            favicon_url=self.favicon_url,
+        )
 
     def validate_query_params(self, query_params: Dict[str, Any]) -> Optional[str]:
         if "file_id" not in query_params:

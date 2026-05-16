@@ -12,7 +12,9 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
-from dsl_worker.sources_v2.base import FetchResult, SourceAdapter, register
+from urllib.parse import urlparse
+
+from dsl_worker.sources_v2.base import FetchResult, SourceAdapter, SourceDescription, register
 
 
 log = logging.getLogger(__name__)
@@ -20,7 +22,41 @@ log = logging.getLogger(__name__)
 
 class BrowserUseAdapter(SourceAdapter):
     name = "browser_use"
+    label = "Browser Session"
+    favicon_url = None  # derived from the target URL at describe time
     predictable = False
+
+    def describe(
+        self,
+        query_params: Dict[str, Any],
+        source: Optional[str] = None,
+    ) -> SourceDescription:
+        qp = query_params or {}
+        url = str(qp.get("url") or "")
+        task = str(qp.get("task") or "")
+        cand = str(qp.get("candidate_description") or "")
+        domain = ""
+        favicon = None
+        if url:
+            try:
+                domain = urlparse(url).hostname or ""
+                if domain:
+                    favicon = f"https://www.google.com/s2/favicons?domain={domain}&sz=32"
+            except Exception:
+                pass
+        headline = f"Extract from {domain}" if domain else "Browser-session extract"
+        details_parts = [f"**URL:** {url}"] if url else []
+        if task:
+            details_parts.append(f"**Task:**\n\n{task}")
+        if cand:
+            details_parts.append(f"**Row shape:** {cand}")
+        return SourceDescription(
+            kind=self.name,
+            label=self.label,
+            query_text=headline,
+            details="\n\n".join(details_parts),
+            favicon_url=favicon,
+        )
 
     def validate_query_params(self, query_params: Dict[str, Any]) -> Optional[str]:
         if "url" not in query_params:

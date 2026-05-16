@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from dsl_worker.sources_v2.base import FetchResult, SourceAdapter, register
+from dsl_worker.sources_v2.base import FetchResult, SourceAdapter, SourceDescription, register
 
 
 log = logging.getLogger(__name__)
@@ -71,9 +71,68 @@ ALLOWED_PARAMS = {
 
 class ApolloCompaniesAdapter(SourceAdapter):
     name = "apollo_companies"
+    label = "Apollo Companies"
+    favicon_url = "https://www.google.com/s2/favicons?domain=apollo.io&sz=32"
     predictable = True
     default_columns = DEFAULT_COLUMNS
     default_dedup_key_column = "domain"
+
+    def describe(
+        self,
+        query_params: Dict[str, Any],
+        source: Optional[str] = None,
+    ) -> SourceDescription:
+        qp = query_params or {}
+        # Headline = the dominant filter (keyword > job titles > name > locations).
+        headline_parts: List[str] = []
+        kw = qp.get("q_organization_keyword_tags")
+        if kw:
+            headline_parts.append(", ".join(map(str, kw)) if isinstance(kw, list) else str(kw))
+        titles = qp.get("q_organization_job_titles")
+        if titles:
+            headline_parts.append("hiring " + (", ".join(map(str, titles)) if isinstance(titles, list) else str(titles)))
+        name = qp.get("q_organization_name")
+        if name:
+            headline_parts.append(f'named "{name}"')
+        locs = qp.get("organization_locations")
+        if locs:
+            headline_parts.append("in " + (", ".join(map(str, locs[:3])) if isinstance(locs, list) else str(locs)))
+        headline = "Companies — " + " · ".join(headline_parts) if headline_parts else "Apollo company search"
+
+        # Details: every applied filter, one bullet each.
+        detail_lines: List[str] = []
+        FRIENDLY = {
+            "organization_locations": "Locations",
+            "organization_not_locations": "Excluded locations",
+            "organization_num_employees_ranges": "Headcount",
+            "revenue_range": "Revenue",
+            "q_organization_keyword_tags": "Keywords",
+            "currently_using_any_of_technology_uids": "Tech stack",
+            "latest_funding_amount_range": "Latest funding amount",
+            "latest_funding_date_range": "Latest funding date",
+            "total_funding_range": "Total funding",
+            "q_organization_job_titles": "Open job titles",
+            "organization_num_jobs_range": "Open jobs",
+            "organization_job_posted_at_range": "Jobs posted",
+            "q_organization_domains_list": "Domains",
+            "q_organization_name": "Name match",
+        }
+        for k, v in qp.items():
+            if k in ("page", "per_page"):
+                continue
+            label_k = FRIENDLY.get(k, k)
+            if isinstance(v, list):
+                val = ", ".join(map(str, v))
+            else:
+                val = str(v)
+            detail_lines.append(f"- **{label_k}:** {val}")
+        return SourceDescription(
+            kind=self.name,
+            label=self.label,
+            query_text=headline,
+            details="\n".join(detail_lines),
+            favicon_url=self.favicon_url,
+        )
 
     def __init__(self) -> None:
         self.api_key = os.getenv("APOLLO_API_KEY")

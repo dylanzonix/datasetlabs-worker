@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from dsl_worker.sources_v2.base import FetchResult, SourceAdapter, register
+from dsl_worker.sources_v2.base import FetchResult, SourceAdapter, SourceDescription, register
 
 
 log = logging.getLogger(__name__)
@@ -68,9 +68,42 @@ ALLOWED_PARAMS = {
 
 class GoogleMapsAdapter(SourceAdapter):
     name = "google_maps"
+    label = "Google Maps"
+    favicon_url = "https://www.google.com/s2/favicons?domain=maps.google.com&sz=32"
     predictable = True
     default_columns = DEFAULT_COLUMNS
     default_dedup_key_column = "place_id"
+
+    def describe(
+        self,
+        query_params: Dict[str, Any],
+        source: Optional[str] = None,
+    ) -> SourceDescription:
+        qp = query_params or {}
+        q = qp.get("query") or "Places"
+        loc = qp.get("location")
+        radius = qp.get("radius_miles")
+        bits = [str(q)]
+        if loc:
+            bits.append(f"near {loc}")
+        if radius:
+            bits.append(f"within {radius}mi")
+        headline = " ".join(bits)
+
+        detail_lines: List[str] = []
+        if qp.get("min_rating"):
+            detail_lines.append(f"- **Min rating:** {qp['min_rating']}")
+        if qp.get("max_review_count"):
+            detail_lines.append(f"- **Max review count:** {qp['max_review_count']}")
+        if qp.get("n"):
+            detail_lines.append(f"- **Target rows:** {qp['n']}")
+        return SourceDescription(
+            kind=self.name,
+            label=self.label,
+            query_text=headline,
+            details="\n".join(detail_lines),
+            favicon_url=self.favicon_url,
+        )
 
     def __init__(self) -> None:
         self.api_key = os.getenv("GOOGLE_API_KEY")

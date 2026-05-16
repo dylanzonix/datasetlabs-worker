@@ -15,7 +15,7 @@ import os
 import re
 from typing import Any, Dict, List, Optional
 
-from dsl_worker.sources_v2.base import FetchResult, SourceAdapter, register
+from dsl_worker.sources_v2.base import FetchResult, SourceAdapter, SourceDescription, register
 
 
 log = logging.getLogger(__name__)
@@ -23,7 +23,32 @@ log = logging.getLogger(__name__)
 
 class WebHarvestAdapter(SourceAdapter):
     name = "web_harvest"
+    label = "Web Research"
+    favicon_url = "https://www.google.com/s2/favicons?domain=google.com&sz=32"
     predictable = False
+
+    def describe(
+        self,
+        query_params: Dict[str, Any],
+        source: Optional[str] = None,
+    ) -> SourceDescription:
+        qp = query_params or {}
+        query = str(qp.get("query") or "Web research")
+        desc = str(qp.get("candidate_description") or "")
+        details_parts = []
+        if desc:
+            details_parts.append(f"**What a row looks like:** {desc}")
+        if qp.get("max_candidates"):
+            details_parts.append(f"**Max candidates:** {qp['max_candidates']}")
+        if qp.get("continuation_hint"):
+            details_parts.append(f"**Avoid prior coverage:** {qp['continuation_hint']}")
+        return SourceDescription(
+            kind=self.name,
+            label=self.label,
+            query_text=query,
+            details="\n\n".join(details_parts),
+            favicon_url=self.favicon_url,
+        )
 
     def validate_query_params(self, query_params: Dict[str, Any]) -> Optional[str]:
         required = {"query", "candidate_description"}

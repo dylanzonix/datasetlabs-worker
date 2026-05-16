@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from dsl_worker.sources_v2.base import FetchResult, SourceAdapter, register
+from dsl_worker.sources_v2.base import FetchResult, SourceAdapter, SourceDescription, register
 
 
 log = logging.getLogger(__name__)
@@ -90,9 +90,82 @@ PARAM_ALIASES = {
 
 class FullEnrichPeopleAdapter(SourceAdapter):
     name = "fullenrich_people"
+    label = "FullEnrich People"
+    favicon_url = "https://www.google.com/s2/favicons?domain=fullenrich.com&sz=32"
     predictable = True
     default_columns = DEFAULT_COLUMNS
     default_dedup_key_column = "linkedin_url"
+
+    @staticmethod
+    def _stringify_filter(v: Any) -> str:
+        """Pretty-print a FE filter value (may be a list of strings or
+        {value, exact_match, exclude} dicts)."""
+        if isinstance(v, list):
+            parts = []
+            for item in v:
+                if isinstance(item, dict):
+                    val = item.get("value")
+                    if val is not None:
+                        parts.append(("¬" if item.get("exclude") else "") + str(val))
+                    elif "min" in item or "max" in item:
+                        parts.append(f"{item.get('min', '')}–{item.get('max', '')}")
+                else:
+                    parts.append(str(item))
+            return ", ".join(parts)
+        return str(v)
+
+    def describe(
+        self,
+        query_params: Dict[str, Any],
+        source: Optional[str] = None,
+    ) -> SourceDescription:
+        qp = {PARAM_ALIASES.get(k, k): v for k, v in (query_params or {}).items()}
+        headline_parts: List[str] = []
+        titles = qp.get("current_position_titles")
+        if titles:
+            headline_parts.append(self._stringify_filter(titles))
+        sen = qp.get("current_position_seniority_level")
+        if sen:
+            headline_parts.append(self._stringify_filter(sen))
+        comp = qp.get("current_company_names") or qp.get("current_company_domains")
+        if comp:
+            headline_parts.append("at " + self._stringify_filter(comp))
+        ind = qp.get("current_company_industries")
+        if ind:
+            headline_parts.append("in " + self._stringify_filter(ind))
+        loc = qp.get("person_locations") or qp.get("current_company_locations")
+        if loc:
+            headline_parts.append("based in " + self._stringify_filter(loc))
+        headline = "People — " + " · ".join(headline_parts) if headline_parts else "FullEnrich people search"
+
+        FRIENDLY = {
+            "current_position_titles": "Titles",
+            "current_position_seniority_level": "Seniority",
+            "current_position_departments": "Departments",
+            "person_locations": "Person locations",
+            "current_company_names": "Companies",
+            "current_company_domains": "Company domains",
+            "current_company_industries": "Industries",
+            "current_company_headcounts": "Company headcount",
+            "current_company_locations": "Company locations",
+            "person_skills": "Skills",
+            "person_universities": "Education",
+            "currently_using_any_of_technology_uids": "Tech stack",
+            "contact_email_status": "Email status",
+        }
+        detail_lines: List[str] = []
+        for k, v in qp.items():
+            if k in ("limit", "offset", "search_after"):
+                continue
+            label_k = FRIENDLY.get(k, k)
+            detail_lines.append(f"- **{label_k}:** {self._stringify_filter(v)}")
+        return SourceDescription(
+            kind=self.name,
+            label=self.label,
+            query_text=headline,
+            details="\n".join(detail_lines),
+            favicon_url=self.favicon_url,
+        )
 
     def __init__(self) -> None:
         self.api_key = os.getenv("FULLENRICH_API_KEY")

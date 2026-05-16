@@ -61,6 +61,25 @@ class ColumnDef:
     type: str  # one of: text, number, url, email, date, bool, enum
 
 
+@dataclass
+class SourceDescription:
+    """Human-readable rendering of a table's source query.
+
+    Surfaced in the table detail panel and the chat "table created" chip.
+    `kind` is the machine-readable source name (used to pick icons, route
+    clicks, etc); `label` is the user-facing name; `query_text` is the
+    one-line iterable shape ("VP Sales at B2B SaaS in NYC", "Restaurants
+    near Mission, SF"); `details` is the longer markdown blob (filters,
+    auth notes, anything that doesn't fit in the headline).
+    """
+
+    kind: str
+    label: str
+    query_text: str
+    details: str = ""
+    favicon_url: Optional[str] = None
+
+
 class SourceAdapter(abc.ABC):
     """Base class. Each concrete source registers exactly one adapter."""
 
@@ -126,6 +145,44 @@ class SourceAdapter(abc.ABC):
         """One-line description for the per-source table_create tool. Override
         to give source-specific guidance to the agent."""
         return f"Create a table from {cls.name}."
+
+    # User-facing label + favicon used in the table detail panel chip.
+    # Override in concrete adapters; both default to sensible fallbacks.
+    label: str = ""
+    favicon_url: Optional[str] = None
+
+    def describe(
+        self,
+        query_params: Dict[str, Any],
+        source: Optional[str] = None,
+    ) -> "SourceDescription":
+        """Render this table's source as a human-friendly description.
+
+        `source` is the full source string including any colon-suffix (e.g.
+        "apify_actor:clearpath/reddit-search-scraper"); most adapters can
+        ignore it, but apify_actor uses it to recover the actor id.
+
+        Override to extract the one-line `query_text` from query_params
+        and (optionally) build a `details` markdown blob. Default is a
+        last-resort JSON dump — every concrete adapter should override.
+        """
+        import json
+        return SourceDescription(
+            kind=self.name,
+            label=self.label or self.name.replace("_", " ").title(),
+            query_text=json.dumps(query_params, separators=(", ", ": "))[:160],
+            details="",
+            favicon_url=self.favicon_url,
+        )
+
+
+def describe_source(source: str, query_params: Dict[str, Any]) -> SourceDescription:
+    """Resolve `source` → adapter and render its description.
+
+    Module-level helper so callers don't have to import get_adapter
+    just to ask "what does this table represent."
+    """
+    return get_adapter(source).describe(query_params or {}, source=source)
 
 
 # Adapter registry — populated by each adapter module on import.
