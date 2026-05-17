@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -207,6 +207,7 @@ class BUClient:
         keep_alive: bool = False,
         timeout: float = 900,
         max_cost_usd: Optional[float] = None,
+        on_partial_cost: Optional[Callable[[float], None]] = None,
     ) -> Tuple[List[Dict[str, Any]], float, Optional[str], str]:
         """
         Extract structured items from a page. For harvesters.
@@ -237,7 +238,33 @@ class BUClient:
             # timeout. SDK doesn't expose timeout via run(), so we set the
             # private attr directly.
             session_run._timeout = timeout
-            result = await self._run_cancellable(session_run)
+            try:
+                result = await self._run_cancellable(session_run)
+            except asyncio.CancelledError:
+                # ALWAYS stop the cloud session on cancel so BU doesn't
+                # keep running on their servers after we've cancelled
+                # locally, AND capture the partial cost so the user's
+                # ledger reflects what they actually burned before the
+                # abort landed.
+                sid = (
+                    getattr(session_run, "session_id", None)
+                    or getattr(session_run, "_session_id", None)
+                )
+                if sid:
+                    try:
+                        await asyncio.shield(self._client.sessions.stop(sid))
+                        logger.info(f"[BUClient] stopped cloud session {str(sid)[:12]}... on CancelledError")
+                    except Exception:
+                        logger.warning(f"[BUClient] failed to stop session on cancel: {sid}", exc_info=True)
+                    if on_partial_cost is not None:
+                        try:
+                            status = await asyncio.shield(self.get_session_status(sid))
+                            partial = float((status or {}).get("total_cost_usd", 0) or 0)
+                            if partial > 0:
+                                on_partial_cost(partial)
+                        except Exception:
+                            logger.debug("[BUClient] partial-cost fetch failed", exc_info=True)
+                raise
             cost = self._parse_cost(result)
             self._log_cost_breakdown(result, "extract")
             sid = self._get_session_id(result)
@@ -396,6 +423,7 @@ async def bu_extract_rows(
     candidate_description: str = "",
     *,
     max_cost_usd: Optional[float] = None,
+    on_partial_cost: Optional[Callable[[float], None]] = None,
 ) -> Tuple[List[Dict[str, Any]], float]:
     """Convenience wrapper used by `sources_v2/browser_use.py`.
 
@@ -422,7 +450,11 @@ async def bu_extract_rows(
         proxy_country=os.getenv("BROWSER_USE_PROXY_COUNTRY", "us"),
     )
     try:
-        items, cost, _sid, _summary = await client.extract(composed_task, max_cost_usd=max_cost_usd)
+        items, cost, _sid, _summary = await client.extract(
+            composed_task,
+            max_cost_usd=max_cost_usd,
+            on_partial_cost=on_partial_cost,
+        )
         return list(items or []), float(cost or 0.0)
     finally:
         await client.close()

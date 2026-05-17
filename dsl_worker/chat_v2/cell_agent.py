@@ -303,6 +303,7 @@ async def _apify_call_actor(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dic
     heartbeat = asyncio.create_task(_heartbeat_emitter(ctx, "apify_call_actor"))
     cost_usd = 0.0
     items: List[Dict[str, Any]] = []
+    apify_run_id: Optional[str] = None
     try:
         async with httpx.AsyncClient(timeout=180) as client:
             # Async pattern: POST /runs → poll until terminal → fetch items +
@@ -323,6 +324,9 @@ async def _apify_call_actor(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dic
             dataset_id = run_data.get("defaultDatasetId")
             if not (run_id and dataset_id):
                 return {"error": "apify: no run id"}, 0.0
+            # Track at function scope so the CancelledError handler in the
+            # outer try can abort the actor and capture partial CU cost.
+            apify_run_id = run_id
             terminal = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
             poll_cap = timeout_secs if timeout_secs is not None else 150
             t0 = asyncio.get_event_loop().time()
@@ -346,6 +350,29 @@ async def _apify_call_actor(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dic
             )
             if items_resp.status_code == 200:
                 items = items_resp.json() or []
+    except asyncio.CancelledError:
+        # Abort the actor on the Apify side so it stops consuming CUs,
+        # then fetch the final cost (CUs used up to the abort) and
+        # bill it to the turn ledger via ctx.partial_cost_usd. Without
+        # this, a user cancel mid-actor would (a) leak compute on
+        # Apify's servers and (b) hide the cost from billing.
+        if apify_run_id:
+            try:
+                async with httpx.AsyncClient(timeout=10) as abort_client:
+                    from dsl_worker.sources_v2.apify_actor import _abort_apify_run_and_get_cost
+                    partial_usd = await asyncio.shield(
+                        _abort_apify_run_and_get_cost(abort_client, api_key, apify_run_id)
+                    )
+                    if partial_usd > 0:
+                        try:
+                            ctx.partial_cost_usd = float(
+                                getattr(ctx, "partial_cost_usd", 0.0)
+                            ) + partial_usd * 10.0
+                        except Exception:
+                            pass
+            except Exception:
+                log.debug("apify abort-on-cancel failed", exc_info=True)
+        raise
     finally:
         heartbeat.cancel()
         try:
@@ -405,12 +432,25 @@ async def _browser_use(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     # inside its session instead of us best-effort capping after the fact.
     max_cost_usd = args.get("__max_cost_usd")
     heartbeat = asyncio.create_task(_heartbeat_emitter(ctx, "browser_use"))
+
+    # On CancelledError, BUClient stops the cloud session and fetches
+    # the partial cost via this callback. We attribute it to ctx so the
+    # agent's CancelledError handler bills it to the turn ledger —
+    # otherwise the user's BU spend up to the abort would be free,
+    # which we DO have to pay for on BU's side.
+    def _bill_partial(usd: float) -> None:
+        try:
+            ctx.partial_cost_usd = float(getattr(ctx, "partial_cost_usd", 0.0)) + usd
+        except Exception:
+            pass
+
     try:
         rows, cost = await bu_extract_rows(
             url=url,
             task=task,
             candidate_description=args.get("candidate_description", ""),
             max_cost_usd=max_cost_usd,
+            on_partial_cost=_bill_partial,
         )
     finally:
         heartbeat.cancel()
