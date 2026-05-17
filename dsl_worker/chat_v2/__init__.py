@@ -71,8 +71,8 @@ def _enrichment_set_schema() -> Dict[str, Any]:
                 "properties": {
                     "research": {
                         "type": "string",
-                        "enum": ["classify", "lookup", "search", "investigate"],
-                        "description": "classify=nano, no tools. lookup=mini + tools (one known call, e.g. FE email/phone). search=5.5 + tools (standard research). investigate=5.5 + tools + higher effort (multi-step).",
+                        "enum": ["none", "low", "medium", "high"],
+                        "description": "none=nano, no tools (just a label from row text). low=mini + tools (one known call, e.g. FE email/phone). medium=5.5 + tools (standard research). high=5.5 + tools + higher effort (multi-step).",
                     },
                     "prompt": {"type": "string", "description": "Natural-language instruction the per-row agent follows."},
                     "columns_to_fill": {
