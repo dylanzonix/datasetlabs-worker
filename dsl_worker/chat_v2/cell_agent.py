@@ -9,22 +9,26 @@ Spawned per row for every enrichment. Each cell agent gets:
 
 Research levels — four flat values, picked per enrichment:
 
-  - "classify" gpt-5.4-nano  | no tools — pure classify-from-text
-  - "light"    gpt-5.4-mini  | all tools, cheap — agent picks if it
-                              | needs to look anything up
-  - "standard" gpt-5.5       | all tools, normal depth
-  - "deep"     gpt-5.5 high  | all tools, multi-step / chained
+  - "classify"    gpt-5.4-nano  | no tools — just a label from row text
+  - "lookup"      gpt-5.4-mini  | all tools — one quick call when needed
+  - "search"      gpt-5.5       | all tools — standard research
+  - "investigate" gpt-5.5 high  | all tools — multi-step / chained
 
 Only "classify" restricts tool access. The other three can all call
 web_search / FE / Apollo / browser_use; tier picks the model + effort +
 default budget rather than what's available.
 
-Legacy aliases:
-  fast/classify → "classify"   (nano name churn from earlier rename pass)
-  smart         → "light"      (mini, was no-tools; now has tools)
-  lookup        → "standard"
-  research      → "deep"
-  expert        → "standard"
+Legacy aliases — covers every prior rename pass so old enrichments still
+resolve:
+  v0:  classify → classify   (kept)
+       lookup   → lookup     (kept)
+       research → investigate
+  v1:  fast   → classify
+       smart  → lookup
+       expert → search
+  v2:  light    → lookup
+       standard → search
+       deep     → investigate
 
 Loop terminates when:
   - Cell agent emits `final_result` (or a parseable JSON message)
@@ -75,23 +79,26 @@ TOOL_COST_ESTIMATES = {
 
 
 RESEARCH_CONFIG = {
-    "classify": {"model": "gpt-5.4-nano", "effort": "medium", "default_cap": 0.3, "tools": []},
-    "light":    {"model": "gpt-5.4-mini", "effort": "medium", "default_cap": 1.0, "tools": "all"},
-    "standard": {"model": "gpt-5.5",      "effort": "medium", "default_cap": 2.0, "tools": "all"},
-    "deep":     {"model": "gpt-5.5",      "effort": "high",   "default_cap": 8.0, "tools": "all"},
+    "classify":    {"model": "gpt-5.4-nano", "effort": "medium", "default_cap": 0.3, "tools": []},
+    "lookup":      {"model": "gpt-5.4-mini", "effort": "medium", "default_cap": 1.0, "tools": "all"},
+    "search":      {"model": "gpt-5.5",      "effort": "medium", "default_cap": 2.0, "tools": "all"},
+    "investigate": {"model": "gpt-5.5",      "effort": "high",   "default_cap": 8.0, "tools": "all"},
 }
 
-# Old → new. Lets pre-rename enrichments keep running.
+# Every old name → current value. Covers v0/v1/v2 churn.
 LEGACY_ALIASES = {
-    # v0 → v1: original three-tier ladder
-    "lookup":   "standard",
-    "research": "deep",
-    # v1 → v2: renamed nano tier
+    # v0 names — pre-rename. "lookup" name is reused but with new semantics
+    # (mini, not 5.5 + tools), so v0 lookup data is intentionally mapped to
+    # the current "lookup" tier; mostly a no-op since same word.
+    "research": "investigate",   # v0 highest tier → current highest
+    # v1 (fast/smart/standard/deep)
     "fast":     "classify",
-    # v1 → v2: mini was no-tools "smart", v2 promotes it to "light" (with tools)
-    "smart":    "light",
-    # v1 → v2: 5.5-no-tools "expert" tier dropped; fold into "standard"
-    "expert":   "standard",
+    "smart":    "lookup",
+    "standard": "search",
+    "deep":     "investigate",
+    "expert":   "search",        # transient 5.5-no-tools tier
+    # v2 (classify/light/standard/deep)
+    "light":    "lookup",
 }
 
 
@@ -102,11 +109,11 @@ def _resolve_research(action: Dict[str, Any], per_row_cap: Optional[float]) -> D
     the research level when caller passes None — fixes the prior bug where
     enrichment.py always passed 5 and trampled per-tier defaults.
     """
-    requested = (action.get("research") or action.get("tier") or "standard").lower()
+    requested = (action.get("research") or action.get("tier") or "search").lower()
     requested = LEGACY_ALIASES.get(requested, requested)
     if requested not in RESEARCH_CONFIG:
-        log.warning("cell_agent: unknown research %r, defaulting to standard", requested)
-        requested = "standard"
+        log.warning("cell_agent: unknown research %r, defaulting to search", requested)
+        requested = "search"
     cfg = RESEARCH_CONFIG[requested].copy()
     cap = float(per_row_cap) if per_row_cap and per_row_cap > 0 else cfg["default_cap"]
     cfg["cap"] = cap

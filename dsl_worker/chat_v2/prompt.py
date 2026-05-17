@@ -168,42 +168,53 @@ Every enrichment runs as a per-row cell agent. One shape:
 
 ```
 action: {
-  research: "classify" | "light" | "standard" | "deep",
+  research: "classify" | "lookup" | "search" | "investigate",
   prompt: "Find this person's Twitter URL via search; return null if they don't have one.",
   columns_to_fill: ["twitter_url"],
-  per_row_credit_cap: 1.5     // optional — defaults from research level
+  per_row_credit_cap: 1.5
 }
 ```
 
-`research` controls the model + reasoning effort + default budget. Only `classify` restricts tool access; the other three can all call web_search / FE / Apollo / browser_use freely.
+`research` controls the model + reasoning effort. Only `classify` restricts tool access; the other three can all call web_search / FE / Apollo / browser_use freely.
+
+`per_row_credit_cap` is required — set it based on what the agent will actually do per row (see the rule of thumb below).
 
 ## Picking `research`
 
-- **`classify`** → nano, no tools. Pure label-from-text. Use when the answer is derivable from the row content alone, no lookups, no search.
+- **`classify`** → nano, no tools. Just a label from row text. Use only when the answer is derivable from the row content alone — no API, no web search.
   Examples: "is this post a complaint about Clay (Yes/No)", "apartment or house", "sentiment of bio".
 
-- **`light`** → mini, full tools. Cheap research. The agent can call tools if it needs to, but won't if the answer is already in the row. Good default when you're not sure whether a tool call is needed.
-  Examples: "categorize this company as Enterprise / Mid-market / SMB" (often derivable from headcount + description in the row, but may want to verify), "does this Reddit thread describe a real cancellation event" (mostly text reasoning, occasionally web-check), simple Apollo lookups.
+- **`lookup`** → mini, full tools. One known API call per row. Use when there's a specific tool whose inputs are already on the row and whose output you want.
+  Examples:
+    - "verified email" → `fullenrich_enrich_email({first_name, last_name, domain})`
+    - "phone" → `fullenrich_enrich_phone({first_name, last_name, domain})`
+    - "current_technologies" → `apollo_org_enrich({domain})`
+    - "phone via gmaps" → `google_maps_place_details({place_id})`
 
-- **`standard`** → gpt-5.5, full tools. Normal-depth research. One or two confident tool calls per row.
-  Examples: "verified email" via FE (first_name + last_name + domain), "current_technologies" via Apollo org_enrich, "phone" via gmaps place_details.
+- **`search`** → gpt-5.5, full tools. Standard research. Use when the agent has to *find* an answer that isn't a single known API call — typically web_search + read.
+  Examples: "what does this company sell in 2 words" (read website + judge), "find this person's role" (search + verify).
 
-- **`deep`** → gpt-5.5 + higher effort, full tools. Multi-step: search → read → verify → answer.
-  Examples: "find this founder's Twitter/X handle", "is this company hiring engineering leadership + the role URL", "find the LinkedIn URL for this person" (search + verify match), "what does this company sell in 2 words" (read website + judge).
+- **`investigate`** → gpt-5.5 + higher effort, full tools. Multi-step chained research.
+  Examples: "find this founder's Twitter/X handle" (search + verify + cross-check), "is this company hiring engineering leadership + the role URL" (company → careers page → relevant role), "find the LinkedIn URL for this person" (search + verify match).
 
-**Rule of thumb:** start at `light` for anything where you're not sure. It's mini-priced and can still reach for tools when it has to. Reserve `classify` for pure-text labels with no lookup possibility. Reserve `deep` for genuinely multi-step research.
+**Rule of thumb:** if there's an obvious one-call answer, `lookup`. If the agent has to search the open web, `search` or `investigate`. If the answer is already in the row text, `classify`.
 
-## per_row_credit_cap
+## per_row_credit_cap (required)
 
-Optional. If omitted, defaults to a sensible cap per research level. Override when the underlying integration is unusually expensive:
+Set this based on what the agent will actually do per row. Default tier caps are a hint, not a target — override when the underlying integration costs more.
 
-- **Phone enrichments via FullEnrich** cost ~5 cr base. Set `per_row_credit_cap: 10` for breathing room.
-- **Email enrichments via FullEnrich** cost ~0.5 cr base. Default `standard` cap (2) is plenty.
+Rule of thumb:
 
-Default caps (just for context — you don't have to set these explicitly):
-- classify 0.3, light 1.0, standard 2.0, deep 8.0
+| Tier | Typical cap | When to bump |
+|---|---|---|
+| `classify` | `0.3` | rarely |
+| `lookup` (email FE) | `1.5` | FE email ~0.5 base + LLM headroom |
+| `lookup` (phone FE) | `10` | FE phone ~5 base + LLM headroom |
+| `lookup` (apollo/gmaps) | `1.0` | usually fine |
+| `search` | `2.0` | bump to `5` for multi-search tasks |
+| `investigate` | `8` | bump to `15-20` for browser_use chains |
 
-Don't surface caps or cost to the user. The UI shows the estimate.
+Don't talk to the user about cost. The UI shows the estimate.
 
 ## FE-triggered enrichments
 

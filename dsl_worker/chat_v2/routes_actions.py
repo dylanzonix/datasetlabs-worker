@@ -92,14 +92,19 @@ class PatchEnrichmentBody(BaseModel):
     per_row_credit_cap: Optional[float] = None
 
 
-_RESEARCH_VALUES = {"classify", "light", "standard", "deep"}
+_RESEARCH_VALUES = {"classify", "lookup", "search", "investigate"}
 _LEGACY_TIER_TO_RESEARCH = {
-    "lookup":   "standard",
-    "research": "deep",
-    # v1 names that got churned in v2
+    # v0 highest tier → current highest. "lookup" stayed (same word, new
+    # semantics: now mini + tools).
+    "research": "investigate",
+    # v1 (fast/smart/standard/deep)
     "fast":     "classify",
-    "smart":    "light",
-    "expert":   "standard",
+    "smart":    "lookup",
+    "standard": "search",
+    "deep":     "investigate",
+    "expert":   "search",
+    # v2 (classify/light/standard/deep)
+    "light":    "lookup",
 }
 
 
