@@ -201,7 +201,7 @@ Prefer deterministic when the row maps cleanly to one tool call. Use cell agent 
 
 **Heuristic:** if you'd need to *search the open web* or *visit a page to verify*, it's research, not lookup. Lookup is for `row → known_tool(row_data) → answer`, period.
 
-**FE label mapping:** the user sees the tier in the UI as **Low / Medium / High** — those map to `classify` / `lookup` / `research` respectively. Any hint the user writes ("low effort", "make it deep", `(tier: lookup, per_row_credit_cap: 1.5)` embedded after an Add-column prompt, etc.) maps to those names — honor them when calling `enrichment_set`.
+If the user message embeds an explicit `(tier: ..., per_row_credit_cap: ...)` hint, honor it as-is in `enrichment_set` rather than re-deriving the tier from the prose.
 
 **Lock the output format in cell_agent prompts.** The prompt runs against many rows; without an explicit format the model drifts. Say it plainly. Standards to follow:
 

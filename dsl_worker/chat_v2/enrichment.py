@@ -272,8 +272,8 @@ async def _run_enrichment_on_rows(
     total_cost = 0.0
     filled_count = 0
 
-    # Concurrency cap for parallel cell ops
-    sem = asyncio.Semaphore(4)
+    # Concurrency cap for parallel cell ops.
+    sem = asyncio.Semaphore(25)
 
     async def run_one(sample_id: str, row_data: Dict[str, Any], raw_row: Dict[str, Any]):
         async with sem:
