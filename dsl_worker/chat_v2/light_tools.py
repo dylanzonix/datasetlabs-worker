@@ -337,7 +337,10 @@ async def suggest_replies(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[
 HANDLERS = {
     "apify_search_actors": apify_search_actors,
     "apify_actor_details": apify_actor_details,
-    "web_search": web_search,
+    # web_search migrated to the OpenAI hosted tool (added directly to
+    # the Responses tools= array in chat_v2/agent.py + cell_agent.py).
+    # The sidecar `web_search` function above is kept for any external
+    # importer but is no longer dispatched by the chat_v2 HANDLERS map.
     "code_exec": code_exec,
     "suggest_replies": suggest_replies,
 }

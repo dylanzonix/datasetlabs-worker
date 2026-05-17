@@ -385,7 +385,6 @@ async def _apify_call_actor(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dic
 from dsl_worker.chat_v2.light_tools import (
     apify_search_actors as _apify_search_actors,
     apify_actor_details as _apify_actor_details,
-    web_search as _web_search,
     code_exec as _code_exec,
 )
 
@@ -470,7 +469,10 @@ CELL_TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any], ToolContext], Awaitable[
     "apify_search_actors": _apify_search_actors,
     "apify_actor_details": _apify_actor_details,
     "apify_call_actor": _apify_call_actor,
-    "web_search": _web_search,
+    # web_search is the OpenAI hosted tool — the model invokes it
+    # server-side as part of its own Responses call. We don't dispatch
+    # it ourselves; web_search_call items in the response output are
+    # handled in the cell loop directly (billing + tool_calls_log).
     "browser_use": _browser_use,
     "code_exec": _code_exec,
 }
@@ -554,44 +556,34 @@ def _final_result_tool_def() -> Dict[str, Any]:
 def _tool_defs_for_tier(tier_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Responses-API tool definitions, scoped to the research level.
 
-    Each tool gets its own param schema + a "when to use / when not to"
-    description. Previously every tool advertised the same generic param
-    bag with a placeholder description ("Cell-level wrapper for X") —
-    that gave the model no signal about which tool fits which task, and
-    `browser_use(url, task)` would consistently win on linguistic match
-    over `web_search(query)` even when web_search would have been the
-    right call. The system prompt teaches the strategy; these schemas
-    surface the strategy at the tool-picker.
+    Each function-style tool gets its own param schema + a "when to use"
+    description. Hosted web_search is appended as {"type": "web_search"}
+    so the model invokes it server-side as part of its own Responses
+    call (no sidecar round-trip).
     """
     defs: List[Dict[str, Any]] = [_final_result_tool_def()]
     if tier_cfg["tools"] != "all":
         return defs
+    # web_search first in the list — reinforces the STEP-1 escalation
+    # framing in the system prompt at the tool-picker.
+    defs.append({"type": "web_search"})
     defs.extend(_CELL_TOOL_DEFS)
     return defs
 
 
+# Per-call cost for hosted web_search. TrackedClient only computes
+# token cost from response.usage and doesn't itemize hosted-tool fees;
+# we add this manually for each web_search_call item we see in output.
+WEB_SEARCH_CALL_COST_USD = 0.025
+
+
 _CELL_TOOL_DEFS: List[Dict[str, Any]] = [
-    {
-        "type": "function",
-        "name": "web_search",
-        "description": (
-            "STEP 1 of the web-access escalation: always try this first. Native "
-            "OpenAI web search; cheap and fast. Works for the vast majority of "
-            "public web pages including static and server-rendered content. "
-            "Don't try to predict whether it'll work — just call it."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query. Include the URL, company name, person name, etc. — whatever identifies the row.",
-                },
-            },
-            "required": ["query"],
-            "additionalProperties": False,
-        },
-    },
+    # web_search is the OpenAI hosted tool — added in _tool_defs_for_tier
+    # as {"type": "web_search"}, not as a function we dispatch. The model
+    # invokes it server-side as part of its own Responses call; results
+    # come back inline so it has them in its own context window. Cost is
+    # OpenAI's per-call fee (added manually below — TrackedClient only
+    # computes token cost).
     {
         "type": "function",
         "name": "apify_search_actors",
@@ -1021,6 +1013,26 @@ async def run_cell_agent(
                     for c in item.content:
                         if hasattr(c, "text"):
                             text_parts.append(c.text)
+                    input_items.append(item.model_dump(exclude_none=True))
+                elif itype == "web_search_call":
+                    # Hosted tool already ran server-side. Bill the
+                    # per-call fee (TrackedClient only sums token cost)
+                    # and log it to tool_calls_log so cell_traces shows
+                    # it just like any other tool the cell agent used.
+                    query = ""
+                    try:
+                        action = getattr(item, "action", None)
+                        if action is not None:
+                            query = getattr(action, "query", "") or ""
+                    except Exception:
+                        pass
+                    total_cost += WEB_SEARCH_CALL_COST_USD
+                    tool_calls_log.append({
+                        "name": "web_search",
+                        "args": {"query": query},
+                        "result_preview": f"native (status={getattr(item, 'status', '?')})",
+                        "cost": WEB_SEARCH_CALL_COST_USD,
+                    })
                     input_items.append(item.model_dump(exclude_none=True))
                 else:
                     try:

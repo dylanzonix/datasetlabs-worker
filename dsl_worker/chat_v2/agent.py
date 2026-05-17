@@ -49,7 +49,13 @@ EventCallback = Optional[Callable[[StreamEvent], Awaitable[None]]]
 
 def _flatten_tool_defs() -> List[Dict[str, Any]]:
     """chat.completions shape {type, function:{name,description,parameters}}
-    → Responses shape {type, name, description, parameters}."""
+    → Responses shape {type, name, description, parameters}.
+
+    Also injects the OpenAI hosted web_search tool. It's a server-side
+    tool that runs as part of the same Responses call (no sidecar LLM
+    round-trip). Cost is OpenAI's flat per-search fee + the tokens it
+    returns to the model.
+    """
     out: List[Dict[str, Any]] = []
     for t in TOOL_DEFS:
         if t.get("type") == "function" and "function" in t:
@@ -62,10 +68,22 @@ def _flatten_tool_defs() -> List[Dict[str, Any]]:
             })
         else:
             out.append(t)
+    # Native web_search — invoked server-side by the model when it
+    # decides a query is needed. We see it come back as web_search_call
+    # items in response.output (handled in the agent loop below).
+    out.append({"type": "web_search"})
     return out
 
 
 _TOOLS_PAYLOAD = _flatten_tool_defs()
+
+# Per-call cost for hosted web_search (OpenAI's pricing as of writing
+# ~$0.025/call on default tier). TrackedClient only computes token cost
+# from response.usage and doesn't itemize hosted-tool fees, so we add
+# this manually for every web_search_call item we see in output. If
+# OpenAI exposes itemized hosted-tool billing later, swap this for a
+# read off response.usage.
+WEB_SEARCH_CALL_COST_USD = 0.025
 
 
 def _build_client() -> TrackedOpenAIClient:
@@ -251,8 +269,45 @@ async def run_turn(
                 function_calls.append(item)
                 input_items.append(item.model_dump(exclude_none=True))
             elif itype == "web_search_call":
-                # Server-side tool — already executed. Keep in history to
-                # preserve reasoning-item pairing.
+                # Hosted tool — OpenAI already executed this server-side as
+                # part of this same Responses call. We didn't dispatch it,
+                # but we still need to:
+                #  (a) emit tool_call_start + tool_call_result events so the
+                #      FE renders it in the tool log (consistent with how
+                #      function-style tools used to render),
+                #  (b) bill the per-call hosted-tool fee, since the
+                #      TrackedClient only computes token cost,
+                #  (c) preserve the item in history so reasoning-item
+                #      pairing stays intact.
+                query = ""
+                try:
+                    action = getattr(item, "action", None)
+                    if action is not None:
+                        query = getattr(action, "query", "") or ""
+                except Exception:
+                    pass
+                call_id = getattr(item, "id", "") or f"web_search_{iteration}"
+                await emit({
+                    "type": "tool_call_start",
+                    "tool_call_id": call_id,
+                    "name": "web_search",
+                    "args": {"query": query},
+                })
+                total_cost_usd += WEB_SEARCH_CALL_COST_USD
+                tool_calls_made.append({
+                    "name": "web_search",
+                    "args": {"query": query},
+                    "result_preview": f"native web_search (status={getattr(item, 'status', '?')})",
+                    "cost_usd": WEB_SEARCH_CALL_COST_USD,
+                })
+                await emit({
+                    "type": "tool_call_result",
+                    "tool_call_id": call_id,
+                    "name": "web_search",
+                    "result_preview": f"native web_search: {query[:120]}",
+                    "cost_usd": WEB_SEARCH_CALL_COST_USD,
+                })
+                await emit({"type": "cost_update", "total_cost_usd": total_cost_usd})
                 input_items.append(item.model_dump(exclude_none=True))
             else:
                 # Unknown / future item type — keep it in history defensively.

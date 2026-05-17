@@ -118,7 +118,11 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
         "row_delete": "Delete rows by id. Approval-gated.",
         # Utility
         "code_exec": "Execute a Python snippet in the sandbox.",
-        "web_search": "Quick web search — for scouting, not row-building. Use web_harvest source for table-building from web.",
+        # web_search is the OpenAI hosted tool — added directly to the
+        # Responses `tools` array in agent.py as {"type": "web_search"},
+        # not registered here as a function. Keeping it out of
+        # tool_descriptions so we don't double-list it with an empty
+        # function shape.
         "suggest_replies": "Emit chip suggestions for the user's next move. Call at end of turn.",
         # Comments — the description thread visible in the table/column detail panel.
         "comment_on_table": "Append a short agent note to a table's description thread (visible in the table detail panel). Use sparingly — for non-obvious decisions or material changes the user should see ('Switched to Apollo because Google Maps capped at 60 results'). Args: table_id, body (markdown ok).",
