@@ -9,15 +9,22 @@ Spawned per row for every enrichment. Each cell agent gets:
 
 Research levels — four flat values, picked per enrichment:
 
-  No tools (model alone, just final_result):
-    - "fast"     gpt-5.4-nano  | simple classification ("complaint? yes/no")
-    - "smart"    gpt-5.4-mini  | nuanced, multi-factor judgment
+  - "classify" gpt-5.4-nano  | no tools — pure classify-from-text
+  - "light"    gpt-5.4-mini  | all tools, cheap — agent picks if it
+                              | needs to look anything up
+  - "standard" gpt-5.5       | all tools, normal depth
+  - "deep"     gpt-5.5 high  | all tools, multi-step / chained
 
-  With tools (web_search, FE, Apollo, browser_use, etc):
-    - "standard" gpt-5.5       | one or two tool calls
-    - "deep"     gpt-5.5 high  | multi-step, browser, chained
+Only "classify" restricts tool access. The other three can all call
+web_search / FE / Apollo / browser_use; tier picks the model + effort +
+default budget rather than what's available.
 
-Legacy aliases: classify→fast, lookup→standard, research→deep, expert→smart.
+Legacy aliases:
+  fast/classify → "classify"   (nano name churn from earlier rename pass)
+  smart         → "light"      (mini, was no-tools; now has tools)
+  lookup        → "standard"
+  research      → "deep"
+  expert        → "standard"
 
 Loop terminates when:
   - Cell agent emits `final_result` (or a parseable JSON message)
@@ -68,19 +75,23 @@ TOOL_COST_ESTIMATES = {
 
 
 RESEARCH_CONFIG = {
-    "fast":     {"model": "gpt-5.4-nano", "effort": "medium", "default_cap": 0.3, "tools": []},
-    "smart":    {"model": "gpt-5.4-mini", "effort": "medium", "default_cap": 0.5, "tools": []},
+    "classify": {"model": "gpt-5.4-nano", "effort": "medium", "default_cap": 0.3, "tools": []},
+    "light":    {"model": "gpt-5.4-mini", "effort": "medium", "default_cap": 1.0, "tools": "all"},
     "standard": {"model": "gpt-5.5",      "effort": "medium", "default_cap": 2.0, "tools": "all"},
     "deep":     {"model": "gpt-5.5",      "effort": "high",   "default_cap": 8.0, "tools": "all"},
 }
 
-# Old → new. Lets pre-rename enrichments keep running. "expert" was a
-# transient 5.5-no-tools tier from the first rename pass — fold into smart.
+# Old → new. Lets pre-rename enrichments keep running.
 LEGACY_ALIASES = {
-    "classify": "fast",
+    # v0 → v1: original three-tier ladder
     "lookup":   "standard",
     "research": "deep",
-    "expert":   "smart",
+    # v1 → v2: renamed nano tier
+    "fast":     "classify",
+    # v1 → v2: mini was no-tools "smart", v2 promotes it to "light" (with tools)
+    "smart":    "light",
+    # v1 → v2: 5.5-no-tools "expert" tier dropped; fold into "standard"
+    "expert":   "standard",
 }
 
 

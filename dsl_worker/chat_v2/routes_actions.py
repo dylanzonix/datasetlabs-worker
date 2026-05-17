@@ -92,12 +92,14 @@ class PatchEnrichmentBody(BaseModel):
     per_row_credit_cap: Optional[float] = None
 
 
-_RESEARCH_VALUES = {"fast", "smart", "standard", "deep"}
+_RESEARCH_VALUES = {"classify", "light", "standard", "deep"}
 _LEGACY_TIER_TO_RESEARCH = {
-    "classify": "fast",
     "lookup":   "standard",
     "research": "deep",
-    "expert":   "smart",  # transient tier from first rename pass
+    # v1 names that got churned in v2
+    "fast":     "classify",
+    "smart":    "light",
+    "expert":   "standard",
 }
 
 
