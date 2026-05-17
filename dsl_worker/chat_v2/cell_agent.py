@@ -507,33 +507,29 @@ Set a column to `null` when the value genuinely doesn't exist. Null is fine. Don
 
 If you have no tools at all, the answer must come from `row_visible_to_user` + `row_hidden_source_fields` alone. Reason carefully and call `final_result` directly.
 
-When tools are available, pick by data shape, not by which tool's name sounds like the verb in the instruction:
+## Web data — strict escalation order
 
-**Finding info on the public web (default path):**
-- **`web_search`** — your default for any "look up X" / "find description of Y" / "verify Z" task. It uses the model's native web search: cheap, fast, returns text excerpts + URLs. Try it first.
-- **`browser_use`** — fallback when, and ONLY when, `web_search` genuinely can't reach the answer. Real headless browser session. Costs real money per session (typically $0.50–$3+). Use only for:
-  * pages with no useful server-side content (everything's loaded by JS, no fallback)
-  * content behind a login wall
-  * something that requires form fill / click / scroll interaction
-  * infinite-scroll lists that web_search can't see past the fold
+Pick by *accessibility*, not by what the instruction sounds like. The rule is empirical: try the cheaper tool, if it gets the answer you're done, if not escalate.
 
-  Most static or server-rendered pages are reachable via web_search. Don't reach for browser_use just because the instruction mentions a URL — try web_search first.
+1. **`web_search`** — ALWAYS try this first. Native OpenAI web search, cheap, fast. Works for the vast majority of public web pages including most static / server-rendered content. Don't try to predict whether it'll work — just call it.
+2. **`apify_call_actor`** — only if `web_search` didn't return the data you need AND there's a platform-specific actor that covers the source (Reddit, LinkedIn, Twitter/X, Instagram, etc.). Use `apify_search_actors` + `apify_actor_details` to discover. Bounded to `maxItems=5` at cell level — for per-row lookups, not bulk fetching.
+3. **`browser_use`** — last resort. Only after both `web_search` and apify have failed (or there's no apify actor for the source). Real headless browser, expensive ($0.50–$3+ per session, sometimes more). This is for the cases where nothing else can reach the data — JS-only content with no server fallback, login walls, form interactions, infinite-scroll pages.
 
-- **`apify_call_actor`** — when a known Apify actor covers the platform (Reddit, LinkedIn, Twitter/X, Instagram, etc.) and web_search doesn't surface the structured data you need. Use `apify_search_actors` to discover and `apify_actor_details` to read the input schema before calling. Bounded by `maxItems` to 5 — apify isn't for bulk fetching at cell level.
+Do NOT pick `browser_use` predictively. Even if the instruction mentions a URL, even if the page sounds JS-heavy — try `web_search` first. It's cheap, and most of the time it works.
 
-**Known per-row API calls (use when the row already has the inputs):**
-- **`fullenrich_enrich_email`** — verified business email. Inputs: `first_name`, `last_name`, `domain`. ~0.5 cr base.
-- **`fullenrich_enrich_phone`** — verified phone. Same inputs as email. **~5 cr base — expensive**, only when the column explicitly asks for phone.
-- **`fullenrich_enrich_company`** — company info from FullEnrich. Input: `domain`. ~0.5 cr.
-- **`apollo_org_enrich`** — company info from Apollo (headcount, revenue, funding, tech stack, etc.). Input: `domain`. ~1 cr.
+## Known per-row API calls
+
+Use these when the row already has the inputs and the column wants the matching field. They're direct lookups, not searches:
+
+- **`fullenrich_enrich_email`** — verified business email. Inputs: `first_name`, `last_name`, `domain`. ~0.5 cr.
+- **`fullenrich_enrich_phone`** — verified phone. Same inputs. **~5 cr — expensive**, only when the column explicitly asks for phone.
+- **`fullenrich_enrich_company`** — company-level enrichment. Input: `domain`. ~0.5 cr.
+- **`apollo_org_enrich`** — Apollo company data (headcount, revenue, funding, tech stack, etc.). Input: `domain`. ~1 cr.
 - **`google_maps_place_details`** — local business info. Input: `place_id` (must already be on the row from a prior Google Maps fetch).
 
-**Computation/parsing:**
-- **`code_exec`** — Python sandbox. For string parsing, math, transforms on the row data. No external network from inside the sandbox — pure compute only.
+## Computation / parsing
 
-# Heuristic
-
-If the instruction is "look up X on the open web" and you have a URL in the row, `web_search` with a query that includes the URL or company name works ~95% of the time. Reserve `browser_use` for the cases where you actually need the browser. If you tried `web_search` and got nothing useful, then escalate.
+- **`code_exec`** — Python sandbox. For string parsing, math, regex, transforms on row data. No external network — pure compute only.
 """
 
 
@@ -579,12 +575,10 @@ _CELL_TOOL_DEFS: List[Dict[str, Any]] = [
         "type": "function",
         "name": "web_search",
         "description": (
-            "DEFAULT for any look-up / find / verify task on the public web. "
-            "Native OpenAI web search: cheap, fast, returns text excerpts + URLs. "
-            "Try this first for any question of the form 'find X on the web', "
-            "'look up Y about company Z', 'get the description on this page'. "
-            "Most static and server-rendered pages are reachable here — don't "
-            "reach for browser_use unless web_search demonstrably fails."
+            "STEP 1 of the web-access escalation: always try this first. Native "
+            "OpenAI web search; cheap and fast. Works for the vast majority of "
+            "public web pages including static and server-rendered content. "
+            "Don't try to predict whether it'll work — just call it."
         ),
         "parameters": {
             "type": "object",
@@ -600,33 +594,8 @@ _CELL_TOOL_DEFS: List[Dict[str, Any]] = [
     },
     {
         "type": "function",
-        "name": "browser_use",
-        "description": (
-            "FALLBACK only — when web_search genuinely can't reach the answer. "
-            "Real headless browser; costs real money per session ($0.50–$3+ typical, "
-            "up to $10 on complex sessions). Use ONLY for: pages where the content "
-            "is JS-only with no server fallback, login walls, form interactions, "
-            "infinite-scroll lists. NEVER pick this just because the instruction "
-            "mentions a URL — most URLs work fine with web_search."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "url": {"type": "string", "description": "Starting URL for the browser session."},
-                "task": {"type": "string", "description": "What to do on the page (extract X, click Y, fill form Z)."},
-                "candidate_description": {
-                    "type": "string",
-                    "description": "Optional: shape of each row to extract, e.g. '{name, role, headshot_url}'.",
-                },
-            },
-            "required": ["url", "task"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "type": "function",
         "name": "apify_search_actors",
-        "description": "Search the Apify actor store for scrapers that cover a platform (Reddit, LinkedIn, Twitter/X, Instagram, etc.). Call before apify_actor_details / apify_call_actor.",
+        "description": "Discover Apify actors that cover a platform (Reddit, LinkedIn, Twitter/X, Instagram, etc.). Use when web_search didn't return the data you need and you're escalating to apify.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -653,10 +622,11 @@ _CELL_TOOL_DEFS: List[Dict[str, Any]] = [
         "type": "function",
         "name": "apify_call_actor",
         "description": (
-            "Run an Apify actor when a platform-specific scraper covers the data "
-            "and web_search can't get there. Bounded to maxItems=5 — actors at the "
-            "cell level are for per-row lookups, not bulk fetches. Costs ~1 cr "
-            "typical; varies by actor."
+            "STEP 2 of the web-access escalation: try this when web_search "
+            "couldn't get the data AND a platform-specific actor covers the "
+            "source. Bounded to maxItems=5 at cell level — for per-row "
+            "lookups, not bulk fetches. Costs ~1 cr typical; varies by actor. "
+            "Do NOT use as a first step."
         ),
         "parameters": {
             "type": "object",
@@ -669,6 +639,31 @@ _CELL_TOOL_DEFS: List[Dict[str, Any]] = [
                 },
             },
             "required": ["actor_id", "input"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "browser_use",
+        "description": (
+            "STEP 3 of the web-access escalation: LAST RESORT only. Use ONLY "
+            "after both web_search and apify have failed (or there's no apify "
+            "actor for the source). Real headless browser session; expensive "
+            "($0.50–$3+ typical, sometimes more). Don't pick this predictively "
+            "from the task description — escalate to it only after the cheaper "
+            "tools demonstrably can't reach the data."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Starting URL for the browser session."},
+                "task": {"type": "string", "description": "What to do on the page (extract X, click Y, fill form Z)."},
+                "candidate_description": {
+                    "type": "string",
+                    "description": "Optional: shape of each row to extract, e.g. '{name, role, headshot_url}'.",
+                },
+            },
+            "required": ["url", "task"],
             "additionalProperties": False,
         },
     },
