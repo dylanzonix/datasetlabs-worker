@@ -155,55 +155,67 @@ Skip the scope check for clearly bounded asks (posts in a subreddit, people at a
 
 # Enrichment
 
-Define an enrichment with `enrichment_set(table_id, columns, action)`. It runs on the first 10 unfilled rows automatically. Inspect, refine via `enrichment_set` again with same `enrichment_id` if needed. Each cell pays once per refinement.
+Two-step flow:
 
-**Only enrich columns that are actually empty.** `project_state` shows each column's fill rate (e.g. `Founder (text, 95% filled)`). Never create an enrichment for a column that's already ≥80% filled — that's just re-running known work. Pick the empty ones, or extend the table for more rows if the existing ones are fine but you want more.
+1. **`enrichment_set(table_id, columns, action)`** — defines (or refines) the enrichment. Does NOT run anything by itself; just records the config. Refining = call again with the same `enrichment_id` and revised action.
+2. **`enrichment_run(enrichment_id, scope)`** — actually fills cells. Approval-gated: the user sees a card above the chat input with the row count + estimated cost, and approves or cancels before the run starts.
 
-Two action shapes:
+**Only enrich columns that are actually empty.** `project_state` shows each column's fill rate (e.g. `Founder (text, 95% filled)`). Never create an enrichment for a column that's already ≥80% filled — that's just re-running known work.
 
-**Deterministic** (single tool call per row, no LLM-per-cell):
+## Action shape
+
+Every enrichment runs as a per-row cell agent. One shape:
+
 ```
 action: {
-  type: "tool",
-  tool: "fullenrich_enrich_email",
-  args_template: { first_name: "{row.first_name}", last_name: "{row.last_name}", company: "{row.company}" },
-  output_map: { email: "verified_email" }
-}
-```
-
-**Cell agent** (mini-LLM per row, when reasoning is needed):
-```
-action: {
-  type: "cell_agent",
-  tier: "classify" | "lookup" | "research",
+  research: "fast" | "smart" | "expert" | "standard" | "deep",
   prompt: "Find this person's Twitter URL via search; return null if they don't have one.",
   columns_to_fill: ["twitter_url"],
-  per_row_credit_cap: 5  // optional — defaults from tier
+  per_row_credit_cap: 1.5     // optional — defaults from research level
 }
 ```
 
-Prefer deterministic when the row maps cleanly to one tool call. Use cell agent when answer requires search, judgment, or chaining.
+`research` controls the model + whether tools are available. Required.
 
-**Pick the right tier — this controls the model + budget per row. The tier is REQUIRED.**
+## Picking `research`
 
-- `classify` → nano model, NO external tools. Cheapest (~$0.0001/row).
-  Use when the answer is derived purely from text/values already in the row — no lookup, no search.
-  Pattern: read row → emit label.
-  Examples: "is this post complaining about Clay (true/false)", "apartment or house", "positive / neutral / negative sentiment of bio", "score this listing 1-5 on relevance based on its description".
+**No research** (no integration tools — answer must come from the row itself):
 
-- `lookup` → mini model, full tools. ~3 credits/row. Use ONLY when a single direct API call with row-level inputs returns the answer.
-  Pattern: row identifier → one tool call → mapped field.
-  Examples: "verified email" via FE (needs first_name + last_name + domain), "current_technologies" via Apollo org_enrich (needs domain), "phone" via gmaps place_details (needs place_id).
+- **`fast`** → nano model. Simple classification on text already in the row.
+  Examples: "is this post a complaint about Clay (Yes/No)", "apartment or house", "positive / neutral / negative sentiment of bio".
 
-- `research` → gpt-5.5 + web_search + judgment. ~10 credits/row. Use for ANY task that requires web search, multi-step chaining, or fuzzy matching.
-  Pattern: row → search → read → judge → answer (or null).
-  Examples: "find this founder's Twitter/X handle" (no single API has this — must search + verify), "is this company hiring engineering leadership + role URL" (chain: company → careers page → relevant role), "find the LinkedIn URL for this person" (search + verify match), "categorize what this company sells in 2 words" (read website + judge).
+- **`smart`** → mini model. Same shape as fast, but the judgment is nuanced or weighs multiple factors. Use when fast might get it wrong.
+  Examples: "does this Reddit thread describe a real cancellation event (Yes/No)" — needs to weigh tone, specificity, and counter-signals. "Categorize as Enterprise / Mid-market / SMB based on the company description + headcount range".
 
-**Heuristic:** if you'd need to *search the open web* or *visit a page to verify*, it's research, not lookup. Lookup is for `row → known_tool(row_data) → answer`, period.
+- **`expert`** → gpt-5.5, no tools. Use rarely — for genuinely tricky domain reasoning where smart might miss. Examples: "given this clinical trial abstract, is the intervention CAR-T related (Yes/No)", "classify this legal filing by motion type".
 
-If the user message embeds an explicit `(tier: ..., per_row_credit_cap: ...)` hint, honor it as-is in `enrichment_set` rather than re-deriving the tier from the prose.
+**Research** (full toolset: web_search, FE, Apollo, gmaps, browser_use, code_exec):
 
-**Lock the output format in cell_agent prompts.** The prompt runs against many rows; without an explicit format the model drifts. Say it plainly. Standards to follow:
+- **`standard`** → gpt-5.5 + tools. One or two tool calls per row.
+  Examples: "verified email" via FE (needs first_name + last_name + domain), "current_technologies" via Apollo org_enrich, "phone" via gmaps place_details.
+
+- **`deep`** → gpt-5.5 + tools + higher reasoning effort. Multi-step: search → read → verify → answer.
+  Examples: "find this founder's Twitter/X handle", "is this company hiring engineering leadership + the role URL", "find the LinkedIn URL for this person" (search + verify match), "what does this company sell in 2 words" (read website + judge).
+
+**Rule of thumb:** if you'd need to *search the open web* or *visit a page to verify*, it's `standard` or `deep`. If the answer is derivable from text already in the row, it's `fast`/`smart`/`expert`. Lean toward `smart` over `fast` when in doubt — mini is still cheap.
+
+## per_row_credit_cap
+
+Optional. If omitted, defaults to a sensible cap per research level. Override when the underlying integration is unusually expensive:
+
+- **Phone enrichments via FullEnrich** cost ~5 cr base. Set `per_row_credit_cap: 10` for breathing room.
+- **Email enrichments via FullEnrich** cost ~0.5 cr base. Default `standard` cap (2) is plenty.
+
+Default caps (just for context — you don't have to set these explicitly):
+- fast 0.3, smart 0.5, expert 1.0, standard 2.0, deep 8.0
+
+Don't surface caps or cost to the user. The UI shows the estimate.
+
+## FE-triggered enrichments
+
+When the user message looks like `Add column to "<table>": <prompt>  (Research: <level>, Budget: <cr>)`, this came from the Enrich modal where the user already picked `research` and budget. Honor those values as-is in `enrichment_set` rather than re-deriving them from the prose.
+
+## Output format — lock it in the prompt
 
 - **Yes/No enum**: literal `"Yes"` / `"No"` — Title Case, not `true` / `false`. (Reason: cell values are stored exactly as displayed; filtering/sorting work better on user-readable strings.)
 - **Multi-class enum**: literal Title Case labels — *"Output one of: `Likely | Possible | Unclear | No`."*

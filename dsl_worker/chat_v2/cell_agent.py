@@ -1,26 +1,28 @@
-"""Cell agent — per-row enrichment runner with tier-based model routing.
+"""Cell agent — per-row enrichment runner with research-level routing.
 
-Spawned per row when an enrichment's action.type == "cell_agent". Each cell
-agent gets:
-  - The full current row data (already-filled columns)
+Spawned per row for every enrichment. Each cell agent gets:
+  - The full current row data (already-filled columns + hidden source fields)
   - The action's `prompt` (natural-language goal)
   - `columns_to_fill` — which column names to produce
-  - A toolset (depends on tier)
-  - A credit budget per row
+  - A toolset (depends on research level)
+  - A credit budget per row (enforced programmatically; NOT shown to the LLM)
 
-Tiers:
-  - "classify": gpt-5.4-nano, reasoning="minimal", no external tools.
-    For classifying / scoring text already in the row.
-    e.g. "is this post complaining about Clay", "apartment vs house",
-    "sentiment of the bio". Target ~0.3 credits per row.
-  - "lookup":   gpt-5.4-mini, reasoning="low", full tool surface.
-    For well-defined tasks: call FE/Apollo/gmaps to find X. (default)
-  - "research": gpt-5.5, reasoning="medium", full tool surface.
-    For genuine research: "find the open role URL", "is this co hiring eng leadership".
+Research levels — five flat values, picked per enrichment:
+
+  No research (no integration tools, just final_result):
+    - "fast"     gpt-5.4-nano  | simple classification ("complaint? yes/no")
+    - "smart"    gpt-5.4-mini  | nuanced, multi-factor judgment
+    - "expert"   gpt-5.5       | genuinely tricky reasoning (rare)
+
+  Research (full toolset — web_search, FE, Apollo, browser_use, etc):
+    - "standard" gpt-5.5       | one or two tool calls
+    - "deep"     gpt-5.5 high  | multi-step, browser, chained
+
+Legacy aliases: classify→fast, lookup→standard, research→deep.
 
 Loop terminates when:
-  - Cell agent emits a `final_result` tool call (or final JSON message)
-  - Budget cap is reached (only hard stop)
+  - Cell agent emits `final_result` (or a parseable JSON message)
+  - per_row_credit_cap is reached — server kills the loop without notice
 """
 
 from __future__ import annotations
@@ -66,40 +68,44 @@ TOOL_COST_ESTIMATES = {
 # ---------------------------------------------------------------------------
 
 
-TIER_CONFIG = {
-    "classify": {
-        "model": "gpt-5.4-nano",
-        "effort": "medium",
-        "default_cap": 0.5,
-        "tools": [],  # only final_result
-    },
-    "lookup": {
-        "model": "gpt-5.4-mini",
-        "effort": "medium",
-        "default_cap": 3.0,
-        "tools": "all",
-    },
-    "research": {
-        "model": "gpt-5.5",
-        "effort": "medium",
-        "default_cap": 10.0,
-        "tools": "all",
-    },
+RESEARCH_CONFIG = {
+    "fast":     {"model": "gpt-5.4-nano", "effort": "medium", "default_cap": 0.3, "tools": []},
+    "smart":    {"model": "gpt-5.4-mini", "effort": "medium", "default_cap": 0.5, "tools": []},
+    "expert":   {"model": "gpt-5.5",      "effort": "medium", "default_cap": 1.0, "tools": []},
+    "standard": {"model": "gpt-5.5",      "effort": "medium", "default_cap": 2.0, "tools": "all"},
+    "deep":     {"model": "gpt-5.5",      "effort": "high",   "default_cap": 8.0, "tools": "all"},
+}
+
+# Old → new. Lets pre-rename enrichments keep running.
+LEGACY_ALIASES = {
+    "classify": "fast",
+    "lookup":   "standard",
+    "research": "deep",
 }
 
 
-def _resolve_tier(action: Dict[str, Any], per_row_cap: float) -> Dict[str, Any]:
-    """Return resolved tier config: {model, effort, cap, tools}."""
-    requested = (action.get("tier") or "lookup").lower()
-    if requested not in TIER_CONFIG:
-        log.warning("cell_agent: unknown tier %r, defaulting to lookup", requested)
-        requested = "lookup"
-    cfg = TIER_CONFIG[requested].copy()
-    # If the caller specified per_row_credit_cap, honor it; otherwise tier default.
+def _resolve_research(action: Dict[str, Any], per_row_cap: Optional[float]) -> Dict[str, Any]:
+    """Return resolved config: {model, effort, cap, tools, name}.
+
+    Reads `research` (or legacy `tier`) from the action. Cap defaults from
+    the research level when caller passes None — fixes the prior bug where
+    enrichment.py always passed 5 and trampled per-tier defaults.
+    """
+    requested = (action.get("research") or action.get("tier") or "standard").lower()
+    requested = LEGACY_ALIASES.get(requested, requested)
+    if requested not in RESEARCH_CONFIG:
+        log.warning("cell_agent: unknown research %r, defaulting to standard", requested)
+        requested = "standard"
+    cfg = RESEARCH_CONFIG[requested].copy()
     cap = float(per_row_cap) if per_row_cap and per_row_cap > 0 else cfg["default_cap"]
     cfg["cap"] = cap
     cfg["name"] = requested
     return cfg
+
+
+# Back-compat alias for any external callers still importing the old name.
+TIER_CONFIG = RESEARCH_CONFIG
+_resolve_tier = _resolve_research
 
 
 # ---------------------------------------------------------------------------
@@ -328,18 +334,17 @@ CELL_TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any], ToolContext], Awaitable[
 # ---------------------------------------------------------------------------
 
 
-CELL_SYSTEM_PROMPT_BASE = """You are a cell agent: fill specific columns for ONE row of a table.
+CELL_SYSTEM_PROMPT = """You are a cell agent: fill specific columns for ONE row of a table.
 
 Inputs you'll receive (JSON):
   - row_visible_to_user: the row's already-filled fields as shown in the user's table
   - row_hidden_source_fields (optional): fields the source returned but the
     orchestrator didn't surface as columns. Use these as additional context
-    when reasoning, but never invent. If a column you need is hiding here,
-    return its value via final_result for the columns_to_fill — the visible
-    row will be updated. You cannot create new columns; only the orchestrator can.
+    when reasoning. If a column you need is hiding here, return its value
+    via final_result — you cannot create new columns, only fill the ones in
+    columns_to_fill.
   - columns_to_fill: column names you must produce values for
   - instruction: what to find or compute
-  - budget_credits_remaining: when this nears zero, stop and emit final_result
 
 Rules:
   - Always finish with `final_result({values: {col_name: value, ...}})`
@@ -347,33 +352,15 @@ Rules:
     invent your own keys like "label", "value", "answer", "result".
   - Set a column to null when the value genuinely doesn't exist. Null is fine.
   - Don't fabricate. If nothing was found, return null.
-  - Output format obeys the instruction exactly. For yes/no answers use
-    enum-style `"Yes"` / `"No"` (Title Case, not booleans). For numbers
-    output plain numeric values, NEVER formatted strings (`5000000`, not
-    `"$5M"`). For dates use ISO 8601 (`"2026-05-15"` or
-    `"2026-05-15T10:30:00Z"`). Don't invent casing variants.
-  - For URL-typed columns: only commit a URL you actually visited and verified.
-    Don't construct URLs from name slugs or guess identifiers; if you didn't
-    open and read the page, return null.
-"""
-
-
-CELL_SYSTEM_PROMPT_CLASSIFY = """You are a cell agent for CLASSIFICATION / SCORING.
-
-Your job: read text already present in the row and emit a label or score.
-You have NO external tools — call `final_result` directly with your answer.
-
-Inputs (JSON):
-  - row_visible_to_user: shown fields
-  - row_hidden_source_fields (optional): unmapped source fields you can also read
-  - columns_to_fill, instruction, budget_credits_remaining
-
-Use ALL the text available (visible + hidden) when judging. The user's mapped
-columns are often a subset and may have truncated values; the hidden fields
-usually carry the full source content.
-
-Output format obeys the instruction exactly. Don't invent variants.
-For yes/no use enum-style "Yes" / "No" (Title Case). Plain numeric values for numbers. ISO 8601 for dates.
+  - Output format obeys the instruction exactly:
+    * Yes/No → enum-style "Yes" / "No" (Title Case, never booleans)
+    * Numbers → plain numeric (5000000, never "$5M")
+    * Dates → ISO 8601 ("2026-05-15" or "2026-05-15T10:30:00Z")
+    * URLs → only commit URLs you actually visited and verified; don't
+      construct URLs from name slugs or guess identifiers
+  - If you have tools, use them when the answer needs lookup or search.
+    If you have no tools, the answer must come from the row context alone —
+    reason carefully and emit final_result directly.
 """
 
 
@@ -396,7 +383,7 @@ def _final_result_tool_def() -> Dict[str, Any]:
 
 
 def _tool_defs_for_tier(tier_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Responses-API tool definitions, scoped to the tier."""
+    """Responses-API tool definitions, scoped to the research level."""
     defs: List[Dict[str, Any]] = [_final_result_tool_def()]
     if tier_cfg["tools"] == "all":
         generic = {
@@ -554,29 +541,33 @@ def _persist_cell_trace(
 async def run_cell_agent(
     action: Dict[str, Any],
     row_data: Dict[str, Any],
-    per_row_cap: float,
+    per_row_cap: Optional[float],
     columns: List[Dict[str, str]],
     ctx: ToolContext,
     *,
     enrichment_id: Optional[str] = None,
     sample_id: Optional[str] = None,
     raw_row: Optional[Dict[str, Any]] = None,
-) -> Tuple[Dict[str, Any], float]:
-    """Per-row Responses-API loop with tier-based model + reasoning routing.
+) -> Tuple[Dict[str, Any], float, str]:
+    """Per-row Responses-API loop with research-level routing.
 
-    Returns (new_fields_dict, total_cost_credits).
+    Returns (new_fields_dict, total_cost_credits, status).
+      status ∈ {"filled", "hit_budget", "error"}
+        - filled: cell agent emitted final_result (values may still be null
+          if the answer genuinely didn't exist)
+        - hit_budget: programmatic kill — per_row_credit_cap reached before
+          final_result. FE renders a "hit budget" badge.
+        - error: LLM call failed or no parseable result. Cell left untouched.
 
-    Cost is the only termination signal; no iteration cap.
+    Budget is NEVER surfaced to the LLM (no budget_credits_remaining in
+    the user payload). The server kills the loop silently when cap is hit.
     If enrichment_id + sample_id are supplied, writes a cell_traces row.
     """
     prompt = action.get("prompt", "")
     columns_to_fill = action.get("columns_to_fill") or [c["name"] for c in columns]
-    tier_cfg = _resolve_tier(action, per_row_cap)
+    tier_cfg = _resolve_research(action, per_row_cap)
 
-    system_prompt = (
-        CELL_SYSTEM_PROMPT_CLASSIFY if tier_cfg["name"] == "classify"
-        else CELL_SYSTEM_PROMPT_BASE
-    )
+    system_prompt = CELL_SYSTEM_PROMPT
 
     # Build a hidden-fields view: source data that isn't currently shown
     # as a visible column. The cell agent gets to see everything the
@@ -593,7 +584,6 @@ async def run_cell_agent(
         "row_visible_to_user": row_data,
         "columns_to_fill": columns_to_fill,
         "instruction": prompt,
-        "budget_credits_remaining": tier_cfg["cap"],
     }
     if hidden_fields:
         user_payload["row_hidden_source_fields"] = hidden_fields
@@ -623,9 +613,21 @@ async def run_cell_agent(
 
     HARD_TURN_LIMIT = 40
     iteration = 0
+    status = "error"  # default; flipped to "filled" or "hit_budget" on exit
     try:
         while iteration < HARD_TURN_LIMIT:
             iteration += 1
+
+            # Cap check before next LLM call — reasoning-only loops would
+            # otherwise never trip the post-tool check below.
+            if total_cost >= tier_cfg["cap"]:
+                error_str = "budget cap reached"
+                status = "hit_budget"
+                log.info(
+                    "cell agent budget hit (research=%s cost=%.2f cap=%.2f) — stopping",
+                    tier_cfg["name"], total_cost, tier_cfg["cap"],
+                )
+                return final_values, total_cost, status
 
             try:
                 response, cost = await client.responses_create(
@@ -638,8 +640,8 @@ async def run_cell_agent(
                 total_cost += cost.total_cost_usd
             except Exception as e:
                 error_str = f"LLM call failed: {e}"[:500]
-                log.warning("cell agent LLM call failed (tier=%s): %s", tier_cfg["name"], e)
-                return final_values, total_cost
+                log.warning("cell agent LLM call failed (research=%s): %s", tier_cfg["name"], e)
+                return final_values, total_cost, "error"
 
             function_calls: List[Any] = []
             text_parts: List[str] = []
@@ -668,14 +670,14 @@ async def run_cell_agent(
                         data = json.loads(content)
                         if isinstance(data, dict) and "values" in data:
                             final_values = data["values"]
-                            return final_values, total_cost
+                            return final_values, total_cost, "filled"
                         if isinstance(data, dict):
                             final_values = data
-                            return final_values, total_cost
+                            return final_values, total_cost, "filled"
                     except json.JSONDecodeError:
                         pass
                 error_str = error_str or "no function call and no parseable message"
-                return final_values, total_cost
+                return final_values, total_cost, "error"
 
             for fc in function_calls:
                 name = fc.name
@@ -691,11 +693,9 @@ async def run_cell_agent(
                         raw_values = args
                     else:
                         raw_values = {}
-                    # Coerce keys to match columns_to_fill — small models
-                    # often invent sensible labels like {label, value, answer,
-                    # result} instead of using the actual column name. This
-                    # used to silently drop the value (the row would never
-                    # fill because the key didn't match any column).
+                    # Small models often invent sensible labels like
+                    # {label, value, answer, result} instead of using the
+                    # actual column name. _coerce_value_keys maps those back.
                     final_values = _coerce_value_keys(raw_values, columns_to_fill)
                     tool_calls_log.append({
                         "name": "final_result",
@@ -703,7 +703,7 @@ async def run_cell_agent(
                         "coerced_values": final_values,
                         "cost": 0.0,
                     })
-                    return final_values, total_cost
+                    return final_values, total_cost, "filled"
 
                 handler = CELL_TOOL_HANDLERS.get(name)
                 if not handler:
@@ -733,17 +733,17 @@ async def run_cell_agent(
                 if total_cost >= tier_cfg["cap"]:
                     error_str = "budget cap reached before final_result"
                     log.info(
-                        "cell agent budget hit (tier=%s cost=%.2f cap=%.2f) — stopping",
+                        "cell agent budget hit (research=%s cost=%.2f cap=%.2f) — stopping",
                         tier_cfg["name"], total_cost, tier_cfg["cap"],
                     )
-                    return final_values, total_cost
+                    return final_values, total_cost, "hit_budget"
 
         error_str = f"hit HARD_TURN_LIMIT={HARD_TURN_LIMIT}"
         log.warning(
-            "cell agent hit HARD_TURN_LIMIT=%d (tier=%s) — emergency stop",
+            "cell agent hit HARD_TURN_LIMIT=%d (research=%s) — emergency stop",
             HARD_TURN_LIMIT, tier_cfg["name"],
         )
-        return final_values, total_cost
+        return final_values, total_cost, "error"
     finally:
         duration_ms = int((time.monotonic() - t0) * 1000)
         _persist_cell_trace(

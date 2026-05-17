@@ -86,8 +86,14 @@ class RunEnrichmentBody(BaseModel):
 
 
 class PatchEnrichmentBody(BaseModel):
-    tier: Optional[str] = None  # "classify" | "lookup" | "research"
+    # New: research level. Legacy `tier` accepted via alias below.
+    research: Optional[str] = None  # fast | smart | expert | standard | deep
+    tier: Optional[str] = None      # legacy: classify | lookup | research
     per_row_credit_cap: Optional[float] = None
+
+
+_RESEARCH_VALUES = {"fast", "smart", "expert", "standard", "deep"}
+_LEGACY_TIER_TO_RESEARCH = {"classify": "fast", "lookup": "standard", "research": "deep"}
 
 
 @router.patch("/projects/{project_id}/enrichments/{enrichment_id}")
@@ -98,13 +104,12 @@ def patch_enrichment(
     user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Update tier (writes action.tier) and/or per_row_credit_cap.
+    """Update research level (writes action.research) and/or per_row_credit_cap.
 
-    Tier only applies to cell_agent actions — for `type: "tool"` enrichments
-    tier is meaningless and is ignored.
+    Accepts the new `research` field as well as the legacy `tier` field
+    (aliased to research). Always writes the new field on the action.
     """
     _verify(project_id, user.user_id, db)
-    # Resolve short_id → uuid.
     row = db.execute(
         sa_text(
             "SELECT id::text, action, per_row_credit_cap FROM enrichments "
@@ -118,11 +123,21 @@ def patch_enrichment(
     action = row[1] if isinstance(row[1], dict) else json.loads(row[1] or "{}")
     cap = row[2]
 
-    if body.tier is not None:
-        if body.tier not in ("classify", "lookup", "research"):
-            raise HTTPException(400, "tier must be classify | lookup | research")
-        if action.get("type") == "cell_agent":
-            action["tier"] = body.tier
+    # Resolve research target: prefer new field, fall back to legacy tier alias.
+    research: Optional[str] = None
+    if body.research is not None:
+        research = body.research.lower()
+    elif body.tier is not None:
+        research = _LEGACY_TIER_TO_RESEARCH.get(body.tier.lower(), body.tier.lower())
+    if research is not None:
+        if research not in _RESEARCH_VALUES:
+            raise HTTPException(
+                400,
+                f"research must be one of {sorted(_RESEARCH_VALUES)} (got {research!r})",
+            )
+        action["research"] = research
+        # Drop legacy `tier` if it lingered on this enrichment.
+        action.pop("tier", None)
     if body.per_row_credit_cap is not None:
         cap = body.per_row_credit_cap
 
@@ -134,7 +149,7 @@ def patch_enrichment(
         {"a": json.dumps(action), "cap": cap, "id": eid_uuid},
     )
     db.commit()
-    return {"ok": True, "tier": action.get("tier"), "per_row_credit_cap": cap}
+    return {"ok": True, "research": action.get("research"), "per_row_credit_cap": cap}
 
 
 @router.post("/projects/{project_id}/enrichments/{enrichment_id}/run")

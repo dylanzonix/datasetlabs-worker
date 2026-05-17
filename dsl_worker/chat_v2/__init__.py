@@ -41,8 +41,61 @@ def _generic_schema() -> Dict[str, Any]:
     }
 
 
+def _enrichment_set_schema() -> Dict[str, Any]:
+    """Tighter schema for enrichment_set so the agent learns the action shape.
+
+    additionalProperties=True keeps it lenient — unknown fields warn server-side
+    but never block the run. Required fields are the bare minimum.
+    """
+    return {
+        "type": "object",
+        "properties": {
+            "table_id": {"type": "string", "description": "Table to enrich."},
+            "enrichment_id": {"type": "string", "description": "Pass when refining an existing enrichment."},
+            "name": {"type": "string", "description": "Short name shown in column header."},
+            "columns": {
+                "type": "array",
+                "description": "One or more columns to add and fill. [{name, type}].",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "type": {"type": "string", "enum": ["text", "number", "url", "email", "date", "enum"]},
+                    },
+                    "required": ["name"],
+                    "additionalProperties": True,
+                },
+            },
+            "action": {
+                "type": "object",
+                "properties": {
+                    "research": {
+                        "type": "string",
+                        "enum": ["fast", "smart", "expert", "standard", "deep"],
+                        "description": "fast/smart/expert = no tools, just the model. standard/deep = full toolset (web_search, FE, apollo, etc).",
+                    },
+                    "prompt": {"type": "string", "description": "Natural-language instruction the per-row agent follows."},
+                    "columns_to_fill": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional. Defaults to all enrichment column names.",
+                    },
+                    "per_row_credit_cap": {
+                        "type": "number",
+                        "description": "Optional. Defaults from research level. Bump for phone (~10) and email (~1.5) enrichments.",
+                    },
+                },
+                "required": ["research", "prompt"],
+                "additionalProperties": True,
+            },
+        },
+        "required": ["table_id", "columns", "action"],
+        "additionalProperties": True,
+    }
+
+
 def _build_tool_defs() -> List[Dict[str, Any]]:
-    """OpenAI function tool definitions for the 15-tool orchestrator surface."""
+    """OpenAI function tool definitions for the orchestrator surface."""
     tool_descriptions = {
         # Tables
         "table_create": "Create a table from a source. Atomic: fetches rows, system internally picks human-readable columns from the actual row shape + table intent, commits. If the fetch fails or returns 0 rows, nothing is written — try a different actor/query. Args: source, query_params, name (2-5 words, Title Case), intent (optional one-liner describing what the user wants — helps the column picker).",
@@ -53,8 +106,8 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
         "apify_actor_details": "Read an actor's full input_schema, output preview, and pricing.",
         # Columns/enrichments
         "column_map_set": "Edit columns on an existing table — rename a column, add one mapped from another source field, drop one. Args: table_id, columns ([{name, source_field, type}]). table_create already commits with its own columns; only use this to revise after the fact.",
-        "enrichment_set": "Define or refine an enrichment. Runs on the first 10 unfilled rows.",
-        "enrichment_run": "Extend an enrichment to more rows. Approval-gated.",
+        "enrichment_set": "Define or refine an enrichment. Does NOT auto-run — call enrichment_run after to fill cells. Args: table_id, columns, action: {research, prompt, per_row_credit_cap?}.",
+        "enrichment_run": "Run an enrichment over a scope of rows. Approval-gated — user sees an estimated-cost card before it executes.",
         # Filters
         "filter_set": "Apply a non-destructive filter to a column. Returns matched count + sample.",
         "filter_clear": "Remove a filter from a column.",
@@ -71,13 +124,16 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
         "comment_on_table": "Append a short agent note to a table's description thread (visible in the table detail panel). Use sparingly — for non-obvious decisions or material changes the user should see ('Switched to Apollo because Google Maps capped at 60 results'). Args: table_id, body (markdown ok).",
         "comment_on_column": "Append a short agent note to a column's description thread. Args: table_id, column (name on the table), body.",
     }
+    schema_for = {
+        "enrichment_set": _enrichment_set_schema(),
+    }
     return [
         {
             "type": "function",
             "function": {
                 "name": name,
                 "description": desc,
-                "parameters": _generic_schema(),
+                "parameters": schema_for.get(name, _generic_schema()),
             },
         }
         for name, desc in tool_descriptions.items()
