@@ -372,10 +372,18 @@ async def _run_enrichment_on_rows(
                 if not (isinstance(new_fields, dict) and new_fields.get(cn)):
                     existing_status[cn] = "hit_budget"
         elif status == "filled" and isinstance(new_fields, dict):
-            # Clear stale status for any column we just filled.
-            for cn, v in new_fields.items():
-                if v not in (None, "") and cn in existing_status:
+            # Differentiate "filled with a value" from "ran and the answer
+            # genuinely doesn't exist". The latter (cell agent returned
+            # null because it couldn't find anything) is its own status
+            # so the FE can show a "Not found" badge — otherwise the cell
+            # looks identical to "haven't tried yet", and the user
+            # re-clicks ▶ wondering if anything happened.
+            for cn in target_cols:
+                v = new_fields.get(cn) if isinstance(new_fields, dict) else None
+                if v not in (None, ""):
                     existing_status.pop(cn, None)
+                else:
+                    existing_status[cn] = "not_found"
         if existing_status:
             merged["__cell_status__"] = existing_status
         elif "__cell_status__" in merged:
