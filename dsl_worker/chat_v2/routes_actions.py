@@ -32,6 +32,8 @@ from dsl_worker.chat_v2.tools import (
     filter_clear,
 )
 from dsl_worker.chat_v2.enrichment import enrichment_run
+from dsl_worker.chat_v2.approvals import REGISTRY as APPROVALS
+from dsl_worker.chat_v2.cancels import REGISTRY as CANCELS
 
 
 router = APIRouter(prefix="/v2")
@@ -179,9 +181,30 @@ async def post_run_enrichment(
     if body.row_ids is not None:
         scope["row_ids"] = body.row_ids
     ctx = ToolContext(db=db, project_id=str(project_id), user_id=str(user.user_id), run_id=None)
-    result, cost = await enrichment_run(
-        {"enrichment_id": str(enrichment_id), "scope": scope, "overwrite": body.overwrite}, ctx
+
+    # Resolve eid early so cancel registry uses the canonical UUID (matches
+    # what /cancel resolves to). Otherwise short_id vs uuid mismatches
+    # would prevent the Stop button from finding the task.
+    from dsl_worker.chat_v2.tools import resolve_enrichment_id
+    canonical_eid = resolve_enrichment_id(db, str(project_id), enrichment_id) or str(enrichment_id)
+
+    # Wrap the run in an asyncio.Task so the Stop button can cancel it.
+    # enrichment.py's cell loop already handles asyncio.CancelledError
+    # (cancels in-flight per-cell tasks + flushes partial cost).
+    import asyncio as _asyncio
+    task: _asyncio.Task = _asyncio.create_task(
+        enrichment_run(
+            {"enrichment_id": str(enrichment_id), "scope": scope, "overwrite": body.overwrite},
+            ctx,
+        )
     )
+    await CANCELS.register(str(project_id), canonical_eid, task)
+    try:
+        result, cost = await task
+    except _asyncio.CancelledError:
+        return {"result": {"cancelled": True}, "cost_usd": 0.0}
+    finally:
+        await CANCELS.unregister(str(project_id), canonical_eid, task)
     return {"result": result, "cost_usd": cost}
 
 
@@ -321,36 +344,71 @@ def list_cell_traces(
     }
 
 
-# ---- Approvals (minimal v1) -----------------------------------------------
-# For v1 the approval mechanism is server-pause-then-resume via in-memory
-# event. The agent loop is synchronous, so approvals don't come into play
-# until we wire streaming. These endpoints exist for FE forward-compat.
+# ---- Approvals ------------------------------------------------------------
+# Tools in APPROVAL_REQUIRED (see approvals.py) pause the agent loop and
+# wait for a decision from the FE. These endpoints surface that flow:
+#   GET   /approvals               → list pending (used to rehydrate the
+#                                    approval card after a reconnect)
+#   POST  /approvals/{id}/respond  → resolve a pending approval
 
 
 @router.get("/projects/{project_id}/approvals")
-def list_approvals(
+async def list_approvals(
     project_id: UUID,
     user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     _verify(project_id, user.user_id, db)
-    # Approval table not yet in v1; returns empty for now. When streaming +
-    # approval flow is wired, this surfaces pending approvals.
-    return {"approvals": []}
+    return {"approvals": await APPROVALS.list_for_project(str(project_id))}
 
 
 class ApprovalDecision(BaseModel):
     approved: bool
 
 
-@router.post("/projects/{project_id}/approvals/{approval_id}")
-def resolve_approval(
+@router.post("/projects/{project_id}/approvals/{approval_id}/respond")
+async def respond_to_approval(
     project_id: UUID,
-    approval_id: UUID,
+    approval_id: str,
     body: ApprovalDecision,
     user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     _verify(project_id, user.user_id, db)
-    # Stub: when approvals are wired, this signals the paused agent.
-    return {"ok": True, "approved": body.approved}
+    found = await APPROVALS.resolve(approval_id, body.approved)
+    if not found:
+        # Approval already resolved (double-click) or no longer pending
+        # (chat run ended) — treat as a no-op rather than 404 so the FE
+        # doesn't surface a confusing error.
+        return {"ok": True, "approved": body.approved, "found": False}
+    return {"ok": True, "approved": body.approved, "found": True}
+
+
+# ---- Cancel ---------------------------------------------------------------
+# Cancels an in-flight REST enrichment run. Chat runs are cancelled via the
+# SSE disconnect; this is the parallel path for the column ▶ button etc.
+
+
+@router.post("/projects/{project_id}/enrichments/{enrichment_id}/cancel")
+async def cancel_enrichment(
+    project_id: UUID,
+    enrichment_id: str,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _verify(project_id, user.user_id, db)
+    # Resolve short_id (e1, e2…) to UUID if needed.
+    from dsl_worker.chat_v2.tools import resolve_enrichment_id
+    eid = resolve_enrichment_id(db, str(project_id), enrichment_id) or enrichment_id
+    cancelled = await CANCELS.cancel_enrichment(str(project_id), eid)
+    return {"ok": True, "cancelled": cancelled}
+
+
+@router.get("/projects/{project_id}/enrichments/running")
+async def list_running_enrichments(
+    project_id: UUID,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _verify(project_id, user.user_id, db)
+    return {"enrichment_ids": await CANCELS.list_running(str(project_id))}

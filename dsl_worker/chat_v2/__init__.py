@@ -82,10 +82,10 @@ def _enrichment_set_schema() -> Dict[str, Any]:
                     },
                     "per_row_credit_cap": {
                         "type": "number",
-                        "description": "Optional. Defaults from research level. Bump for phone (~10) and email (~1.5) enrichments.",
+                        "description": "REQUIRED. Cap on credits the cell agent can spend per row. Defaults by research level (classify 0.3, lookup 1.0, search 2.0, investigate 8.0); bump for known-expensive integrations — phone via FE ~10, email via FE ~1.5. The agent is killed mid-row if it tries to exceed this, so set it generously enough that the typical row completes.",
                     },
                 },
-                "required": ["research", "prompt"],
+                "required": ["research", "prompt", "per_row_credit_cap"],
                 "additionalProperties": True,
             },
         },

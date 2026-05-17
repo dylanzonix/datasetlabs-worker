@@ -199,22 +199,24 @@ action: {
 
 **Rule of thumb:** if there's an obvious one-call answer, `lookup`. If the agent has to search the open web, `search` or `investigate`. If the answer is already in the row text, `classify`.
 
-## per_row_credit_cap (required)
+## per_row_credit_cap (required, always set)
 
-Set this based on what the agent will actually do per row. Default tier caps are a hint, not a target — override when the underlying integration costs more.
+You must include `per_row_credit_cap` on every `enrichment_set` call. The agent is killed mid-row if it exceeds the cap, so size it for the *typical* row to complete (not the absolute worst case).
 
-Rule of thumb:
-
-| Tier | Typical cap | When to bump |
+| Tier | Typical cap | Notes |
 |---|---|---|
-| `classify` | `0.3` | rarely |
-| `lookup` (email FE) | `1.5` | FE email ~0.5 base + LLM headroom |
-| `lookup` (phone FE) | `10` | FE phone ~5 base + LLM headroom |
-| `lookup` (apollo/gmaps) | `1.0` | usually fine |
-| `search` | `2.0` | bump to `5` for multi-search tasks |
+| `classify` | `0.3` | nano + no tools — barely spends anything |
+| `lookup` (apollo/gmaps) | `1.0` | one cheap call + small reasoning headroom |
+| `lookup` (FE email) | `1.5` | FE email ≈ 0.5 base + headroom |
+| `lookup` (FE phone) | `10` | FE phone ≈ 5 base + headroom |
+| `search` | `2.0` | bump to `5` if you expect multiple searches |
 | `investigate` | `8` | bump to `15-20` for browser_use chains |
 
-Don't talk to the user about cost. The UI shows the estimate.
+Don't talk to the user about cost. The UI shows them an estimate.
+
+## enrichment_run is approval-gated
+
+When you call `enrichment_run`, the user sees a card above the chat input with the estimated cost. They click Approve or Cancel. Approved → the run executes and you get the result; denied → the tool returns `{error: "denied", message: "..."}` — acknowledge the denial briefly and either propose an alternative or wait for direction. **Don't re-call the same enrichment_run after a denial.** Wait for the user to tell you what to do instead.
 
 ## FE-triggered enrichments
 

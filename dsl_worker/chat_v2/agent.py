@@ -284,6 +284,75 @@ async def run_turn(
                 tool_result: Dict[str, Any] = {"error": f"unknown tool {name}"}
                 h_cost = 0.0
             else:
+                # Approval gate. For tools in APPROVAL_REQUIRED, register
+                # a pending approval, emit the SSE event so the FE can
+                # show the card, then await the user's decision. Denied
+                # → short-circuit with a result the agent can read and
+                # continue from. Approved → fall through to the normal
+                # handler dispatch.
+                from dsl_worker.chat_v2.approvals import (
+                    APPROVAL_REQUIRED,
+                    REGISTRY as APPROVALS,
+                    estimate_enrichment_run_cost,
+                )
+
+                if name in APPROVAL_REQUIRED:
+                    if name == "enrichment_run":
+                        est_cost, summary = estimate_enrichment_run_cost(args, ctx.db, ctx.project_id)
+                    else:
+                        est_cost, summary = 0.0, f"Run {name}"
+                    pending = await APPROVALS.request(
+                        project_id=ctx.project_id,
+                        tool=name,
+                        args=args,
+                        estimated_cost_credits=est_cost,
+                        summary=summary,
+                    )
+                    await emit({
+                        "type": "approval_required",
+                        "approval_id": pending.id,
+                        "tool": name,
+                        "args": args,
+                        "estimated_cost_credits": est_cost,
+                        "summary": summary,
+                    })
+                    approved = await pending.future
+                    await emit({
+                        "type": "approval_resolved",
+                        "approval_id": pending.id,
+                        "approved": approved,
+                    })
+                    if not approved:
+                        tool_result = {
+                            "error": "denied",
+                            "message": "User denied this action. Acknowledge and propose an alternative or wait for direction.",
+                        }
+                        h_cost = 0.0
+                        preview = json.dumps(tool_result, default=str)[:300]
+                        tool_calls_made.append({
+                            "name": name,
+                            "args": args,
+                            "result_preview": preview,
+                            "cost_usd": h_cost,
+                            "approval": "denied",
+                        })
+                        await emit({
+                            "type": "tool_call_result",
+                            "tool_call_id": fc.call_id,
+                            "name": name,
+                            "result_preview": preview,
+                            "cost_usd": h_cost,
+                        })
+                        # Send the denied result back to the model in the
+                        # same shape as a normal tool result so the loop
+                        # can continue cleanly.
+                        input_items.append({
+                            "type": "function_call_output",
+                            "call_id": fc.call_id,
+                            "output": json.dumps(tool_result),
+                        })
+                        continue
+
                 # Long-running tools (apify) bump ctx.partial_cost_usd
                 # as external cost is incurred. Reset to 0 before each
                 # handler call so the running tally is per-call. On
