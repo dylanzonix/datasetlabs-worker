@@ -45,6 +45,7 @@ markdownify
 httpx
 playwright
 sandbox-service
+selectolax
 
 langfuse>=4.0
 

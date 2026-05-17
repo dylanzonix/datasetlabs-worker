@@ -122,6 +122,7 @@ class ScrubbyClient:
 
 
 _singleton: Optional[ScrubbyClient] = None
+_logged_status: bool = False
 
 
 def get_scrubby_client() -> Optional[ScrubbyClient]:
@@ -130,11 +131,23 @@ def get_scrubby_client() -> Optional[ScrubbyClient]:
     Callers must handle None — the feature is intentionally optional so the
     worker runs fine without a key configured.
     """
-    global _singleton
+    global _singleton, _logged_status
     if _singleton is not None:
         return _singleton
     key = os.environ.get("SCRUBBY_API_KEY")
     if not key:
+        if not _logged_status:
+            # Log loudly once so it's obvious in worker logs why no
+            # emails are getting badges — the silent skip path was
+            # the #1 source of "is email verify broken?" confusion.
+            logger.warning(
+                "scrubby: SCRUBBY_API_KEY is unset — email verification disabled. "
+                "Cells will commit without DELIVERABLE/RISKY/INVALID badges."
+            )
+            _logged_status = True
         return None
     _singleton = ScrubbyClient(key)
+    if not _logged_status:
+        logger.info("scrubby: enabled (key length=%d)", len(key))
+        _logged_status = True
     return _singleton

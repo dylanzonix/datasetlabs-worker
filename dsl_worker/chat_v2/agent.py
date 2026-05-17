@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
 
 from openai import AsyncOpenAI
@@ -179,6 +180,7 @@ async def run_turn(
                     "content": inj_content,
                 })
 
+        llm_started = time.perf_counter()
         try:
             response, cost = await client.responses_create(
                 model=model,
@@ -187,6 +189,11 @@ async def run_turn(
                 reasoning={"effort": effort, "summary": "detailed"},
                 prompt_cache_key=cache_key,
             )
+            llm_ms = int((time.perf_counter() - llm_started) * 1000)
+            log.info(
+                "[chat_v2 timing] llm_call project=%s iter=%d duration_ms=%d cost_usd=%.6f",
+                project_id, iteration, llm_ms, cost.total_cost_usd,
+            )
             total_cost_usd += cost.total_cost_usd
             # Emit running total after each LLM call so the FE can show
             # live cost growth AND so a mid-turn cancellation has the
@@ -194,9 +201,20 @@ async def run_turn(
             # per-turn ledger entry on cancel would miss everything past
             # the last completed tool call.
             await emit({"type": "cost_update", "total_cost_usd": total_cost_usd})
+            await emit({
+                "type": "llm_call_complete",
+                "iteration": iteration,
+                "duration_ms": llm_ms,
+                "cost_usd": cost.total_cost_usd,
+            })
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            llm_ms = int((time.perf_counter() - llm_started) * 1000)
+            log.info(
+                "[chat_v2 timing] llm_call_failed project=%s iter=%d duration_ms=%d err=%s",
+                project_id, iteration, llm_ms, str(e)[:120],
+            )
             log.exception("LLM call failed: %s", e)
             await emit({"type": "error", "message": str(e)})
             return {
@@ -280,6 +298,7 @@ async def run_turn(
             })
 
             handler = HANDLERS.get(name)
+            tool_started = time.perf_counter()
             if not handler:
                 tool_result: Dict[str, Any] = {"error": f"unknown tool {name}"}
                 h_cost = 0.0
@@ -369,6 +388,11 @@ async def run_turn(
                     # total + emit a cost_update so _drive_agent's
                     # cancel handler flushes the right amount to the
                     # balance ledger.
+                    cancel_ms = int((time.perf_counter() - tool_started) * 1000)
+                    log.info(
+                        "[chat_v2 timing] tool_cancelled project=%s tool=%s duration_ms=%d",
+                        project_id, name, cancel_ms,
+                    )
                     total_cost_usd += ctx.partial_cost_usd
                     await emit({"type": "cost_update", "total_cost_usd": total_cost_usd})
                     raise
@@ -376,13 +400,34 @@ async def run_turn(
                     log.exception("tool %s raised: %s", name, e)
                     tool_result = {"error": str(e)[:300]}
                     h_cost = 0.0
+                    # A failed SQL leaves ctx.db in `aborted` state: any
+                    # later statement on this session raises
+                    # InFailedSqlTransaction until rollback. That would
+                    # cascade — every subsequent tool errors out, the
+                    # end-of-turn assistant ChatMessage insert in
+                    # _drive_agent fails, the run is marked failed even
+                    # though the agent had useful text and chips to
+                    # show. Roll back so the session is usable again.
+                    # Non-SQL errors (apify HTTP, validation) cost
+                    # nothing to rollback — the session is already
+                    # clean and rollback() is a no-op.
+                    try:
+                        ctx.db.rollback()
+                    except Exception:
+                        log.exception("post-tool-error rollback failed for %s", name)
 
+            tool_ms = int((time.perf_counter() - tool_started) * 1000)
+            log.info(
+                "[chat_v2 timing] tool project=%s tool=%s duration_ms=%d cost_usd=%.6f",
+                project_id, name, tool_ms, h_cost,
+            )
             preview = json.dumps(tool_result, default=str)[:300]
             tool_calls_made.append({
                 "name": name,
                 "args": args,
                 "result_preview": preview,
                 "cost_usd": h_cost,
+                "duration_ms": tool_ms,
             })
             total_cost_usd += h_cost
 
@@ -392,6 +437,7 @@ async def run_turn(
                 "name": name,
                 "result_preview": preview,
                 "cost_usd": h_cost,
+                "duration_ms": tool_ms,
             })
             # Same running-total emit as after the LLM call — keeps the
             # cancellation safety net up-to-date as tools accumulate cost.

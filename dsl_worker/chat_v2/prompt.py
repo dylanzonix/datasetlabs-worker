@@ -125,9 +125,19 @@ If a project already has a table covering what the user asked for, **`table_exte
 
 Light dedup on the table's `dedup_key_column` catches boundary overlap.
 
-# Suggesting next-page chips
+# Reply chips — mandatory
 
-After every `table_create` or `table_extend`, emit 1-2 `suggest_replies` framed as concrete next queries the user might want. Phrase them like things the user would actually say — "Get the next 30", "Pull more posts from r/Entrepreneur", "Show me ones from 2024 too". Keep them tied to what just happened so clicking one feels like a natural continuation. The FE renders these as clickable chips that come back through the chat exactly as if the user typed them.
+Call `suggest_replies` at the END of every turn. **Mandatory, not optional.** Users are lazy and won't type a paragraph reply when a click would do; a turn that ends without chips leaves them staring at a blank input and often just closing the tab.
+
+Arg shape — `suggest_replies({"chips": [{"label": "...", "message": "..."}]})`. `label` is what shows on the chip; `message` is the text sent back as if the user typed it. 1-3 chips per turn.
+
+When to emit which:
+- **After `table_create` / `table_extend`**: 1-2 chips framed as concrete next queries — "Get the next 30", "Pull more posts from r/Entrepreneur", "Show me ones from 2024 too".
+- **After enrichment_set / enrichment_run**: chips for "Run on the rest", "Refine this column", "Add another column for X".
+- **When you ask a question or propose a choice**: 2-3 chips covering the likely answers — "Yes, go ahead", "Narrow to California first", "Use Apify instead".
+- **When the turn ends with the user clearly in the driver's seat** (you finished an action and are waiting): chips for the most natural next moves.
+
+Keep them tied to what just happened so clicking feels like a continuation, not a fresh start.
 
 # Noise hierarchy — handle on the same table
 

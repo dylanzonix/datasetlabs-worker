@@ -40,6 +40,7 @@ from dsl_worker.chat_v2.tools import (
     resolve_table_id,
     _next_enrichment_short_id,
 )
+from dsl_worker.chat_v2 import verify_hook
 
 
 log = logging.getLogger(__name__)
@@ -324,6 +325,11 @@ async def _run_enrichment_on_rows(
             return sample_id, row_data, new_fields, cost, status, idx
 
     tasks = [asyncio.create_task(run_one(sid, rd, raw)) for sid, rd, raw in rows]
+    # Verify tasks spawned on row commits — pinned in
+    # verify_hook._BACKGROUND_TASKS so they survive past this function
+    # without being GC'd. We collect handles here only so the
+    # CancelledError path can drop the reference cleanly.
+    pending_verifications: List[asyncio.Task] = []
 
     try:
       for fut in asyncio.as_completed(tasks):
@@ -382,6 +388,23 @@ async def _run_enrichment_on_rows(
                     {"row": json.dumps(merged), "sid": sample_id},
                 )
                 ctx.db.commit()
+                # Fire email + URL verifications for the just-written
+                # values. Tasks are pinned in verify_hook so they outlive
+                # this function — they emit url_verifying / url_verified
+                # / row_merged via fresh sessions as each verdict lands.
+                if isinstance(new_fields, dict) and new_fields:
+                    try:
+                        pending_verifications.extend(
+                            verify_hook.schedule_for_row(
+                                run_id=getattr(ctx, "run_id", None),
+                                sample_id=sample_id,
+                                written_values=new_fields,
+                                columns=columns,
+                                row_snapshot=merged,
+                            )
+                        )
+                    except Exception:
+                        log.exception("verify_hook.schedule_for_row raised; suppressed")
             except Exception as e:
                 log.warning("enrichment row commit failed for %s: %s", sample_id, e)
                 ctx.db.rollback()
@@ -423,6 +446,15 @@ async def _run_enrichment_on_rows(
         except Exception:
             pass
         raise
+
+    # Verify tasks are intentionally NOT awaited — they're pinned in
+    # verify_hook._BACKGROUND_TASKS so they survive past this function
+    # without being GC'd, and they emit url_verified / row_merged events
+    # via fresh DB sessions as each verdict lands. Awaiting here would
+    # block the enrichment tool's return on ~3s of HTTP fetches per row
+    # plus the Haiku batch round, defeating the point of streaming the
+    # cell_filled events.
+    del pending_verifications
 
     return filled_count, total_cost
 

@@ -330,6 +330,70 @@ async def _run_chat_v2_task(
         _pending_injections.pop(run_id, None)
 
 
+def _force_persist_v2_terminal(
+    *,
+    run_id: UUID,
+    project_id: UUID,
+    user_id: UUID,
+    final_text: str,
+    applied_changes: Dict[str, Any],
+    spend_cents: int,
+    terminal_payload: Dict[str, Any],
+    cancelled: bool,
+) -> None:
+    """Belt-and-suspenders persist for chat_v2 turn completion.
+
+    Called from _drive_agent when the shared session's commit raises
+    (e.g. an in-flight tool transaction was cut short by a CancelledError
+    and left the session in a poisoned state). Opens a fresh session,
+    writes the assistant ChatMessage, the BalanceLedger entry, and the
+    terminal cancelled/done event, then drops the bus subscriber.
+    Idempotent against the run already being terminal (a concurrent
+    request_cancel may have flipped it first).
+    """
+    fresh = SessionLocal()
+    try:
+        run = fresh.query(ChatRun).filter(ChatRun.id == run_id).first()
+        if run is None:
+            log.warning("force_persist_v2: run %s vanished", run_id)
+            return
+        if run.assistant_message_id is None:
+            msg = ChatMessage(
+                project_id=project_id,
+                role="assistant",
+                content=final_text,
+                run_id=run_id,
+                applied_changes=applied_changes,
+            )
+            fresh.add(msg)
+            fresh.flush()
+            run.assistant_message_id = msg.id
+            if spend_cents > 0:
+                fresh.add(BalanceLedger(
+                    user_id=user_id,
+                    amount=-spend_cents,
+                    reason="chat_v2_run",
+                    project_id=project_id,
+                ))
+            fresh.commit()
+            fresh.refresh(run)
+
+        if run.status not in RUN_TERMINAL_STATUSES:
+            if cancelled:
+                legacy_runs.mark_run_cancelled(fresh, run, terminal_payload)
+            else:
+                legacy_runs.mark_run_completed(fresh, run, terminal_payload)
+        else:
+            log.info(
+                "force_persist_v2: run %s already terminal (%s) — skipping terminal-event emit",
+                run_id, run.status,
+            )
+    except Exception:
+        log.exception("force_persist_v2 failed for run %s", run_id)
+    finally:
+        fresh.close()
+
+
 def cancel_v2_run(run_id: UUID) -> bool:
     """Instantaneous cancel for a chat_v2 run.
 
@@ -450,16 +514,28 @@ async def _drive_agent(
                     tc_id = evt.get("tool_call_id") or ""
                     summary = evt.get("result_preview") or ""
                     cost = float(evt.get("cost_usd") or 0.0)
+                    duration_ms = int(evt.get("duration_ms") or 0)
                     for entry in tool_log:
                         if entry.get("id") == tc_id:
                             entry["summary"] = summary
                             entry["cost"] = cost
+                            entry["duration_ms"] = duration_ms
                             break
                     legacy_runs.emit_event(ldb, lrun, "tool_result", {
                         "id": tc_id,
                         "name": evt.get("name"),
                         "summary": summary,
                         "cost": cost,
+                        "duration_ms": duration_ms,
+                    })
+                elif etype == "llm_call_complete":
+                    # Surface to SSE so a live FE timing overlay (or a
+                    # future per-iteration timing chip) can render
+                    # without re-deriving from logs.
+                    legacy_runs.emit_event(ldb, lrun, "llm_call_complete", {
+                        "iteration": evt.get("iteration"),
+                        "duration_ms": int(evt.get("duration_ms") or 0),
+                        "cost_usd": float(evt.get("cost_usd") or 0.0),
                     })
                 elif etype == "final_message":
                     text = evt.get("text") or ""
@@ -573,56 +649,95 @@ async def _drive_agent(
         except Exception:
             log.exception("collecting table_cards for applied_changes failed")
 
-        assistant_msg = ChatMessage(
-            project_id=project_id,
-            role="assistant",
-            content=final_text,
-            run_id=run_id,
-            applied_changes=ac,
-        )
-        db.add(assistant_msg)
-        db.flush()
+        # Same trick for suggest_replies chips: replay the SSE events
+        # we emitted live so a refresh re-renders them. Multiple emits
+        # in one turn collapse into a single ordered items list.
+        try:
+            from dsl_api.models import ChatRunEvent
+            sg_rows = (
+                db.query(ChatRunEvent.payload)
+                .filter(
+                    ChatRunEvent.run_id == run_id,
+                    ChatRunEvent.type == "suggestions",
+                )
+                .order_by(ChatRunEvent.seq.asc())
+                .all()
+            )
+            sg_items: List[Dict[str, Any]] = []
+            for (p,) in sg_rows:
+                if isinstance(p, dict):
+                    for it in (p.get("items") or []):
+                        if isinstance(it, dict) and it.get("label") and it.get("message"):
+                            sg_items.append(it)
+            if sg_items:
+                ac["suggestions"] = {"items": sg_items}
+        except Exception:
+            log.exception("collecting suggestions for applied_changes failed")
 
-        # Link assistant message id back to the run so the FE / chat
-        # history endpoint can pair them.
-        run.assistant_message_id = assistant_msg.id
-
-        # Charge balance_ledger. cost is USD; ledger.amount is cents-of-USD
-        # (negative = charge). Credit-to-dollar markup happens upstream when
-        # users top up — we store raw USD-cents and let billing apply its
-        # own pricing.
+        # Persist the assistant message + ledger + terminal event. On
+        # cancel paths the shared `db` session may be in an inconsistent
+        # state (an in-flight tool's transaction was cut short between
+        # its execute and its commit), so wrap the whole flush and fall
+        # back to a fresh-session force-persist if anything raises. The
+        # alternative — letting the exception propagate — leaves the
+        # user with their input message and no assistant bubble after
+        # refresh (the exact "last message disappeared" report).
         spend_cents = int(round(total_cost_usd * 100))
-        if spend_cents > 0:
-            db.add(BalanceLedger(
-                user_id=user_id,
-                amount=-spend_cents,
-                reason="chat_v2_run",
-                project_id=project_id,
-            ))
-
-        db.commit()
-        db.refresh(run)
-
         terminal_payload = {
             "total_cost_usd": total_cost_usd,
             "iterations": result.get("iterations"),
             "thinking_duration": thinking_duration_s,
         }
         if cancelled:
-            # Use the cancelled-event helper so the FE's `cancelled`
-            # branch in consumeRunEvents fires (and the bus is cleaned).
-            # Carry the stop_reason in the same payload as the legacy
-            # streaming path so the FE's `done`+stop_reason inline note
-            # logic works for v2 too via the matching applied_changes.
             terminal_payload["stopped"] = True
             terminal_payload["stop_reason"] = "cancel"
-            legacy_runs.mark_run_cancelled(db, run, terminal_payload)
-        else:
-            # Final lifecycle event. thinking_duration drives the FE's
-            # "Took X" label — without it the meta line above the
-            # assistant message stays hidden because the FE gates on
-            # `evt.thinking_duration`.
-            legacy_runs.mark_run_completed(db, run, terminal_payload)
+
+        try:
+            assistant_msg = ChatMessage(
+                project_id=project_id,
+                role="assistant",
+                content=final_text,
+                run_id=run_id,
+                applied_changes=ac,
+            )
+            db.add(assistant_msg)
+            db.flush()
+            run.assistant_message_id = assistant_msg.id
+
+            if spend_cents > 0:
+                db.add(BalanceLedger(
+                    user_id=user_id,
+                    amount=-spend_cents,
+                    reason="chat_v2_run",
+                    project_id=project_id,
+                ))
+
+            db.commit()
+            db.refresh(run)
+
+            if cancelled:
+                legacy_runs.mark_run_cancelled(db, run, terminal_payload)
+            else:
+                legacy_runs.mark_run_completed(db, run, terminal_payload)
+        except Exception:
+            log.exception(
+                "v2 run %s flush failed on shared session — falling back "
+                "to force-persist on a fresh session", run_id,
+            )
+            try:
+                db.rollback()
+            except Exception:
+                log.exception("v2 run %s rollback failed", run_id)
+            _force_persist_v2_terminal(
+                run_id=run_id,
+                project_id=project_id,
+                user_id=user_id,
+                final_text=final_text,
+                applied_changes=ac,
+                spend_cents=spend_cents,
+                terminal_payload=terminal_payload,
+                cancelled=cancelled,
+            )
     finally:
         db.close()
 

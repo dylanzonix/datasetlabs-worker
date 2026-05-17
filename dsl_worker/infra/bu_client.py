@@ -29,6 +29,35 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 
+# Hard efficiency guard prepended to every BU task. BU's internal agent
+# is prone to looping on the same page, exhaustively reading every
+# element it sees, and bloating output with commentary — each behaviour
+# costs LLM tokens and clock time. The wording is deliberate: short,
+# imperative, and uses concrete numeric ceilings so the model can
+# self-check against them. Tune the numbers here (not at the caller),
+# because every caller — chat_v2 browser_use source, web_search_agent,
+# the bulk_browser path — benefits equally from a tighter floor.
+BU_EFFICIENCY_GUARD = (
+    "EFFICIENCY RULES (read first, follow strictly):\n"
+    "1. Hard budget: at most ~30 navigation actions and ~3 minutes per session. "
+    "If the answer isn't in reach within that, STOP and return what you have.\n"
+    "2. No looping. If the same action (scroll, click, search) didn't change the "
+    "page in any useful way once, do NOT repeat it — try a different approach or stop.\n"
+    "3. No exhaustive reading. Extract only the fields the task asks for. Don't "
+    "open detail pages, don't read sidebars, don't summarize the page, don't "
+    "narrate what you see. Skip cookie banners and chat widgets.\n"
+    "4. Output is rows, not prose. Return ONLY the structured output. No analysis, "
+    "no recap, no 'here is what I found'. Empty list is a valid answer.\n"
+    "5. If the page blocks you (login wall, CAPTCHA you can't solve, hard 404, "
+    "JS that won't render), stop immediately and return [] — do NOT try alternate "
+    "URLs, do NOT search the web, do NOT improvise.\n"
+    "6. One scope per session. The task below targets one page or one search. "
+    "Don't expand scope, don't open external links, don't 'also check' anywhere "
+    "else even if it seems related.\n\n"
+    "--- TASK ---\n"
+)
+
+
 class ExtractedItem(BaseModel):
     """Generic extracted item — BU fills in whatever it finds."""
     data: Dict[str, Any] = Field(
@@ -188,7 +217,7 @@ class BUClient:
         """
         try:
             session_run = self._client.run(
-                task,
+                BU_EFFICIENCY_GUARD + task,
                 model=self._model,
                 output_schema=ExtractionResult,
                 proxy_country_code=proxy_country or self._default_proxy,
@@ -275,7 +304,7 @@ class BUClient:
         """
         try:
             session_run = self._client.run(
-                task,
+                BU_EFFICIENCY_GUARD + task,
                 model=self._model,
                 proxy_country_code=proxy_country or self._default_proxy,
                 profile_id=profile_id,

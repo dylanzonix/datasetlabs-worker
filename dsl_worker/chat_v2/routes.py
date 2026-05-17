@@ -391,13 +391,13 @@ def list_table_rows(
             f"seq"
         )
         sql_text = (
-            f"SELECT id::text, row FROM samples "
+            f"SELECT id::text, row, tags FROM samples "
             f"WHERE table_id = :tid AND deleted_at IS NULL{where_extra} "
             f"ORDER BY {order_clause} LIMIT :lim OFFSET :off"
         )
     else:
         sql_text = (
-            f"SELECT id::text, row FROM samples "
+            f"SELECT id::text, row, tags FROM samples "
             f"WHERE table_id = :tid AND deleted_at IS NULL{where_extra} "
             f"ORDER BY seq LIMIT :lim OFFSET :off"
         )
@@ -412,7 +412,7 @@ def list_table_rows(
             sort_col_esc = sort_col.replace("'", "''")
             direction_sql = "ASC" if sort_dir.lower() == "asc" else "DESC"
             fallback_sql = (
-                f"SELECT id::text, row FROM samples "
+                f"SELECT id::text, row, tags FROM samples "
                 f"WHERE table_id = :tid AND deleted_at IS NULL{where_extra} "
                 f"ORDER BY (row->>'{sort_col_esc}' IS NULL) ASC, "
                 f"row->>'{sort_col_esc}' {direction_sql} NULLS LAST, seq "
@@ -432,8 +432,12 @@ def list_table_rows(
         sa_text("SELECT COUNT(*) FROM samples WHERE table_id = :tid AND deleted_at IS NULL"),
         {"tid": tid},
     ).scalar() or 0
+    # tags carries per-cell `sources` citations (source-row commits write
+    # this in _commit_rows; enrichment/fill also writes here) and fill_status
+    # / email_verification metadata — keep it on the wire so CellDetailPanel
+    # can render References and the new SourceRecordDetailPanel chip.
     return {
-        "rows": [{"id": r[0], **(r[1] or {})} for r in rows],
+        "rows": [{"id": r[0], "tags": r[2] or {}, **(r[1] or {})} for r in rows],
         "total": total,
         "unfiltered_total": unfiltered_total,
         "limit": limit,
@@ -646,6 +650,67 @@ def table_column_distinct(
         "values": values,
         "empty_count": empty_count,
         "total": total,
+    }
+
+
+@router.get("/projects/{project_id}/samples/{sample_id}/source-record")
+def get_sample_source_record(
+    project_id: UUID,
+    sample_id: UUID,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return the raw source payload + rendered source description for a sample.
+
+    Powers the SourceRecordDetailPanel on the FE — clicking a "source_record"
+    reference chip on a cell drills into the full unmapped JSON the source
+    returned, with the per-cell source_field path resolvable client-side.
+    """
+    _verify_project(project_id, user.user_id, db)
+    row = db.execute(
+        sa_text(
+            "SELECT s.id::text, s.seq, s.raw_row, s.table_id::text, "
+            "       t.source, t.query_params, t.name, t.short_id "
+            "FROM samples s JOIN tables t ON t.id = s.table_id "
+            "WHERE s.id = :sid AND s.project_id = :pid AND s.deleted_at IS NULL"
+        ),
+        {"sid": str(sample_id), "pid": str(project_id)},
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "Sample not found")
+
+    sid, seq, raw_row, table_id, source, query_params, table_name, table_short_id = row
+    if isinstance(query_params, str):
+        try:
+            query_params = json.loads(query_params or "{}")
+        except Exception:
+            query_params = {}
+    query_params = query_params or {}
+
+    source_description = None
+    try:
+        from dsl_worker.sources_v2 import describe_source
+        d = describe_source(source, query_params)
+        source_description = {
+            "kind": d.kind,
+            "label": d.label,
+            "query_text": d.query_text,
+            "details": d.details,
+            "favicon_url": d.favicon_url,
+        }
+    except Exception:
+        log.exception("describe_source failed for sample %s", sid)
+
+    return {
+        "sample_id": sid,
+        "seq": seq,
+        "raw_row": raw_row,
+        "table_id": table_id,
+        "table_short_id": table_short_id,
+        "table_name": table_name,
+        "source": source,
+        "query_params": query_params,
+        "source_description": source_description,
     }
 
 

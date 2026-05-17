@@ -539,10 +539,13 @@ def _mark_run_failed(run_id: UUID, error: str) -> None:
             try:
                 # Reconstruct what we can from chat_run_events. The
                 # latest text_checkpoint has the cumulative content;
-                # tool_call/tool_result events compose the tool_log.
+                # tool_call/tool_result events compose the tool_log;
+                # the most recent cost_update has the running total
+                # the FE renders under the assistant bubble.
                 content = ""
                 tool_log: List[Dict[str, Any]] = []
                 tool_log_idx: Dict[str, int] = {}
+                last_cost: Optional[float] = None
                 evs = (
                     db.query(ChatRunEvent)
                     .filter(ChatRunEvent.run_id == run.id)
@@ -567,10 +570,21 @@ def _mark_run_failed(run_id: UUID, error: str) -> None:
                             tool_log[tool_log_idx[cid]].update({
                                 "summary": pl.get("summary"),
                                 "cost": pl.get("cost"),
+                                "duration_ms": pl.get("duration_ms"),
                             })
+                    elif e.type == "cost_update":
+                        v = pl.get("total_cost_usd")
+                        if isinstance(v, (int, float)):
+                            last_cost = float(v)
                 ac: Dict[str, Any] = {"error": error[:500], "interrupted": True}
                 if tool_log:
                     ac["tool_log"] = tool_log
+                if last_cost is not None:
+                    # Preserve the cumulative cost so the FE's "$X spent"
+                    # line under the assistant message survives a crash —
+                    # without this the assistant bubble for a failed run
+                    # shows no cost at all, even though credits were used.
+                    ac["total_cost_usd"] = last_cost
                 msg = ChatMessage(
                     project_id=run.project_id,
                     role="assistant",

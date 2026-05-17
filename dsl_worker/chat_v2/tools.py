@@ -335,7 +335,10 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     )
     ctx.db.commit()
 
-    _commit_rows(ctx.db, table_id, res_rows, columns_for_db, store_raw=True)
+    _commit_verify_tasks = _commit_rows(
+        ctx.db, table_id, res_rows, columns_for_db,
+        store_raw=True, run_id=ctx.run_id,
+    )
 
     # Seed the table's comment thread with the agent's "initial description"
     # — what this table represents, rendered from the source adapter. The
@@ -393,6 +396,15 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
             ),
             name=f"apify-stream-{short_id}",
         )
+
+    # Verifications run in the background — table_create returns
+    # immediately so the agent's next tool isn't blocked on dozens of
+    # HTTP fetches + Haiku batches. Each verify writes to
+    # `tags.url_verification` and emits a `row_merged` SSE event so the
+    # FE patches the badge in place as results arrive. The tasks are
+    # held by the event loop's registry; the asyncio scheduler keeps
+    # them alive until done.
+    del _commit_verify_tasks
 
     # Surface sample rows + the raw field schema so the agent can call
     # column_map_set in the same turn with clean names / nested paths /
@@ -458,7 +470,9 @@ async def _drain_stream_into_table(
                                     seen[k] = None
                     cols = [{"name": k, "type": "text", "source_field": k} for k in seen]
 
-                _commit_rows(db, table_id, new_rows, cols, store_raw=True)
+                # Background stream drain — fire-and-forget verify
+                # tasks; their own emit adapter opens fresh sessions.
+                _commit_rows(db, table_id, new_rows, cols, store_raw=True, run_id=run_id)
                 total_committed += len(new_rows)
                 db.execute(
                     sa_text(
@@ -614,7 +628,9 @@ async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     # Commit rows using existing column mapping
     cols = json.loads(columns) if isinstance(columns, str) else (columns or [])
     column_map = [{"source_field": c.get("source_field") or c["name"], "column_name": c["name"], "type": c["type"]} for c in cols]
-    _commit_rows(ctx.db, table_id, res.rows, column_map)
+    _extend_verify_tasks = _commit_rows(
+        ctx.db, table_id, res.rows, column_map, run_id=ctx.run_id,
+    )
 
     # Overwrite query_params with the LLM's exact params (no merge, no
     # cursor). project_state shows this back to the LLM so the next
@@ -639,6 +655,10 @@ async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
         },
     )
     ctx.db.commit()
+
+    # Verifications run in the background — see table_create for the
+    # same fire-and-forget rationale.
+    del _extend_verify_tasks
 
     return {
         "rows_added": len(res.rows),
@@ -728,28 +748,79 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
     )
 
     # Re-derive every sample's mapped row from raw_row through the new
-    # column set. Pull all in one query to minimize round-trips.
+    # column set. Pull all in one query to minimize round-trips. Qualify
+    # every column — `id` exists on both samples and tables.
     sample_rows = ctx.db.execute(
         sa_text(
-            "SELECT id::text, raw_row FROM samples "
-            "WHERE table_id=:tid AND deleted_at IS NULL AND raw_row IS NOT NULL"
+            "SELECT s.id::text, s.raw_row, s.tags, t.source FROM samples s "
+            "JOIN tables t ON t.id = s.table_id "
+            "WHERE s.table_id=:tid AND s.deleted_at IS NULL AND s.raw_row IS NOT NULL"
         ),
         {"tid": table_id},
     ).fetchall()
+    # Rebuild per-column citations from the new column_map so renamed /
+    # added / dropped columns produce fresh source_record entries.
+    new_cell_sources = {
+        c["name"]: [
+            {
+                "type": "source_record",
+                "source": None,  # filled per row below from the joined source
+                "source_field": c["source_field"],
+            }
+        ]
+        for c in columns_for_db
+    }
     rederived = 0
-    for sid, raw in sample_rows:
+    # Capture each re-derived row so we can fire verifications after the
+    # commit. column_map_set is the third row-write site (along with
+    # _commit_rows and enrichment) and URLs land here when the agent
+    # renames or remaps a column from raw_row to a v2 column.
+    rederived_rows: List[Tuple[str, Dict[str, Any]]] = []
+    for sid, raw, tags, src in sample_rows:
         if not isinstance(raw, dict):
             continue
         mapped = {
             c["name"]: _extract_source_value(raw, c["source_field"])
             for c in columns_for_db
         }
+        cell_sources = {
+            name: [{**entry, "source": src} for entry in entries]
+            for name, entries in new_cell_sources.items()
+        }
+        next_tags = dict(tags) if isinstance(tags, dict) else {}
+        next_tags["sources"] = cell_sources
         ctx.db.execute(
-            sa_text("UPDATE samples SET row=CAST(:row AS jsonb) WHERE id=:id"),
-            {"row": json.dumps(mapped, default=str), "id": sid},
+            sa_text(
+                "UPDATE samples SET row=CAST(:row AS jsonb), tags=CAST(:tags AS jsonb) WHERE id=:id"
+            ),
+            {
+                "row": json.dumps(mapped, default=str),
+                "tags": json.dumps(next_tags, default=str),
+                "id": sid,
+            },
         )
         rederived += 1
+        rederived_rows.append((sid, mapped))
     ctx.db.commit()
+
+    # Fire-and-forget URL / email verifications for every re-derived
+    # row. verify_hook now uses value-based URL detection so it works
+    # even though columns_for_db doesn't carry per-column `type`
+    # markers from the mapping array.
+    if rederived_rows:
+        try:
+            from dsl_worker.chat_v2 import verify_hook
+            for sid, mapped in rederived_rows:
+                verify_hook.schedule_for_row(
+                    run_id=ctx.run_id,
+                    sample_id=sid,
+                    written_values=mapped,
+                    columns=columns_for_db,
+                    row_snapshot=mapped,
+                )
+        except Exception:
+            log.exception("column_map_set: verify_hook scheduling raised (suppressed)")
+
     return {
         "ok": True,
         "columns_committed": len(columns_for_db),
@@ -999,15 +1070,29 @@ def _commit_rows(
     rows: List[Dict[str, Any]],
     column_map: List[Dict[str, str]],
     store_raw: bool = True,
-) -> None:
-    """Commit fetched rows into the samples table with column_map applied."""
-    if not rows:
-        return
+    run_id: Optional[str] = None,
+) -> List[asyncio.Task]:
+    """Commit fetched rows into the samples table with column_map applied.
 
-    # Pull the current_version for this project to satisfy samples.version_id NOT NULL.
-    pid = db.execute(
-        sa_text("SELECT project_id FROM tables WHERE id=:id"), {"id": table_id}
-    ).scalar()
+    Returns any URL/email verification tasks spawned for the inserted
+    rows so async callers can await them within their tool window
+    (background drain tasks just discard the return value — fire and
+    forget is fine there).
+    """
+    if not rows:
+        return []
+
+    # Pull project_id and source in one shot. source feeds per-cell
+    # `tags.sources` citations so the FE can link every mapped cell back
+    # to the raw_row payload via SourceRecordDetailPanel.
+    tbl_row = db.execute(
+        sa_text("SELECT project_id, source FROM tables WHERE id=:id"),
+        {"id": table_id},
+    ).fetchone()
+    if not tbl_row:
+        log.error("_commit_rows: table %s not found", table_id)
+        return []
+    pid, source = tbl_row[0], tbl_row[1]
     version_id = db.execute(
         sa_text("SELECT current_version_id FROM projects WHERE id=:id"),
         {"id": str(pid)},
@@ -1016,21 +1101,37 @@ def _commit_rows(
         version_id = _ensure_project_version(db, str(pid))
         if not version_id:
             log.error("_commit_rows: could not ensure project_version for %s", pid)
-            return
+            return []
 
     # column_map entries: [{name, source_field, type}]. source_field can be:
     #   - a plain key:           "founders"
     #   - a dotted path:         "founder_info.email"
     #   - an array map:          "founders[].name"   → list of values
     # Tolerate the legacy "column_name" key from older adapter default_columns.
+    # Preserves `type` (e.g. "url", "email") so the verify hook can pick
+    # the right columns to check.
     normalized_map = [
         {
             "name": (c.get("name") or c.get("column_name")),
             "source_field": c["source_field"],
+            "type": c.get("type") or "text",
         }
         for c in column_map
         if c.get("source_field") and (c.get("name") or c.get("column_name"))
     ]
+
+    # Pre-build the per-column citation list — same shape for every row in
+    # the batch, only differs by sample_id (filled per row below).
+    cell_sources_template: Dict[str, List[Dict[str, Any]]] = {}
+    if store_raw and source:
+        for c in normalized_map:
+            cell_sources_template[c["name"]] = [
+                {
+                    "type": "source_record",
+                    "source": source,
+                    "source_field": c["source_field"],
+                }
+            ]
 
     # Serialize concurrent _commit_rows for the same version (sync first
     # batch + apify background drain + any other parallel commits) so
@@ -1049,27 +1150,60 @@ def _commit_rows(
     ).scalar()
     next_seq = int(next_seq_row or 1)
 
+    # Generate sample_ids client-side so we can hand them to the verify
+    # hook after commit (was using `gen_random_uuid()` server-side, which
+    # didn't return the new id without an extra round-trip).
+    pending_verify: List[Tuple[str, Dict[str, Any]]] = []
     for r in rows:
         mapped: Dict[str, Any] = {}
         for c in normalized_map:
             mapped[c["name"]] = _extract_source_value(r, c["source_field"])
+        tags_payload = (
+            {"sources": cell_sources_template} if cell_sources_template else None
+        )
+        sample_id = str(uuid.uuid4())
         db.execute(
             sa_text(
-                "INSERT INTO samples (id, project_id, table_id, version_id, seq, row, raw_row, created_at) "
-                "VALUES (gen_random_uuid(), :pid, :tid, :vid, :seq, CAST(:row AS jsonb), CAST(:raw AS jsonb), now())"
+                "INSERT INTO samples (id, project_id, table_id, version_id, seq, row, raw_row, tags, created_at) "
+                "VALUES (:sid, :pid, :tid, :vid, :seq, CAST(:row AS jsonb), CAST(:raw AS jsonb), CAST(:tags AS jsonb), now())"
             ),
             {
+                "sid": sample_id,
                 "pid": str(pid),
                 "tid": table_id,
                 "vid": str(version_id),
                 "seq": next_seq,
                 "row": json.dumps(mapped, default=str),
                 "raw": json.dumps(r, default=str) if store_raw else None,
+                "tags": json.dumps(tags_payload) if tags_payload else None,
             },
         )
         next_seq += 1
-    # Commit to release the advisory lock + flush the batch.
+        pending_verify.append((sample_id, mapped))
+    # Commit to release the advisory lock + flush the batch. Must happen
+    # BEFORE we schedule verification — the verify task opens its own
+    # SessionLocal and won't see uncommitted rows.
     db.commit()
+
+    # Auto-verify any URL / email columns in the just-inserted rows.
+    # Cheap for status-only checks (free); LLM judge only fires for
+    # 2xx-but-suspicious URLs, gated by the per-domain cache.
+    verify_tasks: List[asyncio.Task] = []
+    try:
+        from dsl_worker.chat_v2 import verify_hook
+        for sample_id, mapped in pending_verify:
+            verify_tasks.extend(
+                verify_hook.schedule_for_row(
+                    run_id=run_id,
+                    sample_id=sample_id,
+                    written_values=mapped,
+                    columns=normalized_map,
+                    row_snapshot=mapped,
+                )
+            )
+    except Exception:
+        log.exception("_commit_rows: verify_hook scheduling raised (suppressed)")
+    return verify_tasks
 
 
 def _extract_source_value(row: Dict[str, Any], path: str) -> Any:

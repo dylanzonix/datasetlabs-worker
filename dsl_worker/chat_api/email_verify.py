@@ -51,10 +51,22 @@ def extract_emails(text: str) -> Set[str]:
 
 
 def is_email_column(col_def: Optional[Dict[str, Any]], col_name: str) -> bool:
-    """contact_type=='email' wins; fall back to a name match for columns
-    added without the marker so email-ish columns still get verified."""
-    if isinstance(col_def, dict) and col_def.get("contact_type") == "email":
-        return True
+    """Explicit type marker wins; fall back to a name match for columns
+    added without the marker so email-ish columns still get verified.
+
+    Accepts both the legacy chat_api shape (`contact_type=="email"`) and
+    the chat_v2 shape (`type=="email"`) so the same detector can run on
+    both code paths.
+    """
+    if isinstance(col_def, dict):
+        if col_def.get("contact_type") == "email":
+            return True
+        t = (col_def.get("type") or "").lower()
+        if t == "email":
+            return True
+        v2t = (col_def.get("v2_type") or "").lower()
+        if v2t == "email":
+            return True
     return bool(re.search(r"e[\W_-]*mail", col_name or "", re.IGNORECASE))
 
 

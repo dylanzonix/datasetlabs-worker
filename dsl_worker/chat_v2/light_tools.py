@@ -288,15 +288,45 @@ async def code_exec(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, A
 async def suggest_replies(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
     """Emits chip suggestions for the user's next move. UI renders these as
     clickable chips below the assistant's message. Tolerates empty/malformed
-    input — agent shouldn't have to retry; just acknowledge."""
-    chips = args.get("chips") or []
-    if not isinstance(chips, list):
-        chips = []
-    # Best-effort filter: keep dict-shape chips with at least a label
-    cleaned = [
-        c for c in chips
-        if isinstance(c, dict) and c.get("label") and c.get("message")
-    ]
+    input — agent shouldn't have to retry; just acknowledge.
+
+    Emits a `suggestions` SSE event so the FE renders chips live; end-of-turn
+    persistence into applied_changes.suggestions happens in
+    chat_v2/runs.py by replaying these events (mirrors how table_cards is
+    captured for refresh-survival).
+    """
+    # Agent has been observed sending several shapes — accept any of them.
+    raw = args.get("chips") or args.get("suggestions") or args.get("items") or []
+    if not isinstance(raw, list):
+        raw = []
+    cleaned: list[Dict[str, Any]] = []
+    for c in raw:
+        if not isinstance(c, dict):
+            continue
+        label = (c.get("label") or "").strip()
+        message = (c.get("message") or "").strip()
+        if not label or not message:
+            continue
+        item: Dict[str, Any] = {"label": label[:80], "message": message[:500]}
+        cap = c.get("cap_override_cents")
+        if isinstance(cap, (int, float)) and cap > 0:
+            item["cap_override_cents"] = int(cap)
+        cleaned.append(item)
+    if not cleaned:
+        return {"ok": False, "count": 0, "note": "no valid chips (need [{label, message}, ...])"}, 0.0
+
+    if ctx.run_id is not None:
+        try:
+            from dsl_worker.chat_api import runs as legacy_runs
+            from dsl_api.models import ChatRun
+            run_obj = ctx.db.query(ChatRun).filter(ChatRun.id == ctx.run_id).first()
+            if run_obj is not None:
+                legacy_runs.emit_event(ctx.db, run_obj, "suggestions", {
+                    "items": cleaned,
+                })
+        except Exception:
+            log.exception("suggestions emit failed; continuing")
+
     return {"ok": True, "count": len(cleaned), "chips": cleaned}, 0.0
 
 
