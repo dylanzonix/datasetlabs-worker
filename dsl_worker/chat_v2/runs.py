@@ -577,6 +577,25 @@ async def _drive_agent(
                     legacy_runs.emit_event(ldb, lrun, "error", {
                         "message": evt.get("message") or "unknown error",
                     })
+                elif etype == "approval_required":
+                    # Pass-through for the approval gate (agent.py emits
+                    # this and then awaits the user's decision). FE
+                    # useChat picks it up, Project.tsx mounts the approval
+                    # card above the chat input. Without this branch the
+                    # event was silently dropped — agent would block on
+                    # the pending Future forever.
+                    legacy_runs.emit_event(ldb, lrun, "approval_required", {
+                        "approval_id": evt.get("approval_id"),
+                        "tool": evt.get("tool"),
+                        "args": evt.get("args"),
+                        "estimated_cost_credits": evt.get("estimated_cost_credits"),
+                        "summary": evt.get("summary"),
+                    })
+                elif etype == "approval_resolved":
+                    legacy_runs.emit_event(ldb, lrun, "approval_resolved", {
+                        "approval_id": evt.get("approval_id"),
+                        "approved": evt.get("approved"),
+                    })
             except Exception:
                 log.exception("v2 on_event failed for %s", etype)
             finally:
