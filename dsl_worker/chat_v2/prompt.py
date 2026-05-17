@@ -168,7 +168,7 @@ Every enrichment runs as a per-row cell agent. One shape:
 
 ```
 action: {
-  research: "fast" | "smart" | "expert" | "standard" | "deep",
+  research: "fast" | "smart" | "standard" | "deep",
   prompt: "Find this person's Twitter URL via search; return null if they don't have one.",
   columns_to_fill: ["twitter_url"],
   per_row_credit_cap: 1.5     // optional — defaults from research level
@@ -179,7 +179,7 @@ action: {
 
 ## Picking `research`
 
-**No research** (no integration tools — answer must come from the row itself):
+**No tools** (model-only — answer must come from the row itself):
 
 - **`fast`** → nano model. Simple classification on text already in the row.
   Examples: "is this post a complaint about Clay (Yes/No)", "apartment or house", "positive / neutral / negative sentiment of bio".
@@ -187,9 +187,7 @@ action: {
 - **`smart`** → mini model. Same shape as fast, but the judgment is nuanced or weighs multiple factors. Use when fast might get it wrong.
   Examples: "does this Reddit thread describe a real cancellation event (Yes/No)" — needs to weigh tone, specificity, and counter-signals. "Categorize as Enterprise / Mid-market / SMB based on the company description + headcount range".
 
-- **`expert`** → gpt-5.5, no tools. Use rarely — for genuinely tricky domain reasoning where smart might miss. Examples: "given this clinical trial abstract, is the intervention CAR-T related (Yes/No)", "classify this legal filing by motion type".
-
-**Research** (full toolset: web_search, FE, Apollo, gmaps, browser_use, code_exec):
+**With tools** (web_search, FE, Apollo, gmaps, browser_use, code_exec):
 
 - **`standard`** → gpt-5.5 + tools. One or two tool calls per row.
   Examples: "verified email" via FE (needs first_name + last_name + domain), "current_technologies" via Apollo org_enrich, "phone" via gmaps place_details.
@@ -197,7 +195,7 @@ action: {
 - **`deep`** → gpt-5.5 + tools + higher reasoning effort. Multi-step: search → read → verify → answer.
   Examples: "find this founder's Twitter/X handle", "is this company hiring engineering leadership + the role URL", "find the LinkedIn URL for this person" (search + verify match), "what does this company sell in 2 words" (read website + judge).
 
-**Rule of thumb:** if you'd need to *search the open web* or *visit a page to verify*, it's `standard` or `deep`. If the answer is derivable from text already in the row, it's `fast`/`smart`/`expert`. Lean toward `smart` over `fast` when in doubt — mini is still cheap.
+**Rule of thumb:** if you'd need to *search the open web* or *visit a page to verify*, it's `standard` or `deep`. If the answer is derivable from text already in the row, it's `fast`/`smart`. Lean toward `smart` over `fast` when in doubt — mini is still cheap.
 
 ## per_row_credit_cap
 
@@ -207,7 +205,7 @@ Optional. If omitted, defaults to a sensible cap per research level. Override wh
 - **Email enrichments via FullEnrich** cost ~0.5 cr base. Default `standard` cap (2) is plenty.
 
 Default caps (just for context — you don't have to set these explicitly):
-- fast 0.3, smart 0.5, expert 1.0, standard 2.0, deep 8.0
+- fast 0.3, smart 0.5, standard 2.0, deep 8.0
 
 Don't surface caps or cost to the user. The UI shows the estimate.
 

@@ -92,8 +92,13 @@ class PatchEnrichmentBody(BaseModel):
     per_row_credit_cap: Optional[float] = None
 
 
-_RESEARCH_VALUES = {"fast", "smart", "expert", "standard", "deep"}
-_LEGACY_TIER_TO_RESEARCH = {"classify": "fast", "lookup": "standard", "research": "deep"}
+_RESEARCH_VALUES = {"fast", "smart", "standard", "deep"}
+_LEGACY_TIER_TO_RESEARCH = {
+    "classify": "fast",
+    "lookup":   "standard",
+    "research": "deep",
+    "expert":   "smart",  # transient tier from first rename pass
+}
 
 
 @router.patch("/projects/{project_id}/enrichments/{enrichment_id}")
