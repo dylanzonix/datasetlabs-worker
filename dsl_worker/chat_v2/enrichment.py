@@ -381,6 +381,18 @@ async def _run_enrichment_on_rows(
         elif "__cell_status__" in merged:
             merged.pop("__cell_status__")
 
+        # Per-cell cost sidecar. Tagged onto each column the cell agent
+        # just filled so the FE can render a small "$X" badge under the
+        # value (visible at all times, survives reload — cell_filled
+        # events only fire live). Same pattern as __cell_status__.
+        if isinstance(new_fields, dict) and new_fields:
+            existing_cost = merged.get("__cell_cost__") or {}
+            if not isinstance(existing_cost, dict):
+                existing_cost = {}
+            for cn in new_fields.keys():
+                existing_cost[cn] = float(cost)
+            merged["__cell_cost__"] = existing_cost
+
         if merged != original_row:
             try:
                 ctx.db.execute(

@@ -51,22 +51,45 @@ from dsl_worker.chat_v2.tools import ToolContext
 log = logging.getLogger(__name__)
 
 
-# Coarse credit estimates per tool call. Server's actual cost accounting
-# uses balance_ledger; this is just for the cell agent's local budget tracking
-# so it stops at per_row_credit_cap.
-TOOL_COST_ESTIMATES = {
-    "fullenrich_enrich_email": 1.0,
-    "fullenrich_enrich_phone": 10.0,
+# Tools fall into three categories for budget enforcement:
+#
+#   FIXED_COST_TOOLS  — billing is deterministic per successful call.
+#       We pre-check (would total+cost exceed cap?) and refuse pre-call
+#       if so, returning a "skipped" tool result instead of burning.
+#
+#   CAPPED_TOOLS      — tool supports an explicit max-cost / timeout
+#       parameter we plumb the remaining budget into. Tool self-limits.
+#
+#   FREE_TOOLS        — non-billing (final_result, discovery, code_exec,
+#       web_search). No pre-check.
+FIXED_COST_TOOLS = {
+    "fullenrich_enrich_email":  0.5,   # FE charges per successful contact
+    "fullenrich_enrich_phone":  5.0,   # FE phone is expensive
     "fullenrich_enrich_company": 0.5,
-    "apollo_org_enrich": 1.0,
+    "apollo_org_enrich":        1.0,   # Apollo charges per enrich call
     "google_maps_place_details": 0.3,
+}
+
+# Hard floor — refuse to call BU if remaining budget is below this, since
+# even a one-step BU session typically costs ~$0.10-0.30 and the overhead
+# wouldn't get you anything useful.
+BU_MIN_BUDGET = 0.30
+
+# Same idea for apify — actor runs need time + a few CU to be worth it.
+APIFY_MIN_BUDGET = 0.50
+
+CAPPED_TOOLS = {"browser_use", "apify_call_actor"}
+
+# Legacy reference — kept so external imports don't break.
+TOOL_COST_ESTIMATES = dict(FIXED_COST_TOOLS)
+TOOL_COST_ESTIMATES.update({
+    "browser_use": 5.0,
+    "apify_call_actor": 1.0,
     "apify_search_actors": 0.0,
     "apify_actor_details": 0.0,
-    "apify_call_actor": 1.0,
     "web_search": 0.0,
-    "browser_use": 5.0,
     "code_exec": 0.0,
-}
+})
 
 
 # ---------------------------------------------------------------------------
@@ -266,47 +289,69 @@ async def _apify_call_actor(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dic
     if actor_input.get("maxItems", 0) > 5:
         actor_input["maxItems"] = 5
     aid = actor_id.replace("/", "~")
-    import asyncio as _asyncio
-    async with httpx.AsyncClient(timeout=180) as client:
-        # Async pattern: POST /runs → poll until terminal → fetch items +
-        # cost. The /run-sync-get-dataset-items endpoint doesn't expose
-        # run ID; this is the only path that gives us real billing.
-        start = await client.post(
-            f"https://api.apify.com/v2/acts/{aid}/runs",
-            params={"token": api_key},
-            json=actor_input,
-        )
-        if start.status_code >= 400:
-            return {"error": f"apify start HTTP {start.status_code}"}, 0.0
-        run_data = (start.json() or {}).get("data") or {}
-        run_id = run_data.get("id")
-        dataset_id = run_data.get("defaultDatasetId")
-        if not (run_id and dataset_id):
-            return {"error": "apify: no run id"}, 0.0
-        cost_usd = 0.0
-        terminal = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
-        t0 = _asyncio.get_event_loop().time()
-        while True:
-            if _asyncio.get_event_loop().time() - t0 > 150:
-                break
-            rr = await client.get(
-                f"https://api.apify.com/v2/actor-runs/{run_id}",
-                params={"token": api_key},
+    # Remaining-budget cap stuffed into args by the cell-agent loop. Apify's
+    # /runs endpoint accepts timeout (seconds) as a query param — we set it
+    # proportional to the remaining USD so a stuck actor can't keep billing
+    # past the cap. At ~$0.40/CU/hr a conservative 90 sec/dollar bounds the
+    # worst-case spend.
+    max_cost_usd = args.get("__max_cost_usd")
+    timeout_secs = None
+    if max_cost_usd is not None and max_cost_usd > 0:
+        timeout_secs = max(30, min(300, int(max_cost_usd * 90)))
+    # Heartbeat the chat_run so a multi-minute actor poll doesn't trip the
+    # staleness sweeper.
+    heartbeat = asyncio.create_task(_heartbeat_emitter(ctx, "apify_call_actor"))
+    cost_usd = 0.0
+    items: List[Dict[str, Any]] = []
+    try:
+        async with httpx.AsyncClient(timeout=180) as client:
+            # Async pattern: POST /runs → poll until terminal → fetch items +
+            # cost. The /run-sync-get-dataset-items endpoint doesn't expose
+            # run ID; this is the only path that gives us real billing.
+            run_params: Dict[str, Any] = {"token": api_key}
+            if timeout_secs is not None:
+                run_params["timeout"] = timeout_secs
+            start = await client.post(
+                f"https://api.apify.com/v2/acts/{aid}/runs",
+                params=run_params,
+                json=actor_input,
             )
-            if rr.status_code == 200:
-                rd = (rr.json() or {}).get("data") or {}
-                if rd.get("status") in terminal:
-                    from dsl_worker.sources_v2.apify_actor import _apify_run_cost_usd_from_data
-                    cost_usd = _apify_run_cost_usd_from_data(rd)
+            if start.status_code >= 400:
+                return {"error": f"apify start HTTP {start.status_code}"}, 0.0
+            run_data = (start.json() or {}).get("data") or {}
+            run_id = run_data.get("id")
+            dataset_id = run_data.get("defaultDatasetId")
+            if not (run_id and dataset_id):
+                return {"error": "apify: no run id"}, 0.0
+            terminal = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
+            poll_cap = timeout_secs if timeout_secs is not None else 150
+            t0 = asyncio.get_event_loop().time()
+            while True:
+                if asyncio.get_event_loop().time() - t0 > poll_cap:
                     break
-            await _asyncio.sleep(2.0)
-        items = []
-        items_resp = await client.get(
-            f"https://api.apify.com/v2/datasets/{dataset_id}/items",
-            params={"token": api_key, "format": "json", "limit": 5},
-        )
-        if items_resp.status_code == 200:
-            items = items_resp.json() or []
+                rr = await client.get(
+                    f"https://api.apify.com/v2/actor-runs/{run_id}",
+                    params={"token": api_key},
+                )
+                if rr.status_code == 200:
+                    rd = (rr.json() or {}).get("data") or {}
+                    if rd.get("status") in terminal:
+                        from dsl_worker.sources_v2.apify_actor import _apify_run_cost_usd_from_data
+                        cost_usd = _apify_run_cost_usd_from_data(rd)
+                        break
+                await asyncio.sleep(2.0)
+            items_resp = await client.get(
+                f"https://api.apify.com/v2/datasets/{dataset_id}/items",
+                params={"token": api_key, "format": "json", "limit": 5},
+            )
+            if items_resp.status_code == 200:
+                items = items_resp.json() or []
+    finally:
+        heartbeat.cancel()
+        try:
+            await heartbeat
+        except asyncio.CancelledError:
+            pass
     return {"items": items[:5]}, cost_usd * 10.0
 
 
@@ -318,6 +363,34 @@ from dsl_worker.chat_v2.light_tools import (
 )
 
 
+async def _heartbeat_emitter(ctx: ToolContext, tool_name: str, interval: float = 60.0) -> None:
+    """Loop forever emitting tool_heartbeat events into chat_run_events.
+
+    Used as a background task while a long-running tool (BU, apify) is in
+    flight. Keeps the staleness sweeper from flipping the chat_run to
+    failed during legitimate multi-minute tool calls. Cancelled by the
+    caller when the tool returns.
+    """
+    run_id = getattr(ctx, "run_id", None)
+    if not run_id:
+        return
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                from dsl_worker.chat_api import runs as legacy_runs
+                from dsl_api.models import ChatRun
+                run_obj = ctx.db.query(ChatRun).filter(ChatRun.id == run_id).first()
+                if run_obj is not None:
+                    legacy_runs.emit_event(ctx.db, run_obj, "tool_heartbeat", {
+                        "tool": tool_name,
+                    })
+            except Exception:
+                log.debug("tool_heartbeat emit failed; continuing", exc_info=True)
+    except asyncio.CancelledError:
+        return
+
+
 async def _browser_use(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
     try:
         from dsl_worker.infra.bu_client import bu_extract_rows
@@ -327,7 +400,24 @@ async def _browser_use(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     task = args.get("task")
     if not (url and task):
         return {"error": "url + task required"}, 0.0
-    rows, cost = await bu_extract_rows(url=url, task=task, candidate_description=args.get("candidate_description", ""))
+    # max_cost_usd was stuffed into args by the cell-agent loop before
+    # dispatch — it's the remaining per-row budget, so BU self-limits
+    # inside its session instead of us best-effort capping after the fact.
+    max_cost_usd = args.get("__max_cost_usd")
+    heartbeat = asyncio.create_task(_heartbeat_emitter(ctx, "browser_use"))
+    try:
+        rows, cost = await bu_extract_rows(
+            url=url,
+            task=task,
+            candidate_description=args.get("candidate_description", ""),
+            max_cost_usd=max_cost_usd,
+        )
+    finally:
+        heartbeat.cancel()
+        try:
+            await heartbeat
+        except asyncio.CancelledError:
+            pass
     return {"rows": rows[:10]}, cost
 
 
@@ -727,12 +817,50 @@ async def run_cell_agent(
                     tool_result: Dict[str, Any] = {"error": f"unknown tool {name}"}
                     tool_cost = 0.0
                 else:
-                    try:
-                        tool_result, tool_cost = await handler(args, ctx)
-                    except Exception as e:
-                        log.exception("cell tool %s raised: %s", name, e)
-                        tool_result = {"error": str(e)[:300]}
+                    # PRE-TOOL BUDGET GATE — strict, programmatic.
+                    # Three policies depending on the tool category.
+                    remaining = tier_cfg["cap"] - total_cost
+                    tool_result, tool_cost = None, 0.0
+                    skip_reason: Optional[str] = None
+
+                    if name in FIXED_COST_TOOLS:
+                        # Single-call paid APIs (Apollo, FE, gmaps). Their
+                        # success-billing cost is deterministic — refuse pre-
+                        # call if we wouldn't be able to afford the result.
+                        est = FIXED_COST_TOOLS[name]
+                        if remaining < est:
+                            skip_reason = (
+                                f"skipped: {name} costs ~{est} cr but only "
+                                f"{remaining:.2f} cr remaining of per-row cap"
+                            )
+                    elif name == "browser_use":
+                        if remaining < BU_MIN_BUDGET:
+                            skip_reason = (
+                                f"skipped: browser_use needs at least "
+                                f"{BU_MIN_BUDGET} cr; {remaining:.2f} remaining"
+                            )
+                        else:
+                            args["__max_cost_usd"] = float(remaining)
+                    elif name == "apify_call_actor":
+                        if remaining < APIFY_MIN_BUDGET:
+                            skip_reason = (
+                                f"skipped: apify_call_actor needs at least "
+                                f"{APIFY_MIN_BUDGET} cr; {remaining:.2f} remaining"
+                            )
+                        else:
+                            args["__max_cost_usd"] = float(remaining)
+
+                    if skip_reason is not None:
+                        tool_result = {"error": "budget", "message": skip_reason}
                         tool_cost = 0.0
+                        log.info("cell agent pre-tool skip: %s", skip_reason)
+                    else:
+                        try:
+                            tool_result, tool_cost = await handler(args, ctx)
+                        except Exception as e:
+                            log.exception("cell tool %s raised: %s", name, e)
+                            tool_result = {"error": str(e)[:300]}
+                            tool_cost = 0.0
 
                 total_cost += tool_cost
                 tool_calls_log.append({

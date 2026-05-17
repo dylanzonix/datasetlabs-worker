@@ -206,6 +206,7 @@ class BUClient:
         session_id: Optional[str] = None,
         keep_alive: bool = False,
         timeout: float = 900,
+        max_cost_usd: Optional[float] = None,
     ) -> Tuple[List[Dict[str, Any]], float, Optional[str], str]:
         """
         Extract structured items from a page. For harvesters.
@@ -214,16 +215,23 @@ class BUClient:
         summary contains BU's last step summary — useful for pagination/nav reports.
         Pass session_id from a previous call to reuse the same browser session.
         Set keep_alive=True to keep the session open for subsequent calls.
+        max_cost_usd (if set) is passed to BU's SDK so it self-limits inside
+        the session — used by the cell agent to enforce per-row credit caps.
         """
         try:
-            session_run = self._client.run(
-                BU_EFFICIENCY_GUARD + task,
+            run_kwargs = dict(
                 model=self._model,
                 output_schema=ExtractionResult,
                 proxy_country_code=proxy_country or self._default_proxy,
                 profile_id=profile_id,
                 session_id=session_id,
                 keep_alive=keep_alive,
+            )
+            if max_cost_usd is not None and max_cost_usd > 0:
+                run_kwargs["max_cost_usd"] = max_cost_usd
+            session_run = self._client.run(
+                BU_EFFICIENCY_GUARD + task,
+                **run_kwargs,
             )
             # SDK defaults to 14400s (4h) — override with our safety-net
             # timeout. SDK doesn't expose timeout via run(), so we set the
@@ -386,6 +394,8 @@ async def bu_extract_rows(
     url: str,
     task: str,
     candidate_description: str = "",
+    *,
+    max_cost_usd: Optional[float] = None,
 ) -> Tuple[List[Dict[str, Any]], float]:
     """Convenience wrapper used by `sources_v2/browser_use.py`.
 
@@ -393,6 +403,10 @@ async def bu_extract_rows(
     starting URL and a candidate-description into the task so the
     caller only thinks about (url, task, candidate_description).
     Returns (rows, cost_usd).
+
+    `max_cost_usd` (if set) is passed straight through to BU's SDK so
+    BU self-limits inside its session — no further spend after the cap
+    is hit. The cell agent uses this to enforce its per-row credit cap.
     """
     parts = [f"Navigate to {url}.", task.strip()]
     if candidate_description:
@@ -408,7 +422,7 @@ async def bu_extract_rows(
         proxy_country=os.getenv("BROWSER_USE_PROXY_COUNTRY", "us"),
     )
     try:
-        items, cost, _sid, _summary = await client.extract(composed_task)
+        items, cost, _sid, _summary = await client.extract(composed_task, max_cost_usd=max_cost_usd)
         return list(items or []), float(cost or 0.0)
     finally:
         await client.close()

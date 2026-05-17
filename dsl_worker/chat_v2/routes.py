@@ -728,11 +728,20 @@ def list_enrichments(
     rows = db.execute(
         sa_text(
             """
-            SELECT short_id, name, columns, action, per_row_credit_cap,
-                   last_run_filled_rows, last_run_cost_credits, last_run_at
-            FROM enrichments
-            WHERE table_id = :tid AND deleted_at IS NULL
-            ORDER BY created_at
+            SELECT e.short_id, e.name, e.columns, e.action, e.per_row_credit_cap,
+                   e.last_run_filled_rows, e.last_run_cost_credits, e.last_run_at,
+                   COALESCE(
+                       (SELECT round(sum(ct.cost_credits)::numeric, 4)::float
+                        FROM cell_traces ct WHERE ct.enrichment_id = e.id),
+                       0
+                   ) AS total_cost_credits,
+                   COALESCE(
+                       (SELECT count(*) FROM cell_traces ct WHERE ct.enrichment_id = e.id),
+                       0
+                   ) AS total_runs
+            FROM enrichments e
+            WHERE e.table_id = :tid AND e.deleted_at IS NULL
+            ORDER BY e.created_at
             """
         ),
         {"tid": tid},
@@ -748,6 +757,11 @@ def list_enrichments(
                 "last_run_filled_rows": r[5],
                 "last_run_cost_credits": float(r[6]) if r[6] is not None else None,
                 "last_run_at": r[7].isoformat() if r[7] else None,
+                # Cumulative across every run of this enrichment (sum of
+                # cell_traces). The last_run_* fields only reflect the
+                # most recent run; this gives the real total spend.
+                "total_cost_credits": float(r[8] or 0),
+                "total_runs": int(r[9] or 0),
             }
             for r in rows
         ]

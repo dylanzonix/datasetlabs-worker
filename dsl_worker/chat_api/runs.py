@@ -1006,6 +1006,17 @@ def recover_orphan_runs() -> int:
                 except Exception:
                     pass
                 continue
+            # CRITICAL: also cancel the in-process asyncio.Task driving
+            # this run. Without this the DB row says "failed" but cell
+            # tasks keep churning in memory — racking up real $ on BU /
+            # Apollo / FE calls (orphaned-cells bug). Best-effort: if
+            # the registry has no task (worker restarted or task already
+            # finished), this no-ops.
+            try:
+                from dsl_worker.chat_v2.runs import cancel_v2_run as _cancel_v2
+                _cancel_v2(run.id)
+            except Exception:
+                log.exception("orphan recovery: cancel failed for run %s", run.id)
             fixed += 1
         return fixed
     finally:
