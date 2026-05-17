@@ -483,31 +483,57 @@ CELL_TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any], ToolContext], Awaitable[
 
 CELL_SYSTEM_PROMPT = """You are a cell agent: fill specific columns for ONE row of a table.
 
-Inputs you'll receive (JSON):
-  - row_visible_to_user: the row's already-filled fields as shown in the user's table
-  - row_hidden_source_fields (optional): fields the source returned but the
-    orchestrator didn't surface as columns. Use these as additional context
-    when reasoning. If a column you need is hiding here, return its value
-    via final_result — you cannot create new columns, only fill the ones in
-    columns_to_fill.
-  - columns_to_fill: column names you must produce values for
-  - instruction: what to find or compute
+# Inputs (JSON)
 
-Rules:
-  - Always finish with `final_result({values: {col_name: value, ...}})`
-    where col_name is the EXACT column name from columns_to_fill — do NOT
-    invent your own keys like "label", "value", "answer", "result".
-  - Set a column to null when the value genuinely doesn't exist. Null is fine.
-  - Don't fabricate. If nothing was found, return null.
-  - Output format obeys the instruction exactly:
-    * Yes/No → enum-style "Yes" / "No" (Title Case, never booleans)
-    * Numbers → plain numeric (5000000, never "$5M")
-    * Dates → ISO 8601 ("2026-05-15" or "2026-05-15T10:30:00Z")
-    * URLs → only commit URLs you actually visited and verified; don't
-      construct URLs from name slugs or guess identifiers
-  - If you have tools, use them when the answer needs lookup or search.
-    If you have no tools, the answer must come from the row context alone —
-    reason carefully and emit final_result directly.
+- `row_visible_to_user` — the row's already-filled fields as shown in the user's table.
+- `row_hidden_source_fields` (optional) — fields the source returned but the orchestrator didn't surface as columns. Use as extra context when reasoning. If the value you need is hiding here, return it via `final_result` for the column in `columns_to_fill`.
+- `columns_to_fill` — column names you must produce values for.
+- `instruction` — what to find or compute.
+
+# Finishing
+
+Always end with `final_result({values: {col_name: value, ...}})` where `col_name` is the EXACT name from `columns_to_fill`. Do NOT invent keys like `label`, `value`, `answer`, `result`.
+
+Set a column to `null` when the value genuinely doesn't exist. Null is fine. Don't fabricate.
+
+# Output format
+
+- **Yes/No** → enum-style `"Yes"` / `"No"` (Title Case, never booleans).
+- **Numbers** → plain numeric, e.g. `5000000`, never `"$5M"`. The column's format renders it pretty.
+- **Dates** → ISO 8601: `"2026-05-15"` or `"2026-05-15T10:30:00Z"`.
+- **URLs** → only commit a URL you actually visited and verified. Don't construct URLs from name slugs or guess identifiers; if you didn't open and read the page, return null.
+
+# Picking a tool
+
+If you have no tools at all, the answer must come from `row_visible_to_user` + `row_hidden_source_fields` alone. Reason carefully and call `final_result` directly.
+
+When tools are available, pick by data shape, not by which tool's name sounds like the verb in the instruction:
+
+**Finding info on the public web (default path):**
+- **`web_search`** — your default for any "look up X" / "find description of Y" / "verify Z" task. It uses the model's native web search: cheap, fast, returns text excerpts + URLs. Try it first.
+- **`browser_use`** — fallback when, and ONLY when, `web_search` genuinely can't reach the answer. Real headless browser session. Costs real money per session (typically $0.50–$3+). Use only for:
+  * pages with no useful server-side content (everything's loaded by JS, no fallback)
+  * content behind a login wall
+  * something that requires form fill / click / scroll interaction
+  * infinite-scroll lists that web_search can't see past the fold
+
+  Most static or server-rendered pages are reachable via web_search. Don't reach for browser_use just because the instruction mentions a URL — try web_search first.
+
+- **`apify_call_actor`** — when a known Apify actor covers the platform (Reddit, LinkedIn, Twitter/X, Instagram, etc.) and web_search doesn't surface the structured data you need. Use `apify_search_actors` to discover and `apify_actor_details` to read the input schema before calling. Bounded by `maxItems` to 5 — apify isn't for bulk fetching at cell level.
+
+**Known per-row API calls (use when the row already has the inputs):**
+- **`fullenrich_enrich_email`** — verified business email. Inputs: `first_name`, `last_name`, `domain`. ~0.5 cr base.
+- **`fullenrich_enrich_phone`** — verified phone. Same inputs as email. **~5 cr base — expensive**, only when the column explicitly asks for phone.
+- **`fullenrich_enrich_company`** — company info from FullEnrich. Input: `domain`. ~0.5 cr.
+- **`apollo_org_enrich`** — company info from Apollo (headcount, revenue, funding, tech stack, etc.). Input: `domain`. ~1 cr.
+- **`google_maps_place_details`** — local business info. Input: `place_id` (must already be on the row from a prior Google Maps fetch).
+
+**Computation/parsing:**
+- **`code_exec`** — Python sandbox. For string parsing, math, transforms on the row data. No external network from inside the sandbox — pure compute only.
+
+# Heuristic
+
+If the instruction is "look up X on the open web" and you have a URL in the row, `web_search` with a query that includes the URL or company name works ~95% of the time. Reserve `browser_use` for the cases where you actually need the browser. If you tried `web_search` and got nothing useful, then escalate.
 """
 
 
@@ -530,35 +556,232 @@ def _final_result_tool_def() -> Dict[str, Any]:
 
 
 def _tool_defs_for_tier(tier_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Responses-API tool definitions, scoped to the research level."""
+    """Responses-API tool definitions, scoped to the research level.
+
+    Each tool gets its own param schema + a "when to use / when not to"
+    description. Previously every tool advertised the same generic param
+    bag with a placeholder description ("Cell-level wrapper for X") —
+    that gave the model no signal about which tool fits which task, and
+    `browser_use(url, task)` would consistently win on linguistic match
+    over `web_search(query)` even when web_search would have been the
+    right call. The system prompt teaches the strategy; these schemas
+    surface the strategy at the tool-picker.
+    """
     defs: List[Dict[str, Any]] = [_final_result_tool_def()]
-    if tier_cfg["tools"] == "all":
-        generic = {
+    if tier_cfg["tools"] != "all":
+        return defs
+    defs.extend(_CELL_TOOL_DEFS)
+    return defs
+
+
+_CELL_TOOL_DEFS: List[Dict[str, Any]] = [
+    {
+        "type": "function",
+        "name": "web_search",
+        "description": (
+            "DEFAULT for any look-up / find / verify task on the public web. "
+            "Native OpenAI web search: cheap, fast, returns text excerpts + URLs. "
+            "Try this first for any question of the form 'find X on the web', "
+            "'look up Y about company Z', 'get the description on this page'. "
+            "Most static and server-rendered pages are reachable here — don't "
+            "reach for browser_use unless web_search demonstrably fails."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query. Include the URL, company name, person name, etc. — whatever identifies the row.",
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "browser_use",
+        "description": (
+            "FALLBACK only — when web_search genuinely can't reach the answer. "
+            "Real headless browser; costs real money per session ($0.50–$3+ typical, "
+            "up to $10 on complex sessions). Use ONLY for: pages where the content "
+            "is JS-only with no server fallback, login walls, form interactions, "
+            "infinite-scroll lists. NEVER pick this just because the instruction "
+            "mentions a URL — most URLs work fine with web_search."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Starting URL for the browser session."},
+                "task": {"type": "string", "description": "What to do on the page (extract X, click Y, fill form Z)."},
+                "candidate_description": {
+                    "type": "string",
+                    "description": "Optional: shape of each row to extract, e.g. '{name, role, headshot_url}'.",
+                },
+            },
+            "required": ["url", "task"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "apify_search_actors",
+        "description": "Search the Apify actor store for scrapers that cover a platform (Reddit, LinkedIn, Twitter/X, Instagram, etc.). Call before apify_actor_details / apify_call_actor.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Platform or site name to find actors for."},
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "apify_actor_details",
+        "description": "Read an Apify actor's input schema + pricing before calling apify_call_actor.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "actor_id": {"type": "string", "description": "Actor ID, e.g. 'apify/web-scraper'."},
+            },
+            "required": ["actor_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "apify_call_actor",
+        "description": (
+            "Run an Apify actor when a platform-specific scraper covers the data "
+            "and web_search can't get there. Bounded to maxItems=5 — actors at the "
+            "cell level are for per-row lookups, not bulk fetches. Costs ~1 cr "
+            "typical; varies by actor."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "actor_id": {"type": "string"},
+                "input": {
+                    "type": "object",
+                    "description": "Actor-specific input. Read apify_actor_details first.",
+                    "additionalProperties": True,
+                },
+            },
+            "required": ["actor_id", "input"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "fullenrich_enrich_email",
+        "description": (
+            "Verified business email lookup via FullEnrich. Use when the row has "
+            "first_name + last_name + domain and the column wants email. "
+            "~0.5 cr per successful match (no charge on miss)."
+        ),
+        "parameters": {
             "type": "object",
             "properties": {
                 "first_name": {"type": "string"},
                 "last_name": {"type": "string"},
-                "company": {"type": "string"},
-                "domain": {"type": "string"},
-                "query": {"type": "string"},
-                "place_id": {"type": "string"},
-                "url": {"type": "string"},
-                "task": {"type": "string"},
-                "actor_id": {"type": "string"},
-                "input": {"type": "object"},
-                "code": {"type": "string"},
-                "files": {"type": "array", "items": {"type": "string"}},
+                "domain": {"type": "string", "description": "Company domain like 'anthropic.com'."},
+                "company": {"type": "string", "description": "Optional fallback when domain isn't on the row."},
             },
-            "additionalProperties": True,
-        }
-        for name in CELL_TOOL_HANDLERS:
-            defs.append({
-                "type": "function",
-                "name": name,
-                "description": f"Cell-level wrapper for {name}",
-                "parameters": generic,
-            })
-    return defs
+            "required": ["first_name", "last_name"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "fullenrich_enrich_phone",
+        "description": (
+            "Verified phone lookup via FullEnrich. EXPENSIVE — ~5 cr per "
+            "successful match. Only use when the column explicitly asks for "
+            "a phone number. Same inputs as email."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "first_name": {"type": "string"},
+                "last_name": {"type": "string"},
+                "domain": {"type": "string"},
+                "company": {"type": "string"},
+            },
+            "required": ["first_name", "last_name"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "fullenrich_enrich_company",
+        "description": "Company-level enrichment from FullEnrich. Input: domain. ~0.5 cr.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string"},
+            },
+            "required": ["domain"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "apollo_org_enrich",
+        "description": (
+            "Company info from Apollo: headcount, revenue, funding stage, tech "
+            "stack, industry, LinkedIn URL, etc. Input: domain. ~1 cr. Use when "
+            "the column wants company-level data and the row has a domain."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string"},
+            },
+            "required": ["domain"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "google_maps_place_details",
+        "description": (
+            "Local business detail lookup. Requires a Google Maps place_id that's "
+            "already on the row from a prior Google Maps fetch. ~0.3 cr."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "place_id": {"type": "string"},
+            },
+            "required": ["place_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "code_exec",
+        "description": (
+            "Python sandbox. For parsing, string transforms, math, regex on the "
+            "row data. No external network — pure compute only. Useful when the "
+            "instruction wants you to transform a value (e.g. extract domain "
+            "from URL, parse a date, normalize a number)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "Python source. Last expression's value is returned."},
+                "files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional file paths to make available in the sandbox.",
+                },
+            },
+            "required": ["code"],
+            "additionalProperties": False,
+        },
+    },
+]
 
 
 _cell_client: Optional[TrackedOpenAIClient] = None
