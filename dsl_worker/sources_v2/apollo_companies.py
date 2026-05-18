@@ -204,13 +204,32 @@ class ApolloCompaniesAdapter(SourceAdapter):
             total_entries is not None and len(all_rows) + ((prior_cursor or {}).get("seen", 0)) >= total_entries
         )
 
-        # Cost: Apollo doesn't include per-call cost in the response.
-        # Estimate from plan economics: typical Apollo plan ~$0.05/org returned
-        # (mixed_companies_search consumes ~1 Apollo-credit per org;
-        # Apollo plans range $0.03-0.07/credit). 1 our-credit = $0.10 of
-        # compute, so 0.05/org → 0.5 our-credit per org. Override via env.
-        cost_per_org_usd = float(os.getenv("APOLLO_COST_USD_PER_ORG", "0.05"))
-        cost_credits = len(all_rows) * cost_per_org_usd * 10.0
+        # Cost: mixed_companies_search is REQUEST-QUOTA-LIMITED, not
+        # credit-billed. Apollo's response headers confirm this:
+        #
+        #   x-rate-limit-24-hour: 50000   (50k requests/day on this plan)
+        #   x-24-hour-requests-left: 49997
+        #   x-rate-limit-hourly:    6000
+        #   x-rate-limit-minute:    200
+        #
+        # No header indicates per-call "credit" spend, because the user's
+        # Apollo monthly credit allowance (e.g. 5,090 credits/mo on $109)
+        # is reserved for EXPORT / EMAIL+PHONE REVEAL endpoints — NOT for
+        # search. mixed_companies_search returns company data within the
+        # request quota at no per-call charge.
+        #
+        # So this fetch path is effectively free. We record $0 cost.
+        # The per-row enrichment path (cell agent → fullenrich / apollo
+        # people-match with reveal_personal_emails=true) IS where credit
+        # billing lives, and is tracked separately at that handler.
+        #
+        # Env knobs kept in case we ever want to add a flat infra fee
+        # per-fetch (e.g. to cover our own model + parse compute), but
+        # default 0 means we don't double-bill the user.
+        usd_per_apollo_credit = float(os.getenv("APOLLO_USD_PER_CREDIT", "0.02141"))
+        apollo_credits_per_org = float(os.getenv("APOLLO_CREDITS_PER_ORG", "0"))
+        cost_usd = len(all_rows) * apollo_credits_per_org * usd_per_apollo_credit
+        cost_credits = cost_usd * 10.0
 
         return FetchResult(
             rows=all_rows,

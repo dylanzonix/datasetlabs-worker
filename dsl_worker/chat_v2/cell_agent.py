@@ -67,7 +67,9 @@ FIXED_COST_TOOLS = {
     "fullenrich_enrich_email":  0.5,   # FE charges per successful contact
     "fullenrich_enrich_phone":  5.0,   # FE phone is expensive
     "fullenrich_enrich_company": 0.5,
-    "apollo_org_enrich":        1.0,   # Apollo charges per enrich call
+    # apollo_org_enrich removed — organizations/enrich is request-quota
+    # limited (Apollo's response headers confirm: x-rate-limit-* not
+    # credit-* ). Treat as free; pre-call budget gate doesn't refuse it.
     "google_maps_place_details": 0.3,
 }
 
@@ -259,7 +261,7 @@ async def _apollo_org_enrich(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Di
         "short_description": (org.get("short_description") or "")[:500],
         "current_technologies": [t.get("name") for t in (org.get("current_technologies") or [])][:30],
         "departmental_head_count": org.get("departmental_head_count"),
-    }, 1.0
+    }, 0.0  # organizations/enrich is request-quota-limited, not credit-billed
 
 
 async def _google_maps_place_details(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
@@ -718,7 +720,8 @@ _CELL_TOOL_DEFS: List[Dict[str, Any]] = [
         "name": "apollo_org_enrich",
         "description": (
             "Company info from Apollo: headcount, revenue, funding stage, tech "
-            "stack, industry, LinkedIn URL, etc. Input: domain. ~1 cr. Use when "
+            "stack, industry, LinkedIn URL, etc. Input: domain. Effectively "
+            "free — uses Apollo's request quota, not credit balance. Use when "
             "the column wants company-level data and the row has a domain."
         ),
         "parameters": {
