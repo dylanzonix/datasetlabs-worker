@@ -1161,17 +1161,51 @@ async def sort_clear(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, 
 
 
 async def row_inspect(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
+    """Peek at rows. When include_raw=true, also returns the raw_row payload
+    from the source so the agent can see fields that exist in the source
+    but aren't in the current column_map — useful when the user wants a
+    column "unhidden" (just call column_map_set with the new source_field).
+    """
     table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
-    n = int(args.get("n") or 10)
+    n = int(args.get("n") or args.get("limit") or 10)
+    include_raw = bool(args.get("include_raw") or args.get("with_raw"))
     if not table_id:
         return {"error": "table_id is required"}, 0.0
+    select_cols = "row, raw_row" if include_raw else "row"
     rows = ctx.db.execute(
         sa_text(
-            "SELECT row FROM samples WHERE table_id=:tid AND deleted_at IS NULL "
+            f"SELECT {select_cols} FROM samples WHERE table_id=:tid AND deleted_at IS NULL "
             "ORDER BY created_at DESC LIMIT :n"
         ),
         {"tid": table_id, "n": n},
     ).fetchall()
+    if include_raw:
+        # Also surface the set of source_field keys NOT currently mapped —
+        # that's the signal the agent needs to decide "should I column_map_set
+        # this field in?" without guessing what raw fields exist.
+        cols_row = ctx.db.execute(
+            sa_text("SELECT columns FROM tables WHERE id=:tid"),
+            {"tid": table_id},
+        ).fetchone()
+        mapped_source_fields: set[str] = set()
+        if cols_row and cols_row[0]:
+            cols_list = cols_row[0] if isinstance(cols_row[0], list) else json.loads(cols_row[0])
+            for c in cols_list:
+                sf = c.get("source_field") if isinstance(c, dict) else None
+                if sf:
+                    # Keep just the top-level key for the "unmapped" comparison
+                    mapped_source_fields.add(sf.split(".")[0].split("[]")[0])
+        unmapped_raw_fields: set[str] = set()
+        for r in rows:
+            raw = r[1] if isinstance(r[1], dict) else {}
+            if isinstance(raw, dict):
+                for k in raw.keys():
+                    if k not in mapped_source_fields and not k.startswith("_"):
+                        unmapped_raw_fields.add(k)
+        return {
+            "rows": [{"row": r[0], "raw_row": r[1]} for r in rows],
+            "unmapped_raw_fields": sorted(unmapped_raw_fields),
+        }, 0.0
     return {"rows": [r[0] for r in rows]}, 0.0
 
 

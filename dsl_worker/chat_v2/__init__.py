@@ -229,7 +229,23 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
         # Columns/enrichments
         "column_map_set": "Edit columns on an existing table — rename a column, add one mapped from another source field, drop one. Args: table_id, columns ([{name, source_field, type}]). table_create already commits with its own columns; only use this to revise after the fact.",
         "enrichment_set": "Define or refine an enrichment. Does NOT auto-run — call enrichment_run after to fill cells. Args: table_id, columns, action: {research, prompt, per_row_credit_cap?}.",
-        "enrichment_run": "Run an enrichment over a scope of rows. Approval-gated — user sees an estimated-cost card before it executes.",
+        "enrichment_run": (
+            "Run an enrichment over a scope of rows. Approval-gated — user sees an "
+            "estimated-cost card with the row count before it executes. "
+            "Args: {enrichment_id, scope, overwrite?}.\n\n"
+            "Scope shapes:\n"
+            "  {type: 'all_unfilled'} — default. Every row missing at least one of "
+            "the enrichment's target columns.\n"
+            "  {type: 'first_n', first_n: 10} — first N rows of the table.\n"
+            "  {type: 'row_ids', row_ids: ['...']} — explicit row id list.\n"
+            "  {type: 'filtered', filters: [{column, op, value}, ...]} — restrict to "
+            "rows that pass the explicit filters. Same {column, op, value} shape as "
+            "filter_set (canonical 7-op set). Use this when the user has a filter set "
+            "and wants the enrichment scoped to the visible rows — copy the filters "
+            "from project_state into scope.filters explicitly (do NOT rely on the "
+            "table's active filter being read implicitly; scope.filters IS the filter "
+            "set that gets applied)."
+        ),
         # Filters
         "filter_set": (
             "Apply a non-destructive filter to a column. Returns matched count + "

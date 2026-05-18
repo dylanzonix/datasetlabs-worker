@@ -525,6 +525,17 @@ def _resolve_scope_rows(
 
     raw_row is the unmapped source payload — cell agent sees both so it
     has the same context the orchestrator had at column_map_set time.
+
+    Scope types:
+      row_ids:      {type, row_ids: [...]}
+      first_n:      {type, first_n: 10}
+      filtered:     {type, filters: [{column, op, value}, ...]} — same
+                    {column, op, value} shape as filter_set. Filters are
+                    AND'd together, evaluated in Python via the same _match
+                    semantics used everywhere else (no hidden state — the
+                    scope's filters are self-contained, NOT a reference to
+                    whatever table_filters happens to have at exec time).
+      all_unfilled: {type} — every row missing at least one target column.
     """
     base_sql = "SELECT id::text, row, raw_row FROM samples WHERE table_id=:tid AND deleted_at IS NULL"
     params: Dict[str, Any] = {"tid": table_id}
@@ -544,6 +555,44 @@ def _resolve_scope_rows(
             sa_text(base_sql + " ORDER BY seq LIMIT :n"),
             {**params, "n": n},
         ).fetchall()
+    elif scope_type == "filtered":
+        # Explicit-filter scope. Read the table, apply each {column, op,
+        # value} in Python via _match. We could push this to SQL via
+        # _filters_to_where_sql but Python is fast enough at v1 table
+        # sizes and keeps the canonical predicate (used for filter_set's
+        # preview) as the single source of truth for match semantics.
+        from dsl_worker.chat_v2.tools import _match, _normalize_filter
+        raw_filters = scope.get("filters") or []
+        if not isinstance(raw_filters, list) or not raw_filters:
+            # Empty filters → match every row (caller intended "filtered
+            # but no constraints"); still better than silently falling
+            # through to all_unfilled.
+            rows = db.execute(sa_text(base_sql + " ORDER BY seq"), params).fetchall()
+        else:
+            # Normalize each filter into the canonical (op, value) pair
+            # so we evaluate the SAME way filter_set's preview does.
+            norm_filters: List[Tuple[str, str, Any]] = []
+            for f in raw_filters:
+                if not isinstance(f, dict):
+                    continue
+                col = f.get("column") or f.get("column_name") or f.get("field")
+                if not col:
+                    continue
+                normalized = _normalize_filter(f.get("op") or f.get("operator"), f.get("value"))
+                if normalized is None:
+                    continue
+                op, value = normalized
+                norm_filters.append((col, op, value))
+            all_rows = db.execute(sa_text(base_sql + " ORDER BY seq"), params).fetchall()
+            rows = []
+            for sid, row_data, raw_row in all_rows:
+                if not isinstance(row_data, dict):
+                    continue
+                keep = all(
+                    _match(row_data.get(c), op, v) for c, op, v in norm_filters
+                )
+                if keep:
+                    rows.append((sid, row_data, raw_row))
     else:  # all_unfilled
         rows = db.execute(
             sa_text(base_sql + " ORDER BY seq"),

@@ -167,13 +167,47 @@ def estimate_enrichment_run_cost(args: Dict[str, Any], db, project_id: str) -> t
             return 0.0, "Run enrichment"
         name, cap, table_id = row[0], float(row[1] or 1.0), row[2]
 
-        # Resolve scope → row count
+        # Resolve scope → row count. Mirrors the scope handling in
+        # enrichment._resolve_scope_rows so the approval card's "Run on N
+        # rows" matches what will actually run.
         scope = args.get("scope") or {"type": "all_unfilled"}
         scope_type = scope.get("type", "all_unfilled")
         if scope_type == "row_ids":
             n_rows = len(scope.get("row_ids") or [])
         elif scope_type == "first_n":
             n_rows = int(scope.get("first_n") or 10)
+        elif scope_type == "filtered":
+            # Apply explicit scope.filters[] in Python (same predicate
+            # used in _resolve_scope_rows and filter_set's preview).
+            from dsl_worker.chat_v2.tools import _match, _normalize_filter
+            raw_filters = scope.get("filters") or []
+            norm_filters = []
+            for f in raw_filters:
+                if not isinstance(f, dict):
+                    continue
+                col = f.get("column") or f.get("column_name") or f.get("field")
+                if not col:
+                    continue
+                normalized = _normalize_filter(f.get("op") or f.get("operator"), f.get("value"))
+                if normalized is None:
+                    continue
+                op_norm, value_norm = normalized
+                norm_filters.append((col, op_norm, value_norm))
+            if not norm_filters:
+                count_row = db.execute(
+                    sa_text("SELECT count(*) FROM samples WHERE table_id=:tid AND deleted_at IS NULL"),
+                    {"tid": table_id},
+                ).fetchone()
+                n_rows = int(count_row[0] or 0) if count_row else 0
+            else:
+                all_rows = db.execute(
+                    sa_text("SELECT row FROM samples WHERE table_id=:tid AND deleted_at IS NULL"),
+                    {"tid": table_id},
+                ).fetchall()
+                n_rows = sum(
+                    1 for (rd,) in all_rows
+                    if isinstance(rd, dict) and all(_match(rd.get(c), op, v) for c, op, v in norm_filters)
+                )
         else:
             # all_unfilled — count samples missing any of the enrichment's columns
             count_row = db.execute(
