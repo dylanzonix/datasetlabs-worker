@@ -83,7 +83,8 @@ async def enrichment_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
 
     # Normalize columns: accept the various shapes the agent reaches for.
     # Supported: bare strings, {name}, {name, type}, {key, label}, {column, type}.
-    norm_cols: List[Dict[str, str]] = []
+    # `format` (percent / currency / currency_compact) is passed through when set.
+    norm_cols: List[Dict[str, Any]] = []
     for c in columns:
         if isinstance(c, str):
             norm_cols.append({"name": c, "type": "text"})
@@ -91,7 +92,11 @@ async def enrichment_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
             n = c.get("name") or c.get("column") or c.get("column_name") or c.get("key") or c.get("field")
             if not n:
                 return {"error": f"columns entry needs a name (or key/column/field): got {c!r}"}, 0.0
-            norm_cols.append({"name": n, "type": c.get("type") or "text"})
+            entry: Dict[str, Any] = {"name": n, "type": c.get("type") or "text"}
+            fmt = c.get("format")
+            if fmt:
+                entry["format"] = fmt
+            norm_cols.append(entry)
         else:
             return {"error": f"columns entries must be 'col_name' or {{name, type}}; got: {c!r}"}, 0.0
     columns = norm_cols
@@ -210,7 +215,8 @@ async def enrichment_run(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
         return {"error": f"enrichment {enrichment_id} not found"}, 0.0
     table_id = str(row[0])
 
-    rows_filled, cost = await _run_enrichment_on_rows(ctx, table_id, enrichment_id, scope, overwrite)
+    stats = await _run_enrichment_on_rows(ctx, table_id, enrichment_id, scope, overwrite)
+    cost = stats["total_cost_credits"]
 
     ctx.db.execute(
         sa_text(
@@ -222,13 +228,21 @@ async def enrichment_run(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
             WHERE id = :eid
             """
         ),
-        {"eid": enrichment_id, "n": rows_filled, "cost": cost},
+        {"eid": enrichment_id, "n": stats["rows_filled"], "cost": cost},
     )
     ctx.db.commit()
 
+    # Rich return: rows_attempted vs rows_filled lets the agent see drop-off;
+    # sample_filled_row + sample_not_found_row let it eyeball whether values
+    # look right or the prompt is broken (no re-inspect round-trip needed).
     return {
-        "rows_queued": rows_filled,
-        "rows_filled": rows_filled,
+        "rows_attempted": stats["rows_attempted"],
+        "rows_filled": stats["rows_filled"],
+        "rows_not_found": stats["rows_not_found"],
+        "rows_hit_budget": stats["rows_hit_budget"],
+        "rows_errored": stats["rows_errored"],
+        "sample_filled_row": stats["sample_filled_row"],
+        "sample_not_found_row": stats["sample_not_found_row"],
     }, cost * 0.10
 
 
@@ -243,8 +257,24 @@ async def _run_enrichment_on_rows(
     enrichment_id: str,
     scope: Dict[str, Any],
     overwrite: bool = False,
-) -> Tuple[int, float]:
-    """Resolve scope → list of sample rows → run the enrichment action on each."""
+) -> Dict[str, Any]:
+    """Resolve scope → list of sample rows → run the enrichment action on each.
+
+    Returns a stats dict the orchestrator uses to build its rich tool result:
+      rows_attempted, rows_filled, rows_not_found, rows_hit_budget, rows_errored,
+      total_cost_credits, sample_filled_row, sample_not_found_row.
+    """
+    empty_stats = {
+        "rows_attempted": 0,
+        "rows_filled": 0,
+        "rows_not_found": 0,
+        "rows_hit_budget": 0,
+        "rows_errored": 0,
+        "total_cost_credits": 0.0,
+        "sample_filled_row": None,
+        "sample_not_found_row": None,
+    }
+
     enrichment = ctx.db.execute(
         sa_text(
             "SELECT columns, action, per_row_credit_cap FROM enrichments WHERE id=:eid"
@@ -252,7 +282,7 @@ async def _run_enrichment_on_rows(
         {"eid": enrichment_id},
     ).fetchone()
     if not enrichment:
-        return 0, 0.0
+        return empty_stats
 
     columns, action, per_row_cap = enrichment[0], enrichment[1], enrichment[2]
     if isinstance(columns, str):
@@ -265,9 +295,14 @@ async def _run_enrichment_on_rows(
 
     total_cost = 0.0
     filled_count = 0
+    not_found_count = 0
+    hit_budget_count = 0
+    errored_count = 0
+    sample_filled_row: Dict[str, Any] | None = None
+    sample_not_found_row: Dict[str, Any] | None = None
 
     if not rows:
-        return 0, 0.0
+        return empty_stats
 
     target_cols = [c["name"] for c in columns]
     total = len(rows)
@@ -333,6 +368,7 @@ async def _run_enrichment_on_rows(
             raise
         except Exception as e:
             log.warning("cell op raised: %s", e)
+            errored_count += 1
             completed += 1
             continue
 
@@ -352,9 +388,31 @@ async def _run_enrichment_on_rows(
         # Statuses we write: "hit_budget" only (filled is implicit when the
         # value is present; error leaves the cell untouched, no status).
         merged = dict(original_row)
+        has_real_value = bool(
+            isinstance(new_fields, dict)
+            and any(new_fields.get(cn) not in (None, "") for cn in target_cols)
+        )
         if isinstance(new_fields, dict) and new_fields:
             merged.update(new_fields)
-            filled_count += 1
+            if has_real_value:
+                filled_count += 1
+                if sample_filled_row is None:
+                    # Sample what the agent actually wrote — only the
+                    # enrichment's target columns, not the whole row,
+                    # to keep the tool result tight.
+                    sample_filled_row = {cn: new_fields.get(cn) for cn in target_cols}
+        if status == "hit_budget":
+            hit_budget_count += 1
+        elif status == "filled" and not has_real_value:
+            not_found_count += 1
+            if sample_not_found_row is None:
+                # For not_found, give the agent a hint about what was on
+                # the row so it can judge whether the prompt was wrong or
+                # the data genuinely doesn't exist for this kind of input.
+                sample_not_found_row = {
+                    k: v for k, v in original_row.items()
+                    if not k.startswith("__") and k not in target_cols
+                }
 
         existing_status = merged.get("__cell_status__") or {}
         if not isinstance(existing_status, dict):
@@ -444,7 +502,16 @@ async def _run_enrichment_on_rows(
             pass
         raise
 
-    return filled_count, total_cost
+    return {
+        "rows_attempted": total,
+        "rows_filled": filled_count,
+        "rows_not_found": not_found_count,
+        "rows_hit_budget": hit_budget_count,
+        "rows_errored": errored_count,
+        "total_cost_credits": total_cost,
+        "sample_filled_row": sample_filled_row,
+        "sample_not_found_row": sample_not_found_row,
+    }
 
 
 def _resolve_scope_rows(

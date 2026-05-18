@@ -272,11 +272,15 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
             src_field = c.get("source_field") or c.get("from") or c.get("source")
             if not cname or not src_field:
                 return {"error": f"columns entry needs name + source_field; got {c!r}"}, 0.0
-            columns_for_db.append({
+            entry: Dict[str, Any] = {
                 "name": cname,
                 "type": c.get("type") or "text",
                 "source_field": src_field,
-            })
+            }
+            fmt = c.get("format")
+            if fmt:
+                entry["format"] = fmt
+            columns_for_db.append(entry)
     else:
         # Raw passthrough: every top-level key in the rows becomes a column.
         # Names are whatever the source emits (often snake_case); agent can
@@ -689,19 +693,25 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
         }, 0.0
 
     # Normalize the three shapes the agent reaches for into a uniform
-    # [{name, type, source_field}, ...] list.
-    columns_for_db: List[Dict[str, str]] = []
+    # [{name, type, source_field, format?}, ...] list. `format` is the
+    # number-formatting hint the FE consumes; preserve it whenever the
+    # agent set it.
+    columns_for_db: List[Dict[str, Any]] = []
     if isinstance(raw_mapping, dict):
         for src, v in raw_mapping.items():
             if isinstance(v, str):
                 columns_for_db.append({"name": v, "type": "text", "source_field": src})
             elif isinstance(v, dict):
                 name = v.get("name") or v.get("column_name") or src
-                columns_for_db.append({
+                entry: Dict[str, Any] = {
                     "name": name,
                     "type": v.get("type") or "text",
                     "source_field": src,
-                })
+                }
+                fmt = v.get("format")
+                if fmt:
+                    entry["format"] = fmt
+                columns_for_db.append(entry)
             else:
                 return {"error": f"mapping[{src!r}] must be a string or {{name, type}}; got {type(v).__name__}"}, 0.0
     elif isinstance(raw_mapping, list):
@@ -712,11 +722,15 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
             name = item.get("name") or item.get("column_name") or src
             if not src or not name:
                 return {"error": f"mapping list entry needs source_field + name; got {item!r}"}, 0.0
-            columns_for_db.append({
+            entry = {
                 "name": name,
                 "type": item.get("type") or "text",
                 "source_field": src,
-            })
+            }
+            fmt = item.get("format")
+            if fmt:
+                entry["format"] = fmt
+            columns_for_db.append(entry)
     else:
         return {"error": f"mapping must be dict or list; got {type(raw_mapping).__name__}"}, 0.0
 
@@ -776,6 +790,11 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
     # _commit_rows and enrichment) and URLs land here when the agent
     # renames or remaps a column from raw_row to a v2 column.
     rederived_rows: List[Tuple[str, Dict[str, Any]]] = []
+    # Track per-column null counts so the agent can spot a mapping
+    # that silently produced nulls (e.g. a wrong source_field path).
+    # Without this signal the agent has no idea its mapping failed
+    # until a downstream tool surfaces the empty cells.
+    null_counts: Dict[str, int] = {c["name"]: 0 for c in columns_for_db}
     for sid, raw, tags, src in sample_rows:
         if not isinstance(raw, dict):
             continue
@@ -783,6 +802,10 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
             c["name"]: _extract_source_value(raw, c["source_field"])
             for c in columns_for_db
         }
+        for c in columns_for_db:
+            v = mapped.get(c["name"])
+            if v in (None, "", [], {}):
+                null_counts[c["name"]] += 1
         cell_sources = {
             name: [{**entry, "source": src} for entry in entries]
             for name, entries in new_cell_sources.items()
@@ -803,10 +826,23 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
         rederived_rows.append((sid, mapped))
     ctx.db.commit()
 
+    # Return enough that the agent can verify the mapping worked without a
+    # follow-up row_inspect: the committed schema, one sample mapped row,
+    # and per-column null counts (a column that's 100% null after re-derive
+    # is almost certainly a bad source_field — easy to catch and fix).
+    sample_mapped = rederived_rows[0][1] if rederived_rows else None
+    fully_null_columns = [
+        name for name, n in null_counts.items()
+        if rederived > 0 and n == rederived
+    ]
     return {
         "ok": True,
         "columns_committed": len(columns_for_db),
+        "columns": columns_for_db,
         "rows_rederived": rederived,
+        "sample_rederived_row": sample_mapped,
+        "null_counts_per_column": null_counts,
+        "fully_null_columns": fully_null_columns,
     }, 0.0
 
 
@@ -819,13 +855,20 @@ async def table_delete(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
     if not table_id:
         return {"error": "table_id is required"}, 0.0
-    # Read short_id before delete so the emitted event matches what the
-    # FE has cached (it keys tables by short_id, not uuid).
-    short_id_row = ctx.db.execute(
-        sa_text("SELECT short_id FROM tables WHERE id=:id"),
+    # Read short_id + name + row count before delete so the result echoes
+    # exactly what disappeared (FE keys tables by short_id, agent reasons
+    # about deletions by name and scale).
+    pre = ctx.db.execute(
+        sa_text(
+            "SELECT t.short_id, t.name, "
+            "(SELECT COUNT(*) FROM samples WHERE table_id=t.id AND deleted_at IS NULL) "
+            "FROM tables t WHERE t.id=:id"
+        ),
         {"id": table_id},
     ).fetchone()
-    short_id = short_id_row[0] if short_id_row else None
+    short_id = pre[0] if pre else None
+    table_name = pre[1] if pre else None
+    rows_deleted = int(pre[2]) if pre and pre[2] is not None else 0
     ctx.db.execute(
         sa_text("UPDATE tables SET deleted_at=now() WHERE id=:id AND project_id=:pid"),
         {"id": table_id, "pid": ctx.project_id},
@@ -850,7 +893,12 @@ async def table_delete(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
         except Exception:
             log.exception("table_card_removed emit failed; continuing")
 
-    return {"ok": True}, 0.0
+    return {
+        "ok": True,
+        "table_id": short_id,
+        "name": table_name,
+        "rows_deleted": rows_deleted,
+    }, 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -935,14 +983,26 @@ async def filter_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, 
         ),
         {"tid": table_id, "col": column, "op": op, "val": json.dumps(value)},
     )
-    # Return matched count + sample for agent sanity-check
-    matched, sample = _apply_filter_count_sample(ctx.db, table_id, column, op, value)
+    # Return matched count + both samples + canonical op so the agent can
+    # (a) confirm it filtered the right things AND excluded the right things,
+    # (b) verify the op it asked for is the op that got stored (we
+    # normalize aliases like `>` → `gt`, `startswith` → `starts_with`;
+    # echoing the canonical form lets the agent tell at a glance).
+    matched, sample_kept, sample_excluded = _apply_filter_count_sample(
+        ctx.db, table_id, column, op, value,
+    )
     total = ctx.db.execute(
         sa_text("SELECT COUNT(*) FROM samples WHERE table_id=:tid AND deleted_at IS NULL"),
         {"tid": table_id},
     ).scalar() or 0
     ctx.db.commit()
-    return {"matched": matched, "total": total, "sample": sample}, 0.0
+    return {
+        "matched": matched,
+        "total": total,
+        "op": op,
+        "sample_kept": sample_kept,
+        "sample_excluded": sample_excluded,
+    }, 0.0
 
 
 async def filter_clear(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
@@ -950,12 +1010,32 @@ async def filter_clear(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     column = args.get("column")
     if not (table_id and column):
         return {"error": "table_id, column required"}, 0.0
+    # Read existing filter (if any) so the result echoes what was cleared.
+    # Lets the agent tell apart "you removed the filter I wanted to remove"
+    # from "there was no filter on that column to begin with".
+    pre = ctx.db.execute(
+        sa_text(
+            "SELECT op, value FROM table_filters "
+            "WHERE table_id=:tid AND column_name=:col"
+        ),
+        {"tid": table_id, "col": column},
+    ).fetchone()
     ctx.db.execute(
         sa_text("DELETE FROM table_filters WHERE table_id=:tid AND column_name=:col"),
         {"tid": table_id, "col": column},
     )
+    # Count remaining filters on this table so agent has the post-state.
+    remaining = ctx.db.execute(
+        sa_text("SELECT COUNT(*) FROM table_filters WHERE table_id=:tid"),
+        {"tid": table_id},
+    ).scalar() or 0
     ctx.db.commit()
-    return {"ok": True}, 0.0
+    return {
+        "ok": True,
+        "filter_existed": pre is not None,
+        "cleared": {"column": column, "op": pre[0], "value": pre[1]} if pre else None,
+        "remaining_filters_on_table": int(remaining),
+    }, 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -994,6 +1074,12 @@ async def sort_clear(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, 
     table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
     if not table_id:
         return {"error": "table_id required"}, 0.0
+    # Read prior sort so the agent can see what was cleared.
+    pre = ctx.db.execute(
+        sa_text("SELECT sort_column, sort_direction FROM tables WHERE id = :tid"),
+        {"tid": table_id},
+    ).fetchone()
+    was_sorted = bool(pre and pre[0])
     ctx.db.execute(
         sa_text(
             "UPDATE tables SET sort_column = NULL, sort_direction = NULL WHERE id = :tid"
@@ -1001,7 +1087,11 @@ async def sort_clear(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, 
         {"tid": table_id},
     )
     ctx.db.commit()
-    return {"ok": True}, 0.0
+    return {
+        "ok": True,
+        "was_sorted": was_sorted,
+        "cleared": {"column": pre[0], "direction": pre[1]} if was_sorted else None,
+    }, 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -1249,21 +1339,27 @@ def _extract_source_value(row: Dict[str, Any], path: str) -> Any:
 
 def _apply_filter_count_sample(
     db: Session, table_id: str, column: str, op: str, value: Any
-) -> Tuple[int, List[Dict[str, Any]]]:
-    """Return (matched_count, sample_rows[5]) for the filter without materializing it."""
+) -> Tuple[int, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Return (matched_count, sample_kept[5], sample_excluded[5]) for the filter
+    without materializing it. Both samples let the agent sanity-check that
+    the filter kept what it wanted AND excluded what it wanted, in one shot.
+    """
     # Naive: pull rows, filter in Python. Good enough for v1 with table sizes up to ~1000.
     all_rows = db.execute(
         sa_text("SELECT row FROM samples WHERE table_id=:tid AND deleted_at IS NULL"),
         {"tid": table_id},
     ).fetchall()
     matched: List[Dict[str, Any]] = []
+    excluded: List[Dict[str, Any]] = []
     for (row,) in all_rows:
         if not isinstance(row, dict):
             continue
         v = row.get(column)
         if _match(v, op, value):
             matched.append(row)
-    return len(matched), matched[:5]
+        elif len(excluded) < 5:
+            excluded.append(row)
+    return len(matched), matched[:5], excluded
 
 
 def _match(cell: Any, op: str, value: Any) -> bool:

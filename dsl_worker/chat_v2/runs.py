@@ -418,23 +418,41 @@ def cancel_v2_run(run_id: UUID) -> bool:
 async def _heartbeat_loop(run_id: UUID) -> None:
     """Emit a heartbeat event every 30s so the staleness sweeper never
     false-positives an actively-running task. Cancelled by the caller
-    when the run finishes — until then, this is the proof of life."""
+    when the run finishes — until then, this is the proof of life.
+
+    DB write runs via asyncio.to_thread so a slow commit doesn't block
+    the event loop and starve other coroutines (which would in turn
+    starve THIS coroutine on the next iteration — a known regression
+    mode that caused 82% of run failures last week before the
+    url-verify hook removal)."""
+    def _emit_sync() -> bool:
+        """Returns True to keep looping, False if run is terminal."""
+        db = SessionLocal()
+        try:
+            run = db.query(ChatRun).filter(ChatRun.id == run_id).first()
+            if run is None or run.status in RUN_TERMINAL_STATUSES:
+                return False
+            legacy_runs.emit_event(db, run, "heartbeat", {})
+            db.commit()
+            return True
+        except Exception:
+            log.debug("heartbeat emit failed; continuing", exc_info=True)
+            return True
+        finally:
+            db.close()
+
     while True:
         try:
             await asyncio.sleep(30)
         except asyncio.CancelledError:
             return
-        db = SessionLocal()
         try:
-            run = db.query(ChatRun).filter(ChatRun.id == run_id).first()
-            if run is None or run.status in RUN_TERMINAL_STATUSES:
-                return
-            legacy_runs.emit_event(db, run, "heartbeat", {})
-            db.commit()
+            keep = await asyncio.to_thread(_emit_sync)
         except Exception:
-            log.debug("heartbeat emit failed; continuing", exc_info=True)
-        finally:
-            db.close()
+            log.debug("heartbeat to_thread failed; continuing", exc_info=True)
+            continue
+        if not keep:
+            return
 
 
 async def _drive_agent(

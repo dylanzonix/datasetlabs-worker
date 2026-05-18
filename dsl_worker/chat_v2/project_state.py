@@ -31,7 +31,7 @@ def build_project_state(db: Session, project_id: str, max_tables: int = 10) -> s
             """
             SELECT id::text, short_id, name, source, query_params, columns, dedup_key_column,
                    last_fetch_returned_rows, last_fetch_cost_credits, last_fetch_at,
-                   fetch_status, fetch_error
+                   fetch_status, fetch_error, sort_column, sort_direction
             FROM tables
             WHERE project_id = :pid AND deleted_at IS NULL
             ORDER BY created_at
@@ -46,7 +46,8 @@ def build_project_state(db: Session, project_id: str, max_tables: int = 10) -> s
         parts.append("  (none yet)")
     for t in tables:
         (tid, short_id, name, source, qp, columns, dedup_col,
-         last_rows, last_cost, last_at, fetch_status, fetch_err) = t
+         last_rows, last_cost, last_at, fetch_status, fetch_err,
+         sort_column, sort_direction) = t
 
         row_count = db.execute(
             sa_text("SELECT COUNT(*) FROM samples WHERE table_id = :tid AND deleted_at IS NULL"),
@@ -118,6 +119,12 @@ def build_project_state(db: Session, project_id: str, max_tables: int = 10) -> s
         if filters:
             for col, op, val in filters:
                 parts.append(f"      Filter: {col} {op} {json.dumps(val)}")
+
+        # Active sort — surfaces so the agent knows "more rows" or
+        # "first N" requests will land in the sorted order, and so
+        # it doesn't propose a sort that's already applied.
+        if sort_column:
+            parts.append(f"      Sort: {sort_column} {sort_direction or 'desc'}")
 
         # Fetch status + last fetch info
         if fetch_status not in ("idle", "complete"):

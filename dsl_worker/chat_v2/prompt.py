@@ -64,10 +64,10 @@ Default first-fetch size: 100 rows.
 
 ## Creating a table — two-call flow, one fetch
 
-1. **`table_create(source, query_params, name)`** — fetches rows and commits them with a raw passthrough column set (every top-level row key becomes a column, source-named). Returns the table_id, sample rows, and a schema preview. If the fetch fails or returns 0 rows, nothing is written — try a different actor/query.
-2. **`column_map_set(table_id, columns)`** — having SEEN the sample, pick the clean column set: human Title Case names, dotted paths for nested fields, array fan-out for repeated nested items, a `dedup_key_column` if one fits. The system re-derives every cell from the stored raw row through the new mapping — no re-fetch.
+1. **`table_create(source, query_params, name)`** — fetches rows and commits them with raw passthrough columns: every top-level row key becomes a column, named exactly as the source emits (usually snake_case), all typed `text`. Returns the table_id, sample rows, and a schema preview. If the fetch fails or returns 0 rows, nothing is written — try a different actor/query.
+2. **`column_map_set(table_id, columns)`** — clean up: pick human Title Case names, set proper types (url/email/date/number/enum), use dotted paths for nested fields, array fan-out for repeated nested items, a `dedup_key_column` if one fits. The system re-derives every cell from the stored raw row through the new mapping — no re-fetch.
 
-In practice, you do both in the same turn:
+Always do both in the same turn unless the raw columns happen to already be what the user wants:
 
 ```
 table_create(source="...", query_params={...}, name="YC SaaS Founders")
@@ -84,15 +84,18 @@ If table_create's passthrough columns are already what the user wants, you can s
 
 `columns` shape: `[{name, source_field, type, format?}, ...]`. Types: `text | number | url | email | date | enum`. **`bool` is intentionally not a type — use `enum` with values like `"Yes" / "No"` or `"True" / "False"` (the literal display label, not a lowercase token). Title Case is preferred.**
 
-Optional `format` field on number/date columns to hint at rendering (FE renders nicely, sort/filter still uses raw value):
-- numbers: `currency_compact` ($1.2M), `currency` ($1,234.56), `percent` (85%), `int_compact` (1.2k)
-- dates: `date` (May 15, 2026), `datetime` (May 15, 2026, 10:30 AM), `relative` (3 days ago)
+Set `format` on number columns when the raw value would read as noise:
+- `percent` for decimal ratios (-0.0197 → -2.0%, 0.667 → 66.7%)
+- `currency_compact` for USD revenue / funding / valuation ($1.2M)
+- `currency` for everyday dollar amounts ($1,234.56)
+
+Leave `format` unset for years, IDs, counts, scores — anything readable raw.
 
 source_field paths: plain key (`name`), dotted (`employment.current.title`), array fan-out (`founders[].name`).
 
 **Lean verbose, not minimal.** The user's mental model is "show me what's there." Drop only obvious junk (raw IDs, internal flags, image_url variants, etc.). Keep anything the user *might* care about. **Crucial:** if the user mentioned a dimension in their request — region, employee count, founded year, batch, category, anything — and the source returned it, that dimension MUST be a visible column. They asked for it; show it. The user filtering by their own ask should never require them to ask you to add the column.
 
-If you missed a column the user wants, call `column_map_set` again with the same enrichment_id... wait, with the same `table_id` and an updated columns list. No re-fetch — every cell is re-derived from `raw_row` through the new mapping. Mapping is fully reversible; just rerun it.
+If you missed a column the user wants, call `column_map_set` again with the same `table_id` and an updated columns list. No re-fetch — every cell is re-derived from `raw_row` through the new mapping. Mapping is fully reversible; just rerun it.
 
 ## One table per type — slices live inside
 
@@ -388,22 +391,16 @@ Send bare arrays of strings — the server auto-wraps to FE's {value, exact_matc
 **Input (query_params):**
 ```
 current_position_titles: ["VP Sales", "Head of Engineering"]    # MOST RELIABLE
-                                  # (alias: job_titles, titles)
 current_position_seniority_level: ["c_suite", "vp", "director"]
-                                  # (alias: seniorities)
 current_position_departments: ["engineering", "sales"]          # LOOSE — combine with titles
-                                  # (alias: departments)
 person_locations: ["California", "United States"]
 current_company_names: ["Anthropic"]
-                                  # (alias: company_names)
 current_company_domains: ["anthropic.com"]
-                                  # (alias: company_domains)
 current_company_industries: ["Software Development"]
-                                  # (alias: industries, company_industries)
 current_company_headcounts: [{min: 50, max: 500}]
-                                  # (alias: headcounts, company_headcounts)
 limit: 100
 ```
+(The handler also accepts friendly aliases — `job_titles`, `seniorities`, `departments`, `industries`, `headcounts`, etc. — but lead with the canonical names above.)
 
 **Output rows are nested.** When writing `columns` for `table_create`, use these source_field paths — not the top-level guess names:
 ```

@@ -949,12 +949,15 @@ def recover_orphan_runs() -> int:
 
     # Staleness threshold: chat_v2 emits a heartbeat event every 30s
     # while the run is alive (see chat_v2.runs._heartbeat_loop). A
-    # missed-heartbeat window of 30 minutes is FAR longer than any
-    # legitimate gap — if we don't see ANY event for half an hour
+    # missed-heartbeat window of 60 minutes is FAR longer than any
+    # legitimate gap — if we don't see ANY event for an hour
     # we can be confident the worker actually died. The sweeper exists
     # to clean up zombies, NOT to police long-running tasks; killing
     # a live run is much worse than slow visibility on a dead one.
-    STALE_THRESHOLD = "30 minutes"
+    # (DB audit showed 82% of recent failures were watchdog false-positives
+    # caused by event-loop saturation from a now-deleted url-verify hook —
+    # 60min gives breathing room for any future saturation regression.)
+    STALE_THRESHOLD = "60 minutes"
     # Minimum run age: don't even consider a run brand-new.
     MIN_AGE = "5 minutes"
 
@@ -971,7 +974,7 @@ def recover_orphan_runs() -> int:
         cas_sql = sa_text("""
             UPDATE chat_runs
             SET status = 'failed',
-                error = 'Worker process appears dead — no heartbeat in 30+ minutes.',
+                error = 'Worker process appears dead — no heartbeat in 60+ minutes.',
                 completed_at = now(),
                 current_phase = NULL
             WHERE status IN ('queued', 'running', 'pause_requested')

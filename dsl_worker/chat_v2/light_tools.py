@@ -268,10 +268,23 @@ async def code_exec(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, A
                 except Exception as e:
                     log.warning("code_exec post-list failed: %s", e)
 
+            raw_stdout = getattr(result, "stdout", "") or ""
+            raw_stderr = getattr(result, "stderr", "") or ""
+            stdout_truncated = len(raw_stdout) > 8000
+            stderr_truncated = len(raw_stderr) > 2000
+            # If stderr was truncated, prefer the TAIL (where the actual
+            # traceback / fail reason lives) over the HEAD. A truncated
+            # head loses the error that caused the failure — the exact
+            # thing the agent needs to see to fix the snippet.
+            stderr_out = raw_stderr[-2000:] if stderr_truncated else raw_stderr
             return {
                 "ok": bool(getattr(result, "success", False)),
-                "stdout": (getattr(result, "stdout", "") or "")[:8000],
-                "stderr": (getattr(result, "stderr", "") or "")[:2000],
+                "stdout": raw_stdout[:8000],
+                "stderr": stderr_out,
+                "stdout_truncated": stdout_truncated,
+                "stderr_truncated": stderr_truncated,
+                "stdout_total_chars": len(raw_stdout),
+                "stderr_total_chars": len(raw_stderr),
                 "exit_code": getattr(result, "exit_code", None),
                 "files_captured": captured,
             }, 0.0

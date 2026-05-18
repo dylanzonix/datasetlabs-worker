@@ -41,6 +41,93 @@ def _generic_schema() -> Dict[str, Any]:
     }
 
 
+# Canonical column types. Shared across column-passing tools so the
+# model sees one closed set everywhere it picks columns.
+COLUMN_TYPES = ["text", "number", "url", "email", "date", "enum"]
+
+# Canonical column display formats. Surfaced via tool schema so the agent
+# treats it as part of the contract, not a prompt afterthought. Limited
+# to formats the FE actually renders — extending here without wiring the
+# FE side just produces silent no-ops.
+COLUMN_FORMATS = ["percent", "currency", "currency_compact"]
+
+
+def _column_item_schema(*, include_source_field: bool) -> Dict[str, Any]:
+    """Shape of one column entry, shared by table_create / column_map_set /
+    enrichment_set. The `format` enum is the one that matters here — without
+    surfacing it via schema the agent treats it as optional prompt prose and
+    skips it; with it visible, the model picks it up much more reliably.
+    """
+    props: Dict[str, Any] = {
+        "name": {"type": "string", "description": "Display name shown in the column header. Title Case preferred."},
+        "type": {"type": "string", "enum": COLUMN_TYPES},
+        "format": {
+            "type": "string",
+            "enum": COLUMN_FORMATS,
+            "description": (
+                "Optional display format for numbers. Set when raw values would read "
+                "as noise: `percent` for decimal ratios (-0.02, 0.67); `currency` for "
+                "everyday dollar amounts ($1,234.56); `currency_compact` for "
+                "USD revenue/funding/valuation ($1.2M). Leave unset for years, IDs, "
+                "counts, scores, etc."
+            ),
+        },
+    }
+    required = ["name"]
+    if include_source_field:
+        props["source_field"] = {
+            "type": "string",
+            "description": (
+                "Path into the raw source row. Plain key (`name`), dotted (`employment.current.title`), "
+                "or array fan-out (`founders[].email`)."
+            ),
+        }
+        required.append("source_field")
+    return {
+        "type": "object",
+        "properties": props,
+        "required": required,
+        "additionalProperties": True,
+    }
+
+
+def _table_create_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "source": {"type": "string", "description": "Adapter name (apollo_companies, fullenrich_people, google_maps, apify_actor:<id>, web_harvest, browser_use, file)."},
+            "query_params": {"type": "object", "description": "Source-specific query. See system prompt source cards for shapes."},
+            "name": {"type": "string", "description": "Short Title Case table name (2-5 words)."},
+            "intent": {"type": "string", "description": "Optional one-liner on what the user wants from this table."},
+            "columns": {
+                "type": "array",
+                "description": "Optional. If omitted, server raw-passthroughs every top-level key as a text column.",
+                "items": _column_item_schema(include_source_field=True),
+            },
+            "n": {"type": "integer", "description": "Row count target. Defaults to 100."},
+        },
+        "required": ["source", "query_params"],
+        "additionalProperties": True,
+    }
+
+
+def _column_map_set_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "table_id": {"type": "string"},
+            "columns": {
+                "type": "array",
+                "description": "Replacement column set. Every row gets re-derived from raw_row through the new mapping.",
+                "items": _column_item_schema(include_source_field=True),
+            },
+            "dedup_key_column": {"type": "string", "description": "Optional. Column to use as the dedup key for table_extend overlap."},
+        },
+        "required": ["table_id", "columns"],
+        "additionalProperties": True,
+    }
+
+
 def _enrichment_set_schema() -> Dict[str, Any]:
     """Tighter schema for enrichment_set so the agent learns the action shape.
 
@@ -55,16 +142,8 @@ def _enrichment_set_schema() -> Dict[str, Any]:
             "name": {"type": "string", "description": "Short name shown in column header."},
             "columns": {
                 "type": "array",
-                "description": "One or more columns to add and fill. [{name, type}].",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "type": {"type": "string", "enum": ["text", "number", "url", "email", "date", "enum"]},
-                    },
-                    "required": ["name"],
-                    "additionalProperties": True,
-                },
+                "description": "One or more columns to add and fill. [{name, type, format?}].",
+                "items": _column_item_schema(include_source_field=False),
             },
             "action": {
                 "type": "object",
@@ -208,6 +287,8 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
         "comment_on_column": "Append a short agent note to a column's description thread. Args: table_id, column (name on the table), body.",
     }
     schema_for = {
+        "table_create": _table_create_schema(),
+        "column_map_set": _column_map_set_schema(),
         "enrichment_set": _enrichment_set_schema(),
         "filter_set": _filter_set_schema(),
     }
