@@ -109,7 +109,11 @@ def build_project_state(db: Session, project_id: str, max_tables: int = 10) -> s
                 pretty = ", ".join(f"{v} ({n})" for v, n in breakdown.items())
                 parts.append(f"      Class breakdown — {col['name']}: {pretty}")
 
-        # Filters
+        # Filters. Display the canonical op form even if the row was
+        # written with a legacy symbol (`>=` → `gte`, etc.) so the agent's
+        # own state log uses one vocabulary — matches the schema enum it
+        # sees on filter_set and prevents the agent from learning multiple
+        # forms of the same op from its own state.
         filters = db.execute(
             sa_text(
                 "SELECT column_name, op, value FROM table_filters WHERE table_id = :tid"
@@ -118,7 +122,8 @@ def build_project_state(db: Session, project_id: str, max_tables: int = 10) -> s
         ).fetchall()
         if filters:
             for col, op, val in filters:
-                parts.append(f"      Filter: {col} {op} {json.dumps(val)}")
+                canonical_op = _canonical_op_for_display(op)
+                parts.append(f"      Filter: {col} {canonical_op} {json.dumps(val)}")
 
         # Active sort — surfaces so the agent knows "more rows" or
         # "first N" requests will land in the sorted order, and so
@@ -216,6 +221,23 @@ def _human_ago(seconds: float) -> str:
     if seconds < 86400:
         return f"{int(seconds // 3600)} hr ago"
     return f"{int(seconds // 86400)} days ago"
+
+
+_OP_DISPLAY_ALIASES = {
+    ">": "gte", ">=": "gte", "gt": "gte",
+    "<": "lte", "<=": "lte", "lt": "lte",
+    "in": "is_any_of", "any_of": "is_any_of",
+    "text_include_exclude": "text_inc_exc",
+    "isnull": "is_null", "is_empty": "is_null",
+    "is_not_empty": "is_not_null", "exists": "is_not_null",
+}
+
+
+def _canonical_op_for_display(op: str) -> str:
+    """Map any stored filter op to the canonical 7-op form for the project
+    state banner. Display-only; the SQL serving path still tolerates both.
+    """
+    return _OP_DISPLAY_ALIASES.get((op or "").strip().lower(), op or "")
 
 
 def _column_value_breakdown(db: Session, table_id: str, column_name: str, limit: int = 10) -> Dict[str, int]:

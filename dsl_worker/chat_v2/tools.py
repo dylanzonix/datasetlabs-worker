@@ -906,32 +906,84 @@ async def table_delete(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
 # ---------------------------------------------------------------------------
 
 
-_FILTER_OP_ALIASES = {
-    # Symbolic → canonical
-    "=": "equals", "==": "equals", "eq": "equals",
-    "!=": "not_equals", "<>": "not_equals", "neq": "not_equals",
-    ">": "gt", ">=": "gte",
-    "<": "lt", "<=": "lte",
-    "does_not_contain": "not_contains",
-    "startswith": "starts_with",
-    "endswith": "ends_with",
-    "is_any_of": "in", "any_of": "in",
-    "is_none_of": "not_in",
-    "text_include_exclude": "text_inc_exc",
-}
-
-# Canonical set of ops we accept (after alias-normalization). Source of
-# truth lives in chat_v2/__init__.py:FILTER_OPS; this mirror is kept
-# here to avoid an import cycle (__init__ imports tools.HANDLERS).
+# Canonical filter ops — must match chat_v2/__init__.py:FILTER_OPS.
+# Mirrored here to avoid an import cycle.
 _CANONICAL_FILTER_OPS = {
-    "contains", "not_contains", "starts_with", "ends_with",
-    "equals", "not_equals",
-    "contains_any", "contains_all", "not_contains_any", "not_contains_all",
-    "text_inc_exc",
-    "in", "not_in",
-    "gt", "gte", "lt", "lte", "between",
+    "text_inc_exc", "is_any_of", "between", "gte", "lte",
     "is_null", "is_not_null",
 }
+
+
+def _normalize_filter(op_raw: Any, value: Any) -> Optional[Tuple[str, Any]]:
+    """Map any op + value the agent (or legacy FE) emits into the canonical
+    (op, value) pair. Returns None if the op has no clean mapping — caller
+    should surface an error with the canonical set.
+
+    The 7 canonical ops are intentionally small (FE filter UI has 1:1
+    coverage). Older / wider ops collapse:
+      - `contains` / `starts_with` / `ends_with` / `equals` (text)
+            → text_inc_exc {include: [value], exclude: []}
+      - `not_contains`     → text_inc_exc {include: [], exclude: [value]}
+      - `contains_any`     → text_inc_exc {include: list,  exclude: []}
+      - `not_contains_any` → text_inc_exc {include: [],    exclude: list}
+      - `in` / `is_any_of` → is_any_of   list
+      - `equals` (number)  → between [v, v]
+      - `>=` / `gte` / `>` → gte   (note: strict `>` rounds to inclusive)
+      - `<=` / `lte` / `<` → lte
+    No-clean-mapping (returns None): `not_equals`, `contains_all`,
+    `not_contains_all`, `not_in`, `is_none_of` — these can't be expressed in
+    the FE filter UI, so we reject rather than silently doing the wrong
+    thing.
+    """
+    if op_raw is None:
+        return None
+    op = str(op_raw).strip().lower()
+
+    # Already canonical — passthrough.
+    if op in _CANONICAL_FILTER_OPS:
+        return op, value
+
+    # Numeric / date ranges.
+    if op in (">", ">=", "gt", "gte"):
+        return "gte", value
+    if op in ("<", "<=", "lt", "lte"):
+        return "lte", value
+
+    # Multi-value membership.
+    if op in ("in", "any_of"):
+        items = value if isinstance(value, list) else [value]
+        return "is_any_of", items
+
+    # Equality. Without column type info, default to is_any_of which works
+    # for both text and number columns; agent can override by writing
+    # `between [v, v]` for numeric exact-match if needed.
+    if op in ("=", "==", "eq", "equals"):
+        items = value if isinstance(value, list) else [value]
+        return "is_any_of", items
+
+    # Substring family — collapse to text_inc_exc include side.
+    if op in ("contains", "starts_with", "ends_with", "startswith", "endswith", "icontains"):
+        return "text_inc_exc", {"include": [str(value)] if value is not None else [], "exclude": []}
+    if op in ("not_contains", "does_not_contain"):
+        return "text_inc_exc", {"include": [], "exclude": [str(value)] if value is not None else []}
+    if op == "contains_any":
+        items = value if isinstance(value, list) else [value]
+        return "text_inc_exc", {"include": [str(v) for v in items if v is not None], "exclude": []}
+    if op == "not_contains_any":
+        items = value if isinstance(value, list) else [value]
+        return "text_inc_exc", {"include": [], "exclude": [str(v) for v in items if v is not None]}
+    if op == "text_include_exclude":
+        return "text_inc_exc", value
+
+    # Null checks — accept several shapes.
+    if op in ("is_null", "isnull", "is_empty"):
+        return "is_null", None
+    if op in ("is_not_null", "is_not_empty", "exists"):
+        return "is_not_null", None
+
+    # Ops that can't be expressed in the FE filter UI — refuse.
+    # (not_equals, contains_all, not_contains_all, not_in, is_none_of)
+    return None
 
 
 async def filter_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
@@ -957,20 +1009,29 @@ async def filter_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, 
                      "Example: {table_id, column: 'industry', op: 'contains', value: 'SaaS'}",
             "got_keys": list(args.keys()),
         }, 0.0
-    # Normalize op + reject unknown ones so the agent gets corrective
-    # feedback instead of silently no-op'ing (which is what was
-    # happening before — unknown ops fell through _filters_to_where_sql,
-    # the table looked unchanged, and the agent re-tried different
-    # guesses without ever knowing why).
+    # Normalize op + value into the canonical 7-op set. Legacy ops
+    # (`contains`, `>=`, `in`, etc.) collapse into canonical ops with
+    # adjusted values. Ops with no FE-renderable equivalent (`not_equals`,
+    # `contains_all`, etc.) return an error — picking one of those silently
+    # would store a filter the user can't see/edit in the filter panel.
     op_raw = str(op).lower().strip()
-    op = _FILTER_OP_ALIASES.get(op_raw, op_raw)
-    if op not in _CANONICAL_FILTER_OPS:
+    normalized = _normalize_filter(op_raw, value)
+    if normalized is None:
         return {
-            "error": f"filter_set: unsupported op {op_raw!r}. ",
+            "error": (
+                f"filter_set: op {op_raw!r} has no equivalent in the filter UI. "
+                "Pick one of the 7 canonical ops below — they map 1:1 to filter "
+                "controls the user can see and edit."
+            ),
             "supported_ops": sorted(_CANONICAL_FILTER_OPS),
-            "hint": "For text use contains/equals/text_inc_exc; for numbers use gt/gte/lt/lte/between/equals; "
-                    "use is_null/is_not_null for any column.",
+            "hint": (
+                "text/url/email → text_inc_exc {include, exclude}. "
+                "enum → is_any_of [strings]. "
+                "number/date → between [min,max] | gte n | lte n. "
+                "any column → is_null | is_not_null."
+            ),
         }, 0.0
+    op, value = normalized
     # Upsert
     ctx.db.execute(
         sa_text(
@@ -1363,27 +1424,26 @@ def _apply_filter_count_sample(
 
 
 def _match(cell: Any, op: str, value: Any) -> bool:
+    """Python-side predicate matching the SQL semantics in
+    routes.py:_filters_to_where_sql. Canonical ops are the 7-op set; legacy
+    ops (`contains`, `>=`, `in`, etc.) are also recognized here so old DB
+    rows from before the vocabulary shrink keep filtering correctly.
+    """
+    # Null checks — any column.
+    if op in ("is_null", "isnull"):
+        return cell is None or cell == ""
+    if op in ("is_not_null", "is_not_empty", "exists"):
+        return cell is not None and cell != ""
+
+    # Membership / equality.
+    if op in ("is_any_of", "in", "any_of"):
+        return cell in (value or [])
     if op == "equals":
         return cell == value
     if op == "not_equals":
         return cell != value
-    if op == "contains":
-        return value and isinstance(cell, str) and value in cell
-    if op == "not_contains":
-        return not (value and isinstance(cell, str) and value in cell)
-    if op == "starts_with":
-        return isinstance(cell, str) and cell.startswith(value)
-    if op == "ends_with":
-        return isinstance(cell, str) and cell.endswith(value)
-    if op == "is_null":
-        return cell is None or cell == ""
-    if op == "is_not_null":
-        return cell is not None and cell != ""
-    # Numeric comparisons. Accept BOTH the canonical word form (gt/gte/lt/lte
-    # — what filter_set's alias-normalization stores) and the symbolic form
-    # (>/>=/</<= — kept for any legacy filter rows). Previously this handler
-    # only knew the symbolic form, so every `gte`/`lt`/etc. filter silently
-    # matched 0 rows.
+
+    # Numeric / date ranges. Word + symbol forms both recognized.
     if op in (">", "gt"):
         try:
             return float(cell) > float(value)
@@ -1412,10 +1472,32 @@ def _match(cell: Any, op: str, value: Any) -> bool:
             return float(value[0]) <= f <= float(value[1])
         except (TypeError, ValueError):
             return False
-    if op == "in":
-        return cell in (value or [])
-    if op == "not_in":
-        return cell not in (value or [])
+
+    # Text — canonical text_inc_exc plus legacy single-term ops.
+    if op in ("text_inc_exc", "text_include_exclude"):
+        if not isinstance(value, dict):
+            return False
+        include = value.get("include") or []
+        exclude = value.get("exclude") or []
+        if isinstance(include, str): include = [include]
+        if isinstance(exclude, str): exclude = [exclude]
+        cell_str = "" if cell is None else str(cell).lower()
+        if include:
+            if not any(str(t).lower() in cell_str for t in include if t):
+                return False
+        if exclude:
+            if any(str(t).lower() in cell_str for t in exclude if t):
+                return False
+        return True
+    if op in ("contains", "icontains"):
+        return bool(value) and isinstance(cell, str) and str(value).lower() in cell.lower()
+    if op in ("not_contains", "does_not_contain"):
+        return not (bool(value) and isinstance(cell, str) and str(value).lower() in cell.lower())
+    if op in ("starts_with", "startswith"):
+        return isinstance(cell, str) and cell.lower().startswith(str(value).lower())
+    if op in ("ends_with", "endswith"):
+        return isinstance(cell, str) and cell.lower().endswith(str(value).lower())
+
     return False
 
 

@@ -173,23 +173,19 @@ def _enrichment_set_schema() -> Dict[str, Any]:
     }
 
 
-# Canonical list of valid filter ops. Used in both the tool schema
-# (so the model sees a closed set) and the handler validator (so
-# unknown ops error out instead of silently no-op-ing).
+# Canonical filter ops — exactly the ops the FE filter panel can render
+# and edit. Shrunk from 19 → 7 to enforce a 1:1 contract: every filter
+# the AI sets must be expressible in the FE's filter UI, and vice versa.
+# Handler normalizes legacy ops (`contains`, `>=`, `in`, etc.) into one
+# of these on write so old DB rows + agent slips still work.
 FILTER_OPS = [
-    # Text-ish
-    "contains", "not_contains", "starts_with", "ends_with",
-    "equals", "not_equals",
-    "contains_any", "contains_all", "not_contains_any", "not_contains_all",
-    "text_inc_exc",
-    "in", "not_in",
-    # Numeric / date
-    "gt", "gte", "lt", "lte", "between",
-    # Symbolic aliases — the handler accepts both; enum here lists the
-    # word forms only so the agent has one canonical way.
-    # (=, !=, >, >=, <, <= still work server-side as aliases.)
-    # Null checks
-    "is_null", "is_not_null",
+    "text_inc_exc",   # text / url / email — value: {include: [strings], exclude: [strings]}
+    "is_any_of",      # enum (or any column) — value: [strings]
+    "between",        # number / date — value: [min, max]
+    "gte",            # number / date — value: number-or-iso-date
+    "lte",            # number / date — value: number-or-iso-date
+    "is_null",        # any column — value: null
+    "is_not_null",    # any column — value: null
 ]
 
 
@@ -202,12 +198,15 @@ def _filter_set_schema() -> Dict[str, Any]:
             "op": {
                 "type": "string",
                 "enum": FILTER_OPS,
-                "description": "Filter operator. Pick from this enum — anything else is rejected.",
+                "description": "Filter operator. See tool description for the value shape per op.",
             },
             "value": {
                 "description": (
-                    "Shape depends on op: scalar for most; list for contains_any/all + in/not_in; "
-                    "[min,max] for between; {include:[],exclude:[]} for text_inc_exc; "
+                    "Shape depends on op: "
+                    "[min,max] for between; "
+                    "number/iso-date for gte/lte; "
+                    "[strings] for is_any_of; "
+                    "{include:[],exclude:[]} for text_inc_exc; "
                     "null for is_null / is_not_null."
                 ),
             },
@@ -221,7 +220,7 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
     """OpenAI function tool definitions for the orchestrator surface."""
     tool_descriptions = {
         # Tables
-        "table_create": "Create a table from a source. Atomic: fetches rows, system internally picks human-readable columns from the actual row shape + table intent, commits. If the fetch fails or returns 0 rows, nothing is written — try a different actor/query. Args: source, query_params, name (2-5 words, Title Case), intent (optional one-liner describing what the user wants — helps the column picker).",
+        "table_create": "Create a table from a source. Fetches rows and commits them with raw passthrough columns (every top-level source key becomes a snake_case text column). If the fetch fails or returns 0 rows, nothing is written — try a different actor/query. Always follow with column_map_set to clean up names, types, and formats unless the raw columns are already what the user wants. Args: source, query_params, name (2-5 words, Title Case).",
         "table_extend": "Pull MORE rows into an EXISTING table with a non-overlapping next slice. Args: table_id, query_params (the new slice — e.g. next batch / page / date window). Reuses the table's existing column map automatically.",
         "table_delete": "Delete a table and all its rows + enrichments. Approval-gated.",
         # Apify discovery
@@ -233,40 +232,31 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
         "enrichment_run": "Run an enrichment over a scope of rows. Approval-gated — user sees an estimated-cost card before it executes.",
         # Filters
         "filter_set": (
-            "Apply a non-destructive filter to a column. Returns matched count + sample.\n\n"
-            "Args: {table_id, column, op, value}. `op` must be one of the documented "
-            "ops below — anything else is rejected with an error so you can retry "
-            "with a valid op. `value` shape depends on op (scalar / list / "
-            "{include,exclude} / [min,max]).\n\n"
-            "Allowed ops (match to column type — picking the wrong op for the type "
-            "will be rejected):\n"
-            "  Text / URL / email / enum:\n"
-            "    contains            value=string   (case-insensitive substring)\n"
-            "    not_contains        value=string\n"
-            "    starts_with         value=string\n"
-            "    ends_with           value=string\n"
-            "    equals              value=string\n"
-            "    not_equals          value=string\n"
-            "    contains_any        value=[strings]  (OR across terms)\n"
-            "    contains_all        value=[strings]  (AND across terms)\n"
-            "    not_contains_any    value=[strings]\n"
-            "    not_contains_all    value=[strings]\n"
-            "    text_inc_exc        value={include:[strings], exclude:[strings]}  (Apollo-style)\n"
-            "    in                  value=[strings]  (exact match against a set)\n"
-            "    not_in              value=[strings]\n"
-            "  Number / date:\n"
-            "    >, gt               value=number\n"
-            "    >=, gte             value=number\n"
-            "    <, lt               value=number\n"
-            "    <=, lte             value=number\n"
-            "    between             value=[min, max]  (length-2 list)\n"
-            "    equals              value=number\n"
-            "    not_equals          value=number\n"
-            "  Any column:\n"
-            "    is_null             value=null\n"
-            "    is_not_null         value=null\n\n"
-            "Do NOT pass {type, min, max} or other unsupported shapes — use op + "
-            "value as documented."
+            "Apply a non-destructive filter to a column. Returns matched count + "
+            "sample_kept + sample_excluded for sanity-check.\n\n"
+            "Args: {table_id, column, op, value}. `op` must be one of the 7 ops "
+            "below. The set is intentionally small: every op here maps 1:1 to a "
+            "filter UI the user can see and edit in the FE filter panel.\n\n"
+            "Pick by column type:\n"
+            "  text / url / email column:\n"
+            "    text_inc_exc   value={include:[strings], exclude:[strings]}\n"
+            "                   include terms OR'd together (case-insensitive substring).\n"
+            "                   exclude terms also OR'd. include AND exclude AND'd.\n"
+            "                   Use single-element lists for one term. Same op covers\n"
+            "                   'contains', 'starts_with', 'ends_with', 'not_contains'.\n"
+            "  enum column (or any column when filtering to a specific set of values):\n"
+            "    is_any_of      value=[strings]   (matches any of the listed values exactly)\n"
+            "  number / date column:\n"
+            "    between        value=[min, max]  (inclusive on both ends)\n"
+            "    gte            value=number_or_iso_date  (one-sided range, inclusive)\n"
+            "    lte            value=number_or_iso_date  (one-sided range, inclusive)\n"
+            "  any column (empty-cell check):\n"
+            "    is_null        value=null   (cell is empty)\n"
+            "    is_not_null    value=null   (cell has a value)\n\n"
+            "Use `gte`/`lte` (no strict `gt`/`lt` — round the boundary if needed). "
+            "For 'value contains X', use `text_inc_exc {include:[\"X\"]}` not a "
+            "contains/starts_with shape. The handler will rewrite legacy shapes to "
+            "canonical but emit the canonical form to avoid lossy conversions."
         ),
         "filter_clear": "Remove a filter from a column. Args: {table_id, column}.",
         "sort_set": "Set the active sort on a table. Args: table_id, column, direction (asc|desc, default desc). Single sort per table.",
