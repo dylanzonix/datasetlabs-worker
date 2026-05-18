@@ -94,6 +94,50 @@ def _enrichment_set_schema() -> Dict[str, Any]:
     }
 
 
+# Canonical list of valid filter ops. Used in both the tool schema
+# (so the model sees a closed set) and the handler validator (so
+# unknown ops error out instead of silently no-op-ing).
+FILTER_OPS = [
+    # Text-ish
+    "contains", "not_contains", "starts_with", "ends_with",
+    "equals", "not_equals",
+    "contains_any", "contains_all", "not_contains_any", "not_contains_all",
+    "text_inc_exc",
+    "in", "not_in",
+    # Numeric / date
+    "gt", "gte", "lt", "lte", "between",
+    # Symbolic aliases — the handler accepts both; enum here lists the
+    # word forms only so the agent has one canonical way.
+    # (=, !=, >, >=, <, <= still work server-side as aliases.)
+    # Null checks
+    "is_null", "is_not_null",
+]
+
+
+def _filter_set_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "table_id": {"type": "string"},
+            "column": {"type": "string", "description": "Column name to filter on."},
+            "op": {
+                "type": "string",
+                "enum": FILTER_OPS,
+                "description": "Filter operator. Pick from this enum — anything else is rejected.",
+            },
+            "value": {
+                "description": (
+                    "Shape depends on op: scalar for most; list for contains_any/all + in/not_in; "
+                    "[min,max] for between; {include:[],exclude:[]} for text_inc_exc; "
+                    "null for is_null / is_not_null."
+                ),
+            },
+        },
+        "required": ["table_id", "column", "op"],
+        "additionalProperties": True,
+    }
+
+
 def _build_tool_defs() -> List[Dict[str, Any]]:
     """OpenAI function tool definitions for the orchestrator surface."""
     tool_descriptions = {
@@ -109,8 +153,43 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
         "enrichment_set": "Define or refine an enrichment. Does NOT auto-run — call enrichment_run after to fill cells. Args: table_id, columns, action: {research, prompt, per_row_credit_cap?}.",
         "enrichment_run": "Run an enrichment over a scope of rows. Approval-gated — user sees an estimated-cost card before it executes.",
         # Filters
-        "filter_set": "Apply a non-destructive filter to a column. Returns matched count + sample.",
-        "filter_clear": "Remove a filter from a column.",
+        "filter_set": (
+            "Apply a non-destructive filter to a column. Returns matched count + sample.\n\n"
+            "Args: {table_id, column, op, value}. `op` must be one of the documented "
+            "ops below — anything else is rejected with an error so you can retry "
+            "with a valid op. `value` shape depends on op (scalar / list / "
+            "{include,exclude} / [min,max]).\n\n"
+            "Allowed ops (match to column type — picking the wrong op for the type "
+            "will be rejected):\n"
+            "  Text / URL / email / enum:\n"
+            "    contains            value=string   (case-insensitive substring)\n"
+            "    not_contains        value=string\n"
+            "    starts_with         value=string\n"
+            "    ends_with           value=string\n"
+            "    equals              value=string\n"
+            "    not_equals          value=string\n"
+            "    contains_any        value=[strings]  (OR across terms)\n"
+            "    contains_all        value=[strings]  (AND across terms)\n"
+            "    not_contains_any    value=[strings]\n"
+            "    not_contains_all    value=[strings]\n"
+            "    text_inc_exc        value={include:[strings], exclude:[strings]}  (Apollo-style)\n"
+            "    in                  value=[strings]  (exact match against a set)\n"
+            "    not_in              value=[strings]\n"
+            "  Number / date:\n"
+            "    >, gt               value=number\n"
+            "    >=, gte             value=number\n"
+            "    <, lt               value=number\n"
+            "    <=, lte             value=number\n"
+            "    between             value=[min, max]  (length-2 list)\n"
+            "    equals              value=number\n"
+            "    not_equals          value=number\n"
+            "  Any column:\n"
+            "    is_null             value=null\n"
+            "    is_not_null         value=null\n\n"
+            "Do NOT pass {type, min, max} or other unsupported shapes — use op + "
+            "value as documented."
+        ),
+        "filter_clear": "Remove a filter from a column. Args: {table_id, column}.",
         "sort_set": "Set the active sort on a table. Args: table_id, column, direction (asc|desc, default desc). Single sort per table.",
         "sort_clear": "Remove the active sort on a table.",
         # Rows
@@ -130,6 +209,7 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
     }
     schema_for = {
         "enrichment_set": _enrichment_set_schema(),
+        "filter_set": _filter_set_schema(),
     }
     return [
         {

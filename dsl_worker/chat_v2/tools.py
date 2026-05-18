@@ -858,6 +858,34 @@ async def table_delete(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
 # ---------------------------------------------------------------------------
 
 
+_FILTER_OP_ALIASES = {
+    # Symbolic → canonical
+    "=": "equals", "==": "equals", "eq": "equals",
+    "!=": "not_equals", "<>": "not_equals", "neq": "not_equals",
+    ">": "gt", ">=": "gte",
+    "<": "lt", "<=": "lte",
+    "does_not_contain": "not_contains",
+    "startswith": "starts_with",
+    "endswith": "ends_with",
+    "is_any_of": "in", "any_of": "in",
+    "is_none_of": "not_in",
+    "text_include_exclude": "text_inc_exc",
+}
+
+# Canonical set of ops we accept (after alias-normalization). Source of
+# truth lives in chat_v2/__init__.py:FILTER_OPS; this mirror is kept
+# here to avoid an import cycle (__init__ imports tools.HANDLERS).
+_CANONICAL_FILTER_OPS = {
+    "contains", "not_contains", "starts_with", "ends_with",
+    "equals", "not_equals",
+    "contains_any", "contains_all", "not_contains_any", "not_contains_all",
+    "text_inc_exc",
+    "in", "not_in",
+    "gt", "gte", "lt", "lte", "between",
+    "is_null", "is_not_null",
+}
+
+
 async def filter_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
     # Accept friendly aliases the agent reaches for, plus the nested
     # {filter: {op, value}} shape it sometimes emits.
@@ -880,6 +908,20 @@ async def filter_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, 
             "error": "filter_set requires table_id, column, op. "
                      "Example: {table_id, column: 'industry', op: 'contains', value: 'SaaS'}",
             "got_keys": list(args.keys()),
+        }, 0.0
+    # Normalize op + reject unknown ones so the agent gets corrective
+    # feedback instead of silently no-op'ing (which is what was
+    # happening before — unknown ops fell through _filters_to_where_sql,
+    # the table looked unchanged, and the agent re-tried different
+    # guesses without ever knowing why).
+    op_raw = str(op).lower().strip()
+    op = _FILTER_OP_ALIASES.get(op_raw, op_raw)
+    if op not in _CANONICAL_FILTER_OPS:
+        return {
+            "error": f"filter_set: unsupported op {op_raw!r}. ",
+            "supported_ops": sorted(_CANONICAL_FILTER_OPS),
+            "hint": "For text use contains/equals/text_inc_exc; for numbers use gt/gte/lt/lte/between/equals; "
+                    "use is_null/is_not_null for any column.",
         }, 0.0
     # Upsert
     ctx.db.execute(
