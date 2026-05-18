@@ -803,24 +803,6 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
         rederived_rows.append((sid, mapped))
     ctx.db.commit()
 
-    # Fire-and-forget URL / email verifications for every re-derived
-    # row. verify_hook now uses value-based URL detection so it works
-    # even though columns_for_db doesn't carry per-column `type`
-    # markers from the mapping array.
-    if rederived_rows:
-        try:
-            from dsl_worker.chat_v2 import verify_hook
-            for sid, mapped in rederived_rows:
-                verify_hook.schedule_for_row(
-                    run_id=ctx.run_id,
-                    sample_id=sid,
-                    written_values=mapped,
-                    columns=columns_for_db,
-                    row_snapshot=mapped,
-                )
-        except Exception:
-            log.exception("column_map_set: verify_hook scheduling raised (suppressed)")
-
     return {
         "ok": True,
         "columns_committed": len(columns_for_db),
@@ -1184,26 +1166,7 @@ def _commit_rows(
     # BEFORE we schedule verification — the verify task opens its own
     # SessionLocal and won't see uncommitted rows.
     db.commit()
-
-    # Auto-verify any URL / email columns in the just-inserted rows.
-    # Cheap for status-only checks (free); LLM judge only fires for
-    # 2xx-but-suspicious URLs, gated by the per-domain cache.
-    verify_tasks: List[asyncio.Task] = []
-    try:
-        from dsl_worker.chat_v2 import verify_hook
-        for sample_id, mapped in pending_verify:
-            verify_tasks.extend(
-                verify_hook.schedule_for_row(
-                    run_id=run_id,
-                    sample_id=sample_id,
-                    written_values=mapped,
-                    columns=normalized_map,
-                    row_snapshot=mapped,
-                )
-            )
-    except Exception:
-        log.exception("_commit_rows: verify_hook scheduling raised (suppressed)")
-    return verify_tasks
+    return []
 
 
 def _extract_source_value(row: Dict[str, Any], path: str) -> Any:
