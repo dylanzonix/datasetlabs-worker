@@ -1379,22 +1379,27 @@ def _match(cell: Any, op: str, value: Any) -> bool:
         return cell is None or cell == ""
     if op == "is_not_null":
         return cell is not None and cell != ""
-    if op == ">":
+    # Numeric comparisons. Accept BOTH the canonical word form (gt/gte/lt/lte
+    # — what filter_set's alias-normalization stores) and the symbolic form
+    # (>/>=/</<= — kept for any legacy filter rows). Previously this handler
+    # only knew the symbolic form, so every `gte`/`lt`/etc. filter silently
+    # matched 0 rows.
+    if op in (">", "gt"):
         try:
             return float(cell) > float(value)
         except (TypeError, ValueError):
             return False
-    if op == "<":
+    if op in ("<", "lt"):
         try:
             return float(cell) < float(value)
         except (TypeError, ValueError):
             return False
-    if op == ">=":
+    if op in (">=", "gte"):
         try:
             return float(cell) >= float(value)
         except (TypeError, ValueError):
             return False
-    if op == "<=":
+    if op in ("<=", "lte"):
         try:
             return float(cell) <= float(value)
         except (TypeError, ValueError):
