@@ -537,6 +537,16 @@ async def _browser_use(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
             candidate_description=args.get("candidate_description", ""),
             max_cost_usd=max_cost_usd,
             on_partial_cost=_bill_partial,
+            # Per-cell budget is much tighter than the table-level
+            # extraction budget — we're answering one field for one
+            # row, not crawling a directory. 5 actions covers
+            # "open page → find the cell value → return".
+            action_budget=5,
+            # If the cell value is a URL, BU must have actually visited
+            # it (not just spotted it in a link list) before returning.
+            # Guards against the 404-y URLs the cell agent used to
+            # surface from search snippets.
+            include_url_check=True,
         )
     finally:
         heartbeat.cancel()

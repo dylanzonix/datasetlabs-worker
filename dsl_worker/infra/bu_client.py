@@ -37,25 +37,56 @@ logger = logging.getLogger(__name__)
 # self-check against them. Tune the numbers here (not at the caller),
 # because every caller — chat_v2 browser_use source, web_search_agent,
 # the bulk_browser path — benefits equally from a tighter floor.
-BU_EFFICIENCY_GUARD = (
-    "EFFICIENCY RULES (read first, follow strictly):\n"
-    "1. Hard budget: at most ~30 navigation actions and ~3 minutes per session. "
-    "If the answer isn't in reach within that, STOP and return what you have.\n"
-    "2. No looping. If the same action (scroll, click, search) didn't change the "
-    "page in any useful way once, do NOT repeat it — try a different approach or stop.\n"
-    "3. No exhaustive reading. Extract only the fields the task asks for. Don't "
-    "open detail pages, don't read sidebars, don't summarize the page, don't "
-    "narrate what you see. Skip cookie banners and chat widgets.\n"
-    "4. Output is rows, not prose. Return ONLY the structured output. No analysis, "
-    "no recap, no 'here is what I found'. Empty list is a valid answer.\n"
-    "5. If the page blocks you (login wall, CAPTCHA you can't solve, hard 404, "
-    "JS that won't render), stop immediately and return [] — do NOT try alternate "
-    "URLs, do NOT search the web, do NOT improvise.\n"
-    "6. One scope per session. The task below targets one page or one search. "
-    "Don't expand scope, don't open external links, don't 'also check' anywhere "
-    "else even if it seems related.\n\n"
-    "--- TASK ---\n"
-)
+def _build_efficiency_guard(
+    *,
+    action_budget: int = 30,
+    include_url_check: bool = False,
+) -> str:
+    """Build the EFFICIENCY RULES preamble prepended to a BU task.
+
+    `action_budget` tunes rule #1's navigation ceiling — table-level
+    extractions get ~30 actions, per-cell enrichment runs get ~5 since
+    they target one fact per row.
+    `include_url_check` adds a rule for tasks that return URLs:
+    require the agent to actually visit the URL it returns (not just
+    grab it from a link list) so we don't ship 404s downstream.
+    """
+    rules = [
+        f"1. Hard budget: at most ~{action_budget} navigation actions and ~{3 if action_budget >= 15 else 1} minute(s) per session. "
+        "If the answer isn't in reach within that, STOP and return what you have.",
+        "2. No looping. If the same action (scroll, click, search) didn't change the "
+        "page in any useful way once, do NOT repeat it — try a different approach or stop.",
+        "3. No exhaustive reading. Extract only the fields the task asks for. Don't "
+        "open detail pages, don't read sidebars, don't summarize the page, don't "
+        "narrate what you see. Skip cookie banners and chat widgets.",
+        "4. Output is rows, not prose. Return ONLY the structured output. No analysis, "
+        "no recap, no 'here is what I found'. Empty list is a valid answer.",
+        "5. If the page blocks you (login wall, CAPTCHA you can't solve, hard 404, "
+        "JS that won't render), stop immediately and return [] — do NOT try alternate "
+        "URLs, do NOT search the web, do NOT improvise.",
+        "6. One scope per session. The task below targets one page or one search. "
+        "Don't expand scope, don't open external links, don't 'also check' anywhere "
+        "else even if it seems related.",
+    ]
+    if include_url_check:
+        rules.append(
+            "7. URLs you return must be ones you ACTUALLY VISITED and saw render "
+            "correctly. Do NOT return a URL you only saw in a link list, search "
+            "snippet, or sidebar — visit it first, confirm it isn't 404 / "
+            "redirect-to-login / blank, then return it. If the URL fails, return "
+            "null for that field instead of guessing."
+        )
+    return (
+        "EFFICIENCY RULES (read first, follow strictly):\n"
+        + "\n".join(rules)
+        + "\n\n--- TASK ---\n"
+    )
+
+
+# Backwards-compatible alias — the table-level default. Callers wanting
+# a tighter per-cell budget pass action_budget directly through extract()
+# or bu_extract_rows().
+BU_EFFICIENCY_GUARD = _build_efficiency_guard()
 
 
 class ExtractedItem(BaseModel):
@@ -208,6 +239,8 @@ class BUClient:
         timeout: float = 900,
         max_cost_usd: Optional[float] = None,
         on_partial_cost: Optional[Callable[[float], None]] = None,
+        action_budget: int = 30,
+        include_url_check: bool = False,
     ) -> Tuple[List[Dict[str, Any]], float, Optional[str], str]:
         """
         Extract structured items from a page. For harvesters.
@@ -230,8 +263,12 @@ class BUClient:
             )
             if max_cost_usd is not None and max_cost_usd > 0:
                 run_kwargs["max_cost_usd"] = max_cost_usd
+            guard = _build_efficiency_guard(
+                action_budget=action_budget,
+                include_url_check=include_url_check,
+            )
             session_run = self._client.run(
-                BU_EFFICIENCY_GUARD + task,
+                guard + task,
                 **run_kwargs,
             )
             # SDK defaults to 14400s (4h) — override with our safety-net
@@ -424,6 +461,8 @@ async def bu_extract_rows(
     *,
     max_cost_usd: Optional[float] = None,
     on_partial_cost: Optional[Callable[[float], None]] = None,
+    action_budget: int = 30,
+    include_url_check: bool = False,
 ) -> Tuple[List[Dict[str, Any]], float]:
     """Convenience wrapper used by `sources_v2/browser_use.py`.
 
@@ -454,6 +493,8 @@ async def bu_extract_rows(
             composed_task,
             max_cost_usd=max_cost_usd,
             on_partial_cost=on_partial_cost,
+            action_budget=action_budget,
+            include_url_check=include_url_check,
         )
         return list(items or []), float(cost or 0.0)
     finally:
