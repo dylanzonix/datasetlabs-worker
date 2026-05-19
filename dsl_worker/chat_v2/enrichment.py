@@ -566,7 +566,18 @@ async def _run_enrichment_on_rows(
             return sample_id, row_data, new_fields, new_sources, cost, status, idx
 
     phase_marker(ctx, "enrichment_run/tasks_spawning", n=len(ready_rows))
-    tasks = [asyncio.create_task(run_one(sid, rd, raw)) for sid, rd, raw in ready_rows]
+    # Track (sample_id, original_row) per task so the supervisor can
+    # write an error status to the correct row when a task raises.
+    # Until 2026-05-19 the supervisor just `log.warning`'d and dropped
+    # the failure on the floor — the cell stayed blank with no badge,
+    # no trace, no FE signal. User saw 1/10 cells silently missing
+    # after a bulk run.
+    task_meta: Dict[asyncio.Task, Tuple[str, Dict[str, Any]]] = {}
+    tasks: List[asyncio.Task] = []
+    for sid, rd, raw in ready_rows:
+        t = asyncio.create_task(run_one(sid, rd, raw))
+        task_meta[t] = (sid, rd if isinstance(rd, dict) else {})
+        tasks.append(t)
     phase_marker(ctx, "enrichment_run/tasks_spawned", n=len(tasks))
 
     try:
@@ -579,6 +590,67 @@ async def _run_enrichment_on_rows(
             log.warning("cell op raised: %s", e)
             errored_count += 1
             completed += 1
+            # Recover (sample_id, original_row) from the task so we can
+            # write an error sentinel onto the row + emit a cell_filled
+            # event with status='error'. The FE renders this as an
+            # "Error — retry" badge so the user knows the cell ran but
+            # failed, instead of staring at a perpetually-blank cell.
+            failed_sid: Optional[str] = None
+            failed_row: Dict[str, Any] = {}
+            for t, (msid, mrow) in task_meta.items():
+                if t is fut:
+                    failed_sid = msid
+                    failed_row = mrow
+                    break
+            if failed_sid:
+                err_status_delta = {cn: "error" for cn in target_cols}
+                try:
+                    ctx.db.execute(
+                        sa_text(
+                            "SELECT pg_advisory_xact_lock(hashtextextended(:sid, 0))"
+                        ),
+                        {"sid": str(failed_sid)},
+                    )
+                    ctx.db.execute(
+                        sa_text(
+                            "UPDATE samples "
+                            "SET row = jsonb_set("
+                            "  COALESCE(row, '{}'::jsonb), "
+                            "  '{__cell_status__}', "
+                            "  COALESCE(row->'__cell_status__', '{}'::jsonb) || CAST(:s AS jsonb)"
+                            ") "
+                            "WHERE id=:sid"
+                        ),
+                        {"s": json.dumps(err_status_delta), "sid": failed_sid},
+                    )
+                    ctx.db.commit()
+                except Exception:
+                    log.exception(
+                        "failed to write error status for sample %s; suppressing",
+                        failed_sid,
+                    )
+                    try:
+                        ctx.db.rollback()
+                    except Exception:
+                        pass
+                # Cell_filled event with the error status so the FE
+                # clears the spinner and shows the error badge live.
+                _emit(
+                    "cell_filled",
+                    {
+                        "tool_call_id": enrichment_id,
+                        "enrichment_id": enrichment_id,
+                        "sample_id": failed_sid,
+                        "row_id": failed_sid,
+                        "index": 0,
+                        "completed": completed,
+                        "total": ready_total,
+                        "new_fields": None,
+                        "status": "error",
+                        "cell_status": err_status_delta,
+                        "cost": 0,
+                    },
+                )
             continue
 
         total_cost += cost
