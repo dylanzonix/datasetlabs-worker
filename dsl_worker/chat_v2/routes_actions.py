@@ -14,8 +14,11 @@ directly on tables/enrichments.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Dict, List, Optional
 from uuid import UUID
+
+log = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -237,7 +240,36 @@ async def post_run_enrichment(
             except Exception:
                 pass
 
-    return {"result": result, "cost_usd": cost, "cancelled": cancelled}
+    # Patch-first response: fetch the affected rows fresh from samples
+    # and return them so the FE can applyCellEdits without bouncing the
+    # whole table. Chat-initiated runs emit cell_filled SSE events for
+    # this purpose; the REST path uses run_id=None and never streams,
+    # so without this the FE only saw the new value on the next
+    # refreshRows() call. The Tier-1 cleanup removed that refresh, so
+    # values now flow through this payload instead.
+    updated_rows: List[Dict[str, Any]] = []
+    if not cancelled and body.row_ids:
+        try:
+            from sqlalchemy import bindparam
+            # Resolve the canonical sample IDs we just ran against.
+            stmt = (
+                sa_text(
+                    "SELECT id::text, row, tags "
+                    "FROM samples WHERE id = ANY(:ids) AND deleted_at IS NULL"
+                ).bindparams(bindparam("ids", expanding=True))
+            )
+            rows = db.execute(stmt, {"ids": list(body.row_ids)}).fetchall()
+            for r in rows:
+                payload: Dict[str, Any] = {"id": r[0]}
+                row_data = r[1] if isinstance(r[1], dict) else (json.loads(r[1]) if r[1] else {})
+                payload.update(row_data)
+                if r[2]:
+                    payload["tags"] = r[2] if isinstance(r[2], dict) else json.loads(r[2])
+                updated_rows.append(payload)
+        except Exception:
+            log.exception("post_run_enrichment: failed to fetch updated rows for FE patch")
+
+    return {"result": result, "cost_usd": cost, "cancelled": cancelled, "updated_rows": updated_rows}
 
 
 class FilterBody(BaseModel):
