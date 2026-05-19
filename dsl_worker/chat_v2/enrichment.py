@@ -323,6 +323,39 @@ async def _run_enrichment_on_rows(
     depends_on_raw = action.get("depends_on") or []
     depends_on = [c for c in depends_on_raw if isinstance(c, str) and c]
 
+    # Build a map: upstream column name → list of downstream target columns
+    # that should have their stale "missing_dependency" status cleared when
+    # this upstream column gets filled. Without this, a row that was once
+    # blocked on (e.g.) Founder Name keeps showing "Missing inputs" on the
+    # Founder Email cell forever, even after Founder Name fills, because
+    # the Email cell agent never re-runs on its own. With this, the moment
+    # Founder Name lands, the downstream missing_dependency badge clears —
+    # the cell goes back to "blank, never tried" and the user can choose
+    # to re-run the Email enrichment to actually fill it.
+    other_enrichments = ctx.db.execute(
+        sa_text(
+            "SELECT columns, action FROM enrichments "
+            "WHERE table_id=:tid AND id != :eid AND deleted_at IS NULL"
+        ),
+        {"tid": table_id, "eid": enrichment_id},
+    ).fetchall()
+    downstream_unblocks: Dict[str, List[str]] = {}
+    for other_cols_blob, other_action_blob in other_enrichments:
+        try:
+            other_cols = other_cols_blob if isinstance(other_cols_blob, list) else json.loads(other_cols_blob or "[]")
+            other_action = other_action_blob if isinstance(other_action_blob, dict) else json.loads(other_action_blob or "{}")
+        except Exception:
+            continue
+        other_deps = other_action.get("depends_on") or []
+        if not isinstance(other_deps, list):
+            continue
+        other_target_cols = [c.get("name") for c in other_cols if isinstance(c, dict) and c.get("name")]
+        for dep in other_deps:
+            if not isinstance(dep, str) or not dep:
+                continue
+            arr = downstream_unblocks.setdefault(dep, [])
+            arr.extend(other_target_cols)
+
     def _row_missing_deps(row_data: Dict[str, Any]) -> List[str]:
         if not depends_on:
             return []
@@ -523,6 +556,19 @@ async def _run_enrichment_on_rows(
                     existing_status.pop(cn, None)
                 else:
                     existing_status[cn] = "not_found"
+        # Auto-clear stale missing_dependency on DOWNSTREAM enrichments.
+        # When this run just filled an upstream column, any other
+        # enrichment in this table that depends_on it had a stale
+        # "missing_dependency" status sitting on its target cells.
+        # Clear those so the dependent cell goes back to "blank, retry-able"
+        # instead of showing "Missing inputs" indefinitely.
+        if isinstance(new_fields, dict) and new_fields and downstream_unblocks:
+            for cn, v in new_fields.items():
+                if v in (None, ""):
+                    continue
+                for downstream_cn in downstream_unblocks.get(cn, []):
+                    if existing_status.get(downstream_cn) == "missing_dependency":
+                        existing_status.pop(downstream_cn, None)
         if existing_status:
             merged["__cell_status__"] = existing_status
         elif "__cell_status__" in merged:
