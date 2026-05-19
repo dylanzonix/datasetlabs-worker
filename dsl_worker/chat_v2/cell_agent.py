@@ -216,11 +216,13 @@ async def _fullenrich_bulk_enrich(
 
     items = last_result.get("data") or []
     if not items:
-        return {"email": None, "phone": None}, 0.0
+        return {"contact_info": {}}, 0.0
     item = items[0]
-    contact_block = item.get("contact") or {}
+    # FE's response nests results under `contact_info`, not `contact`.
+    # Was reading the wrong key; every successful lookup looked empty.
+    contact_info = item.get("contact_info") or {}
     credits = float(((last_result.get("cost") or {}).get("credits") or 0))
-    return {"_raw": contact_block}, credits
+    return {"contact_info": contact_info}, credits
 
 
 async def _fullenrich_enrich_email(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
@@ -238,21 +240,21 @@ async def _fullenrich_enrich_email(args: Dict[str, Any], ctx: ToolContext) -> Tu
     )
     if "error" in result:
         return result, credits
-    raw = result.get("_raw") or {}
-    emails = raw.get("emails") or []
-    # FE returns a list of email objects, each with {email, qualification, ...}.
-    # Pick the highest-confidence one if any.
-    best = None
-    for e in emails:
-        if not isinstance(e, dict):
-            continue
-        v = e.get("email")
-        if v:
-            best = e
-            break
+    ci = result.get("contact_info") or {}
+    # Prefer the highest-confidence single answer FE picked, fall back
+    # to the first entry in work_emails[].
+    mp = ci.get("most_probable_work_email") or {}
+    email = mp.get("email")
+    status = mp.get("status")
+    if not email:
+        for e in (ci.get("work_emails") or []):
+            if isinstance(e, dict) and e.get("email"):
+                email = e.get("email")
+                status = e.get("status")
+                break
     return {
-        "email": (best or {}).get("email"),
-        "verification_status": (best or {}).get("qualification"),
+        "email": email,
+        "verification_status": status,
     }, credits
 
 
@@ -271,17 +273,15 @@ async def _fullenrich_enrich_phone(args: Dict[str, Any], ctx: ToolContext) -> Tu
     )
     if "error" in result:
         return result, credits
-    raw = result.get("_raw") or {}
-    phones = raw.get("phones") or []
-    best = None
-    for p in phones:
-        if not isinstance(p, dict):
-            continue
-        v = p.get("phone")
-        if v:
-            best = p
-            break
-    return {"phone": (best or {}).get("phone")}, credits
+    ci = result.get("contact_info") or {}
+    mp = ci.get("most_probable_work_phone") or {}
+    phone = mp.get("phone")
+    if not phone:
+        for p in (ci.get("work_phones") or []) + (ci.get("personal_phones") or []):
+            if isinstance(p, dict) and p.get("phone"):
+                phone = p.get("phone")
+                break
+    return {"phone": phone}, credits
 
 
 async def _fullenrich_enrich_company(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
