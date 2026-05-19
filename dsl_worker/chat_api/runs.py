@@ -30,7 +30,7 @@ import asyncio
 import logging
 import os
 from collections import defaultdict
-from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional, Tuple
 from uuid import UUID
 
 import httpx
@@ -208,6 +208,7 @@ def emit_event(
     forever.
     """
     from sqlalchemy.exc import IntegrityError
+    from time import perf_counter_ns
 
     payload = dict(payload or {})
     last_err: Optional[Exception] = None
@@ -219,6 +220,7 @@ def emit_event(
             seq=seq,
             type=event_type,
             payload=payload,
+            mono_ns=perf_counter_ns(),
         ))
         try:
             db.commit()
@@ -247,6 +249,63 @@ def emit_event(
     # Out of retries — propagate the last error.
     log.error("emit_event giving up after 5 seq-conflict retries for run %s", run.id)
     raise last_err if last_err else RuntimeError("emit_event failed")
+
+
+def emit_events_batch(
+    db: Session,
+    run: ChatRun,
+    events: List[Tuple[str, Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Persist many events in a single commit, then fan out to subscribers.
+
+    `events` is a list of `(event_type, payload)` tuples; they receive
+    contiguous seq values and land in one transaction. Use when a hot
+    loop would otherwise emit N events one at a time — each individual
+    emit_event commits, so N events = N round-trips. Batching cuts that
+    to one.
+
+    Falls back to per-event emit on seq conflict to keep the retry
+    behavior identical to emit_event.
+    """
+    from sqlalchemy.exc import IntegrityError
+    from time import perf_counter_ns
+
+    if not events:
+        return []
+
+    rows: List[ChatRunEvent] = []
+    out: List[Dict[str, Any]] = []
+    for event_type, raw_payload in events:
+        payload = dict(raw_payload or {})
+        seq = run.next_event_seq
+        run.next_event_seq = seq + 1
+        rows.append(ChatRunEvent(
+            run_id=run.id, seq=seq, type=event_type,
+            payload=payload, mono_ns=perf_counter_ns(),
+        ))
+        out.append({"type": event_type, "seq": seq, **payload})
+    db.add_all(rows)
+    try:
+        db.commit()
+    except IntegrityError:
+        # Another writer raced us on next_event_seq. Roll back, refresh,
+        # then fall back to per-event emit which already has its own
+        # retry loop. We lose the batching speedup on this call but the
+        # output stays correct.
+        log.warning("emit_events_batch seq conflict for run %s — falling back to per-event emit", run.id)
+        try:
+            db.rollback()
+        except Exception:
+            log.exception("rollback after seq conflict failed")
+        try:
+            db.refresh(run, attribute_names=["next_event_seq"])
+        except Exception:
+            log.exception("refresh after seq conflict failed")
+        return [emit_event(db, run, t, p) for t, p in events]
+
+    for full in out:
+        _BUS.publish(run.id, full)
+    return out
 
 
 def update_run_phase(db: Session, run: ChatRun, phase: Optional[str]) -> None:

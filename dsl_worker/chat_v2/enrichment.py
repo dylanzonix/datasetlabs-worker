@@ -41,6 +41,7 @@ from dsl_worker.chat_v2.tools import (
     _next_enrichment_short_id,
 )
 from dsl_worker.chat_v2 import email_verify_hook
+from dsl_worker.chat_v2.instrumentation import phase_marker, phase_span, time_commit
 
 
 log = logging.getLogger(__name__)
@@ -216,7 +217,9 @@ async def enrichment_run(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
         return {"error": f"enrichment {enrichment_id} not found"}, 0.0
     table_id = str(row[0])
 
+    phase_marker(ctx, "enrichment_run/start", enrichment_id=enrichment_id, scope_type=scope.get("type"))
     stats = await _run_enrichment_on_rows(ctx, table_id, enrichment_id, scope, overwrite)
+    phase_marker(ctx, "enrichment_run/done", rows_filled=stats.get("rows_filled"), rows_attempted=stats.get("rows_attempted"))
     cost = stats["total_cost_credits"]
 
     ctx.db.execute(
@@ -299,7 +302,9 @@ async def _run_enrichment_on_rows(
         action = json.loads(action)
 
     # Resolve scope
-    rows = _resolve_scope_rows(ctx.db, table_id, scope, columns, overwrite)
+    with phase_span(ctx, "enrichment_run/resolve_scope"):
+        rows = _resolve_scope_rows(ctx.db, table_id, scope, columns, overwrite)
+    phase_marker(ctx, "enrichment_run/scope_resolved", rows=len(rows))
 
     total_cost = 0.0
     filled_count = 0
@@ -379,17 +384,36 @@ async def _run_enrichment_on_rows(
         except Exception:
             log.debug("emit %s failed; continuing", event_type, exc_info=True)
 
+    def _emit_many(events: List[Tuple[str, Dict[str, Any]]]) -> None:
+        """Persist many events in a single commit. Same best-effort
+        semantics as `_emit`."""
+        if not run_id or not events:
+            return
+        try:
+            from dsl_worker.chat_api import runs as legacy_runs
+            from dsl_api.models import ChatRun
+            run_obj = ctx.db.query(ChatRun).filter(ChatRun.id == run_id).first()
+            if run_obj is not None:
+                legacy_runs.emit_events_batch(ctx.db, run_obj, events)
+        except Exception:
+            log.debug("emit_many (%d events) failed; continuing", len(events), exc_info=True)
+
     # Partition rows into ready (will run cell agent) vs missing-deps
     # (will be marked "missing_dependency" without spawning a cell agent).
     # No credits are spent on missing-deps rows.
-    ready_rows: List[Tuple[str, Dict[str, Any], Dict[str, Any]]] = []
-    deps_missing_rows: List[Tuple[str, Dict[str, Any], List[str]]] = []
-    for sid, rd, raw in rows:
-        missing = _row_missing_deps(rd)
-        if missing:
-            deps_missing_rows.append((sid, rd, missing))
-        else:
-            ready_rows.append((sid, rd, raw))
+    with phase_span(ctx, "enrichment_run/deps_partition"):
+        ready_rows: List[Tuple[str, Dict[str, Any], Dict[str, Any]]] = []
+        deps_missing_rows: List[Tuple[str, Dict[str, Any], List[str]]] = []
+        for sid, rd, raw in rows:
+            missing = _row_missing_deps(rd)
+            if missing:
+                deps_missing_rows.append((sid, rd, missing))
+            else:
+                ready_rows.append((sid, rd, raw))
+    phase_marker(
+        ctx, "enrichment_run/deps_partitioned",
+        ready=len(ready_rows), missing=len(deps_missing_rows),
+    )
 
     # Up-front: tell FE all the cells about to be processed. Renders as
     # "Queued" badges until cell_start fires per row. Only ready rows
@@ -402,53 +426,90 @@ async def _run_enrichment_on_rows(
         "row_ids": [sid for sid, _, _ in ready_rows],
     })
 
-    # Write the missing_dependency cell status synchronously for every
-    # row that's missing inputs, and fire cell_filled with status so the
-    # FE shows the correct badge. This happens BEFORE any cell agents
-    # spawn, so the FE renders the skip immediately.
-    for sid, row_data, missing in deps_missing_rows:
-        merged = dict(row_data) if isinstance(row_data, dict) else {}
-        existing_status = merged.get("__cell_status__") or {}
-        if not isinstance(existing_status, dict):
-            existing_status = {}
-        for cn in target_cols:
-            existing_status[cn] = "missing_dependency"
-        merged["__cell_status__"] = existing_status
-        try:
-            ctx.db.execute(
-                sa_text("UPDATE samples SET row=CAST(:row AS jsonb) WHERE id=:sid"),
-                {"row": json.dumps(merged), "sid": sid},
-            )
-            ctx.db.commit()
-        except Exception as e:
-            log.warning("dependency-skip row commit failed for %s: %s", sid, e)
-            ctx.db.rollback()
-        skipped_missing_deps_count += 1
-        if sample_missing_deps_row is None:
-            # Hint to the agent: show the missing column names + the row's
-            # other fields so the agent can decide to fill the upstream
-            # column first or expand the scope.
-            sample_missing_deps_row = {
-                "missing_columns": missing,
-                "row_preview": {
-                    k: v for k, v in (row_data or {}).items()
-                    if not k.startswith("__") and k not in target_cols
+    # Write the missing_dependency cell status for every row that's
+    # missing inputs, and fire cell_filled with status so the FE shows
+    # the correct badge. We do this BEFORE any cell agents spawn so the
+    # FE renders the skip immediately.
+    #
+    # This used to be a per-row UPDATE+commit+_emit loop — N rows = N×2
+    # DB round-trips, each commit blocking the event loop. With N=100+
+    # missing-deps rows that translates into seconds of dead time
+    # between fill_start and the first cell_start. Now we do one
+    # batched UPDATE + one batched event insert. _commit_rows and the
+    # cell pool below stay row-at-a-time because each row has its own
+    # cost and real-time progress signalling.
+    if deps_missing_rows:
+      with phase_span(ctx, "enrichment_run/missing_deps_batch", n=len(deps_missing_rows)):
+        ready_total = len(ready_rows)
+        update_payload = []
+        events_to_emit: List[Tuple[str, Dict[str, Any]]] = []
+        for sid, row_data, missing in deps_missing_rows:
+            merged = dict(row_data) if isinstance(row_data, dict) else {}
+            existing_status = merged.get("__cell_status__") or {}
+            if not isinstance(existing_status, dict):
+                existing_status = {}
+            for cn in target_cols:
+                existing_status[cn] = "missing_dependency"
+            merged["__cell_status__"] = existing_status
+            update_payload.append({"sid": sid, "row": json.dumps(merged)})
+            if sample_missing_deps_row is None:
+                sample_missing_deps_row = {
+                    "missing_columns": missing,
+                    "row_preview": {
+                        k: v for k, v in (row_data or {}).items()
+                        if not k.startswith("__") and k not in target_cols
+                    },
+                }
+            events_to_emit.append((
+                "cell_filled",
+                {
+                    "tool_call_id": enrichment_id,
+                    "enrichment_id": enrichment_id,
+                    "sample_id": sid,
+                    "row_id": sid,
+                    "index": 0,
+                    "completed": 0,
+                    "total": ready_total,
+                    "new_fields": None,
+                    "status": "missing_dependency",
+                    "cell_status": existing_status,
+                    "missing_columns": missing,
+                    "cost": 0,
                 },
-            }
-        _emit("cell_filled", {
-            "tool_call_id": enrichment_id,
-            "enrichment_id": enrichment_id,
-            "sample_id": sid,
-            "row_id": sid,
-            "index": 0,
-            "completed": 0,
-            "total": len(ready_rows),
-            "new_fields": None,
-            "status": "missing_dependency",
-            "cell_status": existing_status,
-            "missing_columns": missing,
-            "cost": 0,
-        })
+            ))
+
+        # One batched UPDATE for every skipped row: a single statement
+        # using a VALUES-join, so it goes over the wire once and commits
+        # once. (Per-row execute under one commit would still cost N
+        # network round-trips inside the transaction.)
+        values_sql_parts = []
+        params: Dict[str, Any] = {}
+        for i, p in enumerate(update_payload):
+            values_sql_parts.append(f"(CAST(:sid_{i} AS uuid), :row_{i})")
+            params[f"sid_{i}"] = p["sid"]
+            params[f"row_{i}"] = p["row"]
+        batched_sql = (
+            "UPDATE samples AS s "
+            "SET row = CAST(u.row AS jsonb) "
+            f"FROM (VALUES {', '.join(values_sql_parts)}) AS u(sid, row) "
+            "WHERE s.id = u.sid"
+        )
+        try:
+            with time_commit(ctx, "missing_deps_update", threshold_ms=50):
+                ctx.db.execute(sa_text(batched_sql), params)
+                ctx.db.commit()
+        except Exception as e:
+            log.warning(
+                "dependency-skip batched commit failed (%d rows): %s",
+                len(update_payload), e,
+            )
+            try:
+                ctx.db.rollback()
+            except Exception:
+                pass
+        skipped_missing_deps_count += len(deps_missing_rows)
+        with phase_span(ctx, "enrichment_run/missing_deps_emit", n=len(events_to_emit)):
+            _emit_many(events_to_emit)
 
     # Concurrency cap for parallel cell ops. Cells beyond this wait at the
     # semaphore — FE shows them as "Queued" until cell_start fires.
@@ -479,7 +540,9 @@ async def _run_enrichment_on_rows(
             )
             return sample_id, row_data, new_fields, cost, status, idx
 
+    phase_marker(ctx, "enrichment_run/tasks_spawning", n=len(ready_rows))
     tasks = [asyncio.create_task(run_one(sid, rd, raw)) for sid, rd, raw in ready_rows]
+    phase_marker(ctx, "enrichment_run/tasks_spawned", n=len(tasks))
 
     try:
       for fut in asyncio.as_completed(tasks):

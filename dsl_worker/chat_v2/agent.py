@@ -171,7 +171,16 @@ async def run_turn(
     await emit({"type": "turn_started", "project_id": project_id})
 
     iteration = 0
+    # Phase markers via the same emit channel. We don't import
+    # instrumentation.phase_marker here because `emit()` already routes
+    # through the run's event sink — emit a phase event directly so the
+    # event carries the same mono_ns timestamp as everything else and we
+    # avoid needing a ctx-shaped object in this scope.
+    async def _phase(name: str, **meta: Any) -> None:
+        await emit({"type": "phase", "phase": name, **meta})
+
     for iteration in range(MAX_TURN_ITERATIONS):
+        await _phase("agent/iteration_start", iteration=iteration)
         # Mid-turn user-message drain. Anything the user typed while
         # this turn was thinking lands in input_items as a regular
         # user-role message — same shape as the initial user_message
@@ -315,6 +324,8 @@ async def run_turn(
                     input_items.append(item.model_dump(exclude_none=True))
                 except Exception:
                     log.warning("unknown item type %r, skipping", itype)
+
+        await _phase("agent/iteration_llm_done", iteration=iteration, fn_calls=len(function_calls))
 
         if not function_calls:
             final_text = "".join(text_parts)

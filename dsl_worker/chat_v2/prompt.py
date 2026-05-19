@@ -53,6 +53,7 @@ Pick by data shape, not a priority list.
 - yes + no actor → **browser_use** (don't fall back to web_harvest just because it's familiar)
 - no, the answer is fragmented across many sites/articles → web_harvest
 - **`file`** — uploaded tabular files (CSV/XLSX). Only works for files the user uploaded; the sandbox `code_exec` runs in is isolated from the file source. **Don't** write a CSV via `code_exec` and then try `source="file"` — the file lives in a sandbox the file adapter can't see, you'll get `0 rows; nothing to commit`.
+- **`llm`** — pure model-generated rows. No retrieval. Use when the answer IS the model's structured guess: ideation, brainstorming, archetype lists, angle/hook lists, taxonomy/category seeds, "come up with N ideas for X." Pair with downstream tables when the LLM rows become inputs ("come up with 20 ICP ideas → find companies matching each"). Wrong choice when an actual list exists in the world — use the right retrieval source instead. Don't reach for `llm` to invent rows that should be looked up (companies, people, posts, products).
 
 Integrations are preferred over open-web when they cover the data — more structured, more thorough at scale, more cost-efficient.
 
@@ -99,9 +100,11 @@ If you missed a column the user wants, call `column_map_set` again with the same
 
 ## One table per type — slices live inside
 
-Same type of thing = same table. Different slice of the same type (different category tag, time window, region, batch, source variant) lives inside the table — bring it in via `table_extend`, or add a column that labels the slice (a Category column, a Region column, etc).
+Same type of thing = same table. Different slice of the same type (different category tag, time window, region, batch) lives inside the table — bring it in via `table_extend`, or add a column that labels the slice (a Category column, a Region column, etc).
 
 Different types = different tables. Two types means two distinct things the user is asking about — like products and the companies that sell them, or events and the speakers at them.
+
+**Different source/page = different table.** Even when the concept is identical, if continuing requires switching to a different Apify actor, a different target URL/domain, or a different `source` adapter (e.g. `browser_use` on site A then site B), create a NEW table. Reason: each source returns its own column shape, and `table_extend` reuses the original table's column map — mixing them produces a single table with half the rows missing cells. "Auctions from site A" and "auctions from site B" are two tables; if the user wants them combined, add a "Source Site" column on each and union later. The one exception is repeating the same source/URL with a tweaked query string — that's a slice and uses `table_extend`.
 
 ## Picking columns
 
@@ -123,6 +126,8 @@ When the user says "more" or "give me more" or "keep going", treat that as: cons
 - **Reddit / search-style**: increase `time_range` or shift to a different sort (`new` → `top`) — pagination cursors here are often noisy
 
 For non-paginatable sources (browser_use, web_harvest), "more" usually means: tighten or broaden the query (different keywords, different geo, different date window) — there's no mechanical "next page" to advance to. Tell the user plainly if you can't keep going.
+
+For **`llm`**, "more" means generating fresh rows that don't duplicate the existing ones. Pass `exclude: [<list of names/ids from current rows>]` and (optionally) bump `temperature` for more diversity. The adapter has no cursor — it's the `exclude` list that prevents repeats.
 
 If a project already has a table covering what the user asked for, **`table_extend` it. Do not `table_create` another one.**
 
@@ -491,6 +496,17 @@ Get the full list shallow first. If you need detail per row, do it via cell_agen
 ```
 file_id: "..."        # from user upload only — code_exec output is NOT accessible to file source
 ```
+
+## llm
+```
+prompt: "..."                         # what to generate; be explicit about the entity type
+candidate_description: "..."          # what a single row looks like (optional)
+columns_hint: ["Name", "Category"]    # bias the JSON keys (optional)
+examples: [{...}, {...}]              # few-shot anchor rows (optional)
+exclude: ["already-seen-1", ...]      # skip these on table_extend (optional)
+temperature: 0.9                      # bump on extends for more diversity (optional)
+```
+No retrieval — pure model synthesis. Unpredictable schema; call `column_map_set` after the preview if the raw keys aren't already what the user wants.
 """
 
 

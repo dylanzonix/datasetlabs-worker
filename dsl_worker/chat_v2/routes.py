@@ -714,6 +714,76 @@ def get_sample_source_record(
     }
 
 
+@router.get("/projects/{project_id}/tables/{table_id}/query-history")
+def list_query_history(
+    project_id: UUID,
+    table_id: str,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Audit trail of every fetch (create + extend) against this table.
+
+    Newest first. Includes failed attempts (status='error') so the user can
+    see what the agent tried and why it didn't land. Rendered as the table
+    detail panel's "Query history" section.
+    """
+    _verify_project(project_id, user.user_id, db)
+    tid = _resolve_table_uuid(db, str(project_id), table_id)
+    if not tid:
+        raise HTTPException(404, "Table not found")
+    rows = db.execute(
+        sa_text(
+            """
+            SELECT id::text, action, source, query_params, status,
+                   rows_returned, rows_added, rows_skipped_duplicates,
+                   cost_credits, error, created_at
+            FROM table_query_runs
+            WHERE table_id = :tid
+            ORDER BY created_at DESC
+            """
+        ),
+        {"tid": tid},
+    ).fetchall()
+    # Render each run's query_params through the source adapter so the FE
+    # gets the same human-readable description used in the top-of-table chip.
+    from dsl_worker.sources_v2 import describe_source
+    out = []
+    for r in rows:
+        qp = r[3] or {}
+        if isinstance(qp, str):
+            try:
+                qp = json.loads(qp or "{}")
+            except Exception:
+                qp = {}
+        description = None
+        try:
+            d = describe_source(r[2], qp)
+            description = {
+                "kind": d.kind,
+                "label": d.label,
+                "query_text": d.query_text,
+                "details": d.details,
+                "favicon_url": d.favicon_url,
+            }
+        except Exception:
+            description = None
+        out.append({
+            "id": r[0],
+            "action": r[1],
+            "source": r[2],
+            "query_params": qp,
+            "description": description,
+            "status": r[4],
+            "rows_returned": r[5],
+            "rows_added": r[6],
+            "rows_skipped_duplicates": r[7],
+            "cost_credits": float(r[8]) if r[8] is not None else None,
+            "error": r[9],
+            "created_at": r[10].isoformat() if r[10] else None,
+        })
+    return {"history": out}
+
+
 @router.get("/projects/{project_id}/tables/{table_id}/enrichments")
 def list_enrichments(
     project_id: UUID,

@@ -26,6 +26,7 @@ from dsl_worker.sources_v2 import apify_actor  # noqa: F401
 from dsl_worker.sources_v2 import web_harvest  # noqa: F401
 from dsl_worker.sources_v2 import browser_use  # noqa: F401
 from dsl_worker.sources_v2 import file as file_source  # noqa: F401
+from dsl_worker.sources_v2 import llm  # noqa: F401
 
 
 __all__ = [

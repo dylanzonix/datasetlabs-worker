@@ -95,7 +95,7 @@ def _table_create_schema() -> Dict[str, Any]:
     return {
         "type": "object",
         "properties": {
-            "source": {"type": "string", "description": "Adapter name (apollo_companies, fullenrich_people, google_maps, apify_actor:<id>, web_harvest, browser_use, file)."},
+            "source": {"type": "string", "description": "Adapter name (apollo_companies, fullenrich_people, google_maps, apify_actor:<id>, web_harvest, browser_use, file, llm)."},
             "query_params": {"type": "object", "description": "Source-specific query. See system prompt source cards for shapes."},
             "name": {"type": "string", "description": "Short Title Case table name (2-5 words)."},
             "intent": {"type": "string", "description": "Optional one-liner on what the user wants from this table."},

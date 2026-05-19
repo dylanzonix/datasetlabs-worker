@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text as sa_text
 
 from dsl_worker.sources_v2 import describe_source, get_adapter, list_sources
+from dsl_worker.chat_v2.instrumentation import phase_marker, phase_span_async, time_commit
 
 
 log = logging.getLogger(__name__)
@@ -146,6 +147,62 @@ def _next_enrichment_short_id(db: Session, table_id: str) -> str:
         return "e1"
 
 
+def _record_query_run(
+    db: Session,
+    *,
+    table_id: str,
+    action: str,
+    source: str,
+    query_params: Dict[str, Any],
+    status: str,
+    rows_returned: Optional[int] = None,
+    rows_added: Optional[int] = None,
+    rows_skipped_duplicates: Optional[int] = None,
+    cost_credits: Optional[float] = None,
+    error: Optional[str] = None,
+) -> None:
+    """Append a row to table_query_runs for the audit trail the user sees in
+    the table detail panel. Best-effort — failures here never block the
+    parent fetch from returning to the agent.
+    """
+    try:
+        db.execute(
+            sa_text(
+                """
+                INSERT INTO table_query_runs (
+                    id, table_id, action, source, query_params, status,
+                    rows_returned, rows_added, rows_skipped_duplicates,
+                    cost_credits, error, created_at
+                ) VALUES (
+                    :id, :table_id, :action, :source, CAST(:qp AS jsonb), :status,
+                    :rows_returned, :rows_added, :rows_skipped_duplicates,
+                    :cost, :error, now()
+                )
+                """
+            ),
+            {
+                "id": str(uuid.uuid4()),
+                "table_id": table_id,
+                "action": action,
+                "source": source,
+                "qp": json.dumps(query_params or {}),
+                "status": status,
+                "rows_returned": rows_returned,
+                "rows_added": rows_added,
+                "rows_skipped_duplicates": rows_skipped_duplicates,
+                "cost": cost_credits,
+                "error": (error or None) if error is None else error[:2000],
+            },
+        )
+        db.commit()
+    except Exception:
+        log.exception("table_query_runs insert failed (table_id=%s); continuing", table_id)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Tool: table_create
 # ---------------------------------------------------------------------------
@@ -219,41 +276,43 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
         except Exception:
             pass
 
-    if streaming:
-        try:
-            stream_gen = adapter.fetch_stream(
-                query_params, n, source_full=source, on_cost=_track_partial_cost,
-            )
-            first = await stream_gen.__anext__()
-            res_rows = first.get("rows") or []
-            res_exhausted = first.get("exhausted", False)
-            res_cost = first.get("cost_credits", 0.0)
-        except StopAsyncIteration:
-            res_exhausted = True
-        except asyncio.CancelledError:
-            # Adapter already invoked on_cost in its CancelledError
-            # path before re-raising — ctx.partial_cost_usd is up to
-            # date. Let the cancel propagate so the agent loop's catch
-            # flushes the turn ledger with the right amount.
-            raise
-        except Exception as e:
-            log.exception("table_create stream-first-batch failed: %s", e)
-            return {"error": f"source fetch failed: {e}"}, 0.0
-    else:
-        try:
-            if source.startswith("apify_actor:"):
-                res = await adapter.fetch(
-                    query_params, n, prior_cursor=None, source_full=source,
-                    on_cost=_track_partial_cost,
+    async with phase_span_async(ctx, "table_create/adapter_fetch", source=source, n=n):
+        if streaming:
+            try:
+                stream_gen = adapter.fetch_stream(
+                    query_params, n, source_full=source, on_cost=_track_partial_cost,
                 )
-            else:
-                res = await adapter.fetch(query_params, n, prior_cursor=None)
-            res_rows, res_exhausted, res_cost = res.rows, res.exhausted, res.cost_credits
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log.exception("table_create fetch failed: %s", e)
-            return {"error": f"source fetch failed: {e}"}, 0.0
+                first = await stream_gen.__anext__()
+                res_rows = first.get("rows") or []
+                res_exhausted = first.get("exhausted", False)
+                res_cost = first.get("cost_credits", 0.0)
+            except StopAsyncIteration:
+                res_exhausted = True
+            except asyncio.CancelledError:
+                # Adapter already invoked on_cost in its CancelledError
+                # path before re-raising — ctx.partial_cost_usd is up to
+                # date. Let the cancel propagate so the agent loop's catch
+                # flushes the turn ledger with the right amount.
+                raise
+            except Exception as e:
+                log.exception("table_create stream-first-batch failed: %s", e)
+                return {"error": f"source fetch failed: {e}"}, 0.0
+        else:
+            try:
+                if source.startswith("apify_actor:"):
+                    res = await adapter.fetch(
+                        query_params, n, prior_cursor=None, source_full=source,
+                        on_cost=_track_partial_cost,
+                    )
+                else:
+                    res = await adapter.fetch(query_params, n, prior_cursor=None)
+                res_rows, res_exhausted, res_cost = res.rows, res.exhausted, res.cost_credits
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.exception("table_create fetch failed: %s", e)
+                return {"error": f"source fetch failed: {e}"}, 0.0
+    phase_marker(ctx, "table_create/fetch_returned", rows=len(res_rows), cost=res_cost)
 
     if not res_rows:
         return {"error": "source returned 0 rows; nothing to commit"}, 0.0
@@ -339,9 +398,26 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     )
     ctx.db.commit()
 
-    _commit_verify_tasks = _commit_rows(
-        ctx.db, table_id, res_rows, columns_for_db,
-        store_raw=True, run_id=ctx.run_id,
+    with time_commit(ctx, "table_create_insert", threshold_ms=100):
+        _commit_verify_tasks = _commit_rows(
+            ctx.db, table_id, res_rows, columns_for_db,
+            store_raw=True, run_id=ctx.run_id,
+        )
+
+    # Append to the query-history audit trail. _commit_rows just stashed
+    # dedup stats keyed by table_id; pick them up here.
+    _create_stats = _LAST_COMMIT_STATS.get(table_id, {})
+    _record_query_run(
+        ctx.db,
+        table_id=table_id,
+        action="create",
+        source=source,
+        query_params=query_params,
+        status="success",
+        rows_returned=len(res_rows),
+        rows_added=int(_create_stats.get("inserted", len(res_rows))),
+        rows_skipped_duplicates=int(_create_stats.get("skipped_duplicates", 0)),
+        cost_credits=float(res_cost) if res_cost is not None else None,
     )
 
     # Seed the table's comment thread with the agent's "initial description"
@@ -618,23 +694,44 @@ async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     adapter = get_adapter(source)
     val_err = adapter.validate_query_params(new_query_params)
     if val_err:
+        _record_query_run(
+            ctx.db,
+            table_id=table_id,
+            action="extend",
+            source=source,
+            query_params=new_query_params,
+            status="error",
+            error=val_err,
+        )
         return {"error": val_err}, 0.0
 
     try:
-        if source.startswith("apify_actor:"):
-            res = await adapter.fetch(new_query_params, n, prior_cursor=None, source_full=source)
-        else:
-            res = await adapter.fetch(new_query_params, n, prior_cursor=None)
+        async with phase_span_async(ctx, "table_extend/adapter_fetch", source=source, n=n):
+            if source.startswith("apify_actor:"):
+                res = await adapter.fetch(new_query_params, n, prior_cursor=None, source_full=source)
+            else:
+                res = await adapter.fetch(new_query_params, n, prior_cursor=None)
+        phase_marker(ctx, "table_extend/fetch_returned", rows=len(res.rows), cost=res.cost_credits)
     except Exception as e:
         log.exception("table_extend fetch failed: %s", e)
+        _record_query_run(
+            ctx.db,
+            table_id=table_id,
+            action="extend",
+            source=source,
+            query_params=new_query_params,
+            status="error",
+            error=str(e),
+        )
         return {"error": f"source fetch failed: {e}"}, 0.0
 
     # Commit rows using existing column mapping
     cols = json.loads(columns) if isinstance(columns, str) else (columns or [])
     column_map = [{"source_field": c.get("source_field") or c["name"], "column_name": c["name"], "type": c["type"]} for c in cols]
-    _extend_verify_tasks = _commit_rows(
-        ctx.db, table_id, res.rows, column_map, run_id=ctx.run_id,
-    )
+    with time_commit(ctx, "table_extend_insert", threshold_ms=100):
+        _extend_verify_tasks = _commit_rows(
+            ctx.db, table_id, res.rows, column_map, run_id=ctx.run_id,
+        )
 
     # Overwrite query_params with the LLM's exact params (no merge, no
     # cursor). project_state shows this back to the LLM so the next
@@ -670,6 +767,20 @@ async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     stats = _LAST_COMMIT_STATS.get(table_id, {})
     inserted = int(stats.get("inserted", len(res.rows)))
     skipped_dup = int(stats.get("skipped_duplicates", 0))
+
+    _record_query_run(
+        ctx.db,
+        table_id=table_id,
+        action="extend",
+        source=source,
+        query_params=new_query_params,
+        status="empty" if not res.rows else "success",
+        rows_returned=len(res.rows),
+        rows_added=inserted,
+        rows_skipped_duplicates=skipped_dup,
+        cost_credits=float(res.cost_credits) if res.cost_credits is not None else None,
+    )
+
     return {
         "rows_added": inserted,
         "rows_skipped_duplicates": skipped_dup,

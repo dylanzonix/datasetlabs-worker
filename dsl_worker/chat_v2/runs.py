@@ -632,6 +632,13 @@ async def _drive_agent(
                         "approval_id": evt.get("approval_id"),
                         "approved": evt.get("approved"),
                     })
+                elif etype == "phase":
+                    # Pass-through for timing instrumentation. Carries
+                    # `phase` (dotted path like "agent/iteration_start")
+                    # plus arbitrary meta from the emitter.
+                    legacy_runs.emit_event(ldb, lrun, "phase", {
+                        k: v for k, v in evt.items() if k != "type"
+                    })
             except Exception:
                 log.exception("v2 on_event failed for %s", etype)
             finally:
