@@ -402,7 +402,7 @@ async def run_turn(
                             "message": "User denied this action. Acknowledge and propose an alternative or wait for direction.",
                         }
                         h_cost = 0.0
-                        preview = json.dumps(tool_result, default=str)[:300]
+                        preview = json.dumps(tool_result, default=str)
                         tool_calls_made.append({
                             "name": name,
                             "args": args,
@@ -476,7 +476,7 @@ async def run_turn(
                 "[chat_v2 timing] tool project=%s tool=%s duration_ms=%d cost_usd=%.6f",
                 project_id, name, tool_ms, h_cost,
             )
-            preview = json.dumps(tool_result, default=str)[:300]
+            preview = json.dumps(tool_result, default=str)
             tool_calls_made.append({
                 "name": name,
                 "args": args,

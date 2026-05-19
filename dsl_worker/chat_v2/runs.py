@@ -535,7 +535,7 @@ async def _drive_agent(
                 elif etype == "tool_call_start":
                     tc_id = evt.get("tool_call_id") or ""
                     name = evt.get("name") or "?"
-                    args_preview = json.dumps(evt.get("args") or {}, default=str)[:200]
+                    args_preview = json.dumps(evt.get("args") or {}, default=str)
                     tool_log.append({
                         "id": tc_id,
                         "name": name,
