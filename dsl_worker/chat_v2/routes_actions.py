@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from dsl_api.auth import CurrentUser, get_current_user
 from dsl_api.db import SessionLocal
 from dsl_api.models import Project
+from dsl_api.models.balance_ledger import BalanceLedger
 from dsl_worker.chat_v2.tools import (
     ToolContext,
     table_extend,
@@ -203,13 +204,40 @@ async def post_run_enrichment(
         )
     )
     await CANCELS.register(str(project_id), canonical_eid, task)
+    cost = 0.0
+    cancelled = False
     try:
         result, cost = await task
     except _asyncio.CancelledError:
-        return {"result": {"cancelled": True}, "cost_usd": 0.0}
+        cancelled = True
+        # Partial cost may have accrued in ctx.partial_cost_usd before cancel.
+        cost = float(getattr(ctx, "partial_cost_usd", 0.0) or 0.0)
+        result = {"cancelled": True}
     finally:
         await CANCELS.unregister(str(project_id), canonical_eid, task)
-    return {"result": result, "cost_usd": cost}
+
+    # Charge the user. Chat-initiated enrichment_run is charged via
+    # runs.py's end-of-turn flush, but THIS path (FE-clicked ▶) had no
+    # ledger write — runs cost real money on Apollo / FE / BU but
+    # nothing got deducted, so the project's spend display stayed flat
+    # and the user's balance didn't reflect actual usage.
+    spend_cents = int(round(float(cost or 0.0) * 100))
+    if spend_cents > 0:
+        try:
+            db.add(BalanceLedger(
+                user_id=user.user_id,
+                amount=-spend_cents,
+                reason="enrichment_run_rest",
+                project_id=project_id,
+            ))
+            db.commit()
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+    return {"result": result, "cost_usd": cost, "cancelled": cancelled}
 
 
 class FilterBody(BaseModel):
