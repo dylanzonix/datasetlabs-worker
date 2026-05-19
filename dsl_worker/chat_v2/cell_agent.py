@@ -595,6 +595,15 @@ Always end with `final_result({values: {col_name: value, ...}})` where `col_name
 
 Set a column to `null` when the value genuinely doesn't exist. Null is fine. Don't fabricate.
 
+When you used an external tool to find a value, also pass `sources`: `final_result({values: {...}, sources: {col_name: [citation, ...]}})`.
+
+Two citation shapes — pick the one that matches the tool:
+
+- **Web hits** (`web_search`, browser_use pages you visited): `{type: "url", value: "https://example.com/full-page-url"}`. Use the actual page URL. NEVER use OpenAI's internal annotation pointers like `turn1search3` — those are useless to the user.
+- **Paid services** (`fullenrich_enrich_phone`, `apollo_org_enrich`, `google_maps_place_details`, `apify_call_actor`, etc.): `{source: "<tool_name>"}` — just the tool name, no value/field needed.
+
+Omit `sources` entirely when the value came purely from reasoning over `row_visible_to_user` / `row_hidden_source_fields`.
+
 # Output format
 
 - **Yes/No** → enum-style `"Yes"` / `"No"` (Title Case, never booleans).
@@ -643,7 +652,20 @@ def _final_result_tool_def() -> Dict[str, Any]:
                 "values": {
                     "type": "object",
                     "description": "Map of column_name → value to fill on this row.",
-                }
+                },
+                "sources": {
+                    "type": "object",
+                    "description": (
+                        "Optional map of column_name → list of source citations "
+                        "describing where each value came from. Each citation is "
+                        "{source, source_field?}: `source` is the tool you used "
+                        "(e.g. fullenrich_enrich_phone, apollo_org_enrich, "
+                        "web_search, browser_use); `source_field` is the JSON "
+                        "path into that tool's result (e.g. "
+                        "\"phone_numbers[0].sanitized\"). Omit if no external "
+                        "tool produced the value."
+                    ),
+                },
             },
             "required": ["values"],
         },
@@ -957,6 +979,112 @@ def _coerce_value_keys(
     return exact
 
 
+# Tool names that don't represent an external data source — pure compute or
+# control flow. Inference skips these when guessing the citation for a value.
+_NON_SOURCE_TOOLS = {"final_result", "code_exec"}
+
+# Map raw tool names → canonical sources_v2 kinds. The FE's sourceDisplay()
+# only renders nice labels + favicons for canonical kinds; raw tool names
+# fall through to ugly "fullenrich enrich phone" text. Anything not in this
+# map passes through unchanged.
+_TOOL_TO_SOURCE_KIND: Dict[str, str] = {
+    "fullenrich_enrich_phone": "fullenrich_people",
+    "fullenrich_enrich_email": "fullenrich_people",
+    "fullenrich_enrich_company": "fullenrich_people",
+    "apollo_org_enrich": "apollo_companies",
+    "google_maps_place_details": "google_maps",
+    "browser_use": "browser_use",
+    "apify_call_actor": "apify_actor",
+    "web_search": "web_search",
+}
+
+
+def _normalize_tool_to_kind(tool_name: str) -> str:
+    """Map a cell-agent tool name to a canonical sources_v2 kind for FE display."""
+    return _TOOL_TO_SOURCE_KIND.get(tool_name, tool_name)
+
+
+def _looks_like_url(s: Any) -> bool:
+    return isinstance(s, str) and (s.startswith("http://") or s.startswith("https://"))
+
+
+def _infer_source_from_tool_calls(
+    tool_calls_log: List[Dict[str, Any]],
+) -> Optional[Dict[str, str]]:
+    """Walk tool_calls_log backwards; return the most recent data-producing
+    tool as a source_record citation. Returns None if no such tool ran.
+
+    Used as a fallback when the cell agent fills a value but forgets to
+    declare `sources` in `final_result`.
+    """
+    for entry in reversed(tool_calls_log):
+        name = entry.get("name") or ""
+        if not name or name in _NON_SOURCE_TOOLS:
+            continue
+        cost = entry.get("cost") or 0.0
+        result_preview = entry.get("result_preview") or ""
+        if cost <= 0 and "error" in result_preview.lower():
+            continue
+        return {"type": "source_record", "source": _normalize_tool_to_kind(name)}
+    return None
+
+
+def _coerce_sources_keys(
+    raw_sources: Any,
+    canonical_columns: List[str],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Normalize the LLM's `sources` arg into {canonical_col: [citation, ...]}.
+
+    Output shapes (matching frontend/src/components/project/CellDetailPanel.tsx):
+      - {type: "url", value: "https://..."}              — web hits, real URLs
+      - {type: "source_record", source: "<kind>"}        — paid APIs, service-level
+
+    `source_field` is intentionally dropped from source_record citations: the
+    FE's drill-through panel queries the sample's raw_row, which doesn't
+    exist for enrichment. Cell-trace drill-through is future work.
+    """
+    if not isinstance(raw_sources, dict) or not raw_sources or not canonical_columns:
+        return {}
+
+    def _norm(s: str) -> str:
+        return "".join(ch for ch in s.lower() if ch.isalnum())
+
+    canon_by_norm = {_norm(c): c for c in canonical_columns}
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for k, v in raw_sources.items():
+        col = k if k in canonical_columns else canon_by_norm.get(_norm(k))
+        if not col:
+            continue
+        citations = v if isinstance(v, list) else [v]
+        normalized: List[Dict[str, Any]] = []
+        for c in citations:
+            # Allow bare strings: URL → url citation, else → service name.
+            if isinstance(c, str):
+                if _looks_like_url(c):
+                    c = {"type": "url", "value": c}
+                else:
+                    c = {"type": "source_record", "source": c}
+            if not isinstance(c, dict):
+                continue
+            declared_type = c.get("type")
+            # URL citation — pass through if the value is actually a URL.
+            url_value = c.get("value")
+            if (declared_type == "url" or _looks_like_url(url_value)) and _looks_like_url(url_value):
+                normalized.append({"type": "url", "value": url_value})
+                continue
+            # source_record citation — normalize the source name; drop
+            # source_field (no drill-through endpoint for enrichment yet).
+            src = c.get("source")
+            if src:
+                normalized.append({
+                    "type": "source_record",
+                    "source": _normalize_tool_to_kind(src),
+                })
+        if normalized:
+            out[col] = normalized
+    return out
+
+
 def _persist_cell_trace(
     ctx: ToolContext,
     enrichment_id: Optional[str],
@@ -1012,16 +1140,22 @@ async def run_cell_agent(
     enrichment_id: Optional[str] = None,
     sample_id: Optional[str] = None,
     raw_row: Optional[Dict[str, Any]] = None,
-) -> Tuple[Dict[str, Any], float, str]:
+) -> Tuple[Dict[str, Any], Dict[str, List[Dict[str, Any]]], float, str]:
     """Per-row Responses-API loop with research-level routing.
 
-    Returns (new_fields_dict, total_cost_credits, status).
+    Returns (new_fields_dict, sources_per_column, total_cost_credits, status).
       status ∈ {"filled", "hit_budget", "error"}
         - filled: cell agent emitted final_result (values may still be null
           if the answer genuinely didn't exist)
         - hit_budget: programmatic kill — per_row_credit_cap reached before
           final_result. FE renders a "hit budget" badge.
         - error: LLM call failed or no parseable result. Cell left untouched.
+
+    sources_per_column maps {col_name → [source_record citation, ...]} for
+    each filled value. Same shape as the fetch-side sources stored in
+    samples.tags.sources. Populated either from the agent's declared
+    `sources` arg in final_result, or inferred from tool_calls_log when the
+    agent omits it.
 
     Budget is NEVER surfaced to the LLM (no budget_credits_remaining in
     the user payload). The server kills the loop silently when cap is hit.
@@ -1066,9 +1200,28 @@ async def run_cell_agent(
     tool_defs = _tool_defs_for_tier(tier_cfg)
     total_cost = 0.0
     final_values: Dict[str, Any] = {}
+    final_sources: Dict[str, List[Dict[str, Any]]] = {}
     tool_calls_log: List[Dict[str, Any]] = []
     error_str: Optional[str] = None
     t0 = time.monotonic()
+
+    def _build_sources_with_fallback(
+        declared: Dict[str, List[Dict[str, Any]]],
+        values: Dict[str, Any],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Fill in implicit citations for columns the agent set but didn't
+        cite. Uses the last informative tool call as the fallback source."""
+        if not values:
+            return declared
+        fallback = _infer_source_from_tool_calls(tool_calls_log)
+        if not fallback:
+            return declared
+        out = dict(declared)
+        for col, v in values.items():
+            if v in (None, "") or col in out:
+                continue
+            out[col] = [fallback]
+        return out
 
     client = _get_client()
     cache_key = hashlib.sha256(
@@ -1091,7 +1244,7 @@ async def run_cell_agent(
                     "cell agent budget hit (research=%s cost=%.2f cap=%.2f) — stopping",
                     tier_cfg["name"], total_cost, tier_cfg["cap"],
                 )
-                return final_values, total_cost, status
+                return final_values, final_sources, total_cost, status
 
             try:
                 response, cost = await client.responses_create(
@@ -1105,7 +1258,7 @@ async def run_cell_agent(
             except Exception as e:
                 error_str = f"LLM call failed: {e}"[:500]
                 log.warning("cell agent LLM call failed (research=%s): %s", tier_cfg["name"], e)
-                return final_values, total_cost, "error"
+                return final_values, final_sources, total_cost, "error"
 
             function_calls: List[Any] = []
             text_parts: List[str] = []
@@ -1154,14 +1307,19 @@ async def run_cell_agent(
                         data = json.loads(content)
                         if isinstance(data, dict) and "values" in data:
                             final_values = data["values"]
-                            return final_values, total_cost, "filled"
+                            final_sources = _build_sources_with_fallback(
+                                _coerce_sources_keys(data.get("sources"), list(final_values.keys())),
+                                final_values,
+                            )
+                            return final_values, final_sources, total_cost, "filled"
                         if isinstance(data, dict):
                             final_values = data
-                            return final_values, total_cost, "filled"
+                            final_sources = _build_sources_with_fallback({}, final_values)
+                            return final_values, final_sources, total_cost, "filled"
                     except json.JSONDecodeError:
                         pass
                 error_str = error_str or "no function call and no parseable message"
-                return final_values, total_cost, "error"
+                return final_values, final_sources, total_cost, "error"
 
             for fc in function_calls:
                 name = fc.name
@@ -1181,13 +1339,20 @@ async def run_cell_agent(
                     # {label, value, answer, result} instead of using the
                     # actual column name. _coerce_value_keys maps those back.
                     final_values = _coerce_value_keys(raw_values, columns_to_fill)
+                    declared_sources = _coerce_sources_keys(
+                        args.get("sources"), list(final_values.keys())
+                    )
+                    final_sources = _build_sources_with_fallback(
+                        declared_sources, final_values
+                    )
                     tool_calls_log.append({
                         "name": "final_result",
                         "args": args,
                         "coerced_values": final_values,
+                        "coerced_sources": final_sources,
                         "cost": 0.0,
                     })
-                    return final_values, total_cost, "filled"
+                    return final_values, final_sources, total_cost, "filled"
 
                 handler = CELL_TOOL_HANDLERS.get(name)
                 if not handler:
@@ -1258,14 +1423,14 @@ async def run_cell_agent(
                         "cell agent budget hit (research=%s cost=%.2f cap=%.2f) — stopping",
                         tier_cfg["name"], total_cost, tier_cfg["cap"],
                     )
-                    return final_values, total_cost, "hit_budget"
+                    return final_values, final_sources, total_cost, "hit_budget"
 
         error_str = f"hit HARD_TURN_LIMIT={HARD_TURN_LIMIT}"
         log.warning(
             "cell agent hit HARD_TURN_LIMIT=%d (research=%s) — emergency stop",
             HARD_TURN_LIMIT, tier_cfg["name"],
         )
-        return final_values, total_cost, "error"
+        return final_values, final_sources, total_cost, "error"
     finally:
         duration_ms = int((time.monotonic() - t0) * 1000)
         _persist_cell_trace(

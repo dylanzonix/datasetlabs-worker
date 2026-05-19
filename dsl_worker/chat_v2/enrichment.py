@@ -533,12 +533,12 @@ async def _run_enrichment_on_rows(
                 "total": ready_total,
                 "columns": target_cols,
             })
-            new_fields, cost, status = await _execute_action(
+            new_fields, new_sources, cost, status = await _execute_action(
                 action, row_data, per_row_cap, columns, ctx,
                 enrichment_id=enrichment_id, sample_id=sample_id,
                 raw_row=raw_row,
             )
-            return sample_id, row_data, new_fields, cost, status, idx
+            return sample_id, row_data, new_fields, new_sources, cost, status, idx
 
     phase_marker(ctx, "enrichment_run/tasks_spawning", n=len(ready_rows))
     tasks = [asyncio.create_task(run_one(sid, rd, raw)) for sid, rd, raw in ready_rows]
@@ -547,7 +547,7 @@ async def _run_enrichment_on_rows(
     try:
       for fut in asyncio.as_completed(tasks):
         try:
-            sample_id, original_row, new_fields, cost, status, idx = await fut
+            sample_id, original_row, new_fields, new_sources, cost, status, idx = await fut
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -650,12 +650,50 @@ async def _run_enrichment_on_rows(
                 existing_cost[cn] = float(cost)
             merged["__cell_cost__"] = existing_cost
 
-        if merged != original_row:
+        # Per-cell source citations. Stored in samples.tags.sources, same
+        # shape and place as fetch-side sources written by the row generator
+        # (see worker/dsl_worker/agents/row.py). FE reads `row.tags.sources`
+        # uniformly — no code path differs between fetched and enriched.
+        sources_to_persist: Dict[str, List[Dict[str, Any]]] = {}
+        if isinstance(new_sources, dict):
+            for cn, citations in new_sources.items():
+                # Only persist sources for columns that actually got a value.
+                if (
+                    isinstance(new_fields, dict)
+                    and new_fields.get(cn) not in (None, "")
+                    and isinstance(citations, list)
+                    and citations
+                ):
+                    sources_to_persist[cn] = citations
+
+        if merged != original_row or sources_to_persist:
             try:
-                ctx.db.execute(
-                    sa_text("UPDATE samples SET row=CAST(:row AS jsonb) WHERE id=:sid"),
-                    {"row": json.dumps(merged), "sid": sample_id},
-                )
+                if sources_to_persist:
+                    # jsonb deep-merge: tags.sources gets per-column upsert
+                    # (new columns merged in, existing columns overwritten,
+                    # other tags keys untouched).
+                    ctx.db.execute(
+                        sa_text(
+                            "UPDATE samples "
+                            "SET row=CAST(:row AS jsonb), "
+                            "    tags=jsonb_set("
+                            "      COALESCE(tags, '{}'::jsonb), "
+                            "      '{sources}', "
+                            "      COALESCE(tags->'sources', '{}'::jsonb) || CAST(:srcs AS jsonb)"
+                            "    ) "
+                            "WHERE id=:sid"
+                        ),
+                        {
+                            "row": json.dumps(merged),
+                            "srcs": json.dumps(sources_to_persist),
+                            "sid": sample_id,
+                        },
+                    )
+                else:
+                    ctx.db.execute(
+                        sa_text("UPDATE samples SET row=CAST(:row AS jsonb) WHERE id=:sid"),
+                        {"row": json.dumps(merged), "sid": sample_id},
+                    )
                 ctx.db.commit()
                 # Schedule Scrubby verify for any email values just
                 # written. Tasks are pinned in email_verify_hook so they
@@ -843,9 +881,12 @@ async def _execute_action(
     enrichment_id: Optional[str] = None,
     sample_id: Optional[str] = None,
     raw_row: Optional[Dict[str, Any]] = None,
-) -> Tuple[Dict[str, Any], float, str]:
+) -> Tuple[Dict[str, Any], Dict[str, List[Dict[str, Any]]], float, str]:
     """Run one enrichment action against one row.
-    Returns (new_fields_dict, cost_credits, status).
+    Returns (new_fields_dict, sources_per_column, cost_credits, status).
+
+    sources_per_column matches the shape of fetch-side citations stored in
+    samples.tags.sources: {col_name → [{type: "source_record", source, source_field?}]}.
     """
     from dsl_worker.chat_v2.cell_agent import run_cell_agent
     return await run_cell_agent(

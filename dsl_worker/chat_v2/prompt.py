@@ -256,9 +256,9 @@ You must include `per_row_credit_cap` on every `enrichment_set` call. The agent 
 | `classify` | `0.3` | nano + no tools — barely spends anything |
 | `research` (one cheap call, e.g. Apollo enrich) | `1.0` |  |
 | `research` (FE email) | `1.5` | FE email ≈ 0.5 base + headroom |
-| `research` (web search / single-site read) | `5.0` | default for most research |
-| `research` (FE phone) | `10` | FE phone ≈ 5 base + headroom |
-| `research` (browser_use chains) | `15-20` | multi-step BU |
+| `research` (web search / single-site read) | `2.0` | default for most research |
+| `research` (FE phone) | `7` | FE phone ≈ 5 base + headroom |
+| `research` (browser_use chains) | `5-10` | 5 for a simple page fetch, up to 10 for multi-step BU |
 
 Don't talk to the user about cost. The UI shows them an estimate.
 
