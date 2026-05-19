@@ -563,15 +563,21 @@ async def _drain_stream_into_table(
                 db.commit()
 
                 # Emit a rows_added event into the chat_run_events stream
-                # so the FE refreshes the table view. Best-effort.
+                # with the actual inserted rows so the FE can applyRowInsert
+                # each one instead of refetching the whole table. The
+                # _LAST_COMMIT_STATS sidecar populated by _commit_rows
+                # carries the FE-canonical payloads (id + mapped data +
+                # tags).
                 if run_id is not None:
                     try:
                         run_obj = db.query(ChatRun).filter(ChatRun.id == run_id).first()
                         if run_obj is not None:
+                            stats = _LAST_COMMIT_STATS.get(table_id) or {}
                             legacy_runs.emit_event(db, run_obj, "rows_added", {
                                 "table_id": table_id,
-                                "added": len(new_rows),
+                                "added": int(stats.get("inserted") or 0),
                                 "total": total_committed,
+                                "rows": stats.get("inserted_rows") or [],
                             })
                     except Exception:
                         log.exception("rows_added emit failed; continuing")
@@ -1564,9 +1570,25 @@ def _commit_rows(
     # table_extend (and friends) can read them without changing every
     # caller's signature. Last-write-wins; only the most recent commit
     # for a table is what callers care about.
+    # Stash the inserted rows in FE-canonical shape (id + mapped data)
+    # so emitters of the `rows_added` SSE event can carry the payloads
+    # — that lets the FE applyRowInsert() each one surgically instead
+    # of refetching the whole table. Without this, the FE bounced a
+    # full /tables/{id}/rows on every batch which was the post-fetch
+    # jitter source on streaming tables.
+    inserted_rows_payload: List[Dict[str, Any]] = []
+    for sid, mapped in pending_verify:
+        payload: Dict[str, Any] = {"id": sid}
+        payload.update(mapped)
+        # tags_payload was the same for every row in this batch — attach
+        # so the FE has cell-side citations from frame 1.
+        if cell_sources_template:
+            payload["tags"] = {"sources": cell_sources_template}
+        inserted_rows_payload.append(payload)
     _LAST_COMMIT_STATS[table_id] = {
         "inserted": len(pending_verify),
         "skipped_duplicates": skipped_dup_count,
+        "inserted_rows": inserted_rows_payload,
     }
 
     # Email verification for any email cells just written. Imported
