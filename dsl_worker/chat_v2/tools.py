@@ -664,8 +664,16 @@ async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     # same fire-and-forget rationale.
     del _extend_verify_tasks
 
+    # Read the dedup-aware counts that _commit_rows stashed. rows_added
+    # is the count of rows that actually landed (post dedup); the actor
+    # may have returned more if it duplicated items.
+    stats = _LAST_COMMIT_STATS.get(table_id, {})
+    inserted = int(stats.get("inserted", len(res.rows)))
+    skipped_dup = int(stats.get("skipped_duplicates", 0))
     return {
-        "rows_added": len(res.rows),
+        "rows_added": inserted,
+        "rows_skipped_duplicates": skipped_dup,
+        "rows_returned_by_source": len(res.rows),
     }, res.cost_credits * 0.10
 
 
@@ -908,6 +916,13 @@ async def table_delete(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
 
 # Canonical filter ops — must match chat_v2/__init__.py:FILTER_OPS.
 # Mirrored here to avoid an import cycle.
+# Per-table stats from the last _commit_rows call. Read by table_extend
+# (and table_create's apify streaming drain) so the public tool result
+# can report rows_added vs rows_skipped_duplicates honestly. Last-write-
+# wins; small leak per table is fine.
+_LAST_COMMIT_STATS: Dict[str, Dict[str, int]] = {}
+
+
 _CANONICAL_FILTER_OPS = {
     "text_inc_exc", "is_any_of", "between", "gte", "lte",
     "is_null", "is_not_null",
@@ -1359,14 +1374,50 @@ def _commit_rows(
     ).scalar()
     next_seq = int(next_seq_row or 1)
 
+    # Dedup against existing rows when the table has a dedup_key_column.
+    # Without this, table_extend (and apify's background streaming drain)
+    # cheerfully inserts every row the adapter returns — including rows
+    # that match existing ones, since most actors don't paginate via the
+    # `startUrls` config and re-return the same items on each call. The
+    # dedup_key was set on the table but never enforced; this is the
+    # missing enforcement.
+    dedup_key_row = db.execute(
+        sa_text("SELECT dedup_key_column FROM tables WHERE id=:tid"),
+        {"tid": table_id},
+    ).fetchone()
+    dedup_key = dedup_key_row[0] if dedup_key_row else None
+    existing_dedup_values: set[str] = set()
+    if dedup_key:
+        existing = db.execute(
+            sa_text(
+                "SELECT DISTINCT row->>:k FROM samples "
+                "WHERE table_id=:tid AND deleted_at IS NULL AND row->>:k IS NOT NULL"
+            ),
+            {"k": dedup_key, "tid": table_id},
+        ).fetchall()
+        existing_dedup_values = {x[0] for x in existing if x[0] is not None and x[0] != ""}
+
     # Generate sample_ids client-side so we can hand them to the verify
     # hook after commit (was using `gen_random_uuid()` server-side, which
     # didn't return the new id without an extra round-trip).
     pending_verify: List[Tuple[str, Dict[str, Any]]] = []
+    skipped_dup_count = 0
     for r in rows:
         mapped: Dict[str, Any] = {}
         for c in normalized_map:
             mapped[c["name"]] = _extract_source_value(r, c["source_field"])
+
+        # Skip if this row's dedup_key value matches an existing row OR
+        # another row in this same batch (the actor sometimes repeats
+        # items within a single response).
+        if dedup_key:
+            key_val = mapped.get(dedup_key)
+            if key_val not in (None, "") and str(key_val) in existing_dedup_values:
+                skipped_dup_count += 1
+                continue
+            if key_val not in (None, ""):
+                existing_dedup_values.add(str(key_val))
+
         tags_payload = (
             {"sources": cell_sources_template} if cell_sources_template else None
         )
@@ -1393,6 +1444,19 @@ def _commit_rows(
     # BEFORE we schedule verification — the verify task opens its own
     # SessionLocal and won't see uncommitted rows.
     db.commit()
+    if skipped_dup_count:
+        log.info(
+            "_commit_rows: skipped %d duplicate rows on dedup_key=%s for table %s",
+            skipped_dup_count, dedup_key, table_id,
+        )
+    # Stash the dedup counts on a module-level dict keyed by table_id so
+    # table_extend (and friends) can read them without changing every
+    # caller's signature. Last-write-wins; only the most recent commit
+    # for a table is what callers care about.
+    _LAST_COMMIT_STATS[table_id] = {
+        "inserted": len(pending_verify),
+        "skipped_duplicates": skipped_dup_count,
+    }
     return []
 
 
