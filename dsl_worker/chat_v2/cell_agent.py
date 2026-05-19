@@ -161,59 +161,127 @@ _resolve_tier = _resolve_research
 # ---------------------------------------------------------------------------
 
 
-async def _fullenrich_enrich_email(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
+async def _fullenrich_bulk_enrich(
+    api_key: str,
+    contact: Dict[str, Any],
+    enrich_fields: list[str],
+    timeout_s: int = 120,
+    poll_interval_s: int = 3,
+) -> Tuple[Dict[str, Any], float]:
+    """Shared FE waterfall path. Submits a 1-contact bulk job, polls until
+    FINISHED (typical: 30-60s), returns the contact's enriched fields +
+    the credits FE actually billed. Returns 0.0 credits on miss /
+    timeout / error so the user only pays for successful matches.
+
+    FE's single-contact /v1 endpoint we used to hit doesn't exist (404 on
+    every call). The bulk endpoint is what's actually live.
+    """
     import httpx
+    BASE = "https://app.fullenrich.com"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "name": "cell_enrich",
+        "data": [{**contact, "enrich_fields": enrich_fields}],
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(f"{BASE}/api/v2/contact/enrich/bulk", headers=headers, json=body)
+    if r.status_code != 200:
+        return {"error": f"FE submit HTTP {r.status_code}: {r.text[:200]}"}, 0.0
+    eid = (r.json() or {}).get("enrichment_id")
+    if not eid:
+        return {"error": "FE returned no enrichment_id"}, 0.0
+    # Poll. Single-contact bulk runs typically finish in 30-60s. Beyond
+    # timeout_s, give up and charge nothing (user shouldn't pay for our
+    # poll budget running out).
+    elapsed = 0
+    last_result: Dict[str, Any] = {}
+    while elapsed < timeout_s:
+        await asyncio.sleep(poll_interval_s)
+        elapsed += poll_interval_s
+        async with httpx.AsyncClient(timeout=15) as client:
+            g = await client.get(f"{BASE}/api/v2/contact/enrich/bulk/{eid}", headers=headers)
+        if g.status_code != 200:
+            continue
+        last_result = g.json() or {}
+        status = last_result.get("status", "")
+        if status == "FINISHED":
+            break
+        if status in ("CANCELED", "CREDITS_INSUFFICIENT", "RATE_LIMIT"):
+            return {"error": f"FE {status}"}, 0.0
+    else:
+        return {"error": f"FE timed out after {timeout_s}s", "enrichment_id": eid}, 0.0
+
+    items = last_result.get("data") or []
+    if not items:
+        return {"email": None, "phone": None}, 0.0
+    item = items[0]
+    contact_block = item.get("contact") or {}
+    credits = float(((last_result.get("cost") or {}).get("credits") or 0))
+    return {"_raw": contact_block}, credits
+
+
+async def _fullenrich_enrich_email(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
     api_key = os.getenv("FULLENRICH_API_KEY")
     if not api_key:
         return {"error": "FULLENRICH_API_KEY not configured"}, 0.0
-    body = {
+    contact = {
         "first_name": args.get("first_name", ""),
         "last_name": args.get("last_name", ""),
         "domain": args.get("domain") or args.get("company_domain", ""),
         "company_name": args.get("company", ""),
-        "include_email": True,
-        "include_phone": False,
     }
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(
-            "https://app.fullenrich.com/api/v1/contact/enrich",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json=body,
-        )
-        if r.status_code != 200:
-            return {"error": f"FE HTTP {r.status_code}"}, 0.0
-        data = r.json() or {}
-    contact = (data.get("data") or {})
+    result, credits = await _fullenrich_bulk_enrich(
+        api_key, contact, ["contact.emails"], timeout_s=120,
+    )
+    if "error" in result:
+        return result, credits
+    raw = result.get("_raw") or {}
+    emails = raw.get("emails") or []
+    # FE returns a list of email objects, each with {email, qualification, ...}.
+    # Pick the highest-confidence one if any.
+    best = None
+    for e in emails:
+        if not isinstance(e, dict):
+            continue
+        v = e.get("email")
+        if v:
+            best = e
+            break
     return {
-        "email": contact.get("email"),
-        "verification_status": contact.get("email_status"),
-    }, 1.0
+        "email": (best or {}).get("email"),
+        "verification_status": (best or {}).get("qualification"),
+    }, credits
 
 
 async def _fullenrich_enrich_phone(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
-    import httpx
     api_key = os.getenv("FULLENRICH_API_KEY")
     if not api_key:
         return {"error": "FULLENRICH_API_KEY not configured"}, 0.0
-    body = {
+    contact = {
         "first_name": args.get("first_name", ""),
         "last_name": args.get("last_name", ""),
         "domain": args.get("domain") or args.get("company_domain", ""),
         "company_name": args.get("company", ""),
-        "include_email": False,
-        "include_phone": True,
     }
-    async with httpx.AsyncClient(timeout=90) as client:
-        r = await client.post(
-            "https://app.fullenrich.com/api/v1/contact/enrich",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json=body,
-        )
-        if r.status_code != 200:
-            return {"error": f"FE HTTP {r.status_code}"}, 0.0
-        data = r.json() or {}
-    contact = (data.get("data") or {})
-    return {"phone": contact.get("phone")}, 10.0
+    result, credits = await _fullenrich_bulk_enrich(
+        api_key, contact, ["contact.phones"], timeout_s=180,
+    )
+    if "error" in result:
+        return result, credits
+    raw = result.get("_raw") or {}
+    phones = raw.get("phones") or []
+    best = None
+    for p in phones:
+        if not isinstance(p, dict):
+            continue
+        v = p.get("phone")
+        if v:
+            best = p
+            break
+    return {"phone": (best or {}).get("phone")}, credits
 
 
 async def _fullenrich_enrich_company(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
