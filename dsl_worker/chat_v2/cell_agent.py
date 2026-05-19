@@ -7,24 +7,21 @@ Spawned per row for every enrichment. Each cell agent gets:
   - A toolset (depends on research level)
   - A credit budget per row (enforced programmatically; NOT shown to the LLM)
 
-Research levels — four flat values, picked per enrichment. IDs match
-the user-facing labels (No / Low / Medium / High research) so the chat
-message format and the stored value line up.
+Research levels — two values, picked per enrichment:
 
-  - "none"   gpt-5.4-nano  | no tools — just a label from row text
-  - "low"    gpt-5.4-mini  | all tools — one quick call when needed
-  - "medium" gpt-5.5       | all tools — standard research
-  - "high"   gpt-5.5 high  | all tools — multi-step / chained
+  - "classify"  gpt-5.4-nano  | no tools — decide a label from row text
+  - "research"  gpt-5.5       | all tools — go find more data (web /
+                                FE / Apollo / browser_use / etc.)
 
-Only "none" restricts tool access. The other three can all call
-web_search / FE / Apollo / browser_use; level picks the model + effort
-rather than what's available.
+The split is binary: does the cell agent need to look OUTSIDE this row's
+data? If yes → research. If no → classify. The middle tiers (mini, etc.)
+proved awkward in practice — for paid integrations the LLM cost is a
+rounding error vs the tool fee, so picking 5.5 everywhere we research
+buys reliability at imperceptible cost.
 
-Legacy aliases cover every prior rename pass:
-  v0:  research → high
-  v1:  fast/smart/standard/deep → none/low/medium/high   (expert → medium)
-  v2:  light → low                                       (also: standard → medium, deep → high)
-  v3:  classify/lookup/search/investigate → none/low/medium/high
+Legacy aliases cover every prior rename pass (none/low/medium/high,
+classify/lookup/search/investigate, fast/smart/expert, etc.) — all
+collapse into one of the two canonical tiers above.
 
 Loop terminates when:
   - Cell agent emits `final_result` (or a parseable JSON message)
@@ -101,29 +98,37 @@ TOOL_COST_ESTIMATES.update({
 
 
 RESEARCH_CONFIG = {
-    "none":   {"model": "gpt-5.4-nano", "effort": "medium", "default_cap": 0.3, "tools": []},
-    "low":    {"model": "gpt-5.4-mini", "effort": "medium", "default_cap": 1.0, "tools": "all"},
-    "medium": {"model": "gpt-5.5",      "effort": "medium", "default_cap": 2.0, "tools": "all"},
-    "high":   {"model": "gpt-5.5",      "effort": "high",   "default_cap": 8.0, "tools": "all"},
+    # Two tiers. The split is binary: "process row data only" vs "go find
+    # more data via web/integrations". Mini tier was awkward in practice —
+    # for paid integrations the LLM cost is a rounding error vs the tool
+    # fee, so we just use the smart model everywhere we do research and
+    # buy reliability for $0.005/row.
+    "classify": {"model": "gpt-5.4-nano", "effort": "medium", "default_cap": 0.3, "tools": []},
+    "research": {"model": "gpt-5.5",      "effort": "medium", "default_cap": 5.0, "tools": "all"},
 }
 
-# Every old name → current value. Covers every prior rename pass.
+# Every old name (across every prior rename pass + the latest collapse)
+# normalizes to one of the two canonical tiers. Old enrichment rows in
+# the DB keep working, agent slips are tolerated.
 LEGACY_ALIASES = {
+    # v4 (none/low/medium/high) — current rename. Anything that needed
+    # tools collapses to "research"; tool-less stays "classify".
+    "none":   "classify",
+    "low":    "research",
+    "medium": "research",
+    "high":   "research",
     # v3 (classify/lookup/search/investigate)
-    "classify":    "none",
-    "lookup":      "low",
-    "search":      "medium",
-    "investigate": "high",
+    "lookup":      "research",
+    "search":      "research",
+    "investigate": "research",
     # v2 (light)
-    "light":       "low",
+    "light":       "research",
     # v1 (fast/smart/standard/deep/expert)
-    "fast":        "none",
-    "smart":       "low",
-    "expert":      "medium",
-    "standard":    "medium",
-    "deep":        "high",
-    # v0 (research as the highest tier)
-    "research":    "high",
+    "fast":     "classify",
+    "smart":    "research",
+    "expert":   "research",
+    "standard": "research",
+    "deep":     "research",
 }
 
 
@@ -134,11 +139,11 @@ def _resolve_research(action: Dict[str, Any], per_row_cap: Optional[float]) -> D
     the research level when caller passes None — fixes the prior bug where
     enrichment.py always passed 5 and trampled per-tier defaults.
     """
-    requested = (action.get("research") or action.get("tier") or "medium").lower()
+    requested = (action.get("research") or action.get("tier") or "research").lower()
     requested = LEGACY_ALIASES.get(requested, requested)
     if requested not in RESEARCH_CONFIG:
-        log.warning("cell_agent: unknown research %r, defaulting to medium", requested)
-        requested = "medium"
+        log.warning("cell_agent: unknown research %r, defaulting to research", requested)
+        requested = "research"
     cfg = RESEARCH_CONFIG[requested].copy()
     cap = float(per_row_cap) if per_row_cap and per_row_cap > 0 else cfg["default_cap"]
     cfg["cap"] = cap

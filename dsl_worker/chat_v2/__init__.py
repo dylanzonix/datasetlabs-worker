@@ -150,8 +150,14 @@ def _enrichment_set_schema() -> Dict[str, Any]:
                 "properties": {
                     "research": {
                         "type": "string",
-                        "enum": ["none", "low", "medium", "high"],
-                        "description": "none=nano, no tools (just a label from row text). low=mini + tools (one known call, e.g. FE email/phone). medium=5.5 + tools (standard research). high=5.5 + tools + higher effort (multi-step).",
+                        "enum": ["classify", "research"],
+                        "description": (
+                            "Two tiers. "
+                            "`classify` = nano model, NO tools — decides a label from the row's existing text "
+                            "(e.g. 'is this a SaaS company yes/no', 'sentiment of bio'). "
+                            "`research` = gpt-5.5 + all tools (web search, FE, Apollo, browser_use) — "
+                            "fills cells by looking outside the row. Use this for anything that needs a lookup or web call."
+                        ),
                     },
                     "prompt": {"type": "string", "description": "Natural-language instruction the per-row agent follows."},
                     "columns_to_fill": {
@@ -159,9 +165,24 @@ def _enrichment_set_schema() -> Dict[str, Any]:
                         "items": {"type": "string"},
                         "description": "Optional. Defaults to all enrichment column names.",
                     },
+                    "depends_on": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional. Column names this enrichment needs as inputs. Rows where ANY listed column "
+                            "is empty are skipped at run time (no credits spent on guaranteed-fail rows). "
+                            "Example: a 'Founder Email' enrichment depends_on ['Founder Name', 'Domain'] — "
+                            "rows missing either get skipped until those columns are filled."
+                        ),
+                    },
                     "per_row_credit_cap": {
                         "type": "number",
-                        "description": "REQUIRED. Cap on credits the cell agent can spend per row. Defaults by research level (classify 0.3, lookup 1.0, search 2.0, investigate 8.0); bump for known-expensive integrations — phone via FE ~10, email via FE ~1.5. The agent is killed mid-row if it tries to exceed this, so set it generously enough that the typical row completes.",
+                        "description": (
+                            "REQUIRED. Cap on credits the cell agent can spend per row. Defaults: "
+                            "classify=0.3, research=5.0. Bump for known-expensive integrations — "
+                            "phone via FE ~10, browser_use chains ~15. The agent is killed mid-row "
+                            "if it tries to exceed this, so set it generously enough that the typical row completes."
+                        ),
                     },
                 },
                 "required": ["research", "prompt", "per_row_credit_cap"],

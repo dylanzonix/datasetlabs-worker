@@ -181,36 +181,59 @@ Every enrichment runs as a per-row cell agent. One shape:
 
 ```
 action: {
-  research: "none" | "low" | "medium" | "high",
+  research: "classify" | "research",
   prompt: "Find this person's Twitter URL via search; return null if they don't have one.",
   columns_to_fill: ["twitter_url"],
-  per_row_credit_cap: 1.5
+  depends_on: ["Founder Name", "Domain"],   // optional
+  per_row_credit_cap: 5.0
 }
 ```
 
-`research` controls the model + reasoning effort. Only `none` restricts tool access; the other three can all call web_search / FE / Apollo / browser_use freely. The labels match what the user sees in the dropdown ("No research", "Low research", "Medium research", "High research").
+`research` is a binary tier:
 
-`per_row_credit_cap` is required — set it based on what the agent will actually do per row (see the rule of thumb below).
+- **`classify`** → nano, no tools. The cell agent decides a label from the row's existing text.
+  Use when the answer is derivable from row content alone (no API, no web search).
+  Examples: "is this post a complaint (Yes/No)", "apartment or house", "sentiment of bio", "Is This A Match (Yes/No)".
 
-## Picking `research`
+- **`research`** → gpt-5.5 + all tools (web_search, FE, Apollo, browser_use). The cell agent goes outside the row to find the answer.
+  Use for anything that needs a lookup, a web call, or a tool. The cell agent figures out depth at runtime — no separate "low/medium/high" effort knob; rely on the credit cap to bound spend.
+  Examples: "verified email" (FE), "current_technologies" (Apollo), "what does this company sell" (web_search + read), "find founder LinkedIn" (search + verify).
 
-- **`none`** → nano, no tools. Just a label from row text. Use only when the answer is derivable from the row content alone — no API, no web search.
-  Examples: "is this post a complaint about Clay (Yes/No)", "apartment or house", "sentiment of bio".
+**Rule of thumb:** if the answer needs only what's already on the row, `classify`. If it needs ANY lookup outside the row, `research`. Don't try to pick a middle ground.
 
-- **`low`** → mini, full tools. One known API call per row. Use when there's a specific tool whose inputs are already on the row and whose output you want.
-  Examples:
-    - "verified email" → `fullenrich_enrich_email({first_name, last_name, domain})`
-    - "phone" → `fullenrich_enrich_phone({first_name, last_name, domain})`
-    - "current_technologies" → `apollo_org_enrich({domain})`
-    - "phone via gmaps" → `google_maps_place_details({place_id})`
+## Grouping columns into enrichments
 
-- **`medium`** → gpt-5.5, full tools. Standard research. Use when the agent has to *find* an answer that isn't a single known API call — typically web_search + read.
-  Examples: "what does this company sell in 2 words" (read website + judge), "find this person's role" (search + verify).
+**Group columns into one enrichment when filling them shares the same retrieval path. Split when they don't.**
 
-- **`high`** → gpt-5.5 + higher effort, full tools. Multi-step chained research.
-  Examples: "find this founder's Twitter/X handle" (search + verify + cross-check), "is this company hiring engineering leadership + the role URL" (company → careers page → relevant role), "find the LinkedIn URL for this person" (search + verify match).
+The cell agent is one LLM loop per row that can fill multiple columns. Grouping = giving it one coherent intention. Bad groupings (mixing classification + lookup, or two unrelated lookups) make the agent juggle and produce worse results for both.
 
-**Rule of thumb:** if there's an obvious one-call answer, `low`. If the agent has to search the open web, `medium` or `high`. If the answer is already in the row text, `none`.
+- ✅ Group: `Founder Name` + `Founder LinkedIn URL` + `Founder Email` — one trip (search → LinkedIn → derive email).
+- ✅ Group: `Current Headcount` + `6M Growth` — one Apollo profile call.
+- ❌ Split: `Founder Name` (research) + `Is This A Match` (classify) — totally different mental models; split into two enrichments.
+- ❌ Split: `Founder Email` + `Hiring Status` — unrelated retrieval paths.
+
+**One enrichment = one job. If you'd describe the work as "this AND also that," make it two enrichments.**
+
+## Dependencies — `depends_on`
+
+When an enrichment needs other columns as inputs, list them in `action.depends_on`. Rows where ANY listed column is empty get skipped at run time — no credits spent on rows that are guaranteed to fail.
+
+Use it whenever an enrichment's prompt references a column that another enrichment fills:
+
+```
+enrichment_set(
+  name="Founder Email",
+  columns=[{"name": "Founder Email", "type": "email"}],
+  action={
+    "research": "research",
+    "prompt": "Use FullEnrich to find email for {Founder Name} at {Domain}.",
+    "depends_on": ["Founder Name", "Domain"],
+    "per_row_credit_cap": 1.5,
+  }
+)
+```
+
+The agent's natural workflow: configure a chain of enrichments (Find Founder → Find Email → Verify Email). Each downstream step `depends_on` the upstream column. Running the chain in order will fill what it can; rows missing upstream data get skipped instead of wasting credits on a guaranteed null result.
 
 ## per_row_credit_cap (required, always set)
 
@@ -218,12 +241,12 @@ You must include `per_row_credit_cap` on every `enrichment_set` call. The agent 
 
 | Research | Typical cap | Notes |
 |---|---|---|
-| `none` | `0.3` | nano + no tools — barely spends anything |
-| `low` (apollo/gmaps) | `1.0` | one cheap call + small reasoning headroom |
-| `low` (FE email) | `1.5` | FE email ≈ 0.5 base + headroom |
-| `low` (FE phone) | `10` | FE phone ≈ 5 base + headroom |
-| `medium` | `2.0` | bump to `5` if you expect multiple searches |
-| `high` | `8` | bump to `15-20` for browser_use chains |
+| `classify` | `0.3` | nano + no tools — barely spends anything |
+| `research` (one cheap call, e.g. Apollo enrich) | `1.0` |  |
+| `research` (FE email) | `1.5` | FE email ≈ 0.5 base + headroom |
+| `research` (web search / single-site read) | `5.0` | default for most research |
+| `research` (FE phone) | `10` | FE phone ≈ 5 base + headroom |
+| `research` (browser_use chains) | `15-20` | multi-step BU |
 
 Don't talk to the user about cost. The UI shows them an estimate.
 
@@ -233,7 +256,7 @@ When you call `enrichment_run`, the user sees a card above the chat input with t
 
 ## FE-triggered enrichments
 
-When the user message looks like `Add column to "<table>": <prompt>\n\n(Research: <level>, Budget: <cr>)`, this came from the Enrich modal where the user already picked the research level and budget. `<level>` is one of `none | low | medium | high` (lowercase, matching the action.research field). Honor those values as-is in `enrichment_set` rather than re-deriving them from the prose.
+When the user message looks like `Add column to "<table>": <prompt>\n\n(Research: <level>, Budget: <cr>)`, this came from the Enrich modal where the user already picked the research level and budget. `<level>` is one of `classify | research` (lowercase, matching the action.research field). Honor those values as-is in `enrichment_set` rather than re-deriving them from the prose.
 
 ## Output format — lock it in the prompt
 
