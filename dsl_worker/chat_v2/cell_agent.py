@@ -235,6 +235,12 @@ async def _fullenrich_enrich_email(args: Dict[str, Any], ctx: ToolContext) -> Tu
         "domain": args.get("domain") or args.get("company_domain", ""),
         "company_name": args.get("company", ""),
     }
+    # LinkedIn URL gates FE's deeper waterfall. Many contacts return
+    # empty without it but DELIVERABLE with it (e.g. Malik Shamsuddin
+    # @ coldemailhustle.com → second@example.com once linkedin is sent).
+    linkedin_url = args.get("linkedin_url") or args.get("professional_network_url")
+    if linkedin_url:
+        contact["linkedin_url"] = linkedin_url
     result, credits = await _fullenrich_bulk_enrich(
         api_key, contact, ["contact.emails"], timeout_s=120,
     )
@@ -268,6 +274,11 @@ async def _fullenrich_enrich_phone(args: Dict[str, Any], ctx: ToolContext) -> Tu
         "domain": args.get("domain") or args.get("company_domain", ""),
         "company_name": args.get("company", ""),
     }
+    # Same lever as email: LinkedIn URL gates FE's deeper waterfall. Many
+    # contacts return empty without it but a real phone with it.
+    linkedin_url = args.get("linkedin_url") or args.get("professional_network_url")
+    if linkedin_url:
+        contact["linkedin_url"] = linkedin_url
     result, credits = await _fullenrich_bulk_enrich(
         api_key, contact, ["contact.phones"], timeout_s=180,
     )
@@ -741,7 +752,10 @@ _CELL_TOOL_DEFS: List[Dict[str, Any]] = [
         "description": (
             "Verified business email lookup via FullEnrich. Use when the row has "
             "first_name + last_name + domain and the column wants email. "
-            "~0.5 cr per successful match (no charge on miss)."
+            "~1 cr per successful match (no charge on miss). "
+            "**Pass `linkedin_url` whenever the row has it** — FE's waterfall is "
+            "dramatically better with a LinkedIn URL; many contacts return empty "
+            "without it but DELIVERABLE with it."
         ),
         "parameters": {
             "type": "object",
@@ -750,6 +764,10 @@ _CELL_TOOL_DEFS: List[Dict[str, Any]] = [
                 "last_name": {"type": "string"},
                 "domain": {"type": "string", "description": "Company domain like 'anthropic.com'."},
                 "company": {"type": "string", "description": "Optional fallback when domain isn't on the row."},
+                "linkedin_url": {
+                    "type": "string",
+                    "description": "Person's LinkedIn profile URL if known. Improves hit rate substantially — include it whenever the row has it.",
+                },
             },
             "required": ["first_name", "last_name"],
             "additionalProperties": False,
@@ -761,7 +779,8 @@ _CELL_TOOL_DEFS: List[Dict[str, Any]] = [
         "description": (
             "Verified phone lookup via FullEnrich. EXPENSIVE — ~5 cr per "
             "successful match. Only use when the column explicitly asks for "
-            "a phone number. Same inputs as email."
+            "a phone number. Same inputs as email; pass linkedin_url when the "
+            "row has it for a better hit rate."
         ),
         "parameters": {
             "type": "object",
@@ -770,6 +789,7 @@ _CELL_TOOL_DEFS: List[Dict[str, Any]] = [
                 "last_name": {"type": "string"},
                 "domain": {"type": "string"},
                 "company": {"type": "string"},
+                "linkedin_url": {"type": "string"},
             },
             "required": ["first_name", "last_name"],
             "additionalProperties": False,
