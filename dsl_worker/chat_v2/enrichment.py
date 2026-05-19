@@ -546,11 +546,23 @@ async def _run_enrichment_on_rows(
                 "total": ready_total,
                 "columns": target_cols,
             })
-            new_fields, new_sources, cost, status = await _execute_action(
-                action, row_data, per_row_cap, columns, ctx,
-                enrichment_id=enrichment_id, sample_id=sample_id,
-                raw_row=raw_row,
+            # Register this row as in-progress so the /cells/running
+            # endpoint surfaces it to the FE for refresh-resilient
+            # pending state. Remove on completion or error.
+            from dsl_worker.chat_v2.cell_runs import REGISTRY as CELL_RUNS
+            await CELL_RUNS.add(
+                ctx.project_id, enrichment_id, sample_id, target_cols,
             )
+            try:
+                new_fields, new_sources, cost, status = await _execute_action(
+                    action, row_data, per_row_cap, columns, ctx,
+                    enrichment_id=enrichment_id, sample_id=sample_id,
+                    raw_row=raw_row,
+                )
+            finally:
+                await CELL_RUNS.remove(
+                    ctx.project_id, enrichment_id, sample_id, target_cols,
+                )
             return sample_id, row_data, new_fields, new_sources, cost, status, idx
 
     phase_marker(ctx, "enrichment_run/tasks_spawning", n=len(ready_rows))

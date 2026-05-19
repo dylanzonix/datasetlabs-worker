@@ -489,3 +489,20 @@ async def list_running_enrichments(
 ):
     _verify(project_id, user.user_id, db)
     return {"enrichment_ids": await CANCELS.list_running(str(project_id))}
+
+
+@router.get("/projects/{project_id}/cells/running")
+async def list_running_cells(
+    project_id: UUID,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Cells currently being filled by an in-flight enrichment run.
+
+    Used by the FE on page mount + during active runs to rebuild
+    pendingCells, so the per-cell spinner survives a refresh. Each
+    entry: {enrichment_id (uuid), sample_id, columns: [...]}.
+    """
+    _verify(project_id, user.user_id, db)
+    from dsl_worker.chat_v2.cell_runs import REGISTRY as CELL_RUNS
+    return {"cells": await CELL_RUNS.list_for_project(str(project_id))}
