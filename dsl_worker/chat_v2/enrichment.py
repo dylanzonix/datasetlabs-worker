@@ -441,17 +441,23 @@ async def _run_enrichment_on_rows(
     if deps_missing_rows:
       with phase_span(ctx, "enrichment_run/missing_deps_batch", n=len(deps_missing_rows)):
         ready_total = len(ready_rows)
-        update_payload = []
+        sids_to_update: List[str] = []
         events_to_emit: List[Tuple[str, Dict[str, Any]]] = []
+        # Status delta is the same for every row in this batch: every
+        # target column flips to missing_dependency. We deep-merge into
+        # __cell_status__ in SQL so we don't clobber other enrichments'
+        # values or status entries.
+        status_delta = {cn: "missing_dependency" for cn in target_cols}
         for sid, row_data, missing in deps_missing_rows:
-            merged = dict(row_data) if isinstance(row_data, dict) else {}
-            existing_status = merged.get("__cell_status__") or {}
-            if not isinstance(existing_status, dict):
-                existing_status = {}
-            for cn in target_cols:
-                existing_status[cn] = "missing_dependency"
-            merged["__cell_status__"] = existing_status
-            update_payload.append({"sid": sid, "row": json.dumps(merged)})
+            sids_to_update.append(sid)
+            # Build a cell_status preview for the SSE event so the FE can
+            # render the badge immediately. Best-effort against the
+            # snapshot; the SQL below is authoritative.
+            existing_status_preview = (row_data.get("__cell_status__") if isinstance(row_data, dict) else None) or {}
+            if not isinstance(existing_status_preview, dict):
+                existing_status_preview = {}
+            preview = dict(existing_status_preview)
+            preview.update(status_delta)
             if sample_missing_deps_row is None:
                 sample_missing_deps_row = {
                     "missing_columns": missing,
@@ -472,31 +478,38 @@ async def _run_enrichment_on_rows(
                     "total": ready_total,
                     "new_fields": None,
                     "status": "missing_dependency",
-                    "cell_status": existing_status,
+                    "cell_status": preview,
                     "missing_columns": missing,
                     "cost": 0,
                 },
             ))
 
-        # One batched UPDATE for every skipped row: a single statement
-        # using a VALUES-join, so it goes over the wire once and commits
-        # once. (Per-row execute under one commit would still cost N
-        # network round-trips inside the transaction.)
-        values_sql_parts = []
-        params: Dict[str, Any] = {}
-        for i, p in enumerate(update_payload):
-            values_sql_parts.append(f"(CAST(:sid_{i} AS uuid), :row_{i})")
-            params[f"sid_{i}"] = p["sid"]
-            params[f"row_{i}"] = p["row"]
+        # One batched UPDATE for every skipped row. Uses jsonb_set so we
+        # only touch __cell_status__ (deep-merged with whatever's already
+        # there) — concurrent writers can still update other columns on
+        # the same row without us clobbering them. Until 2026-05-19 this
+        # was a full-row replace which raced disastrously with parallel
+        # enrichment runs.
+        from sqlalchemy import bindparam
         batched_sql = (
-            "UPDATE samples AS s "
-            "SET row = CAST(u.row AS jsonb) "
-            f"FROM (VALUES {', '.join(values_sql_parts)}) AS u(sid, row) "
-            "WHERE s.id = u.sid"
+            "UPDATE samples "
+            "SET row = jsonb_set("
+            "  COALESCE(row, '{}'::jsonb), "
+            "  '{__cell_status__}', "
+            "  COALESCE(row->'__cell_status__', '{}'::jsonb) || CAST(:status_delta AS jsonb)"
+            ") "
+            "WHERE id::text IN :sids"
         )
+        params: Dict[str, Any] = {
+            "status_delta": json.dumps(status_delta),
+            "sids": tuple(sids_to_update),
+        }
         try:
             with time_commit(ctx, "missing_deps_update", threshold_ms=50):
-                ctx.db.execute(sa_text(batched_sql), params)
+                ctx.db.execute(
+                    sa_text(batched_sql).bindparams(bindparam("sids", expanding=True)),
+                    params,
+                )
                 ctx.db.commit()
         except Exception as e:
             log.warning(
@@ -567,97 +580,76 @@ async def _run_enrichment_on_rows(
         if not isinstance(original_row, dict):
             original_row = {}
 
-        # Merge new values + cell_status sidecar in one write. We treat
-        # `__cell_status__` as a reserved row key: a dict of column → status.
-        # Statuses we write: "hit_budget" only (filled is implicit when the
-        # value is present; error leaves the cell untouched, no status).
-        merged = dict(original_row)
+        # Compute DELTAS this enrichment will apply (only keys we own:
+        # the enrichment's target_cols + sidecars for those cols, plus
+        # downstream missing_dependency clears).
+        #
+        # CRITICAL: until 2026-05-19 this code copied original_row,
+        # mutated it, and wrote the whole JSONB back. Two enrichments
+        # touching the same sample concurrently raced on that write —
+        # last writer wins, intermediate values silently dropped. On
+        # Captain (project beae87a4, table t2) 4/10 Universities cells
+        # and 7/11 Past Employers cells were wiped this way. Fix: lock
+        # the sample, re-read fresh state, apply ONLY our deltas, write.
         has_real_value = bool(
             isinstance(new_fields, dict)
             and any(new_fields.get(cn) not in (None, "") for cn in target_cols)
         )
-        if isinstance(new_fields, dict) and new_fields:
-            merged.update(new_fields)
-            if has_real_value:
-                filled_count += 1
-                if sample_filled_row is None:
-                    # Sample what the agent actually wrote — only the
-                    # enrichment's target columns, not the whole row,
-                    # to keep the tool result tight.
-                    sample_filled_row = {cn: new_fields.get(cn) for cn in target_cols}
+        if isinstance(new_fields, dict) and new_fields and has_real_value:
+            filled_count += 1
+            if sample_filled_row is None:
+                sample_filled_row = {cn: new_fields.get(cn) for cn in target_cols}
         if status == "hit_budget":
             hit_budget_count += 1
         elif status == "filled" and not has_real_value:
             not_found_count += 1
             if sample_not_found_row is None:
-                # For not_found, give the agent a hint about what was on
-                # the row so it can judge whether the prompt was wrong or
-                # the data genuinely doesn't exist for this kind of input.
                 sample_not_found_row = {
                     k: v for k, v in original_row.items()
                     if not k.startswith("__") and k not in target_cols
                 }
 
-        existing_status = merged.get("__cell_status__") or {}
-        if not isinstance(existing_status, dict):
-            existing_status = {}
+        # Value delta: only the columns this enrichment is responsible for.
+        value_delta: Dict[str, Any] = {}
+        if isinstance(new_fields, dict):
+            for cn in target_cols:
+                if cn in new_fields:
+                    value_delta[cn] = new_fields[cn]
+
+        # Status delta: keys to SET vs keys to CLEAR (within target_cols
+        # only — plus downstream missing_dependency clears that this run
+        # legitimately unblocks).
+        status_set: Dict[str, str] = {}
+        status_clear: List[str] = []
         if status == "hit_budget":
-            # Mark every target column that didn't get a value — that's
-            # what hit the cap.
             for cn in target_cols:
                 if not (isinstance(new_fields, dict) and new_fields.get(cn)):
-                    existing_status[cn] = "hit_budget"
+                    status_set[cn] = "hit_budget"
         elif status == "filled" and isinstance(new_fields, dict):
-            # Differentiate "filled with a value" from "ran and the answer
-            # genuinely doesn't exist". The latter (cell agent returned
-            # null because it couldn't find anything) is its own status
-            # so the FE can show a "Not found" badge — otherwise the cell
-            # looks identical to "haven't tried yet", and the user
-            # re-clicks ▶ wondering if anything happened.
             for cn in target_cols:
-                v = new_fields.get(cn) if isinstance(new_fields, dict) else None
+                v = new_fields.get(cn)
                 if v not in (None, ""):
-                    existing_status.pop(cn, None)
+                    status_clear.append(cn)
                 else:
-                    existing_status[cn] = "not_found"
-        # Auto-clear stale missing_dependency on DOWNSTREAM enrichments.
-        # When this run just filled an upstream column, any other
-        # enrichment in this table that depends_on it had a stale
-        # "missing_dependency" status sitting on its target cells.
-        # Clear those so the dependent cell goes back to "blank, retry-able"
-        # instead of showing "Missing inputs" indefinitely.
+                    status_set[cn] = "not_found"
         if isinstance(new_fields, dict) and new_fields and downstream_unblocks:
             for cn, v in new_fields.items():
                 if v in (None, ""):
                     continue
                 for downstream_cn in downstream_unblocks.get(cn, []):
-                    if existing_status.get(downstream_cn) == "missing_dependency":
-                        existing_status.pop(downstream_cn, None)
-        if existing_status:
-            merged["__cell_status__"] = existing_status
-        elif "__cell_status__" in merged:
-            merged.pop("__cell_status__")
+                    status_clear.append(downstream_cn)
 
-        # Per-cell cost sidecar. Tagged onto each column the cell agent
-        # just filled so the FE can render a small "$X" badge under the
-        # value (visible at all times, survives reload — cell_filled
-        # events only fire live). Same pattern as __cell_status__.
+        # Cost delta: only the columns whose values we just wrote.
+        cost_delta: Dict[str, float] = {}
         if isinstance(new_fields, dict) and new_fields:
-            existing_cost = merged.get("__cell_cost__") or {}
-            if not isinstance(existing_cost, dict):
-                existing_cost = {}
             for cn in new_fields.keys():
-                existing_cost[cn] = float(cost)
-            merged["__cell_cost__"] = existing_cost
+                cost_delta[cn] = float(cost)
 
-        # Per-cell source citations. Stored in samples.tags.sources, same
-        # shape and place as fetch-side sources written by the row generator
-        # (see worker/dsl_worker/agents/row.py). FE reads `row.tags.sources`
-        # uniformly — no code path differs between fetched and enriched.
+        # Sources delta: only persist sources for columns that actually
+        # got a value this run.
         sources_to_persist: Dict[str, List[Dict[str, Any]]] = {}
         if isinstance(new_sources, dict):
             for cn, citations in new_sources.items():
-                # Only persist sources for columns that actually got a value.
                 if (
                     isinstance(new_fields, dict)
                     and new_fields.get(cn) not in (None, "")
@@ -666,12 +658,68 @@ async def _run_enrichment_on_rows(
                 ):
                     sources_to_persist[cn] = citations
 
-        if merged != original_row or sources_to_persist:
+        # Default existing_status for the SSE event in the no-write path
+        # (best-effort: original_row's status; next refresh corrects).
+        existing_status: Dict[str, str] = {}
+        _orig_status = original_row.get("__cell_status__") if isinstance(original_row, dict) else None
+        if isinstance(_orig_status, dict):
+            existing_status = dict(_orig_status)
+
+        has_any_change = bool(value_delta or status_set or status_clear or cost_delta or sources_to_persist)
+        if has_any_change:
             try:
+                # Serialize concurrent writes on this sample. xact lock is
+                # released at commit; other writers wait. Without this,
+                # the read+modify+write below races at the row-JSONB level
+                # and clobbers fields the other writer just committed.
+                ctx.db.execute(
+                    sa_text("SELECT pg_advisory_xact_lock(hashtextextended(:sid, 0))"),
+                    {"sid": str(sample_id)},
+                )
+                # Re-read inside the lock so we merge with anything the
+                # other writer just committed.
+                fresh = ctx.db.execute(
+                    sa_text("SELECT row FROM samples WHERE id=:sid"),
+                    {"sid": sample_id},
+                ).fetchone()
+                if fresh:
+                    fresh_row = fresh[0] if isinstance(fresh[0], dict) else json.loads(fresh[0] or "{}")
+                else:
+                    fresh_row = {}
+                if not isinstance(fresh_row, dict):
+                    fresh_row = {}
+
+                # Build the row we'll write: start from FRESH state,
+                # layer our deltas on top. Sidecars deep-merge.
+                final = dict(fresh_row)
+                for k, v in value_delta.items():
+                    final[k] = v
+
+                final_status = final.get("__cell_status__") if isinstance(final.get("__cell_status__"), dict) else {}
+                if not isinstance(final_status, dict):
+                    final_status = {}
+                else:
+                    final_status = dict(final_status)
+                for cn, s in status_set.items():
+                    final_status[cn] = s
+                for cn in status_clear:
+                    final_status.pop(cn, None)
+                if final_status:
+                    final["__cell_status__"] = final_status
+                elif "__cell_status__" in final:
+                    final.pop("__cell_status__")
+
+                final_cost = final.get("__cell_cost__") if isinstance(final.get("__cell_cost__"), dict) else {}
+                if not isinstance(final_cost, dict):
+                    final_cost = {}
+                else:
+                    final_cost = dict(final_cost)
+                for cn, c in cost_delta.items():
+                    final_cost[cn] = c
+                if final_cost:
+                    final["__cell_cost__"] = final_cost
+
                 if sources_to_persist:
-                    # jsonb deep-merge: tags.sources gets per-column upsert
-                    # (new columns merged in, existing columns overwritten,
-                    # other tags keys untouched).
                     ctx.db.execute(
                         sa_text(
                             "UPDATE samples "
@@ -684,7 +732,7 @@ async def _run_enrichment_on_rows(
                             "WHERE id=:sid"
                         ),
                         {
-                            "row": json.dumps(merged),
+                            "row": json.dumps(final),
                             "srcs": json.dumps(sources_to_persist),
                             "sid": sample_id,
                         },
@@ -692,8 +740,14 @@ async def _run_enrichment_on_rows(
                 else:
                     ctx.db.execute(
                         sa_text("UPDATE samples SET row=CAST(:row AS jsonb) WHERE id=:sid"),
-                        {"row": json.dumps(merged), "sid": sample_id},
+                        {"row": json.dumps(final), "sid": sample_id},
                     )
+                # Keep `merged` + `existing_status` for downstream code
+                # (cell_filled SSE payload, email verify hook). `final`
+                # is value_delta layered over a fresh snapshot — what
+                # the FE should see in the event.
+                merged = final
+                existing_status = final_status
                 ctx.db.commit()
                 # Schedule Scrubby verify for any email values just
                 # written. Tasks are pinned in email_verify_hook so they
