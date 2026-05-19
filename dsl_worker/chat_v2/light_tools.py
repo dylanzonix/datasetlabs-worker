@@ -32,23 +32,36 @@ async def apify_search_actors(args: Dict[str, Any], ctx: ToolContext) -> Tuple[D
     if not api_key:
         return {"error": "APIFY_API_KEY not configured"}, 0.0
 
+    # Pull a wider net than we return (limit=25) so we can re-sort client-side
+    # by popularity. Apify's default search ordering is relevance-only, which
+    # routinely puts niche / unmaintained actors above battle-tested ones with
+    # 100k+ runs. We re-sort by total runs descending and return the top 8 so
+    # the agent sees the high-trust options first.
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(
             "https://api.apify.com/v2/store",
-            params={"token": api_key, "search": query, "limit": 8},
+            params={"token": api_key, "search": query, "limit": 25},
         )
         if r.status_code != 200:
             return {"error": f"apify search HTTP {r.status_code}: {r.text[:200]}"}, 0.0
         items = (r.json().get("data") or {}).get("items") or []
 
+    def _runs(it: Dict[str, Any]) -> int:
+        return int(((it.get("stats") or {}).get("totalRuns") or 0))
+
+    items.sort(key=_runs, reverse=True)
+
     actors = []
-    for it in items:
+    for it in items[:8]:
         stats = it.get("stats") or {}
         actors.append({
             "actor_id": f"{(it.get('username') or '')}/{(it.get('name') or '')}",
             "title": it.get("title"),
             "short_description": (it.get("description") or "")[:200],
-            "monthly_run_count": stats.get("totalRuns"),
+            # All-time, not monthly — old name was misleading. Agent should
+            # prefer actors with 10k+ total_runs unless there's a clear
+            # reason to pick a niche one.
+            "total_runs": stats.get("totalRuns"),
             "rating": (it.get("stats") or {}).get("publicActorStats", {}).get("avgRating"),
             "pricing_summary": [p.get("pricingModel") for p in (it.get("pricingInfos") or [])],
         })

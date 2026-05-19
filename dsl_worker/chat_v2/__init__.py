@@ -245,7 +245,15 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
         "table_extend": "Pull MORE rows into an EXISTING table with a non-overlapping next slice. Args: table_id, query_params (the new slice — e.g. next batch / page / date window). Reuses the table's existing column map automatically.",
         "table_delete": "Delete a table and all its rows + enrichments. Approval-gated.",
         # Apify discovery
-        "apify_search_actors": "Discover Apify actors matching a query. Returns lightweight summaries.",
+        "apify_search_actors": (
+            "Discover Apify actors matching a query. Returns up to 8 actors "
+            "sorted by total_runs descending — the highest-traffic / most "
+            "battle-tested ones first. Prefer actors with >10k total_runs "
+            "when they exist; lower-traffic actors are often unmaintained "
+            "or have broken pagination (a niche YC actor that doesn't crawl "
+            "past the first page, etc.). Inspect input_schema via "
+            "apify_actor_details before calling table_create — don't guess."
+        ),
         "apify_actor_details": "Read an actor's full input_schema, output preview, and pricing.",
         # Columns/enrichments
         "column_map_set": "Edit columns on an existing table — rename a column, add one mapped from another source field, drop one. Args: table_id, columns ([{name, source_field, type}]). table_create already commits with its own columns; only use this to revise after the fact.",
