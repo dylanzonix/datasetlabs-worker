@@ -808,7 +808,8 @@ def list_enrichments(
                    COALESCE(
                        (SELECT count(*) FROM cell_traces ct WHERE ct.enrichment_id = e.id),
                        0
-                   ) AS total_runs
+                   ) AS total_runs,
+                   e.id::text AS uuid
             FROM enrichments e
             WHERE e.table_id = :tid AND e.deleted_at IS NULL
             ORDER BY e.created_at
@@ -820,6 +821,13 @@ def list_enrichments(
         "enrichments": [
             {
                 "id": r[0],
+                # Full UUID. tables.columns[].enrichment_id stores this, so
+                # the FE needs it to look up an enrichment by what's on the
+                # column metadata. Without uuid, enrichmentInfo keyed by
+                # short_id never matched col.enrichment_id (UUID), and the
+                # column ▶ dropdown silently fell back to default
+                # "research" / 5 credits instead of the persisted values.
+                "uuid": r[10],
                 "name": r[1],
                 "columns": r[2] if isinstance(r[2], list) else json.loads(r[2] or "[]"),
                 "action": r[3] if isinstance(r[3], dict) else json.loads(r[3] or "{}"),
