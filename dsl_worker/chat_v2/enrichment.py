@@ -235,14 +235,19 @@ async def enrichment_run(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
     # Rich return: rows_attempted vs rows_filled lets the agent see drop-off;
     # sample_filled_row + sample_not_found_row let it eyeball whether values
     # look right or the prompt is broken (no re-inspect round-trip needed).
+    # rows_skipped_missing_deps tells the agent how many rows were skipped
+    # because depends_on inputs were empty — usually a sign to run the
+    # upstream enrichment first OR expand the filter.
     return {
         "rows_attempted": stats["rows_attempted"],
         "rows_filled": stats["rows_filled"],
         "rows_not_found": stats["rows_not_found"],
         "rows_hit_budget": stats["rows_hit_budget"],
         "rows_errored": stats["rows_errored"],
+        "rows_skipped_missing_deps": stats["rows_skipped_missing_deps"],
         "sample_filled_row": stats["sample_filled_row"],
         "sample_not_found_row": stats["sample_not_found_row"],
+        "sample_missing_deps_row": stats["sample_missing_deps_row"],
     }, cost * 0.10
 
 
@@ -270,9 +275,11 @@ async def _run_enrichment_on_rows(
         "rows_not_found": 0,
         "rows_hit_budget": 0,
         "rows_errored": 0,
+        "rows_skipped_missing_deps": 0,
         "total_cost_credits": 0.0,
         "sample_filled_row": None,
         "sample_not_found_row": None,
+        "sample_missing_deps_row": None,
     }
 
     enrichment = ctx.db.execute(
@@ -298,13 +305,29 @@ async def _run_enrichment_on_rows(
     not_found_count = 0
     hit_budget_count = 0
     errored_count = 0
+    skipped_missing_deps_count = 0
     sample_filled_row: Dict[str, Any] | None = None
     sample_not_found_row: Dict[str, Any] | None = None
+    sample_missing_deps_row: Dict[str, Any] | None = None
 
     if not rows:
         return empty_stats
 
     target_cols = [c["name"] for c in columns]
+    # depends_on: pre-filter rows where any listed input column is empty.
+    # These rows skip the cell agent entirely (no credits spent) and get
+    # __cell_status__: "missing_dependency" written so the FE shows the
+    # right badge. The agent's tool result echoes the count + a sample so
+    # it can decide whether to expand the filter or fill the upstream
+    # column first.
+    depends_on_raw = action.get("depends_on") or []
+    depends_on = [c for c in depends_on_raw if isinstance(c, str) and c]
+
+    def _row_missing_deps(row_data: Dict[str, Any]) -> List[str]:
+        if not depends_on:
+            return []
+        return [c for c in depends_on if row_data.get(c) in (None, "", [], {})]
+
     total = len(rows)
     completed = 0
 
@@ -322,15 +345,76 @@ async def _run_enrichment_on_rows(
         except Exception:
             log.debug("emit %s failed; continuing", event_type, exc_info=True)
 
+    # Partition rows into ready (will run cell agent) vs missing-deps
+    # (will be marked "missing_dependency" without spawning a cell agent).
+    # No credits are spent on missing-deps rows.
+    ready_rows: List[Tuple[str, Dict[str, Any], Dict[str, Any]]] = []
+    deps_missing_rows: List[Tuple[str, Dict[str, Any], List[str]]] = []
+    for sid, rd, raw in rows:
+        missing = _row_missing_deps(rd)
+        if missing:
+            deps_missing_rows.append((sid, rd, missing))
+        else:
+            ready_rows.append((sid, rd, raw))
+
     # Up-front: tell FE all the cells about to be processed. Renders as
-    # "Queued" badges until cell_start fires per row.
+    # "Queued" badges until cell_start fires per row. Only ready rows
+    # are queued; missing-deps rows get their terminal state directly.
     _emit("fill_start", {
         "tool_call_id": enrichment_id,
         "enrichment_id": enrichment_id,
-        "total": total,
+        "total": len(ready_rows),
         "columns": target_cols,
-        "row_ids": [sid for sid, _, _ in rows],
+        "row_ids": [sid for sid, _, _ in ready_rows],
     })
+
+    # Write the missing_dependency cell status synchronously for every
+    # row that's missing inputs, and fire cell_filled with status so the
+    # FE shows the correct badge. This happens BEFORE any cell agents
+    # spawn, so the FE renders the skip immediately.
+    for sid, row_data, missing in deps_missing_rows:
+        merged = dict(row_data) if isinstance(row_data, dict) else {}
+        existing_status = merged.get("__cell_status__") or {}
+        if not isinstance(existing_status, dict):
+            existing_status = {}
+        for cn in target_cols:
+            existing_status[cn] = "missing_dependency"
+        merged["__cell_status__"] = existing_status
+        try:
+            ctx.db.execute(
+                sa_text("UPDATE samples SET row=CAST(:row AS jsonb) WHERE id=:sid"),
+                {"row": json.dumps(merged), "sid": sid},
+            )
+            ctx.db.commit()
+        except Exception as e:
+            log.warning("dependency-skip row commit failed for %s: %s", sid, e)
+            ctx.db.rollback()
+        skipped_missing_deps_count += 1
+        if sample_missing_deps_row is None:
+            # Hint to the agent: show the missing column names + the row's
+            # other fields so the agent can decide to fill the upstream
+            # column first or expand the scope.
+            sample_missing_deps_row = {
+                "missing_columns": missing,
+                "row_preview": {
+                    k: v for k, v in (row_data or {}).items()
+                    if not k.startswith("__") and k not in target_cols
+                },
+            }
+        _emit("cell_filled", {
+            "tool_call_id": enrichment_id,
+            "enrichment_id": enrichment_id,
+            "sample_id": sid,
+            "row_id": sid,
+            "index": 0,
+            "completed": 0,
+            "total": len(ready_rows),
+            "new_fields": None,
+            "status": "missing_dependency",
+            "cell_status": existing_status,
+            "missing_columns": missing,
+            "cost": 0,
+        })
 
     # Concurrency cap for parallel cell ops. Cells beyond this wait at the
     # semaphore — FE shows them as "Queued" until cell_start fires.
@@ -338,6 +422,9 @@ async def _run_enrichment_on_rows(
 
     # Index assigned by start order — useful for the toolLog summary.
     start_seq = {"i": 0}
+    # The "total" the cell_start events report reflects ready rows only —
+    # missing-deps rows are already terminal at this point.
+    ready_total = len(ready_rows)
 
     async def run_one(sample_id: str, row_data: Dict[str, Any], raw_row: Dict[str, Any]):
         async with sem:
@@ -348,7 +435,7 @@ async def _run_enrichment_on_rows(
                 "enrichment_id": enrichment_id,
                 "row_id": sample_id,
                 "index": idx,
-                "total": total,
+                "total": ready_total,
                 "columns": target_cols,
             })
             new_fields, cost, status = await _execute_action(
@@ -358,7 +445,7 @@ async def _run_enrichment_on_rows(
             )
             return sample_id, row_data, new_fields, cost, status, idx
 
-    tasks = [asyncio.create_task(run_one(sid, rd, raw)) for sid, rd, raw in rows]
+    tasks = [asyncio.create_task(run_one(sid, rd, raw)) for sid, rd, raw in ready_rows]
 
     try:
       for fut in asyncio.as_completed(tasks):
@@ -474,7 +561,7 @@ async def _run_enrichment_on_rows(
             "row_id": sample_id,
             "index": idx,
             "completed": completed,
-            "total": total,
+            "total": ready_total,
             "new_fields": new_fields if isinstance(new_fields, dict) else None,
             "status": status,
             "cell_status": existing_status or None,
@@ -503,14 +590,17 @@ async def _run_enrichment_on_rows(
         raise
 
     return {
-        "rows_attempted": total,
+        # rows_attempted = rows the cell agent actually tried (excludes skipped)
+        "rows_attempted": ready_total,
         "rows_filled": filled_count,
         "rows_not_found": not_found_count,
         "rows_hit_budget": hit_budget_count,
         "rows_errored": errored_count,
+        "rows_skipped_missing_deps": skipped_missing_deps_count,
         "total_cost_credits": total_cost,
         "sample_filled_row": sample_filled_row,
         "sample_not_found_row": sample_not_found_row,
+        "sample_missing_deps_row": sample_missing_deps_row,
     }
 
 
