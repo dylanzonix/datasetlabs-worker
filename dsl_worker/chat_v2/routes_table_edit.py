@@ -157,11 +157,17 @@ async def create_table_from_file(
         user_id=str(user.user_id),
         run_id=None,
     )
+    # File uploads should pull every row the user gave us. table_create
+    # defaults n=100 (sensible for Apollo / FE / web search / etc.) but
+    # for a CSV/XLSX the user already chose the row count by what's in
+    # the file — truncating at 100 silently drops the rest. Pass an
+    # effectively-unlimited n so the file adapter reads to EOF.
     result, _cost = await table_create(
         {
             "source": "file",
             "query_params": {"file_id": body.file_id},
             "name": name,
+            "n": 10_000_000,
         },
         ctx,
     )
