@@ -40,6 +40,7 @@ from dsl_worker.chat_v2.tools import (
     resolve_table_id,
     _next_enrichment_short_id,
 )
+from dsl_worker.chat_v2 import email_verify_hook
 
 
 log = logging.getLogger(__name__)
@@ -593,6 +594,22 @@ async def _run_enrichment_on_rows(
                     {"row": json.dumps(merged), "sid": sample_id},
                 )
                 ctx.db.commit()
+                # Schedule Scrubby verify for any email values just
+                # written. Tasks are pinned in email_verify_hook so they
+                # outlive this function; they emit email_verifying /
+                # email_verified / row_merged via fresh DB sessions as
+                # each verdict lands. Fire-and-forget — awaiting here
+                # would block cell_filled on Scrubby's 15-60s round trip.
+                if isinstance(new_fields, dict) and new_fields:
+                    try:
+                        email_verify_hook.schedule_for_row(
+                            run_id=getattr(ctx, "run_id", None),
+                            sample_id=sample_id,
+                            written_values=new_fields,
+                            columns=columns,
+                        )
+                    except Exception:
+                        log.exception("email_verify_hook.schedule_for_row raised; suppressed")
             except Exception as e:
                 log.warning("enrichment row commit failed for %s: %s", sample_id, e)
                 ctx.db.rollback()

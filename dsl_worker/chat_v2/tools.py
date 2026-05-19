@@ -1457,6 +1457,27 @@ def _commit_rows(
         "inserted": len(pending_verify),
         "skipped_duplicates": skipped_dup_count,
     }
+
+    # Email verification for any email cells just written. Imported
+    # lazily so this module stays import-cycle-free (email_verify_hook
+    # imports from chat_api). Fire-and-forget: tasks pin themselves
+    # in the hook's _BACKGROUND_TASKS set to survive past this return.
+    if run_id and pending_verify:
+        from dsl_worker.chat_v2 import email_verify_hook
+        col_defs = [
+            {"name": c["name"], "type": c["type"]}
+            for c in normalized_map
+        ]
+        for sid, mapped in pending_verify:
+            try:
+                email_verify_hook.schedule_for_row(
+                    run_id=run_id,
+                    sample_id=sid,
+                    written_values=mapped,
+                    columns=col_defs,
+                )
+            except Exception:
+                log.exception("email_verify_hook.schedule_for_row raised in _commit_rows; suppressed")
     return []
 
 
