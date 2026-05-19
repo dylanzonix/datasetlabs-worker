@@ -145,12 +145,18 @@ def _drain_injections(run_id: UUID) -> List[Dict[str, str]]:
 _DEFAULT_PROJECT_NAMES = {"New Dataset", "Untitled", "", None}
 
 
-async def _auto_name_project(project_id: UUID, user_content: str) -> None:
+async def _auto_name_project(project_id: UUID, user_content: str, run_id: Optional[UUID] = None) -> None:
     """One-shot mini LLM call to generate a 3-5 word project name from the
     first message. Subsidized — bypasses TrackedOpenAIClient + balance_ledger
     on purpose; this isn't user-facing OpenAI usage worth charging for.
     Only runs if the project is still on the default name; idempotent for
-    subsequent turns."""
+    subsequent turns.
+
+    When run_id is provided, emits a `project_name` SSE event after the
+    DB update so the FE swaps the title in place (useChat handles it at
+    case "project_name"). Without this event the new name only shows
+    after a page refresh.
+    """
     import os
     db = SessionLocal()
     try:
@@ -181,7 +187,7 @@ async def _auto_name_project(project_id: UUID, user_content: str) -> None:
 
     db = SessionLocal()
     try:
-        db.execute(
+        result = db.execute(
             sa_text(
                 "UPDATE projects SET name=:n, updated_at=now() "
                 "WHERE id=:p AND name = ANY(:defaults)"
@@ -189,6 +195,16 @@ async def _auto_name_project(project_id: UUID, user_content: str) -> None:
             {"n": name, "p": str(project_id), "defaults": ["New Dataset", "Untitled", ""]},
         )
         db.commit()
+        if result.rowcount and run_id is not None:
+            # Tell the FE so the header title swaps in place. Without
+            # this the rename only shows on next page refresh.
+            run = db.query(ChatRun).filter(ChatRun.id == run_id).first()
+            if run is not None:
+                try:
+                    legacy_runs.emit_event(db, run, "project_name", {"name": name})
+                    db.commit()
+                except Exception:
+                    log.exception("project_name event emit failed for project %s", project_id)
     except Exception:
         log.exception("auto-name UPDATE failed for project %s", project_id)
     finally:
@@ -251,8 +267,10 @@ async def start_v2_run(
     # Fire-and-forget project naming. Independent of the orchestrator
     # so a slow LLM here can't block the run. Only names projects that
     # are still on the default name; subsequent turns won't re-trigger.
+    # Pass run_id so the helper can emit a `project_name` SSE event
+    # after the rename — that's what swaps the FE title in place.
     asyncio.create_task(
-        _auto_name_project(project_id, user_content),
+        _auto_name_project(project_id, user_content, run_id=run_id),
         name=f"chat-v2-name-{project_id}",
     )
 
