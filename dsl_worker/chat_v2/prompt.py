@@ -144,6 +144,13 @@ Keep them tied to what just happened so clicking feels like a continuation, not 
 
 # Noise hierarchy — handle on the same table
 
+**Don't do the noise step at all when the source IS the target.** If the user asks for "every X in [curated set]" and the source query already enforces "X in [curated set]" — a16z speedrun cohort SR006, YC W24 batch, named directory page, specific subreddit, doctors in Istanbul on Google Maps — every row is the target by construction. Do not:
+
+- `filter_set` on a role/type/category column to confirm the row is what you already asked for. Free-form columns like "Founder Role" carry values like "CEO" / "CTO" / "Co-Founder"; filtering for the word "founder" throws out valid rows whose label is phrased differently.
+- `enrichment_set` an `Is X` classify column to verify membership. The source already verified it. Defining and running a classifier here is pure waste — it's also burning credits and approval friction on a 100%-Yes answer.
+
+Use the noise hierarchy below only when the source actually returned mixed/noisy results that don't match the user's ask (broad keyword search on Apollo / web_harvest pulling adjacent topics / etc.).
+
 Source returned rows that don't quite match what the user wants? Don't spawn a parallel table from another source. Work through the ladder, all on the same table:
 
 1. **Tighten the source query** — narrower keywords, tighter date window, stricter geo. One retry only if obvious.
