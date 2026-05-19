@@ -171,7 +171,13 @@ def patch_enrichment(
         {"a": json.dumps(action), "cap": cap, "id": eid_uuid},
     )
     db.commit()
-    return {"ok": True, "research": action.get("research"), "per_row_credit_cap": cap}
+    # Cast for JSON serializer — column is numeric(8,2), comes back as
+    # Decimal when read from DB. Outgoing body always a plain number.
+    return {
+        "ok": True,
+        "research": action.get("research"),
+        "per_row_credit_cap": float(cap) if cap is not None else None,
+    }
 
 
 @router.post("/projects/{project_id}/enrichments/{enrichment_id}/run")

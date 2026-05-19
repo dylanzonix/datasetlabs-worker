@@ -831,7 +831,9 @@ def list_enrichments(
                 "name": r[1],
                 "columns": r[2] if isinstance(r[2], list) else json.loads(r[2] or "[]"),
                 "action": r[3] if isinstance(r[3], dict) else json.loads(r[3] or "{}"),
-                "per_row_credit_cap": r[4],
+                # column is now numeric(8,2) — cast to float so the JSON
+                # encoder handles it and the FE gets a number not a string.
+                "per_row_credit_cap": float(r[4]) if r[4] is not None else None,
                 "last_run_filled_rows": r[5],
                 "last_run_cost_credits": float(r[6]) if r[6] is not None else None,
                 "last_run_at": r[7].isoformat() if r[7] else None,
