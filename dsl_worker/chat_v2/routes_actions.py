@@ -251,11 +251,18 @@ async def post_run_enrichment(
     if not cancelled and body.row_ids:
         try:
             from sqlalchemy import bindparam
-            # Resolve the canonical sample IDs we just ran against.
+            # IMPORTANT: `IN :ids` (not `ANY(:ids)`) with expanding=True —
+            # SQLAlchemy expands the bind into a tuple of placeholders,
+            # and Postgres ANY() needs an array, not a tuple. With ANY()
+            # the query silently errored and updated_rows came back
+            # empty, so the FE cleared the spinner without patching
+            # anything (cells stayed blank until manual refresh).
+            # `id::text IN :ids` also avoids the uuid-vs-text comparison
+            # cast since body.row_ids is a list of plain strings.
             stmt = (
                 sa_text(
                     "SELECT id::text, row, tags "
-                    "FROM samples WHERE id = ANY(:ids) AND deleted_at IS NULL"
+                    "FROM samples WHERE id::text IN :ids AND deleted_at IS NULL"
                 ).bindparams(bindparam("ids", expanding=True))
             )
             rows = db.execute(stmt, {"ids": list(body.row_ids)}).fetchall()
