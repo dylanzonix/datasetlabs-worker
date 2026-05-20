@@ -1,13 +1,19 @@
 """
 Scrubby email-validation API client.
 
-Single-email validation only — Scrubby's bulk endpoint is overkill for our
-drip-fed cell fills. Calls return None on any error so callers can degrade
-gracefully (no crashes, no UI alerts).
+Two paths:
+  • validate_email — single email, returns immediately (15s server timeout).
+    Right call for cell-agent enrichment (one email at a time).
+  • validate_emails_bulk — submit a batch, poll until done (30–60s typical).
+    Right call for connector imports that drop N emails in one go.
 
-API: https://api.scrubby.io/validate_email
+Calls return None / empty on any error so callers can degrade gracefully
+(no crashes, no UI alerts).
+
+API: https://api.scrubby.io/
 Auth: x-api-key header
-Cost: 1 credit per validation regardless of result.
+Cost: 1 credit per email, billed at submission.
+Rate limit: 1 request per second per API key.
 """
 
 import asyncio
@@ -15,7 +21,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Dict, List, Literal, Optional
 
 import httpx
 
@@ -119,6 +125,144 @@ class ScrubbyClient:
             credits_used=int(data.get("credits_used") or 0),
             remaining_credits=int(data.get("remaining_credits") or 0),
         )
+
+    async def validate_emails_bulk(
+        self,
+        emails: List[str],
+        poll_interval: float = 30.0,
+        max_wait: float = 600.0,
+    ) -> Dict[str, ScrubbyResult]:
+        """Submit a batch and poll until done. Returns {email: ScrubbyResult}.
+
+        Emails missing from the returned map either failed to validate or
+        the batch timed out — caller treats absence as UNVERIFIED. Errors
+        never raise; the worst case is an empty dict (no badges; same as
+        the feature being disabled).
+
+        Cost: 1 credit per email, billed at submit time. Scrubby caches
+        results — re-submitting the same email is free on the second hit.
+        """
+        if not emails:
+            return {}
+        # Dedup before submit. Scrubby would charge per duplicate even
+        # though it returns identical results.
+        unique = list({e.strip().lower() for e in emails if isinstance(e, str) and "@" in e})
+        if not unique:
+            return {}
+
+        # Submit step — respects the 1-RPS lock since /validate_bulk_emails
+        # is rate-limited the same as the single endpoint.
+        async with self._submit_lock:
+            elapsed = time.monotonic() - self._last_submit_at
+            if elapsed < 1.05:
+                await asyncio.sleep(1.05 - elapsed)
+            self._last_submit_at = time.monotonic()
+
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                resp = await client.post(
+                    f"{BASE_URL}/validate_bulk_emails",
+                    headers=self._headers,
+                    json={"email": unique},
+                )
+        except Exception as e:
+            logger.warning("scrubby: bulk submit failed (%d emails): %s", len(unique), e)
+            return {}
+
+        if resp.status_code not in (200, 202):
+            logger.info("scrubby: bulk submit HTTP %s: %s", resp.status_code, resp.text[:300])
+            return {}
+
+        try:
+            sub = resp.json()
+        except Exception:
+            logger.info("scrubby: bulk submit non-json: %s", resp.text[:200])
+            return {}
+
+        identifier = sub.get("identifier")
+        if not identifier:
+            logger.info("scrubby: bulk submit missing identifier: %s", sub)
+            return {}
+        retry_after = float(sub.get("retry_after_seconds") or poll_interval)
+        logger.info(
+            "scrubby: bulk submitted — %d emails, batch=%s, first poll in %.0fs",
+            len(unique), identifier, retry_after,
+        )
+
+        # Poll step — wait retry_after first, then every poll_interval.
+        await asyncio.sleep(retry_after)
+        started = time.monotonic()
+        while True:
+            async with self._submit_lock:
+                elapsed = time.monotonic() - self._last_submit_at
+                if elapsed < 1.05:
+                    await asyncio.sleep(1.05 - elapsed)
+                self._last_submit_at = time.monotonic()
+            try:
+                async with httpx.AsyncClient(timeout=self._timeout) as client:
+                    poll = await client.post(
+                        f"{BASE_URL}/fetch_bulk_results",
+                        headers=self._headers,
+                        json={"identifier": identifier},
+                    )
+            except Exception as e:
+                logger.info("scrubby: bulk poll failed (batch=%s): %s", identifier, e)
+                if time.monotonic() - started > max_wait:
+                    return {}
+                await asyncio.sleep(poll_interval)
+                continue
+
+            if poll.status_code != 200:
+                logger.info("scrubby: bulk poll HTTP %s: %s", poll.status_code, poll.text[:200])
+                if time.monotonic() - started > max_wait:
+                    return {}
+                await asyncio.sleep(poll_interval)
+                continue
+
+            try:
+                pdata = poll.json()
+            except Exception:
+                logger.info("scrubby: bulk poll non-json: %s", poll.text[:200])
+                await asyncio.sleep(poll_interval)
+                continue
+
+            status = pdata.get("status")
+            if status == "completed":
+                return self._parse_bulk_results(pdata.get("results") or {})
+            if time.monotonic() - started > max_wait:
+                logger.warning(
+                    "scrubby: bulk batch=%s timed out after %.0fs in %s",
+                    identifier, max_wait, status,
+                )
+                return self._parse_bulk_results(pdata.get("results") or {})
+            await asyncio.sleep(poll_interval)
+
+    @staticmethod
+    def _parse_bulk_results(results: Dict[str, Dict[str, str]]) -> Dict[str, "ScrubbyResult"]:
+        status_map = {
+            "Valid": "DELIVERABLE",
+            "Invalid": "INVALID",
+            "Risky": "RISKY",
+            "Unknown": "UNVERIFIED",
+        }
+        out: Dict[str, ScrubbyResult] = {}
+        for email, payload in results.items():
+            if not isinstance(payload, dict):
+                continue
+            result_raw = (payload.get("result") or "").strip()
+            if result_raw in ("pending", ""):
+                continue
+            mapped: Optional[ScrubbyStatus] = status_map.get(result_raw)
+            if mapped is None:
+                continue
+            out[email.lower()] = ScrubbyResult(
+                email=email,
+                status=mapped,
+                raw_status=str(payload.get("status") or ""),
+                credits_used=1,
+                remaining_credits=0,
+            )
+        return out
 
 
 _singleton: Optional[ScrubbyClient] = None

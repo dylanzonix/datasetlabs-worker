@@ -799,7 +799,17 @@ async def tail_events(
         finally:
             db.close()
         for row in rows:
+            last_seq = row.seq
             yield {"type": row.type, "seq": row.seq, **(row.payload or {})}
+        # Grace tail — background Scrubby (and other fire-and-forget
+        # tasks pinned in `_BACKGROUND_TASKS`) fire row_merged AFTER the
+        # run is marked done. Without polling here those late events
+        # land in chat_run_events but no subscriber sees them — the user
+        # has to refresh to pick up cleared INVALID cells / late badges.
+        # 120s covers Scrubby's typical 30-60s bulk roundtrip plus
+        # padding for the worst case.
+        async for ev in _grace_tail(run_id, last_seq, is_disconnected):
+            yield ev
         return
 
     # Atomic subscribe + snapshot. The snapshot is the cumulative
@@ -837,7 +847,15 @@ async def tail_events(
                             .all()
                         )
                         for row in rows:
+                            last_seq = row.seq
                             yield {"type": row.type, "seq": row.seq, **(row.payload or {})}
+                        # Background Scrubby (and other fire-and-forget
+                        # tasks) fire row_merged events AFTER the agent
+                        # marks done. Keep tailing for a grace window so
+                        # those late events reach the FE without forcing
+                        # a page refresh.
+                        async for ev in _grace_tail(run_id, last_seq, is_disconnected):
+                            yield ev
                         return
                 finally:
                     db.close()
@@ -854,9 +872,55 @@ async def tail_events(
                 last_seq = seq
             yield event
             if event.get("type") in ("done", "paused", "cancelled", "error"):
+                # Don't exit yet — late row_merged from background
+                # Scrubby verifications still need a delivery window.
+                async for ev in _grace_tail(run_id, last_seq, is_disconnected):
+                    yield ev
                 return
     finally:
         _BUS.unsubscribe(run_id, q)
+
+
+async def _grace_tail(
+    run_id: UUID,
+    after_seq: int,
+    is_disconnected: Optional[Callable[[], Awaitable[bool]]],
+    duration_s: float = 120.0,
+    poll_interval_s: float = 3.0,
+) -> AsyncGenerator[Dict[str, Any], None]:
+    """Poll chat_run_events for new rows after the run goes terminal.
+
+    Scrubby's bulk verify path (and other tasks pinned in
+    `_BACKGROUND_TASKS`) finish AFTER the agent emits `done`. They
+    write row_merged + email_verified into chat_run_events but, before
+    this grace window existed, no subscriber was listening so the FE
+    silently missed them — the user had to refresh to see verified
+    badges / cleared INVALID cells.
+    """
+    deadline = asyncio.get_event_loop().time() + duration_s
+    last_seq = after_seq
+    while True:
+        if is_disconnected is not None and await is_disconnected():
+            return
+        if asyncio.get_event_loop().time() >= deadline:
+            return
+        db = SessionLocal()
+        try:
+            rows = (
+                db.query(ChatRunEvent)
+                .filter(
+                    ChatRunEvent.run_id == run_id,
+                    ChatRunEvent.seq > last_seq,
+                )
+                .order_by(ChatRunEvent.seq.asc())
+                .all()
+            )
+        finally:
+            db.close()
+        for row in rows:
+            last_seq = row.seq
+            yield {"type": row.type, "seq": row.seq, **(row.payload or {})}
+        await asyncio.sleep(poll_interval_s)
 
 
 # ---- Pause / cancel / resume control surface -----------------------------

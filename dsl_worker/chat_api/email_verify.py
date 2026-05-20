@@ -16,9 +16,12 @@ the FE shows no badge (same as if the feature were disabled).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
+
+from sqlalchemy import text as sa_text
 
 from dsl_api.db import SessionLocal
 from dsl_api.models.sample import Sample
@@ -27,6 +30,58 @@ from dsl_worker.infra.scrubby_client import ScrubbyStatus, get_scrubby_client
 
 
 log = logging.getLogger(__name__)
+
+
+def _resolve_live_column_name(
+    db,
+    table_id: Optional[str],
+    column: str,
+    source_field: Optional[str],
+) -> Optional[str]:
+    """Return the current column name to write the verdict under.
+
+    Handles the column-rename race: agent renames a column via
+    column_map_set while Scrubby is mid-poll, so the verify task
+    scheduled with the OLD name needs to chase the new one. Match
+    rules, in order:
+
+      1. `column` is still a current column name → use it.
+      2. `source_field` is given and some current column has that
+         source_field → use that column's current name.
+      3. `column` itself happens to match some current column's
+         source_field (passthrough case where original name == sf)
+         → use that column's current name.
+      4. None → column was dropped; caller should skip the write.
+    """
+    if not table_id:
+        return column  # legacy callers without a table_id stay correct-by-default
+    try:
+        row = db.execute(
+            sa_text("SELECT columns FROM tables WHERE id=:tid"),
+            {"tid": str(table_id)},
+        ).fetchone()
+    except Exception:
+        return column
+    if not row or not row[0]:
+        return column
+    raw = row[0]
+    try:
+        cols = raw if isinstance(raw, list) else json.loads(raw)
+    except Exception:
+        return column
+    if not isinstance(cols, list):
+        return column
+    names = {c.get("name") for c in cols if isinstance(c, dict) and c.get("name")}
+    if column in names:
+        return column
+    if source_field:
+        for c in cols:
+            if isinstance(c, dict) and c.get("source_field") == source_field and c.get("name"):
+                return str(c["name"])
+    for c in cols:
+        if isinstance(c, dict) and c.get("source_field") == column and c.get("name"):
+            return str(c["name"])
+    return None
 
 ProgressCallback = Callable[[Dict[str, Any]], Awaitable[None]]
 
@@ -99,21 +154,71 @@ async def verify_and_apply(
         sr = None
     status: ScrubbyStatus = sr.status if sr is not None else "UNVERIFIED"
     log.info("scrubby: %s/%s %s → %s (raw=%s)", sample_id, column, email, status, sr.raw_status if sr else "none")
+    await _persist_verdict(
+        sample_id=sample_id,
+        column=column,
+        email=email,
+        status=status,
+        raw_status=sr.raw_status if sr is not None else None,
+        progress_cb=progress_cb,
+    )
 
-    cleared = False
+
+async def _persist_verdict(
+    *,
+    sample_id: str,
+    column: str,
+    email: str,
+    status: ScrubbyStatus,
+    raw_status: Optional[str],
+    progress_cb: Optional[ProgressCallback],
+    source_field: Optional[str] = None,
+) -> None:
+    """Persist one Scrubby verdict and emit the matching SSE events.
+
+    Shared by both the single-email and bulk paths so the on-disk shape
+    + event contract stays identical regardless of which submit mode the
+    caller used.
+
+    `column` is the column name as seen at schedule time. If the agent
+    renamed the column via column_map_set while Scrubby was processing,
+    the live name is resolved via source_field (or, in the passthrough
+    case where original name == source_field, by treating `column` as
+    a source_field). Without this lookup the verdict orphans under the
+    old name and the FE badge (which keys by current column name) never
+    finds it.
+    """
     row_snapshot: Optional[Dict[str, Any]] = None
     write_db = SessionLocal()
     try:
         sample = write_db.query(Sample).filter(Sample.id == sample_id).first()
         if sample is None:
             return
+        live_column = _resolve_live_column_name(
+            write_db,
+            getattr(sample, "table_id", None),
+            column,
+            source_field,
+        )
+        if live_column is None:
+            log.info(
+                "scrubby: column gone for %s/%s (sf=%s) — skipping verdict write",
+                sample_id, column, source_field,
+            )
+            return
+        if live_column != column:
+            log.info(
+                "scrubby: column renamed %r → %r for sample %s — writing under live name",
+                column, live_column, sample_id,
+            )
+            column = live_column
         tags = dict(sample.tags or {})
         verifications = dict(tags.get("email_verification") or {})
         verifications[column] = {
             "value": email,
             "status": status,
             "source": "scrubby",
-            "raw_status": (sr.raw_status if sr is not None else None),
+            "raw_status": raw_status,
         }
         tags["email_verification"] = verifications
         if status == "INVALID":
@@ -121,7 +226,6 @@ async def verify_and_apply(
             if row.get(column) == email:
                 row[column] = None
                 sample.row = row
-                cleared = True
             failed = dict(tags.get("failed_emails") or {})
             bucket = list(failed.get(column) or [])
             if email.lower() not in {e.lower() for e in bucket}:
@@ -165,16 +269,66 @@ async def verify_and_apply(
             "status": status,
             "value": email if status != "INVALID" else None,
         })
-        # Always push the updated row snapshot so the FE gets the new
-        # tags.email_verification entry. Without this the badge logic
-        # reads from stale client-side tags and never shows the green
-        # check / risky icon. (Earlier this was gated on `cleared`
-        # which only fires for INVALID — so DELIVERABLE/RISKY emails
-        # silently did nothing in the UI.)
         if row_snapshot is not None:
             await progress_cb({"type": "row_merged", "row": row_snapshot})
     except Exception:
-        log.exception("progress_cb raised in verify_and_apply (suppressed)")
+        log.exception("progress_cb raised in _persist_verdict (suppressed)")
+
+
+async def verify_and_apply_bulk(
+    *,
+    targets: List[Tuple[str, str, str]],
+    progress_cb: Optional[ProgressCallback],
+) -> None:
+    """Bulk-verify a batch of (sample_id, column, email) triples.
+
+    One Scrubby /validate_bulk_emails submit + poll instead of N single
+    /validate_email calls. Roughly 5–10× faster on connector imports
+    that drop 50+ emails at once. Spinners light up immediately via
+    email_verifying; verdicts land all at once when the bulk poll
+    returns `completed`.
+    """
+    if not targets:
+        return
+    scrubby = get_scrubby_client()
+    if scrubby is None:
+        log.info("scrubby: verify_and_apply_bulk called but client is None — skipping %d targets", len(targets))
+        return
+
+    # Light up spinners on all target cells before the long bulk wait.
+    if progress_cb is not None:
+        for sid, col, val in targets:
+            try:
+                await progress_cb({
+                    "type": "email_verifying",
+                    "row_id": str(sid),
+                    "column": col,
+                    "value": val,
+                })
+            except Exception:
+                log.exception("progress_cb email_verifying raised; suppressed")
+
+    unique_emails = list({val for _, _, val in targets})
+    log.info("scrubby: bulk-verifying %d emails across %d cells", len(unique_emails), len(targets))
+    try:
+        results = await scrubby.validate_emails_bulk(unique_emails)
+    except Exception:
+        log.exception("scrubby.validate_emails_bulk raised")
+        results = {}
+
+    for sid, col, email in targets:
+        sr = results.get(email.lower())
+        status: ScrubbyStatus = sr.status if sr is not None else "UNVERIFIED"
+        raw = sr.raw_status if sr is not None else None
+        log.info("scrubby[bulk]: %s/%s %s → %s (raw=%s)", sid, col, email, status, raw)
+        await _persist_verdict(
+            sample_id=sid,
+            column=col,
+            email=email,
+            status=status,
+            raw_status=raw,
+            progress_cb=progress_cb,
+        )
 
 
 def schedule_verifications(

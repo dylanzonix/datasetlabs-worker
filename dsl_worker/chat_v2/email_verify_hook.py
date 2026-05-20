@@ -115,3 +115,52 @@ def schedule_for_row(
     for t in tasks:
         _register_background(t)
     return tasks
+
+
+def schedule_bulk_for_rows(
+    *,
+    run_id: Optional[Any],
+    rows: List[tuple],
+    columns: List[Dict[str, Any]],
+) -> Optional[asyncio.Task]:
+    """Fire ONE Scrubby /validate_bulk_emails task for a batch of rows.
+
+    Right call when many rows land in one go (connector imports,
+    Apify stream drains) — submits all emails in one API call instead
+    of N single calls paced at 1-RPS. Returns the spawned task pinned
+    in `_BACKGROUND_TASKS`; caller can drop the reference.
+
+    `rows`: list of (sample_id, written_values) tuples — same shape
+    `schedule_for_row` accepts for one row.
+
+    Returns None if Scrubby isn't configured or there are no email
+    cells across the batch.
+    """
+    if not rows:
+        return None
+    email_cols = _email_columns_from_defs(columns)
+    if not email_cols:
+        return None
+    # Collect (sample_id, column, email) triples across the batch.
+    targets: List[tuple] = []
+    for sample_id, written in rows:
+        if not isinstance(written, dict):
+            continue
+        for col, val in written.items():
+            if col not in email_cols:
+                continue
+            if not isinstance(val, str) or "@" not in val:
+                continue
+            targets.append((str(sample_id), col, val))
+    if not targets:
+        return None
+    progress_cb = _make_event_emitter(run_id)
+    log.info("scrubby: scheduling bulk verify — %d cells across %d rows", len(targets), len(rows))
+    task = asyncio.create_task(
+        email_verify.verify_and_apply_bulk(
+            targets=targets,
+            progress_cb=progress_cb,
+        )
+    )
+    _register_background(task)
+    return task

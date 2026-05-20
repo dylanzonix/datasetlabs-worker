@@ -864,11 +864,41 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
     # rename / add / drop columns and switch source_field paths (e.g.
     # flatten nested fields) without re-fetching the source.
     table_row = ctx.db.execute(
-        sa_text("SELECT 1 FROM tables WHERE id=:id AND deleted_at IS NULL"),
+        sa_text("SELECT columns FROM tables WHERE id=:id AND deleted_at IS NULL"),
         {"id": table_id},
     ).fetchone()
     if not table_row:
         return {"error": f"table {table_id} not found"}, 0.0
+
+    # Build a source_field -> old_column_name map BEFORE we overwrite
+    # tables.columns. Used below to migrate per-column tag buckets
+    # (email_verification, fill_status) when the agent renames a column —
+    # without this, Scrubby verdicts stay keyed by the pre-rename name
+    # and the FE badge lookup (which keys by current column name) misses
+    # every row.
+    old_cols_raw = table_row[0]
+    old_cols = old_cols_raw if isinstance(old_cols_raw, list) else (
+        json.loads(old_cols_raw) if old_cols_raw else []
+    )
+    old_sf_to_name: Dict[str, str] = {}
+    for c in old_cols:
+        if isinstance(c, dict):
+            sf = c.get("source_field")
+            nm = c.get("name") or c.get("column_name")
+            if sf and nm:
+                old_sf_to_name[str(sf)] = str(nm)
+    # Reverse the new column list to source_field -> new name.
+    new_sf_to_name: Dict[str, str] = {
+        str(c["source_field"]): str(c["name"]) for c in columns_for_db
+    }
+    # rename_map: old_name -> new_name for columns whose source_field is
+    # still present. Columns dropped in the new mapping have their tag
+    # entries removed; new columns start fresh.
+    rename_map: Dict[str, str] = {}
+    for sf, old_name in old_sf_to_name.items():
+        new_name = new_sf_to_name.get(sf)
+        if new_name and new_name != old_name:
+            rename_map[old_name] = new_name
 
     ctx.db.execute(
         sa_text(
@@ -937,6 +967,50 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
         }
         next_tags = dict(tags) if isinstance(tags, dict) else {}
         next_tags["sources"] = cell_sources
+        # Migrate per-column tag buckets through the rename map so
+        # Scrubby verdicts (email_verification) + null reasons
+        # (fill_status) stay aligned with the new column names. Keys
+        # for columns that were dropped in the new mapping are removed;
+        # keys for columns that didn't change keep their entry intact.
+        new_cols_set = set(new_sf_to_name.values())
+        for bucket_key in ("email_verification", "fill_status", "failed_emails"):
+            bucket = next_tags.get(bucket_key)
+            if not isinstance(bucket, dict) or not bucket:
+                continue
+            migrated: Dict[str, Any] = {}
+            for k, v in bucket.items():
+                target = rename_map.get(k, k)
+                if target in new_cols_set:
+                    migrated[target] = v
+            if migrated:
+                next_tags[bucket_key] = migrated
+            else:
+                next_tags.pop(bucket_key, None)
+        # Reconcile INVALID emails. When a column is renamed mid-stream
+        # (Scrubby verify task submitted under the old name, re-derive
+        # writes under the new name), the verdict tag lands here but the
+        # value stays in `mapped[new_name]`. Without this sweep, INVALID
+        # emails remain visible in cells + exports — the user has to
+        # know what Scrubby said, which defeats the verify gate.
+        ev_now = next_tags.get("email_verification") or {}
+        if isinstance(ev_now, dict):
+            for col_name, verdict in ev_now.items():
+                if not isinstance(verdict, dict):
+                    continue
+                if verdict.get("status") != "INVALID":
+                    continue
+                stale = verdict.get("value")
+                if stale and mapped.get(col_name) == stale:
+                    mapped[col_name] = None
+                    # Make the empty-cell reason discoverable in the FE.
+                    fs = dict(next_tags.get("fill_status") or {})
+                    fs.setdefault(col_name, {
+                        "status": "null_legitimate",
+                        "reason": "Email failed verification — Scrubby marked it Invalid.",
+                        "cost": 0.0,
+                        "strategy": "scrubby_verify",
+                    })
+                    next_tags["fill_status"] = fs
         ctx.db.execute(
             sa_text(
                 "UPDATE samples SET row=CAST(:row AS jsonb), tags=CAST(:tags AS jsonb) WHERE id=:id"
@@ -1595,22 +1669,25 @@ def _commit_rows(
     # lazily so this module stays import-cycle-free (email_verify_hook
     # imports from chat_api). Fire-and-forget: tasks pin themselves
     # in the hook's _BACKGROUND_TASKS set to survive past this return.
+    # Bulk path — one /validate_bulk_emails submit for all rows in the
+    # batch. ~5–10× faster than N single-email calls when a connector
+    # drops 50+ emails at once. Single-mode (schedule_for_row) is still
+    # the right call for one-cell enrichment hits — those go through
+    # enrichment.py.
     if run_id and pending_verify:
         from dsl_worker.chat_v2 import email_verify_hook
         col_defs = [
             {"name": c["name"], "type": c["type"]}
             for c in normalized_map
         ]
-        for sid, mapped in pending_verify:
-            try:
-                email_verify_hook.schedule_for_row(
-                    run_id=run_id,
-                    sample_id=sid,
-                    written_values=mapped,
-                    columns=col_defs,
-                )
-            except Exception:
-                log.exception("email_verify_hook.schedule_for_row raised in _commit_rows; suppressed")
+        try:
+            email_verify_hook.schedule_bulk_for_rows(
+                run_id=run_id,
+                rows=pending_verify,
+                columns=col_defs,
+            )
+        except Exception:
+            log.exception("email_verify_hook.schedule_bulk_for_rows raised in _commit_rows; suppressed")
     return []
 
 
