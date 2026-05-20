@@ -12,6 +12,8 @@ Skip if this doesn't fit the column you're filling.
 
 A `Domain` or `Website` in the row. Without one, return null and stop — no domain means nothing to inspect.
 
+**Use the row's domain only.** Derive `<domain>` directly from the row's `Website URL` / `Domain` field (strip protocol + `www.`). Do NOT BuiltWith adjacent or competitor companies surfaced by web_search — those are different businesses. One call, on the row's domain.
+
 ### Step 1: BuiltWith Apify actor (preferred)
 
 Call `apify_call_actor`:
@@ -68,6 +70,17 @@ Dedupe; return as a list.
 ### Step 2 (fallback): Apollo current_technologies
 
 If BuiltWith fails or returns zero techs, call `apollo_org_enrich(domain=<domain>)`. Response includes `current_technologies` — a similar array. Apply the same classification list. Apollo's tech taxonomy is narrower than BuiltWith's, so BuiltWith is preferred when both succeed.
+
+### Strict no-pixel rule
+
+If BuiltWith returns zero techs from the strict ad-name list, **the answer is NO** (or null if even non-ad techs are empty). Do not write YES based on:
+
+- Marketing language on the homepage ("we advertise locally").
+- Web_search snippets that mention the company runs ads.
+- Google Maps "ads enabled" indicators or Local Services Ads badges.
+- Inference from the company's category ("HVAC companies usually advertise").
+
+Pixel presence is the contract. No pixel → no YES. The whole point of this skill is to replace inference with ground-truth detection.
 
 ### When null is right
 
