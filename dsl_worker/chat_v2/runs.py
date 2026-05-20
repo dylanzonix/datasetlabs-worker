@@ -27,9 +27,10 @@ from uuid import UUID
 from sqlalchemy import text as sa_text
 from sqlalchemy.sql import func
 
+from dsl_api.credits import consume_credits
 from dsl_api.db import SessionLocal
-from dsl_api.models import ChatMessage, ChatRun, Project
-from dsl_api.models.balance_ledger import BalanceLedger
+from dsl_api.models import Account, ChatMessage, ChatRun, Project
+from dsl_api.plans import CENTS_PER_CREDIT
 from dsl_api.models.chat_run import (
     RUN_STATUS_CANCELLED,
     RUN_STATUS_FAILED,
@@ -55,6 +56,30 @@ log = logging.getLogger(__name__)
 # next event-loop tick, and the loop's CancelledError path persists
 # whatever cost was already incurred before exiting.
 _active_tasks: Dict[UUID, asyncio.Task] = {}
+
+
+def _charge_run_credits(
+    db, user_id, spend_cents: int, project_id, reason: str
+) -> None:
+    """Deduct credits via consume_credits — decrements Account pools AND
+    writes the BalanceLedger entries. Doing only the ledger write (the
+    historical mistake) leaves Account.subscription_credits / daily /
+    rollover untouched, so the user's balance display stays flat while
+    the audit log says they spent.
+    """
+    if spend_cents <= 0:
+        return
+    account = db.query(Account).filter(Account.user_id == user_id).first()
+    if not account:
+        log.warning("charge_run_credits: no account for user %s", user_id)
+        return
+    consume_credits(
+        db,
+        account,
+        spend_cents / CENTS_PER_CREDIT,
+        project_id=project_id,
+        reason=reason,
+    )
 
 
 # Per-run queue of user messages injected via the inject endpoint while
@@ -356,6 +381,7 @@ def _force_persist_v2_terminal(
     final_text: str,
     applied_changes: Dict[str, Any],
     spend_cents: int,
+    charged_cents: int,
     terminal_payload: Dict[str, Any],
     cancelled: bool,
 ) -> None:
@@ -386,13 +412,13 @@ def _force_persist_v2_terminal(
             fresh.add(msg)
             fresh.flush()
             run.assistant_message_id = msg.id
-            if spend_cents > 0:
-                fresh.add(BalanceLedger(
-                    user_id=user_id,
-                    amount=-spend_cents,
-                    reason="chat_v2_run",
-                    project_id=project_id,
-                ))
+            # Settle the residual — incremental cost_update charges
+            # already debited charged_cents mid-turn on a separate
+            # session, so this fresh-session flush only owes the delta.
+            residual_cents = spend_cents - charged_cents
+            _charge_run_credits(
+                fresh, user_id, residual_cents, project_id, reason="chat_v2_run"
+            )
             fresh.commit()
             fresh.refresh(run)
 
@@ -517,6 +543,12 @@ async def _drive_agent(
 
         tool_log: List[Dict[str, Any]] = []
         total_cost_ref = {"value": 0.0}
+        # Cents already deducted from the account during this turn via
+        # incremental cost_update events. The end-of-turn flush charges
+        # only the residual (final spend minus what's already settled).
+        # Decoupled from total_cost_ref so we can read it both at normal
+        # completion and on the cancel/force-persist path.
+        charged_cents_ref = {"value": 0}
         final_text_ref = {"value": ""}
 
         async def on_event(evt: Dict[str, Any]) -> None:
@@ -604,6 +636,35 @@ async def _drive_agent(
                         evt.get("total_cost_usd") or total_cost_ref["value"]
                     )
                     total_cost_ref["value"] = new_total
+
+                    # Incremental balance debit: subtract the delta since
+                    # the last cost_update from the user's account pools
+                    # right now, not at end-of-turn. Long turns (multi-
+                    # step agent loops, BU sessions) previously hid spend
+                    # until the very end. ldb is a fresh session so this
+                    # commit is independent of the main turn's state.
+                    new_cumulative_cents = int(round(new_total * 100))
+                    delta_cents = new_cumulative_cents - charged_cents_ref["value"]
+                    if delta_cents > 0:
+                        try:
+                            _charge_run_credits(
+                                ldb, user_id, delta_cents, project_id,
+                                reason="chat_v2_run",
+                            )
+                            ldb.commit()
+                            charged_cents_ref["value"] = new_cumulative_cents
+                        except Exception:
+                            log.exception(
+                                "incremental credit charge failed (run=%s, "
+                                "delta_cents=%d) — end-of-turn flush will "
+                                "settle the residual",
+                                run_id, delta_cents,
+                            )
+                            try:
+                                ldb.rollback()
+                            except Exception:
+                                pass
+
                     legacy_runs.emit_event(ldb, lrun, "cost_update", {
                         "total_cost_usd": new_total,
                     })
@@ -766,13 +827,12 @@ async def _drive_agent(
             db.flush()
             run.assistant_message_id = assistant_msg.id
 
-            if spend_cents > 0:
-                db.add(BalanceLedger(
-                    user_id=user_id,
-                    amount=-spend_cents,
-                    reason="chat_v2_run",
-                    project_id=project_id,
-                ))
+            # Settle the residual — incremental cost_update charges
+            # already debited charged_cents_ref["value"] mid-turn.
+            residual_cents = spend_cents - charged_cents_ref["value"]
+            _charge_run_credits(
+                db, user_id, residual_cents, project_id, reason="chat_v2_run"
+            )
 
             db.commit()
             db.refresh(run)
@@ -797,6 +857,7 @@ async def _drive_agent(
                 final_text=final_text,
                 applied_changes=ac,
                 spend_cents=spend_cents,
+                charged_cents=charged_cents_ref["value"],
                 terminal_payload=terminal_payload,
                 cancelled=cancelled,
             )

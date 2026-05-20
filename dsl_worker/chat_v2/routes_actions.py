@@ -26,9 +26,10 @@ from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
 
 from dsl_api.auth import CurrentUser, get_current_user
+from dsl_api.credits import consume_credits
 from dsl_api.db import SessionLocal
-from dsl_api.models import Project
-from dsl_api.models.balance_ledger import BalanceLedger
+from dsl_api.models import Account, Project
+from dsl_api.plans import CENTS_PER_CREDIT
 from dsl_worker.chat_v2.tools import (
     ToolContext,
     table_extend,
@@ -225,21 +226,29 @@ async def post_run_enrichment(
     finally:
         await CANCELS.unregister(str(project_id), canonical_eid, task)
 
-    # Charge the user. Chat-initiated enrichment_run is charged via
-    # runs.py's end-of-turn flush, but THIS path (FE-clicked ▶) had no
-    # ledger write — runs cost real money on Apollo / FE / BU but
-    # nothing got deducted, so the project's spend display stayed flat
-    # and the user's balance didn't reflect actual usage.
+    # Charge the user via consume_credits — that decrements Account
+    # pools (subscription / rollover / daily) AND writes the BalanceLedger
+    # entries in one go. A bare ledger insert leaves the Account pools
+    # untouched, so balance displays go stale while audit shows spend.
     spend_cents = int(round(float(cost or 0.0) * 100))
     if spend_cents > 0:
         try:
-            db.add(BalanceLedger(
-                user_id=user.user_id,
-                amount=-spend_cents,
-                reason="enrichment_run_rest",
-                project_id=project_id,
-            ))
-            db.commit()
+            account = (
+                db.query(Account).filter(Account.user_id == user.user_id).first()
+            )
+            if account:
+                consume_credits(
+                    db,
+                    account,
+                    spend_cents / CENTS_PER_CREDIT,
+                    project_id=project_id,
+                    reason="enrichment_run_rest",
+                )
+                db.commit()
+            else:
+                log.warning(
+                    "enrichment_run_rest: no account for user %s", user.user_id
+                )
         except Exception:
             try:
                 db.rollback()
