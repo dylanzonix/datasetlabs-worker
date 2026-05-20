@@ -214,7 +214,7 @@ async def run_turn(
                 model=model,
                 input=[system_msg] + input_items,
                 tools=_TOOLS_PAYLOAD,
-                reasoning={"effort": effort, "summary": "detailed"},
+                reasoning={"effort": effort, "summary": "concise"},
                 prompt_cache_key=cache_key,
             )
             llm_ms = int((time.perf_counter() - llm_started) * 1000)
