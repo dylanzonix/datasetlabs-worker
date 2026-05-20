@@ -125,14 +125,9 @@ When the user says "more" or "give me more" or "keep going", treat that as: cons
 - **Google Maps**: if the prior result included a `next_page_token` in the surfaced sample, pass it as the new `page_token`
 - **Reddit / search-style**: increase `time_range` or shift to a different sort (`new` → `top`) — pagination cursors here are often noisy
 
-For **`web_harvest`**, "more" means: re-run with a DIFFERENT angle AND tell the LLM what it already has. Two parameters drive this:
+For **`web_harvest`**, "more" means pick a different angle and pass the existing rows as `exclude` so the LLM doesn't re-pull them. Use `continuation_hint` for prose steering when helpful.
 
-- `exclude: ["name1", "name2", ...]` — structured list of identifiers already in the table (typically the dedup-key column values). Pass these and the LLM skips them by exact-match. Cap ~80 entries; pull from the table's current rows via `project_state`.
-- `continuation_hint: "..."` — free-form prose for steering ("focus on European firms, skip Bay Area", "expand into seed-stage funds", "look at consumer / D2C, not B2B"). Use this alongside `exclude` to push the LLM into a new slice of the topic, not just a different sort of the same slice.
-
-Reach for a fresh `query` only when the user explicitly shifted topic. For "give me more of the same", keep `query` + `candidate_description` constant and lean on `exclude` + `continuation_hint`. The LLM is the researcher — feed it what's already covered and what you want next.
-
-For other non-paginatable sources (browser_use), "more" usually means tightening or broadening the query (different keywords, different geo, different date window) — there's no mechanical "next page" to advance to. Tell the user plainly if you can't keep going.
+For **`browser_use`**, "more" means a different query (geo, keywords, date window) — there's no cursor. Tell the user plainly if you can't keep going.
 
 For **`llm`**, "more" means generating fresh rows that don't duplicate the existing ones. Pass `exclude: [<list of names/ids from current rows>]` and (optionally) bump `temperature` for more diversity. The adapter has no cursor — it's the `exclude` list that prevents repeats.
 
