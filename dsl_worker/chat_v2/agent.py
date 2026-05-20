@@ -27,6 +27,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
 from openai import AsyncOpenAI
 from sqlalchemy.orm import Session
 
+from dsl_worker.billing.pricing import get_pricing_config
 from dsl_worker.billing.tracked_client import TrackedOpenAIClient
 from dsl_worker.chat_v2 import (
     HANDLERS,
@@ -209,14 +210,89 @@ async def run_turn(
                 })
 
         llm_started = time.perf_counter()
+        # IDs of web_search_call items we've already emitted live during
+        # the stream — the post-call response.output loop skips emit for
+        # these (still bills + adds to history).
+        streamed_search_ids: set[str] = set()
         try:
-            response, cost = await client.responses_create(
+            # Stream the Responses API so hosted web_search calls and
+            # reasoning summaries flow to the FE live, instead of all
+            # landing as one blob at the end of a multi-minute call.
+            # Function-call dispatch is unchanged — we still iterate
+            # response.output after the stream completes.
+            stream_kwargs = {
+                "model": model,
+                "input": [system_msg] + input_items,
+                "tools": _TOOLS_PAYLOAD,
+                "reasoning": {"effort": effort, "summary": "concise"},
+                "prompt_cache_key": cache_key,
+            }
+            raw = client.raw_client
+            response = None
+            async with raw.responses.stream(**stream_kwargs) as stream:
+                async for event in stream:
+                    etype = getattr(event, "type", None)
+                    if etype == "response.reasoning_summary_text.delta":
+                        delta = getattr(event, "delta", "") or ""
+                        if delta:
+                            await emit({"type": "reasoning", "text": delta})
+                    elif etype == "response.output_item.added":
+                        added = getattr(event, "item", None)
+                        if added is not None and getattr(added, "type", None) == "web_search_call":
+                            item_id = getattr(added, "id", None) or ""
+                            if item_id and item_id not in streamed_search_ids:
+                                streamed_search_ids.add(item_id)
+                                q = ""
+                                action = getattr(added, "action", None)
+                                if action is not None:
+                                    q = getattr(action, "query", "") or ""
+                                await emit({
+                                    "type": "tool_call_start",
+                                    "tool_call_id": item_id,
+                                    "name": "web_search",
+                                    "args": {"query": q} if q else {},
+                                })
+                    elif etype == "response.output_item.done":
+                        done = getattr(event, "item", None)
+                        if done is not None and getattr(done, "type", None) == "web_search_call":
+                            item_id = getattr(done, "id", None) or ""
+                            if item_id and item_id in streamed_search_ids:
+                                q = ""
+                                action = getattr(done, "action", None)
+                                if action is not None:
+                                    q = getattr(action, "query", "") or ""
+                                await emit({
+                                    "type": "tool_call_result",
+                                    "tool_call_id": item_id,
+                                    "name": "web_search",
+                                    "result_preview": f"native web_search: {q[:120]}" if q else "native web_search",
+                                    "cost_usd": WEB_SEARCH_CALL_COST_USD,
+                                    "duration_ms": 0,
+                                })
+                response = await stream.get_final_response()
+
+            if response is None:
+                raise RuntimeError("stream ended without final response")
+
+            # Cost compute mirrors TrackedOpenAIClient.responses_create:
+            # input/output/cached tokens off response.usage, priced via
+            # the loaded pricing config.
+            pricing = get_pricing_config()
+            usage = getattr(response, "usage", None)
+            in_tok = getattr(usage, "input_tokens", 0) if usage else 0
+            out_tok = getattr(usage, "output_tokens", 0) if usage else 0
+            cached_tok = 0
+            details = getattr(usage, "input_tokens_details", None) if usage else None
+            if details is not None:
+                cached_tok = getattr(details, "cached_tokens", 0) or 0
+            non_cached = max(in_tok - cached_tok, 0)
+            cost = pricing.calculate_cost(
                 model=model,
-                input=[system_msg] + input_items,
-                tools=_TOOLS_PAYLOAD,
-                reasoning={"effort": effort, "summary": "detailed"},
-                prompt_cache_key=cache_key,
+                input_tokens=non_cached,
+                output_tokens=out_tok,
+                cached_input_tokens=cached_tok,
             )
+
             llm_ms = int((time.perf_counter() - llm_started) * 1000)
             log.info(
                 "[chat_v2 timing] llm_call project=%s iter=%d duration_ms=%d cost_usd=%.6f",
@@ -279,16 +355,12 @@ async def run_turn(
                 function_calls.append(item)
                 input_items.append(item.model_dump(exclude_none=True))
             elif itype == "web_search_call":
-                # Hosted tool — OpenAI already executed this server-side as
-                # part of this same Responses call. We didn't dispatch it,
-                # but we still need to:
-                #  (a) emit tool_call_start + tool_call_result events so the
-                #      FE renders it in the tool log (consistent with how
-                #      function-style tools used to render),
-                #  (b) bill the per-call hosted-tool fee, since the
-                #      TrackedClient only computes token cost,
-                #  (c) preserve the item in history so reasoning-item
-                #      pairing stays intact.
+                # Hosted tool — OpenAI ran it server-side inside this
+                # same Responses call. The live tool_call_start /
+                # tool_call_result events were emitted during the stream
+                # (see the stream loop above), so we don't re-emit here.
+                # We still bill the per-call hosted-tool fee and preserve
+                # the item in history so reasoning-item pairing holds.
                 query = ""
                 try:
                     action = getattr(item, "action", None)
@@ -297,12 +369,6 @@ async def run_turn(
                 except Exception:
                     pass
                 call_id = getattr(item, "id", "") or f"web_search_{iteration}"
-                await emit({
-                    "type": "tool_call_start",
-                    "tool_call_id": call_id,
-                    "name": "web_search",
-                    "args": {"query": query},
-                })
                 total_cost_usd += WEB_SEARCH_CALL_COST_USD
                 tool_calls_made.append({
                     "name": "web_search",
@@ -310,13 +376,23 @@ async def run_turn(
                     "result_preview": f"native web_search (status={getattr(item, 'status', '?')})",
                     "cost_usd": WEB_SEARCH_CALL_COST_USD,
                 })
-                await emit({
-                    "type": "tool_call_result",
-                    "tool_call_id": call_id,
-                    "name": "web_search",
-                    "result_preview": f"native web_search: {query[:120]}",
-                    "cost_usd": WEB_SEARCH_CALL_COST_USD,
-                })
+                # If the stream missed the item for some reason, emit
+                # the synthesized events as a fallback so the FE still
+                # renders the row in the tool log.
+                if call_id not in streamed_search_ids:
+                    await emit({
+                        "type": "tool_call_start",
+                        "tool_call_id": call_id,
+                        "name": "web_search",
+                        "args": {"query": query},
+                    })
+                    await emit({
+                        "type": "tool_call_result",
+                        "tool_call_id": call_id,
+                        "name": "web_search",
+                        "result_preview": f"native web_search: {query[:120]}",
+                        "cost_usd": WEB_SEARCH_CALL_COST_USD,
+                    })
                 await emit({"type": "cost_update", "total_cost_usd": total_cost_usd})
                 input_items.append(item.model_dump(exclude_none=True))
             else:
