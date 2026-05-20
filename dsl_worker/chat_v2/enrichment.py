@@ -775,8 +775,19 @@ async def _run_enrichment_on_rows(
 
                 # Build the row we'll write: start from FRESH state,
                 # layer our deltas on top. Sidecars deep-merge.
+                #
+                # When overwrite=false, also skip cells that already hold a
+                # value in fresh_row. Row-level filtering already drops
+                # fully-filled rows, but a partially-filled row's filled
+                # cells were still being clobbered by the agent's restated
+                # values (e.g. an adopted query column where URL was scraped
+                # and Starting Bid was missing — agent emits both and the
+                # original URL got rewritten). With this skip, "overwrite:
+                # false" means "fill missing" at the cell level too.
                 final = dict(fresh_row)
                 for k, v in value_delta.items():
+                    if not overwrite and fresh_row.get(k) not in (None, ""):
+                        continue
                     final[k] = v
 
                 final_status = final.get("__cell_status__") if isinstance(final.get("__cell_status__"), dict) else {}
@@ -1061,10 +1072,13 @@ def _ensure_columns_on_table(
     enrichment_columns: List[Dict[str, str]],
     enrichment_id: Optional[str] = None,
 ) -> None:
-    """Append enrichment columns to the table's columns array if not present.
+    """Attach enrichment columns to the table's columns array.
 
-    Each appended column carries `enrichment_id` so the FE can render
-    grouped headers + per-cell rerun buttons for enrichment columns.
+    New columns are appended. Existing query columns (no enrichment_id) get
+    adopted — the enrichment_id is stamped on them so a partially-filled
+    query column can be backfilled by enrichment_run without redefining or
+    overwriting good data. Existing columns already owned by a different
+    enrichment are left alone.
     """
     row = db.execute(
         sa_text("SELECT columns FROM tables WHERE id=:tid"),
@@ -1073,16 +1087,22 @@ def _ensure_columns_on_table(
     if not row:
         return
     existing = row[0] if isinstance(row[0], list) else json.loads(row[0] or "[]")
-    existing_names = {c["name"] for c in existing}
-    to_add = []
+    by_name = {c["name"]: c for c in existing}
+    to_add: List[Dict[str, Any]] = []
+    adopted = False
     for c in enrichment_columns:
-        if c["name"] in existing_names:
+        name = c["name"]
+        if name in by_name:
+            current = by_name[name]
+            if enrichment_id and not current.get("enrichment_id"):
+                current["enrichment_id"] = enrichment_id
+                adopted = True
             continue
         cnew = dict(c)
         if enrichment_id:
             cnew["enrichment_id"] = enrichment_id
         to_add.append(cnew)
-    if not to_add:
+    if not to_add and not adopted:
         return
     new_cols = existing + to_add
     db.execute(

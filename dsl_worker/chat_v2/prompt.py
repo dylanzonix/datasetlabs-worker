@@ -226,6 +226,16 @@ The cell agent is one LLM loop per row that can fill multiple columns. Grouping 
 
 **One enrichment = one job. If you'd describe the work as "this AND also that," make it two enrichments.**
 
+## Backfilling missing cells in a query column
+
+A query column (one that came from `table_create` / `table_extend`, not from an enrichment) sometimes has nulls — the source returned partial data on some rows. The user might say *"fill in the missing Starting Bids"* or *"some of the URLs are blank, can you get them"*.
+
+Don't define a new column. Instead, define an enrichment that **adopts the existing query column(s)**: pass the same column name(s) in `enrichment_set.columns`. `_ensure_columns_on_table` will stamp the new `enrichment_id` onto the existing column entry without touching its data. Then `enrichment_run` with `overwrite: false` (the default) skips already-filled cells and only works on rows where one of the adopted columns is null.
+
+When you adopt, **group all query columns from that table that came from the same source** into one enrichment, not one per missing column. Reason: a row often has multiple missing cells, and the cell agent should re-fetch the source page (or person, or listing) once and fill them together. Splitting forces N redundant retrievals per row.
+
+Example: user asks to fill missing `Starting Bid` on an auction table that also has query columns `URL`, `Title`, `Address`. Define one enrichment owning all four; `research: "research"`; prompt: *"For each row, open the auction URL and extract URL, Title, Address, and Starting Bid. Leave any field blank that the page doesn't show."* Run with `{type: "all_unfilled"}` (or `first_n: 10` for a sample first). The 50% of rows where every field is filled are skipped; only rows missing at least one field get worked.
+
 ## Dependencies — `depends_on`
 
 When an enrichment needs other columns as inputs, list them in `action.depends_on`. Rows where ANY listed column is empty get skipped at run time — no credits spent on rows that are guaranteed to fail.

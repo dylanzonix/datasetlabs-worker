@@ -285,6 +285,150 @@ async def post_run_enrichment(
     return {"result": result, "cost_usd": cost, "cancelled": cancelled, "updated_rows": updated_rows}
 
 
+class PromoteQueryColumnsBody(BaseModel):
+    # When set, only adopt this column (plus any other query columns on the
+    # same table — they share retrieval). Omit to adopt every query column.
+    # The server always groups all query columns into one ghost so multi-cell
+    # missing rows fill in a single trip.
+    column: Optional[str] = None
+
+
+@router.post("/projects/{project_id}/tables/{table_id}/promote_query_columns")
+async def post_promote_query_columns(
+    project_id: UUID,
+    table_id: str,
+    body: PromoteQueryColumnsBody,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Idempotent: ensure a ghost enrichment exists adopting all query
+    columns on the table. Returns its id/short_id + the adopted columns.
+
+    A "query column" is a column with no enrichment_id — i.e. it was
+    populated by the original scrape (table_create / table_extend) rather
+    than by a prior enrichment. After this call the column has an
+    enrichment_id; from then on it behaves like any enrichment column and
+    the existing /enrichments/{eid}/run endpoint backfills missing cells.
+
+    The auto-derived prompt is intentionally generic ("use available tools
+    to fill these fields for each row"). The cell agent's research tools
+    figure out the retrieval from the row's existing values (URL, domain,
+    name, etc.).
+    """
+    _verify(project_id, user.user_id, db)
+
+    from dsl_worker.chat_v2.tools import resolve_table_id, _next_enrichment_short_id
+    from dsl_worker.chat_v2.enrichment import _ensure_columns_on_table
+
+    tid = resolve_table_id(db, str(project_id), table_id)
+    if not tid:
+        raise HTTPException(404, "Table not found")
+
+    row = db.execute(
+        sa_text("SELECT name, source, columns FROM tables WHERE id=:tid AND deleted_at IS NULL"),
+        {"tid": tid},
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "Table not found")
+    table_name = row[0] or "table"
+    source = row[1] or ""
+    cols = row[2] if isinstance(row[2], list) else (json.loads(row[2]) if row[2] else [])
+
+    query_cols = [c for c in cols if isinstance(c, dict) and not c.get("enrichment_id")]
+    if not query_cols:
+        # Nothing to adopt — caller should just use the existing enrichment.
+        raise HTTPException(400, "No query columns on this table to promote")
+
+    # If a ghost already exists for this table, reuse it (idempotent).
+    existing_ghost = db.execute(
+        sa_text(
+            "SELECT id::text, short_id FROM enrichments "
+            "WHERE table_id=:tid AND deleted_at IS NULL "
+            "AND COALESCE(action->>'ghost', '') = '1' "
+            "ORDER BY created_at ASC LIMIT 1"
+        ),
+        {"tid": tid},
+    ).fetchone()
+
+    if existing_ghost:
+        eid = existing_ghost[0]
+        short_id = existing_ghost[1]
+        # Re-adopt: pick up any query columns added since the ghost was
+        # created (e.g. user ran fetch_more, source returned a new field).
+        _ensure_columns_on_table(db, tid, query_cols, enrichment_id=eid)
+        # Sync the enrichment's own columns JSON to include the freshly
+        # adopted ones.
+        ghost_cols_row = db.execute(
+            sa_text("SELECT columns FROM enrichments WHERE id=:eid"),
+            {"eid": eid},
+        ).fetchone()
+        ghost_cols = ghost_cols_row[0] if isinstance(ghost_cols_row[0], list) else (
+            json.loads(ghost_cols_row[0]) if ghost_cols_row[0] else []
+        )
+        ghost_names = {c.get("name") for c in ghost_cols if isinstance(c, dict)}
+        added = False
+        for qc in query_cols:
+            if qc.get("name") not in ghost_names:
+                ghost_cols.append({"name": qc["name"], "type": qc.get("type", "text")})
+                added = True
+        if added:
+            db.execute(
+                sa_text("UPDATE enrichments SET columns=CAST(:c AS jsonb) WHERE id=:eid"),
+                {"c": json.dumps(ghost_cols), "eid": eid},
+            )
+        db.commit()
+        return {"enrichment_id": eid, "short_id": short_id, "columns": ghost_cols}
+
+    # Fresh ghost. Synthesize an action prompt from the table's source +
+    # column list. Generic on purpose — the cell agent figures out
+    # retrieval from row context.
+    col_names = [c["name"] for c in query_cols if c.get("name")]
+    col_list_md = "\n".join(
+        f"- **{c['name']}** ({c.get('type', 'text')})"
+        for c in query_cols if c.get("name")
+    )
+    source_hint = f" The table was originally populated from `{source}`." if source else ""
+    prompt = (
+        f"For each row in '{table_name}', use the row's existing fields "
+        f"(URL, domain, name, identifier, etc.) to look up and fill these columns:\n\n"
+        f"{col_list_md}\n\n"
+        f"Skip fields that are already populated; only fill what's missing. "
+        f"If a value isn't findable, leave it null — don't fabricate."
+        f"{source_hint}"
+    )
+
+    eid = str(__import__("uuid").uuid4())
+    short_id = _next_enrichment_short_id(db, tid)
+    action = {
+        "research": "research",
+        "prompt": prompt,
+        "ghost": "1",
+    }
+    enrichment_columns = [
+        {"name": c["name"], "type": c.get("type", "text")}
+        for c in query_cols if c.get("name")
+    ]
+    db.execute(
+        sa_text(
+            "INSERT INTO enrichments (id, table_id, short_id, name, columns, action, per_row_credit_cap, created_at) "
+            "VALUES (:eid, :tid, :sid, :name, CAST(:cols AS jsonb), CAST(:action AS jsonb), :cap, now())"
+        ),
+        {
+            "eid": eid,
+            "tid": tid,
+            "sid": short_id,
+            "name": "Backfill missing",
+            "cols": json.dumps(enrichment_columns),
+            "action": json.dumps(action),
+            "cap": 2.0,
+        },
+    )
+    _ensure_columns_on_table(db, tid, query_cols, enrichment_id=eid)
+    db.commit()
+
+    return {"enrichment_id": eid, "short_id": short_id, "columns": enrichment_columns}
+
+
 class FilterBody(BaseModel):
     column: str
     op: str
