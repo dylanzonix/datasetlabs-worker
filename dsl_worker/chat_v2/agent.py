@@ -434,10 +434,44 @@ async def run_turn(
                 "text": mid_text_raw,
             })
 
-        # Dispatch each tool call sequentially. Parallel-tool execution is
-        # a follow-up — for now agent rarely emits >1 fn call per turn at
-        # this surface size.
-        for fc in function_calls:
+        # Dispatch all tool calls concurrently when the model emits a batch
+        # of independent function_calls in one response. Each branch gets
+        # its own SessionLocal + cloned ToolContext so SQLAlchemy sessions
+        # never overlap. Approval cards still serialize on the FE through
+        # `approval_lock` — only one card visible at a time. The single
+        # end-of-batch `cost_update` avoids the out-of-order debit race in
+        # _drive_agent's incremental ledger flusher (sibling branches can
+        # finish in any order; emitting only the final sum keeps the
+        # cumulative monotonic).
+        from dsl_api.db import SessionLocal as _SessionLocal
+        from dsl_worker.chat_v2.approvals import (
+            APPROVAL_REQUIRED,
+            REGISTRY as APPROVALS,
+            estimate_enrichment_run_cost,
+        )
+
+        branch_dbs: List[Any] = []
+        branch_ctxs: List[ToolContext] = []
+        for _ in function_calls:
+            _bdb = _SessionLocal()
+            branch_dbs.append(_bdb)
+            branch_ctxs.append(ToolContext(
+                db=_bdb,
+                project_id=ctx.project_id,
+                user_id=ctx.user_id,
+                run_id=ctx.run_id,
+                emit_progress=ctx.emit_progress,
+                emit_event=None,
+                cancel_event=ctx.cancel_event,
+                partial_cost_usd=0.0,
+            ))
+
+        # Per-iteration lock: only one approval card visible at a time on
+        # the FE. Non-approval tools never touch it and run fully in
+        # parallel with the approval await.
+        approval_lock = asyncio.Lock()
+
+        async def _dispatch_call(fc: Any, bctx: ToolContext) -> Dict[str, Any]:
             name = fc.name
             try:
                 args = json.loads(fc.arguments or "{}")
@@ -451,31 +485,24 @@ async def run_turn(
                 "args": args,
             })
 
-            handler = HANDLERS.get(name)
             tool_started = time.perf_counter()
-            if not handler:
-                tool_result: Dict[str, Any] = {"error": f"unknown tool {name}"}
-                h_cost = 0.0
-            else:
-                # Approval gate. For tools in APPROVAL_REQUIRED, register
-                # a pending approval, emit the SSE event so the FE can
-                # show the card, then await the user's decision. Denied
-                # → short-circuit with a result the agent can read and
-                # continue from. Approved → fall through to the normal
-                # handler dispatch.
-                from dsl_worker.chat_v2.approvals import (
-                    APPROVAL_REQUIRED,
-                    REGISTRY as APPROVALS,
-                    estimate_enrichment_run_cost,
-                )
+            handler = HANDLERS.get(name)
+            tool_result: Dict[str, Any] = {}
+            h_cost = 0.0
+            approval_denied = False
 
-                if name in APPROVAL_REQUIRED:
+            if not handler:
+                tool_result = {"error": f"unknown tool {name}"}
+            elif name in APPROVAL_REQUIRED:
+                async with approval_lock:
                     if name == "enrichment_run":
-                        est_cost, summary = estimate_enrichment_run_cost(args, ctx.db, ctx.project_id)
+                        est_cost, summary = estimate_enrichment_run_cost(
+                            args, bctx.db, bctx.project_id
+                        )
                     else:
                         est_cost, summary = 0.0, f"Run {name}"
                     pending = await APPROVALS.request(
-                        project_id=ctx.project_id,
+                        project_id=bctx.project_id,
                         tool=name,
                         args=args,
                         estimated_cost_credits=est_cost,
@@ -495,78 +522,38 @@ async def run_turn(
                         "approval_id": pending.id,
                         "approved": approved,
                     })
-                    if not approved:
-                        tool_result = {
-                            "error": "denied",
-                            "message": "User denied this action. Acknowledge and propose an alternative or wait for direction.",
-                        }
+                if not approved:
+                    approval_denied = True
+                    tool_result = {
+                        "error": "denied",
+                        "message": "User denied this action. Acknowledge and propose an alternative or wait for direction.",
+                    }
+                else:
+                    try:
+                        tool_result, h_cost = await handler(args, bctx)
+                    except asyncio.CancelledError:
+                        # Partial cost already in bctx.partial_cost_usd.
+                        # Outer cancel handler aggregates across branches.
+                        raise
+                    except Exception as e:
+                        log.exception("tool %s raised: %s", name, e)
+                        tool_result = {"error": str(e)[:300]}
                         h_cost = 0.0
-                        preview = json.dumps(tool_result, default=str)
-                        tool_calls_made.append({
-                            "name": name,
-                            "args": args,
-                            "result_preview": preview,
-                            "cost_usd": h_cost,
-                            "approval": "denied",
-                        })
-                        await emit({
-                            "type": "tool_call_result",
-                            "tool_call_id": fc.call_id,
-                            "name": name,
-                            "result_preview": preview,
-                            "cost_usd": h_cost,
-                        })
-                        # Send the denied result back to the model in the
-                        # same shape as a normal tool result so the loop
-                        # can continue cleanly.
-                        input_items.append({
-                            "type": "function_call_output",
-                            "call_id": fc.call_id,
-                            "output": json.dumps(tool_result),
-                        })
-                        continue
-
-                # Long-running tools (apify) bump ctx.partial_cost_usd
-                # as external cost is incurred. Reset to 0 before each
-                # handler call so the running tally is per-call. On
-                # CancelledError, we sum partial_cost_usd into the
-                # turn total below before re-raising.
-                ctx.partial_cost_usd = 0.0
+                        try:
+                            bctx.db.rollback()
+                        except Exception:
+                            log.exception("post-tool-error rollback failed for %s", name)
+            else:
                 try:
-                    tool_result, h_cost = await handler(args, ctx)
+                    tool_result, h_cost = await handler(args, bctx)
                 except asyncio.CancelledError:
-                    # User cancelled while this tool was in flight.
-                    # Capture any partial external cost the tool
-                    # accumulated (e.g. apify aborted mid-run still
-                    # bills for compute units burned) into the turn
-                    # total + emit a cost_update so _drive_agent's
-                    # cancel handler flushes the right amount to the
-                    # balance ledger.
-                    cancel_ms = int((time.perf_counter() - tool_started) * 1000)
-                    log.info(
-                        "[chat_v2 timing] tool_cancelled project=%s tool=%s duration_ms=%d",
-                        project_id, name, cancel_ms,
-                    )
-                    total_cost_usd += ctx.partial_cost_usd
-                    await emit({"type": "cost_update", "total_cost_usd": total_cost_usd})
                     raise
                 except Exception as e:
                     log.exception("tool %s raised: %s", name, e)
                     tool_result = {"error": str(e)[:300]}
                     h_cost = 0.0
-                    # A failed SQL leaves ctx.db in `aborted` state: any
-                    # later statement on this session raises
-                    # InFailedSqlTransaction until rollback. That would
-                    # cascade — every subsequent tool errors out, the
-                    # end-of-turn assistant ChatMessage insert in
-                    # _drive_agent fails, the run is marked failed even
-                    # though the agent had useful text and chips to
-                    # show. Roll back so the session is usable again.
-                    # Non-SQL errors (apify HTTP, validation) cost
-                    # nothing to rollback — the session is already
-                    # clean and rollback() is a no-op.
                     try:
-                        ctx.db.rollback()
+                        bctx.db.rollback()
                     except Exception:
                         log.exception("post-tool-error rollback failed for %s", name)
 
@@ -575,16 +562,8 @@ async def run_turn(
                 "[chat_v2 timing] tool project=%s tool=%s duration_ms=%d cost_usd=%.6f",
                 project_id, name, tool_ms, h_cost,
             )
-            preview = json.dumps(tool_result, default=str)
-            tool_calls_made.append({
-                "name": name,
-                "args": args,
-                "result_preview": preview,
-                "cost_usd": h_cost,
-                "duration_ms": tool_ms,
-            })
-            total_cost_usd += h_cost
 
+            preview = json.dumps(tool_result, default=str)
             await emit({
                 "type": "tool_call_result",
                 "tool_call_id": fc.call_id,
@@ -593,15 +572,84 @@ async def run_turn(
                 "cost_usd": h_cost,
                 "duration_ms": tool_ms,
             })
-            # Same running-total emit as after the LLM call — keeps the
-            # cancellation safety net up-to-date as tools accumulate cost.
-            await emit({"type": "cost_update", "total_cost_usd": total_cost_usd})
 
+            return {
+                "fc": fc,
+                "name": name,
+                "args": args,
+                "tool_result": tool_result,
+                "h_cost": h_cost,
+                "tool_ms": tool_ms,
+                "preview": preview,
+                "approval_denied": approval_denied,
+            }
+
+        # Spawn one task per call; gather waits for the whole batch.
+        # return_exceptions=False so CancelledError surfaces here and we
+        # can sum partial costs from every branch's bctx before re-raising.
+        dispatch_tasks = [
+            asyncio.create_task(_dispatch_call(fc, bctx))
+            for fc, bctx in zip(function_calls, branch_ctxs)
+        ]
+        try:
+            results = await asyncio.gather(*dispatch_tasks)
+        except asyncio.CancelledError:
+            # Stop-button cancel landed mid-batch. Each branch raised
+            # CancelledError out of its handler (or hadn't started yet);
+            # bctx.partial_cost_usd carries any spend the in-flight tool
+            # accrued before the cancel cut it off. Cancel any siblings
+            # still running, drain them, then sum partials so the outer
+            # _drive_agent flushes the right amount to the ledger.
+            for t in dispatch_tasks:
+                if not t.done():
+                    t.cancel()
+            for t in dispatch_tasks:
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+            for bctx_i in branch_ctxs:
+                total_cost_usd += bctx_i.partial_cost_usd
+            await emit({"type": "cost_update", "total_cost_usd": total_cost_usd})
+            for bdb in branch_dbs:
+                try:
+                    bdb.close()
+                except Exception:
+                    log.exception("branch db close failed during cancel")
+            raise
+
+        # Walk results in the model's emission order so input_items keeps
+        # the canonical fc/output pairing for the next iteration.
+        results_by_call_id = {r["fc"].call_id: r for r in results}
+        for fc in function_calls:
+            r = results_by_call_id[fc.call_id]
+            entry: Dict[str, Any] = {
+                "name": r["name"],
+                "args": r["args"],
+                "result_preview": r["preview"],
+                "cost_usd": r["h_cost"],
+                "duration_ms": r["tool_ms"],
+            }
+            if r["approval_denied"]:
+                entry["approval"] = "denied"
+            tool_calls_made.append(entry)
+            total_cost_usd += r["h_cost"]
             input_items.append({
                 "type": "function_call_output",
                 "call_id": fc.call_id,
-                "output": json.dumps(tool_result, default=str)[:8000],
+                "output": json.dumps(r["tool_result"], default=str)[:8000],
             })
+
+        # One cost_update at the end of the batch — keeps _drive_agent's
+        # incremental debit monotonic (sibling branches finishing out of
+        # order would otherwise emit decreasing totals).
+        await emit({"type": "cost_update", "total_cost_usd": total_cost_usd})
+
+        for bdb in branch_dbs:
+            try:
+                bdb.close()
+            except Exception:
+                log.exception("branch db close failed")
     else:
         log.warning(
             "agent loop hit MAX_TURN_ITERATIONS=%d for project %s",

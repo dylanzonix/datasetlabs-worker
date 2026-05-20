@@ -113,8 +113,18 @@ def resolve_enrichment_id(db: Session, project_id: str, id_or_short: str) -> Opt
 
 
 def _next_short_id(db: Session, project_id: str) -> str:
-    """Return the next free 't<N>' for this project. Caller holds a write lock
-    on the parent (we're inside a transaction that's about to INSERT)."""
+    """Return the next free 't<N>' for this project.
+
+    Acquires a per-project advisory lock that's held until the caller's
+    transaction commits — so a parallel table_create in another branch
+    waits here instead of racing on the (project_id, short_id) unique
+    index. Salt 1 distinguishes from the version-id lock in _commit_rows
+    (salt 0) so the two locks never collide on the same hash slot.
+    """
+    db.execute(
+        sa_text("SELECT pg_advisory_xact_lock(hashtextextended(:pid, 1))"),
+        {"pid": str(project_id)},
+    )
     row = db.execute(
         sa_text(
             "SELECT short_id FROM tables WHERE project_id=:pid "
@@ -131,7 +141,14 @@ def _next_short_id(db: Session, project_id: str) -> str:
 
 
 def _next_enrichment_short_id(db: Session, table_id: str) -> str:
-    """Return the next free 'e<N>' for this table."""
+    """Return the next free 'e<N>' for this table. Per-table advisory lock
+    so parallel enrichment_set on the same table can't collide on
+    (table_id, short_id) unique. Salt 2 keeps this distinct from the
+    project-level table lock (salt 1) and the version lock (salt 0)."""
+    db.execute(
+        sa_text("SELECT pg_advisory_xact_lock(hashtextextended(:tid, 2))"),
+        {"tid": str(table_id)},
+    )
     row = db.execute(
         sa_text(
             "SELECT short_id FROM enrichments WHERE table_id=:tid "
