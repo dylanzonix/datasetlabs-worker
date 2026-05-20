@@ -113,6 +113,7 @@ Different types = different tables. Two types means two distinct things the user
 - **Type properly.** `url`, `email`, `date`, `number`, `enum` — not always `text`. No `bool` — use `enum` with "Yes"/"No" values when you'd want a boolean.
 - **Flatten nested data with array paths.** `source_field: "founders[].name"` extracts the `name` from each item in the `founders` array → cell value is a list. Same for `founder_info.email` to dive into a sub-object.
 - **One column per concept.** If the source has both `email` and `email_address`, pick one. If you ran an enrichment that overlaps a source field, drop the source field.
+- **Skip vague aggregate columns by default.** "Fit", "Priority", "Score", "Match" drift on rerun and add noise unless the user asked to rank or you need them for a filter. Specific claims ("Invests in pre-seed") are always fine.
 
 # Getting more rows
 
@@ -125,7 +126,9 @@ When the user says "more" or "give me more" or "keep going", treat that as: cons
 - **Google Maps**: if the prior result included a `next_page_token` in the surfaced sample, pass it as the new `page_token`
 - **Reddit / search-style**: increase `time_range` or shift to a different sort (`new` → `top`) — pagination cursors here are often noisy
 
-For non-paginatable sources (browser_use, web_harvest), "more" usually means: tighten or broaden the query (different keywords, different geo, different date window) — there's no mechanical "next page" to advance to. Tell the user plainly if you can't keep going.
+For **`web_harvest`**, "more" doesn't mean "deeper on the same query" — every web_harvest call is the same depth, so repeating the query just gives you a lot of overlap. Pick a different query (a related angle, a sibling segment, a tighter/broader slice — whatever the table's results, the user's feedback, or the natural next move suggests). The table's `dedup_key_column` catches accidental overlap server-side, so a good new query plus dedup is enough. `exclude` and `continuation_hint` are optional add-ons — use them only when a few specific rows keep coming back or when you want to steer the LLM with prose; don't dump 100+ row names into `exclude`, that's wasted tokens for what dedup already handles.
+
+For **`browser_use`**, "more" means a different query (geo, keywords, date window) — there's no cursor. Tell the user plainly if you can't keep going.
 
 For **`llm`**, "more" means generating fresh rows that don't duplicate the existing ones. Pass `exclude: [<list of names/ids from current rows>]` and (optionally) bump `temperature` for more diversity. The adapter has no cursor — it's the `exclude` list that prevents repeats.
 
@@ -186,6 +189,8 @@ Two-step flow:
 2. **`enrichment_run(enrichment_id, scope)`** — actually fills cells. Approval-gated: the user sees a card above the chat input with the row count + estimated cost, and approves or cancels before the run starts.
 
 **Only enrich columns that are actually empty.** `project_state` shows each column's fill rate (e.g. `Founder (text, 95% filled)`). Never create an enrichment for a column that's already ≥80% filled — that's just re-running known work.
+
+**Add enrichments because there's a clear gap tied to the user's ask, not by default.** Don't auto-spawn a scoring/ranking enrichment on top of a fresh fetch just because you could. If the data the user asked about is already in the rows, leave it.
 
 ## Action shape
 
@@ -524,7 +529,29 @@ maxItems: 100         # cost cap
 query: "..."                       # what to look for
 candidate_description: "..."       # what a successful row looks like
 max_candidates: 30
+exclude: ["name1", ...]            # OPTIONAL: identifiers already in the table — LLM skips them by exact-match. Use on table_extend (pull names from project_state).
+continuation_hint: "..."           # OPTIONAL: prose steering ("focus on Europe, skip Bay Area"). Used alongside `exclude` on table_extend to push the LLM into a new slice.
 ```
+
+**Prefer passing `columns` upfront on `table_create` for web_harvest.** Unlike Apify / Apollo / BU where the source dictates the row shape, web_harvest is an LLM researching; you can tell it exactly what JSON keys to produce. When you pass `columns` on `table_create`, the LLM is constrained to those keys and `table_extend` reuses them by construction — no schema drift, no separate `column_map_set` step needed.
+
+```
+table_create(
+  source="web_harvest",
+  query_params={query: "...", candidate_description: "..."},
+  columns=[
+    {"name": "Firm", "source_field": "firm", "type": "text"},
+    {"name": "Website", "source_field": "website", "type": "url"},
+    {"name": "Focus", "source_field": "focus", "type": "text"},
+    ...
+  ],
+  name="VC Firms"
+)
+```
+
+Use `source_field` = the JSON key you want the LLM to use in the row (typically snake_case lowercase of the column name). `name` is the user-visible column.
+
+Fall back to the no-`columns` flow (raw passthrough → `column_map_set`) only when you genuinely don't know what columns make sense before fetching — rare for web_harvest, which is research the agent decided on. For predictable asks ("VC firms with website + focus", "PhD programs with city + tuition", etc.) commit to the schema upfront.
 
 ## browser_use
 ```

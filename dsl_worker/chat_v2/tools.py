@@ -249,6 +249,26 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     if val_err:
         return {"error": val_err}, 0.0
 
+    # web_harvest is the LLM-driven research source. By default the LLM
+    # picks whatever JSON keys it wants and the agent reconciles
+    # afterward via column_map_set. When the agent passes `columns`
+    # upfront on table_create, we pipe those source_field paths into
+    # query_params.__existing_schema so the adapter prompt locks the
+    # LLM to those exact keys. Skipping column_map_set entirely is
+    # then safe — the schema matches what the agent asked for.
+    # Limited to web_harvest by design: BU and apify dictate their own
+    # row shape from the page/actor; constraining them with a synthetic
+    # schema would just drop fields. LLM source has its own
+    # columns_hint path.
+    if source == "web_harvest" and raw_columns:
+        schema_keys = [
+            (c.get("source_field") or c.get("name"))
+            for c in raw_columns
+            if isinstance(c, dict) and (c.get("source_field") or c.get("name"))
+        ]
+        if schema_keys:
+            query_params = {**query_params, "__existing_schema": schema_keys}
+
     # File source needs project_id to find files in the candidate store.
     # Underscore-prefixed keys are stripped before storing in table.query_params.
     if source == "file" and ctx.project_id:
@@ -710,6 +730,23 @@ async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
             error=val_err,
         )
         return {"error": val_err}, 0.0
+
+    # For schema-unpredictable sources (web_harvest, llm) the LLM picks
+    # its own row keys. table_extend reuses the table's column_map from
+    # the first fetch, so if the LLM picks DIFFERENT keys on the
+    # extend, every mapped cell goes empty except the few keys that
+    # happen to match. Pipe the existing source_field paths into
+    # query_params so the adapter can constrain its prompt to those
+    # exact keys.
+    if source in ("web_harvest", "llm"):
+        cols_for_schema = json.loads(columns) if isinstance(columns, str) else (columns or [])
+        existing_schema = [
+            c.get("source_field") or c.get("name")
+            for c in cols_for_schema
+            if (c.get("source_field") or c.get("name"))
+        ]
+        if existing_schema:
+            new_query_params = {**new_query_params, "__existing_schema": existing_schema}
 
     try:
         async with phase_span_async(ctx, "table_extend/adapter_fetch", source=source, n=n):

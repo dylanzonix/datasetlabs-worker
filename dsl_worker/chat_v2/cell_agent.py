@@ -221,8 +221,18 @@ async def _fullenrich_bulk_enrich(
     # FE's response nests results under `contact_info`, not `contact`.
     # Was reading the wrong key; every successful lookup looked empty.
     contact_info = item.get("contact_info") or {}
-    credits = float(((last_result.get("cost") or {}).get("credits") or 0))
-    return {"contact_info": contact_info}, credits
+    # FE returns its cost as `cost.credits` — those are FE's INTERNAL
+    # credits (not USD, not our credits). Pro plan: ~$55 per 1000
+    # credits → $0.055/credit. Cell agent's total_cost is denominated in
+    # USD, so we MUST convert here. Before this conversion existed,
+    # every FE email lookup was being billed as $1 USD (raw credit
+    # count) — a 20x overcharge confirmed against project c978ed19
+    # where 10 enrichments all clustered at $1.25-$1.50 because the
+    # $1.00 FE line dominated.
+    raw_fe_credits = float(((last_result.get("cost") or {}).get("credits") or 0))
+    fe_credit_to_usd = float(os.getenv("FULLENRICH_COST_PER_CREDIT", "0.055"))
+    cost_usd = raw_fe_credits * fe_credit_to_usd
+    return {"contact_info": contact_info}, cost_usd
 
 
 async def _fullenrich_enrich_email(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
@@ -690,10 +700,10 @@ def _tool_defs_for_tier(tier_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     return defs
 
 
-# Per-call cost for hosted web_search. TrackedClient only computes
-# token cost from response.usage and doesn't itemize hosted-tool fees;
-# we add this manually for each web_search_call item we see in output.
-WEB_SEARCH_CALL_COST_USD = 0.025
+# Per-call cost for hosted web_search — see dsl_worker/billing/web_search.py
+# for the full billing model. Imported (not re-defined) so the orchestrator,
+# cell agent, and web_harvest all read from the same source.
+from dsl_worker.billing.web_search import WEB_SEARCH_CALL_COST_USD  # noqa: E402
 
 
 _CELL_TOOL_DEFS: List[Dict[str, Any]] = [

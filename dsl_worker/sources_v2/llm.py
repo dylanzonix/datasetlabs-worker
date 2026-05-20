@@ -133,6 +133,10 @@ class LLMAdapter(SourceAdapter):
         examples = query_params.get("examples") or []
         exclude = query_params.get("exclude") or []
         temperature = query_params.get("temperature")
+        # On table_extend the prior batch's keys are piped in here so the
+        # LLM can lock to the schema the column_map already expects.
+        # See web_harvest for the same pattern + rationale.
+        existing_schema = query_params.get("__existing_schema") or []
 
         from dsl_worker.billing.tracked_client import TrackedOpenAIClient
         from openai import AsyncOpenAI
@@ -145,7 +149,16 @@ class LLMAdapter(SourceAdapter):
         ]
         if candidate_description:
             prompt_parts.append(f"\nWhat one row looks like: {candidate_description}")
-        if columns_hint:
+        if existing_schema:
+            # Hard constraint — overrides columns_hint when both are set.
+            # Used by table_extend so reused column_map paths match.
+            prompt_parts.append(
+                "\nMANDATORY SCHEMA — every row MUST use these EXACT keys "
+                f"(no renames, no synonyms): {existing_schema}.\n"
+                "If a value is unknown for a row, return null for that key. "
+                "Do not add extra keys."
+            )
+        elif columns_hint:
             prompt_parts.append(f"\nUse these JSON keys for each row: {', '.join(columns_hint)}")
         if examples:
             prompt_parts.append(
