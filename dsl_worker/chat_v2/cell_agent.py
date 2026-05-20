@@ -690,10 +690,10 @@ def _tool_defs_for_tier(tier_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     return defs
 
 
-# Per-call cost for hosted web_search. TrackedClient only computes
-# token cost from response.usage and doesn't itemize hosted-tool fees;
-# we add this manually for each web_search_call item we see in output.
-WEB_SEARCH_CALL_COST_USD = 0.025
+# Per-call cost for hosted web_search — see dsl_worker/billing/web_search.py
+# for the full billing model. Imported (not re-defined) so the orchestrator,
+# cell agent, and web_harvest all read from the same source.
+from dsl_worker.billing.web_search import WEB_SEARCH_CALL_COST_USD  # noqa: E402
 
 
 _CELL_TOOL_DEFS: List[Dict[str, Any]] = [

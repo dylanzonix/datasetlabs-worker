@@ -101,6 +101,19 @@ class WebHarvestAdapter(SourceAdapter):
             log.exception("web_harvest LLM call failed: %s", e)
             return FetchResult(rows=[], schema=[], cost_credits=0.0, exhausted=True)
 
+        # OpenAI's hosted web_search tool is billed per call separately
+        # from token cost. TrackedClient only counts the token side, so
+        # we sum the per-call fee here. See dsl_worker/billing/web_search.py
+        # for the full billing model (advertised rate, sub-search
+        # multiplier, why we use 0.025).
+        try:
+            from dsl_worker.billing.web_search import web_search_cost_usd
+            web_search_call_cost_usd = web_search_cost_usd(resp.output or [])
+        except Exception:
+            # Best-effort; never crash the harvest on a billing tally.
+            log.exception("web_harvest: web_search_call cost tally failed")
+            web_search_call_cost_usd = 0.0
+
         text = (resp.output_text or "").strip()
         if text.startswith("```"):
             text = text.strip("`")
@@ -126,13 +139,14 @@ class WebHarvestAdapter(SourceAdapter):
             log.warning("web_harvest: no parsable rows from model output")
 
         schema_keys = sorted({k for r in rows for k in r.keys()})[:40]
-        # Real cost from TrackedOpenAIClient: token-priced LLM usage from
-        # the responses call. Web_search tool is free server-side. Convert
-        # USD → credits at 1 credit = $0.10 of compute.
+        # Total cost = token cost from TrackedOpenAIClient + per-call
+        # web_search fee (hosted tool, billed separately by OpenAI).
+        # Convert USD → credits at 1 credit = $0.10 of compute.
+        total_cost_usd = llm_cost_usd + web_search_call_cost_usd
         return FetchResult(
             rows=rows[:n],
             schema=schema_keys,
-            cost_credits=llm_cost_usd * 10.0,
+            cost_credits=total_cost_usd * 10.0,
             exhausted=True,  # one-shot; agent passes a fresh continuation_hint for more
             cursor=None,
             dedup_key_column_hint="url" if "url" in schema_keys else None,

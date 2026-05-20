@@ -77,13 +77,14 @@ def _flatten_tool_defs() -> List[Dict[str, Any]]:
 
 _TOOLS_PAYLOAD = _flatten_tool_defs()
 
-# Per-call cost for hosted web_search (OpenAI's pricing as of writing
-# ~$0.025/call on default tier). TrackedClient only computes token cost
-# from response.usage and doesn't itemize hosted-tool fees, so we add
-# this manually for every web_search_call item we see in output. If
-# OpenAI exposes itemized hosted-tool billing later, swap this for a
-# read off response.usage.
-WEB_SEARCH_CALL_COST_USD = 0.025
+# Per-call cost for hosted web_search — see dsl_worker/billing/web_search.py
+# for the full billing model (advertised rate, sub-search multiplier,
+# why we use 0.025 and not 0.010). Re-exported here so existing imports
+# of WEB_SEARCH_CALL_COST_USD from agent.py keep working.
+from dsl_worker.billing.web_search import (
+    WEB_SEARCH_CALL_COST_USD,  # noqa: F401  (re-export)
+    web_search_cost_usd,  # noqa: F401
+)
 
 
 def _build_client() -> TrackedOpenAIClient:
