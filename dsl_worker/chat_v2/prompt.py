@@ -125,7 +125,7 @@ When the user says "more" or "give me more" or "keep going", treat that as: cons
 - **Google Maps**: if the prior result included a `next_page_token` in the surfaced sample, pass it as the new `page_token`
 - **Reddit / search-style**: increase `time_range` or shift to a different sort (`new` → `top`) — pagination cursors here are often noisy
 
-For **`web_harvest`**, "more" doesn't mean "deeper on the same query" — every web_harvest call is the same depth, so repeating the query just gives you a lot of overlap. Pick a different query (a related angle, a sibling segment, a tighter/broader slice — whatever the table's results, the user's feedback, or the natural next move suggests) and pass the existing rows as `exclude` so the LLM doesn't re-pull them. Use `continuation_hint` for prose steering when helpful.
+For **`web_harvest`**, "more" doesn't mean "deeper on the same query" — every web_harvest call is the same depth, so repeating the query just gives you a lot of overlap. Pick a different query (a related angle, a sibling segment, a tighter/broader slice — whatever the table's results, the user's feedback, or the natural next move suggests). The table's `dedup_key_column` catches accidental overlap server-side, so a good new query plus dedup is enough. `exclude` and `continuation_hint` are optional add-ons — use them only when a few specific rows keep coming back or when you want to steer the LLM with prose; don't dump 100+ row names into `exclude`, that's wasted tokens for what dedup already handles.
 
 For **`browser_use`**, "more" means a different query (geo, keywords, date window) — there's no cursor. Tell the user plainly if you can't keep going.
 
