@@ -72,6 +72,15 @@ class WebHarvestAdapter(SourceAdapter):
         candidate_description = query_params["candidate_description"]
         max_candidates = int(query_params.get("max_candidates", min(n, 30)))
         continuation_hint = query_params.get("continuation_hint")
+        # Structured exclude list — same shape as the llm source. Each
+        # entry is a unique identifier for a row already in the table
+        # (typically the dedup-key value). Cleaner than free-form
+        # continuation_hint for the common "extend without re-pulling"
+        # case: the agent passes the existing row names and the LLM
+        # skips them by exact-match.
+        exclude_list = query_params.get("exclude") or []
+        if not isinstance(exclude_list, list):
+            exclude_list = []
         # When table_extend reuses this adapter, the table's existing
         # column_map is reapplied to every new row. If the LLM picks
         # DIFFERENT keys this time, the mapped cells are mostly empty
@@ -106,6 +115,16 @@ class WebHarvestAdapter(SourceAdapter):
             )
         if continuation_hint:
             prompt_parts.append(f"\nAvoid candidates from this prior coverage: {continuation_hint}")
+        if exclude_list:
+            ex_sample = exclude_list[:80]
+            prompt_parts.append(
+                "\nDO NOT include any of these (already in the table — duplicates wasted): "
+                + ", ".join(str(x) for x in ex_sample)
+                + (
+                    f" — and {len(exclude_list) - 80} more not listed."
+                    if len(exclude_list) > 80 else ""
+                )
+            )
         prompt = "\n".join(prompt_parts)
 
         try:
