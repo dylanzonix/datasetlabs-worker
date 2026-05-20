@@ -249,6 +249,26 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     if val_err:
         return {"error": val_err}, 0.0
 
+    # web_harvest is the LLM-driven research source. By default the LLM
+    # picks whatever JSON keys it wants and the agent reconciles
+    # afterward via column_map_set. When the agent passes `columns`
+    # upfront on table_create, we pipe those source_field paths into
+    # query_params.__existing_schema so the adapter prompt locks the
+    # LLM to those exact keys. Skipping column_map_set entirely is
+    # then safe — the schema matches what the agent asked for.
+    # Limited to web_harvest by design: BU and apify dictate their own
+    # row shape from the page/actor; constraining them with a synthetic
+    # schema would just drop fields. LLM source has its own
+    # columns_hint path.
+    if source == "web_harvest" and raw_columns:
+        schema_keys = [
+            (c.get("source_field") or c.get("name"))
+            for c in raw_columns
+            if isinstance(c, dict) and (c.get("source_field") or c.get("name"))
+        ]
+        if schema_keys:
+            query_params = {**query_params, "__existing_schema": schema_keys}
+
     # File source needs project_id to find files in the candidate store.
     # Underscore-prefixed keys are stripped before storing in table.query_params.
     if source == "file" and ctx.project_id:

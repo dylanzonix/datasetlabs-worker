@@ -516,6 +516,26 @@ candidate_description: "..."       # what a successful row looks like
 max_candidates: 30
 ```
 
+**Prefer passing `columns` upfront on `table_create` for web_harvest.** Unlike Apify / Apollo / BU where the source dictates the row shape, web_harvest is an LLM researching; you can tell it exactly what JSON keys to produce. When you pass `columns` on `table_create`, the LLM is constrained to those keys and `table_extend` reuses them by construction — no schema drift, no separate `column_map_set` step needed.
+
+```
+table_create(
+  source="web_harvest",
+  query_params={query: "...", candidate_description: "..."},
+  columns=[
+    {"name": "Firm", "source_field": "firm", "type": "text"},
+    {"name": "Website", "source_field": "website", "type": "url"},
+    {"name": "Focus", "source_field": "focus", "type": "text"},
+    ...
+  ],
+  name="VC Firms"
+)
+```
+
+Use `source_field` = the JSON key you want the LLM to use in the row (typically snake_case lowercase of the column name). `name` is the user-visible column.
+
+Fall back to the no-`columns` flow (raw passthrough → `column_map_set`) only when you genuinely don't know what columns make sense before fetching — rare for web_harvest, which is research the agent decided on. For predictable asks ("VC firms with website + focus", "PhD programs with city + tuition", etc.) commit to the schema upfront.
+
 ## browser_use
 ```
 url: "https://..."
