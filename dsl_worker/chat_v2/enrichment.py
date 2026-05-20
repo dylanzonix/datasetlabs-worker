@@ -176,6 +176,37 @@ async def enrichment_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
         {"eid": enrichment_id},
     ).scalar() or enrichment_id
 
+    # Emit an enrichment_card_added SSE event so the chat sidebar can
+    # render an "Enrichment created" chip inline next to the assistant
+    # message — same pattern as table_card_added. Only on NEW creation;
+    # refinements would spam the chip list every time the agent tweaked
+    # the prompt or cap.
+    if ctx.run_id is not None and not is_refinement:
+        try:
+            from dsl_worker.chat_api import runs as legacy_runs
+            from dsl_api.models import ChatRun
+            run_obj = ctx.db.query(ChatRun).filter(ChatRun.id == ctx.run_id).first()
+            if run_obj is not None:
+                table_short = ctx.db.execute(
+                    sa_text("SELECT short_id FROM tables WHERE id=:tid"),
+                    {"tid": table_id},
+                ).scalar() or table_id
+                research_tier = action.get("research") or action.get("tier") or None
+                prompt_text = (action.get("prompt") or "").strip()
+                column_names = [c.get("name") for c in columns if isinstance(c, dict) and c.get("name")]
+                legacy_runs.emit_event(ctx.db, run_obj, "enrichment_card_added", {
+                    "enrichment_id": public_eid,
+                    "enrichment_uuid": enrichment_id,
+                    "table_id": table_short,
+                    "table_uuid": table_id,
+                    "name": name,
+                    "columns": column_names,
+                    "research_tier": research_tier,
+                    "prompt": prompt_text,
+                })
+        except Exception:
+            log.exception("enrichment_card_added emit failed; continuing")
+
     return {
         "enrichment_id": public_eid,
         "status": "configured",

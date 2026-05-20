@@ -772,6 +772,24 @@ async def _drive_agent(
         except Exception:
             log.exception("collecting table_cards for applied_changes failed")
 
+        # Same for enrichment_card_added — mirrors the table_cards block
+        # so a refresh keeps the "Enrichment created" chips visible.
+        try:
+            from dsl_api.models import ChatRunEvent
+            ecards = (
+                db.query(ChatRunEvent.payload)
+                .filter(
+                    ChatRunEvent.run_id == run_id,
+                    ChatRunEvent.type == "enrichment_card_added",
+                )
+                .order_by(ChatRunEvent.seq.asc())
+                .all()
+            )
+            if ecards:
+                ac["enrichment_cards"] = [c[0] for c in ecards if c[0]]
+        except Exception:
+            log.exception("collecting enrichment_cards for applied_changes failed")
+
         # Same trick for suggest_replies chips: replay the SSE events
         # we emitted live so a refresh re-renders them. Multiple emits
         # in one turn collapse into a single ordered items list.
