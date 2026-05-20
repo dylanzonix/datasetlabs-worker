@@ -553,6 +553,21 @@ async def _drive_agent(
 
         async def on_event(evt: Dict[str, Any]) -> None:
             etype = evt.get("type")
+            # Fast path for live token deltas: skip the DB session +
+            # ChatRun lookup (publish_token_delta only needs run_id) and
+            # yield to the event loop so SSE subscribers drain BEFORE
+            # the next delta lands. Without the explicit sleep(0) the
+            # OpenAI stream loop can fire dozens of output_text.delta
+            # events between scheduler ticks — the bus enqueues them
+            # all and the consumer flushes them in one burst at the
+            # end, making the FE see the full text "all at once" after
+            # the LLM call completes.
+            if etype == "text_delta":
+                delta = evt.get("text") or ""
+                if delta:
+                    legacy_runs.publish_token_delta(run_id, delta)
+                    await asyncio.sleep(0)
+                return
             # Open a fresh session per emit since this callback may fire
             # while the outer `db` session is mid-statement on the LLM
             # call. Legacy emit_event needs a clean session.
@@ -608,20 +623,30 @@ async def _drive_agent(
                 elif etype == "final_message":
                     text = evt.get("text") or ""
                     final_text_ref["value"] = text
-                    # Stream the full text via token-delta then persist
-                    # via text_checkpoint so a reconnecting subscriber
-                    # gets the assistant content even after the live
-                    # bus emit is gone.
-                    legacy_runs.publish_token_delta(lrun.id, text)
-                    legacy_runs.emit_text_checkpoint(ldb, lrun)
+                    # Deltas already streamed live via text_delta. Use
+                    # replace_text_content to overwrite the bus
+                    # accumulator with the canonical final text (handles
+                    # any drift between concat'd deltas and the
+                    # authoritative response text, e.g. citation-cleaned
+                    # variants) AND persist a text_checkpoint for
+                    # reconnects.
+                    legacy_runs.replace_text_content(ldb, lrun, text)
                 elif etype == "text_segment":
-                    # Mid-iteration text from the agent — emit as its
-                    # own SSE event so the FE can render it between
-                    # tool batches as a discrete segment rather than
-                    # appending to the final content blob.
+                    # Mid-iteration text from the agent — the iteration
+                    # had both message text AND function calls. The
+                    # deltas already streamed live into the final-text
+                    # slot, so we (1) trim them out of the bus
+                    # accumulator (keeps the cumulative snapshot equal
+                    # to "what's in the FINAL segment") and (2) emit the
+                    # durable text_segment event. The FE handler
+                    # demotes the currently-streaming final-text segment
+                    # to a mid-iteration segment in place.
+                    seg_text = evt.get("text") or ""
+                    if seg_text:
+                        legacy_runs.trim_token_content(lrun.id, seg_text)
                     legacy_runs.emit_event(ldb, lrun, "text_segment", {
                         "iteration": evt.get("iteration"),
-                        "text": evt.get("text") or "",
+                        "text": seg_text,
                     })
                 elif etype == "cost_update":
                     # Running cost from agent.py after each LLM call or
@@ -725,8 +750,14 @@ async def _drive_agent(
             # as a normal completion. Re-raise after persisting.
             cancelled = True
             log.info("v2 run %s cancelled mid-turn; flushing partial state", run_id)
+            # If the cancel hit before the final_message event fired
+            # (e.g. mid-stream of the final iteration), fall back to the
+            # bus accumulator so we persist whatever text was streamed
+            # to the user — otherwise refresh would show an empty
+            # assistant bubble for a turn that visibly produced text.
+            partial_text = final_text_ref["value"] or legacy_runs._BUS._content.get(str(run_id), "")
             result = {
-                "final_message": final_text_ref["value"],
+                "final_message": partial_text,
                 "tool_calls_made": [],
                 "total_cost_usd": total_cost_ref["value"],
                 "iterations": None,

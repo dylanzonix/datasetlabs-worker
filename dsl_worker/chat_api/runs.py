@@ -384,6 +384,24 @@ def replace_text_content(
     return emit_event(db, run, "text_checkpoint", {"full_content": content})
 
 
+def trim_token_content(run_id: UUID, suffix: str) -> bool:
+    """Remove `suffix` from the end of the run's accumulated token
+    content if present. Returns True if trimmed.
+
+    Used when a mid-iteration text segment finalizes: the deltas were
+    already streamed (and the accumulator grew), but the text actually
+    belongs to a separate `text_segment` event for durability — not the
+    final-text snapshot. Trimming keeps the accumulator equal to "what
+    is in the FINAL text segment" so reconnect snapshots don't double-
+    render the mid-text alongside its durable text_segment event."""
+    key = str(run_id)
+    current = _BUS._content.get(key, "")
+    if suffix and current.endswith(suffix):
+        _BUS._content[key] = current[: -len(suffix)]
+        return True
+    return False
+
+
 # ---- Pause / cancel polling ----------------------------------------------
 def check_should_stop(db: Session, run: ChatRun) -> Optional[str]:
     """Re-read run.status. Returns 'pause' or 'cancel' if the agent

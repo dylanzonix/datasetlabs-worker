@@ -236,6 +236,16 @@ async def run_turn(
                         delta = getattr(event, "delta", "") or ""
                         if delta:
                             await emit({"type": "reasoning", "text": delta})
+                    elif etype == "response.output_text.delta":
+                        # Live assistant-text delta. Stream straight to
+                        # subscribers as a `text_delta` event; the runs.py
+                        # router publishes a token delta on the bus. We
+                        # still walk response.output post-stream to make
+                        # the final-vs-mid-iteration decision (does this
+                        # iteration also have function calls?).
+                        delta = getattr(event, "delta", "") or ""
+                        if delta:
+                            await emit({"type": "text_delta", "iteration": iteration, "text": delta})
                     elif etype == "response.output_item.added":
                         added = getattr(event, "item", None)
                         if added is not None and getattr(added, "type", None) == "web_search_call":
@@ -412,15 +422,16 @@ async def run_turn(
         # Mid-iteration text: the model produced a message AND function
         # calls in the same response. Emit it as a `text_segment` event
         # so the FE renders it as its own segment between tool batches
-        # (tool — text — tool — text — final). Previously this text
-        # was silently dropped because we only emit on `final_message`
-        # when no tools are called.
-        mid_text = "".join(text_parts).strip()
-        if mid_text:
+        # (tool — text — tool — text — final). The raw (un-stripped)
+        # text is sent so runs.py can trim the exact deltas it streamed
+        # out of the bus accumulator — keeping the cumulative snapshot
+        # equal to "what's in the FINAL text segment".
+        mid_text_raw = "".join(text_parts)
+        if mid_text_raw.strip():
             await emit({
                 "type": "text_segment",
                 "iteration": iteration,
-                "text": mid_text,
+                "text": mid_text_raw,
             })
 
         # Dispatch each tool call sequentially. Parallel-tool execution is
