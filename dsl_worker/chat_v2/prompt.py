@@ -588,6 +588,40 @@ No retrieval — pure model synthesis. Unpredictable schema; call `column_map_se
 """
 
 
+def _render_skills_section() -> str:
+    """Render the `# Skills` directory section.
+
+    Lists every skill (name + description) with an `(orchestrator)` or
+    `(enrichment)` marker so the orchestrator sees the full capability
+    surface. Bodies are NOT included here — they're loaded on demand via
+    the `load_skill` tool. Stable across runs (changes only when the
+    skills directory does), so the cached prompt stays warm.
+    """
+    from dsl_worker.skills import list_all_skills
+    skills = list_all_skills()
+    if not skills:
+        return ""
+    lines = [
+        "# Skills",
+        "",
+        "A directory of documented playbooks for specific tasks. Not exhaustive — most tasks won't match. If what you're doing happens to match a skill, load it to learn the optimized way to do it.",
+        "",
+        "Available:",
+    ]
+    for s in skills:
+        applies = s.get("applies_to") or []
+        if "orchestrator" in applies and "cell_agent" in applies:
+            marker = "orchestrator + enrichment"
+        elif "cell_agent" in applies:
+            marker = "enrichment"
+        else:
+            marker = "orchestrator"
+        lines.append(f"- **{s['name']}** *({marker})* — {s.get('description') or ''}")
+    lines.append("")
+    lines.append("Call `load_skill(name)` to read an `(orchestrator)` playbook when one applies to this turn. `(enrichment)` skills are used by the cell agent at enrichment time — listed here so you know which enrichment patterns are battle-tested when deciding what columns to set up.")
+    return "\n".join(lines)
+
+
 def build_system_prompt() -> str:
     """Return the full system prompt with today's date filled in.
 
@@ -596,4 +630,8 @@ def build_system_prompt() -> str:
     """
     today = dt.date.today()
     header = f"Today's date: {today.isoformat()} ({today.strftime('%A')}).\n\n"
-    return header + SYSTEM_PROMPT_BASE
+    skills_section = _render_skills_section()
+    base = header + SYSTEM_PROMPT_BASE
+    if skills_section:
+        base = base + "\n\n" + skills_section
+    return base

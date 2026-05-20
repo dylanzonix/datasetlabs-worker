@@ -567,6 +567,43 @@ async def _browser_use(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     return {"rows": rows[:10]}, cost
 
 
+def _render_enrichment_skills_section() -> str:
+    """Render the `# Skills` directory section for the research-tier cell agent.
+
+    Lists every enrichment-applicable skill (name + description). Bodies are
+    NOT included — loaded on demand via `load_skill`. Returns "" when no
+    enrichment skills exist so the prompt stays clean.
+    """
+    from dsl_worker.skills import list_enrichment_skills
+    skills = list_enrichment_skills()
+    if not skills:
+        return ""
+    lines = [
+        "# Skills",
+        "",
+        "A directory of documented playbooks for specific column-fill tasks. Not exhaustive — most cells won't match. If filling this column happens to match a skill below, load it for the optimized approach.",
+        "",
+        "Available:",
+    ]
+    for s in skills:
+        lines.append(f"- **{s['name']}** — {s.get('description') or ''}")
+    lines.append("")
+    lines.append("Call `load_skill(name)` to read a playbook. Bodies are not loaded by default.")
+    return "\n".join(lines)
+
+
+async def _load_skill_cell(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
+    """Cell-agent variant of load_skill — returns the body of a named skill."""
+    name = (args.get("name") or "").strip()
+    if not name:
+        return {"error": "name is required"}, 0.0
+    from dsl_worker.skills import get_skill_body
+    body = get_skill_body(name)
+    if body is None:
+        return {"error": f"unknown skill: {name}"}, 0.0
+    return {"name": name, "body": body}, 0.0
+
+
 CELL_TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any], ToolContext], Awaitable[Tuple[Dict[str, Any], float]]]] = {
     "fullenrich_enrich_email": _fullenrich_enrich_email,
     "fullenrich_enrich_phone": _fullenrich_enrich_phone,
@@ -582,6 +619,7 @@ CELL_TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any], ToolContext], Awaitable[
     # handled in the cell loop directly (billing + tool_calls_log).
     "browser_use": _browser_use,
     "code_exec": _code_exec,
+    "load_skill": _load_skill_cell,
 }
 
 
@@ -697,6 +735,26 @@ def _tool_defs_for_tier(tier_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     # framing in the system prompt at the tool-picker.
     defs.append({"type": "web_search"})
     defs.extend(_CELL_TOOL_DEFS)
+    # Research tier gets load_skill so it can read enrichment-scoped
+    # playbooks listed in its system prompt under `# Skills`.
+    defs.append({
+        "type": "function",
+        "name": "load_skill",
+        "description": (
+            "Load the playbook for a named skill from the directory listed "
+            "under '# Skills' in the system prompt. Returns the full body. "
+            "Call only when one of the listed skills clearly matches the "
+            "current column-fill task."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Skill name as listed in '# Skills'"},
+            },
+            "required": ["name"],
+            "additionalProperties": False,
+        },
+    })
     return defs
 
 
@@ -1214,6 +1272,10 @@ async def run_cell_agent(
     tier_cfg = _resolve_research(action, per_row_cap)
 
     system_prompt = CELL_SYSTEM_PROMPT
+    if tier_cfg["tools"] == "all":
+        skills_section = _render_enrichment_skills_section()
+        if skills_section:
+            system_prompt = CELL_SYSTEM_PROMPT + "\n\n" + skills_section
 
     # Build a hidden-fields view: source data that isn't currently shown
     # as a visible column. The cell agent gets to see everything the

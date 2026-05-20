@@ -332,6 +332,12 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
         # tool_descriptions so we don't double-list it with an empty
         # function shape.
         "suggest_replies": "Emit chip suggestions for the user's next move. Call at end of turn.",
+        "load_skill": (
+            "Load the playbook for a named skill from the directory listed under "
+            "'# Skills' in the system prompt. Returns the full body of that skill "
+            "as a string. Call only when one of the listed skills clearly matches "
+            "the current task; most tasks won't need any skill. Args: {name}."
+        ),
         # Comments — the description thread visible in the table/column detail panel.
         "comment_on_table": "Append a short agent note to a table's description thread (visible in the table detail panel). Use sparingly — for non-obvious decisions or material changes the user should see ('Switched to Apollo because Google Maps capped at 60 results'). Args: table_id, body (markdown ok).",
         "comment_on_column": "Append a short agent note to a column's description thread. Args: table_id, column (name on the table), body.",

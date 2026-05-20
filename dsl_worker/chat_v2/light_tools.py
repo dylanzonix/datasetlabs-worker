@@ -360,6 +360,33 @@ async def suggest_replies(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[
 # Registry merge point
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# load_skill
+# ---------------------------------------------------------------------------
+
+
+async def load_skill(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
+    """Return the body of a named skill from the skills directory.
+
+    The orchestrator (and research-tier cell agent) see each skill's name +
+    description in their system prompt under `# Skills`. When one matches the
+    current task they call this to read the playbook. Bodies don't enter
+    context until called.
+    """
+    name = (args.get("name") or "").strip()
+    if not name:
+        return {"error": "name is required"}, 0.0
+    from dsl_worker.skills import get_skill_body
+    body = get_skill_body(name)
+    if body is None:
+        return {"error": f"unknown skill: {name}"}, 0.0
+    return {"name": name, "body": body}, 0.0
+
+
+# ---------------------------------------------------------------------------
+# Registry merge point
+# ---------------------------------------------------------------------------
+
 HANDLERS = {
     "apify_search_actors": apify_search_actors,
     "apify_actor_details": apify_actor_details,
@@ -369,4 +396,5 @@ HANDLERS = {
     # importer but is no longer dispatched by the chat_v2 HANDLERS map.
     "code_exec": code_exec,
     "suggest_replies": suggest_replies,
+    "load_skill": load_skill,
 }

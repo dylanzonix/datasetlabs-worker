@@ -1,28 +1,34 @@
-"""Skills: per-topic markdown rules-of-thumb injected into agent prompts.
+"""Skills: per-task markdown playbooks loaded on demand.
 
-Each .md file in this directory is a small playbook. Frontmatter declares
-who it applies to and what columns trigger it; the body is the rule
-content (markdown bullets, examples, what to bail on). At fill time the
-loader matches a skill's `triggers` against the target columns'
-name/description/format and appends the matching skill bodies to the
-cell-agent system prompt.
+Each `.md` file in this directory is a skill — a hand-written playbook for
+a specific recurring task pattern. Frontmatter declares the skill's name,
+one-line description, and where it applies; the body is the playbook itself.
 
-This is meant to be hand-curated. When we observe a recurring failure
-pattern (founders' names differ between Speedrun and X, LinkedIn slug
-collisions, etc.), we write it down here so future runs benefit. Auto
-patterns can be added later (post-fill summarizer); for now humans edit
-these files directly.
+The directory is a curated reference shelf, not an exhaustive capability
+list. Most tasks won't match any skill — that's expected. Skills are how
+we accumulate hard-won patterns over time without ballooning the system
+prompt.
+
+Two scopes:
+
+  applies_to: [orchestrator]   — orchestrator-level task playbook
+                                  (e.g. "how to find subreddits about a topic")
+  applies_to: [cell_agent]     — per-cell enrichment playbook
+                                  (e.g. "how to detect if a company runs ads")
+
+Both surfaces list available skills (name + description) in their system
+prompts. The model calls `load_skill(name)` to read the playbook body
+when relevant. Bodies never enter context until called.
 
 Frontmatter shape:
 
     ---
-    name: find_x_handles
-    description: Finding X (Twitter) handles for individuals
-    applies_to: [cell_agent]
-    triggers: [x handle, twitter, twitter handle]
+    name: find-subreddits
+    description: Listing subreddits relevant to a topic or audience.
+    applies_to: [orchestrator]
     ---
 
-    body markdown here...
+    body markdown...
 """
 
 from __future__ import annotations
@@ -31,7 +37,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Dict, List, Optional
 
 import yaml
 
@@ -48,12 +54,11 @@ class Skill:
     name: str
     description: str
     body: str
-    triggers: List[str] = field(default_factory=list)
-    applies_to: List[str] = field(default_factory=lambda: ["cell_agent"])
+    applies_to: List[str] = field(default_factory=lambda: ["orchestrator"])
     file: Optional[str] = None
 
 
-_skills_cache: Optional[List[Skill]] = None
+_skills_cache: Optional[Dict[str, Skill]] = None
 
 
 def _parse_skill_file(path: Path) -> Optional[Skill]:
@@ -78,85 +83,67 @@ def _parse_skill_file(path: Path) -> Optional[Skill]:
     name = str(meta.get("name") or path.stem).strip()
     if not name:
         return None
-    triggers = meta.get("triggers") or []
-    applies_to = meta.get("applies_to") or ["cell_agent"]
+    applies_to = meta.get("applies_to") or ["orchestrator"]
     return Skill(
         name=name,
         description=str(meta.get("description") or "").strip(),
         body=body,
-        triggers=[str(t).strip().lower() for t in triggers if str(t).strip()],
         applies_to=[str(a).strip() for a in applies_to if str(a).strip()],
         file=path.name,
     )
 
 
-def load_skills(force: bool = False) -> List[Skill]:
-    """Load all skill files. Cached after first call unless force=True.
-
-    Force-reload is mainly useful in dev — in production the worker
-    process is long-lived and skills don't change at runtime.
-    """
+def _load_skills(force: bool = False) -> Dict[str, Skill]:
+    """Load all skill files into a {name: Skill} map. Cached after first call."""
     global _skills_cache
     if _skills_cache is not None and not force:
         return _skills_cache
-    out: List[Skill] = []
-    if not SKILLS_DIR.exists():
-        _skills_cache = out
-        return out
-    for p in sorted(SKILLS_DIR.glob("*.md")):
-        skill = _parse_skill_file(p)
-        if skill is not None:
-            out.append(skill)
+    out: Dict[str, Skill] = {}
+    if SKILLS_DIR.exists():
+        for p in sorted(SKILLS_DIR.glob("*.md")):
+            skill = _parse_skill_file(p)
+            if skill is not None:
+                out[skill.name] = skill
     _skills_cache = out
     return out
 
 
-def _column_haystack(col: Dict[str, Any]) -> str:
-    parts = [
-        str(col.get("name") or ""),
-        str(col.get("description") or ""),
-        str(col.get("format") or ""),
-    ]
-    return " ".join(parts).lower()
+def list_all_skills() -> List[Dict[str, object]]:
+    """Return every skill's name + description + applies_to.
 
-
-def match_skills(
-    applies_to: str,
-    columns: Sequence[Dict[str, Any]],
-) -> List[Skill]:
-    """Return skills whose triggers match any of the given column specs.
-
-    Match is a simple case-insensitive substring check against
-    `name + description + format` of each column. A skill matches if
-    ANY of its triggers matches ANY of the columns.
-
-    De-duplicated and order-stable (sorted by skill name).
+    Used by the orchestrator system prompt to show the full directory
+    (with `(orchestrator)` / `(enrichment)` markers). Result is stable
+    across runs because skills change rarely.
     """
-    skills = load_skills()
-    matched: Dict[str, Skill] = {}
-    haystacks = [_column_haystack(c) for c in columns]
-    for s in skills:
-        if applies_to not in s.applies_to:
-            continue
-        if not s.triggers:
-            continue
-        for trig in s.triggers:
-            if any(trig in h for h in haystacks):
-                matched[s.name] = s
-                break
-    return [matched[k] for k in sorted(matched.keys())]
-
-
-def render_skills(skills: Sequence[Skill]) -> str:
-    """Render matched skills as a system-prompt extension. Empty if none."""
-    if not skills:
-        return ""
-    parts = [
-        "# Hard-won patterns (skills)",
-        "Targeted advice for the kind of column you're filling. Apply when "
-        "it fits this row; skip if it doesn't.",
+    return [
+        {
+            "name": s.name,
+            "description": s.description,
+            "applies_to": list(s.applies_to),
+        }
+        for s in _load_skills().values()
     ]
-    for s in skills:
-        parts.append("")
-        parts.append(s.body.strip())
-    return "\n".join(parts)
+
+
+def list_enrichment_skills() -> List[Dict[str, str]]:
+    """Return skills applicable to the research-tier cell_agent.
+
+    Used to render the cell_agent's `# Skills` section so it knows which
+    enrichment playbooks are available before deciding whether to load
+    one via load_skill.
+    """
+    return [
+        {"name": s.name, "description": s.description}
+        for s in _load_skills().values()
+        if "cell_agent" in s.applies_to
+    ]
+
+
+def get_skill_body(name: str) -> Optional[str]:
+    """Return the body of a named skill, or None if not found.
+
+    Called by the load_skill tool handler. Strips frontmatter; returns
+    just the playbook text the agent should follow.
+    """
+    skill = _load_skills().get(name)
+    return skill.body if skill is not None else None

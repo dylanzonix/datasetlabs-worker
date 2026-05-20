@@ -33,7 +33,6 @@ from dsl_api.db import SessionLocal
 from dsl_api.models import Project
 from dsl_api.models.sample import Sample
 
-from dsl_worker import skills as skills_loader
 from dsl_worker.chat_api import cell_traces, email_verify, sources
 
 ProgressCallback = Callable[[Dict[str, Any]], Awaitable[None]]
@@ -732,28 +731,6 @@ async def fill_rows(
         if spec.get("contact_type") == "email" or re.search(r"e[\W_-]*mail", col, re.IGNORECASE):
             email_columns.add(col)
 
-    # Skills matching: once per fill batch (same target columns for every
-    # row). Builds the prompt extension and a list of skill names to record
-    # in each cell trace, so we can correlate "which skills were active"
-    # with which cells succeeded/failed when iterating on the playbook.
-    skill_columns_for_match = [
-        {
-            "name": col,
-            "description": target_specs[col]["description"],
-            "format": target_specs[col]["format"],
-        }
-        for col in target_columns
-    ]
-    try:
-        matched_skills = skills_loader.match_skills("cell_agent", skill_columns_for_match)
-        skills_extra_system = skills_loader.render_skills(matched_skills)
-        skills_applied_names = [s.name for s in matched_skills]
-    except Exception:
-        log.exception("skills loader failed (continuing without skills)")
-        matched_skills = []
-        skills_extra_system = ""
-        skills_applied_names = []
-
     # Fetch rows in a short-lived session — we'll then spawn per-cell sessions.
     db = SessionLocal()
     try:
@@ -922,8 +899,8 @@ async def fill_rows(
                 target_columns=unfilled_cols,
                 target_specs=row_specs,
                 max_cost=max_cost,
-                extra_system=skills_extra_system or None,
-                skills_applied=skills_applied_names or None,
+                extra_system=None,
+                skills_applied=None,
                 progress_cb=progress_cb,
                 cell_idx=idx,
                 cell_total=len(work_items),
@@ -1173,8 +1150,6 @@ async def fill_rows(
         summary["voided_cost_usd"] = round(voided_cost, 4)
     if trace_persist_info and trace_persist_info.get("persisted"):
         summary["trace_file"] = trace_persist_info.get("file")
-    if skills_applied_names:
-        summary["skills_applied"] = list(skills_applied_names)
     if rows_skipped_already_filled and len(results) == 0:
         summary["note"] = (
             "All matched rows already have values in the target columns."

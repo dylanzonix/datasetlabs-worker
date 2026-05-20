@@ -30,7 +30,6 @@ from dsl_api.db import SessionLocal
 from dsl_api.models import Project
 from dsl_api.models.sample import Sample
 
-from dsl_worker import skills as skills_loader
 from dsl_worker.chat_api import cell_traces, email_verify, sources
 
 ProgressCallback = Callable[[Dict[str, Any]], Awaitable[None]]
@@ -333,22 +332,8 @@ async def bulk_fill_rows(
         if email_verify.is_email_column(project_columns.get(c) or {}, c)
     }
 
-    skill_columns_for_match = [
-        {
-            "name": col,
-            "description": target_specs[col]["description"],
-            "format": target_specs[col]["format"],
-        }
-        for col in target_columns
-    ]
-    try:
-        matched_skills = skills_loader.match_skills("cell_agent", skill_columns_for_match)
-        skills_extra = skills_loader.render_skills(matched_skills) or None
-        skills_applied_names = [s.name for s in matched_skills]
-    except Exception:
-        log.exception("skills loader failed (continuing without skills)")
-        skills_extra = None
-        skills_applied_names = []
+    skills_extra = None
+    skills_applied_names: List[str] = []
 
     db = SessionLocal()
     try:
