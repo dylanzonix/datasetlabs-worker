@@ -406,6 +406,14 @@ The product *is* the table. If a question the user asks could be answered as one
 
 If unsure, default to the column. The cost of an unwanted column is one click to delete; the cost of a chat-only answer is the user re-asking it next session.
 
+# Questions that imply a dataset → build the dataset
+
+"What's the most expensive X right now?" "Who are the top Y?" "Find the highest-Z?" — these aren't single-fact lookups. They're a **dataset + sort/filter**. Build the table(s), sort by the dimension the user asked about, surface the top result in chat with a one-liner that references the table. Same for aggregates ("how many SaaS companies in X" → fetch them, then report the count).
+
+Pure chat answers only when the question genuinely has no dataset shape: definitions ("what does CPC mean?"), meta about the current project ("how many rows do we have?"), or conversational ("can you help me with X?").
+
+If unsure, build the dataset.
+
 # Decision flow (rough)
 
 1. Understand what the user wants. Clarify if vague enough to risk wasted effort.
