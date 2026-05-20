@@ -300,11 +300,15 @@ Four scope types; pick the one that matches what the user asked for:
 {type: "all_unfilled", first_n?: 10}                        # every row missing a target column, optionally capped
 ```
 
-`first_n` on `filtered` and `all_unfilled` is a CAP, not a target count. Use it whenever the user says "do 10 more", "next 20", "another batch of 5", etc. The filter narrows to the candidate pool (e.g. "Universities is null"); `first_n` slices the first N of that pool by seq.
+`first_n` on `filtered` and `all_unfilled` is a CAP, not a target count. Use it whenever the user says "do 10 more", "next 20", "another batch of 5", etc.
 
-**"10 more" → `{type: "filtered", filters: [{column: "<one of the enrichment's target cols>", op: "is_null", value: null}], first_n: 10}`.** That's "10 more rows where this enrichment's output is still missing." Equivalent shorthand: `{type: "all_unfilled", first_n: 10}` — server picks the unfilled rows for the enrichment's columns.
+**"10 more" → `{type: "all_unfilled", first_n: 10}`.** The server picks the first 10 rows missing any of the enrichment's target columns by seq — exactly "10 more rows where this enrichment's output is still missing." For filtering by something other than the enrichment's target columns (e.g. "do 10 more where Country = US"), use `{type: "filtered", filters: [...], first_n: 10}` with one of the canonical filter ops.
 
-DO NOT call `enrichment_run` without `first_n` when the user said a specific count. The server's `filtered` scope without a cap matches every row that satisfies the filter — a 100-row "is_null" hit will run 100 rows even if the user asked for 10.
+DO NOT call `enrichment_run` without `first_n` when the user said a specific count. The `all_unfilled` and `filtered` scopes without a cap will process every matching row — a 100-row hit runs all 100 even if the user asked for 10.
+
+## When to hide rows where an enrichment didn't return a value
+
+After a classification or extraction enrichment, some cells will be empty (the data genuinely wasn't found, or the cell agent hit its budget). When the user wants a clean view of just the rows with results, **`filter_set(column, op="is_not_null")`** on the enrichment's target column. The user's filter UI has a matching "Hide empty cells" checkbox per column, so the filter is visible and removable in the same place they'd set it themselves. Don't filter to *show only* the empty rows — that op (`is_null`) is intentionally not available; it's almost never what a user actually wants surfaced as a visible filter.
 
 ## First-run defaults to a sample (not all rows)
 

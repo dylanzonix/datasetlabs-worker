@@ -1168,9 +1168,14 @@ async def table_delete(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
 _LAST_COMMIT_STATS: Dict[str, Dict[str, int]] = {}
 
 
+# Canonical set mirrors chat_v2/__init__.py:FILTER_OPS. `is_null` was
+# removed from the AI's vocabulary (see comment there); the normalizer
+# below still accepts is_null aliases and passes them through so legacy
+# DB rows continue to apply, but `filter_set` schema validation gates
+# new writes to this set.
 _CANONICAL_FILTER_OPS = {
     "text_inc_exc", "is_any_of", "between", "gte", "lte",
-    "is_null", "is_not_null",
+    "is_not_null",
 }
 
 

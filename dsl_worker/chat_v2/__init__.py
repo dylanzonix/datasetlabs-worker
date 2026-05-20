@@ -195,18 +195,24 @@ def _enrichment_set_schema() -> Dict[str, Any]:
 
 
 # Canonical filter ops — exactly the ops the FE filter panel can render
-# and edit. Shrunk from 19 → 7 to enforce a 1:1 contract: every filter
-# the AI sets must be expressible in the FE's filter UI, and vice versa.
+# and edit. Enforces a 1:1 contract: every filter the AI sets must be
+# expressible in the FE's filter UI, and vice versa.
 # Handler normalizes legacy ops (`contains`, `>=`, `in`, etc.) into one
 # of these on write so old DB rows + agent slips still work.
+#
+# Note: `is_null` was intentionally removed — users almost never want
+# "show me only the empty rows" as a visible filter. To target unfilled
+# rows for an enrichment run, use scope `{type: "all_unfilled"}` which
+# the server resolves against the enrichment's target columns. SQL +
+# Python predicate handlers still tolerate `is_null` for any legacy DB
+# rows that have it set, but the AI can no longer construct new ones.
 FILTER_OPS = [
     "text_inc_exc",   # text / url / email — value: {include: [strings], exclude: [strings]}
     "is_any_of",      # enum (or any column) — value: [strings]
     "between",        # number / date — value: [min, max]
     "gte",            # number / date — value: number-or-iso-date
     "lte",            # number / date — value: number-or-iso-date
-    "is_null",        # any column — value: null
-    "is_not_null",    # any column — value: null
+    "is_not_null",    # any column — value: null  (hide rows where this cell is empty)
 ]
 
 
@@ -228,7 +234,7 @@ def _filter_set_schema() -> Dict[str, Any]:
                     "number/iso-date for gte/lte; "
                     "[strings] for is_any_of; "
                     "{include:[],exclude:[]} for text_inc_exc; "
-                    "null for is_null / is_not_null."
+                    "null for is_not_null."
                 ),
             },
         },
@@ -278,8 +284,8 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
             "size, ALWAYS pass first_n. Without it, 'filtered' runs every matching row "
             "and 'all_unfilled' runs every unfilled row — a 100-row hit will run all 100 "
             "even if the user asked for 10. Shape: "
-            "{type: 'all_unfilled', first_n: 10} (server picks the unfilled rows) or "
-            "{type: 'filtered', filters: [{column: '<target_col>', op: 'is_null', value: null}], first_n: 10}."
+            "{type: 'all_unfilled', first_n: 10} (server picks the unfilled rows for the "
+            "enrichment's target columns automatically)."
         ),
         # Filters
         "filter_set": (
@@ -301,9 +307,12 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
             "    between        value=[min, max]  (inclusive on both ends)\n"
             "    gte            value=number_or_iso_date  (one-sided range, inclusive)\n"
             "    lte            value=number_or_iso_date  (one-sided range, inclusive)\n"
-            "  any column (empty-cell check):\n"
-            "    is_null        value=null   (cell is empty)\n"
-            "    is_not_null    value=null   (cell has a value)\n\n"
+            "  any column (hide empty cells):\n"
+            "    is_not_null    value=null   (cell has a value)\n"
+            "                   Use this to hide rows where a column is unfilled —\n"
+            "                   the common case after a classification enrichment\n"
+            "                   that leaves some cells blank. The user's UI has a\n"
+            "                   matching 'Hide empty cells' checkbox.\n\n"
             "Use `gte`/`lte` (no strict `gt`/`lt` — round the boundary if needed). "
             "For 'value contains X', use `text_inc_exc {include:[\"X\"]}` not a "
             "contains/starts_with shape. The handler will rewrite legacy shapes to "
