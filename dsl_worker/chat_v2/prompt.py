@@ -126,7 +126,7 @@ When the user says "more" or "give me more" or "keep going", treat that as: cons
 - **Google Maps**: if the prior result included a `next_page_token` in the surfaced sample, pass it as the new `page_token`
 - **Reddit / search-style**: increase `time_range` or shift to a different sort (`new` → `top`) — pagination cursors here are often noisy
 
-For **`web_harvest`**, "more" doesn't mean "deeper on the same query" — every web_harvest call is the same depth, so repeating the query just gives you a lot of overlap. Pick a different query (a related angle, a sibling segment, a tighter/broader slice — whatever the table's results, the user's feedback, or the natural next move suggests). The table's `dedup_key_column` catches accidental overlap server-side, so a good new query plus dedup is enough. `exclude` and `continuation_hint` are optional add-ons — use them only when a few specific rows keep coming back or when you want to steer the LLM with prose; don't dump 100+ row names into `exclude`, that's wasted tokens for what dedup already handles.
+For **`web_harvest`**, "more" means a DIFFERENT query — every call is the same depth, so repeating just produces overlap. The `dedup_key_column` catches accidental overlap; `exclude` / `continuation_hint` are optional add-ons, not the main lever.
 
 For **`browser_use`**, "more" means a different query (geo, keywords, date window) — there's no cursor. Tell the user plainly if you can't keep going.
 
@@ -533,25 +533,7 @@ exclude: ["name1", ...]            # OPTIONAL: identifiers already in the table 
 continuation_hint: "..."           # OPTIONAL: prose steering ("focus on Europe, skip Bay Area"). Used alongside `exclude` on table_extend to push the LLM into a new slice.
 ```
 
-**Prefer passing `columns` upfront on `table_create` for web_harvest.** Unlike Apify / Apollo / BU where the source dictates the row shape, web_harvest is an LLM researching; you can tell it exactly what JSON keys to produce. When you pass `columns` on `table_create`, the LLM is constrained to those keys and `table_extend` reuses them by construction — no schema drift, no separate `column_map_set` step needed.
-
-```
-table_create(
-  source="web_harvest",
-  query_params={query: "...", candidate_description: "..."},
-  columns=[
-    {"name": "Firm", "source_field": "firm", "type": "text"},
-    {"name": "Website", "source_field": "website", "type": "url"},
-    {"name": "Focus", "source_field": "focus", "type": "text"},
-    ...
-  ],
-  name="VC Firms"
-)
-```
-
-Use `source_field` = the JSON key you want the LLM to use in the row (typically snake_case lowercase of the column name). `name` is the user-visible column.
-
-Fall back to the no-`columns` flow (raw passthrough → `column_map_set`) only when you genuinely don't know what columns make sense before fetching — rare for web_harvest, which is research the agent decided on. For predictable asks ("VC firms with website + focus", "PhD programs with city + tuition", etc.) commit to the schema upfront.
+**`columns` upfront (optional but recommended).** Pass `columns` on `table_create` to lock the JSON schema before fetch — the LLM produces exactly those keys. Skips `column_map_set` and prevents schema drift on extends. `source_field` = the JSON key the LLM should use (typically snake_case of `name`).
 
 ## browser_use
 ```
