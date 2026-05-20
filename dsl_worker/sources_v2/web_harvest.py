@@ -72,6 +72,13 @@ class WebHarvestAdapter(SourceAdapter):
         candidate_description = query_params["candidate_description"]
         max_candidates = int(query_params.get("max_candidates", min(n, 30)))
         continuation_hint = query_params.get("continuation_hint")
+        # When table_extend reuses this adapter, the table's existing
+        # column_map is reapplied to every new row. If the LLM picks
+        # DIFFERENT keys this time, the mapped cells are mostly empty
+        # (the column map's source_field paths won't find the new keys).
+        # tools.table_extend stuffs the prior keys here so the prompt
+        # can pin the schema. Empty/missing on first-fetch table_create.
+        existing_schema = query_params.get("__existing_schema") or []
 
         from dsl_worker.billing.tracked_client import TrackedOpenAIClient
         from openai import AsyncOpenAI
@@ -86,6 +93,17 @@ class WebHarvestAdapter(SourceAdapter):
             "Use consistent keys across rows. Include a `url` key if you have a source URL for the candidate.",
             "No prose, no markdown, no preamble — just the JSON array.",
         ]
+        if existing_schema:
+            # Lock the schema to the prior batch's keys. The downstream
+            # column_map_set is reused on extends, so any key the LLM
+            # invents that's NOT in this list will land in raw_row but
+            # not in the mapped row.
+            prompt_parts.append(
+                "\nMANDATORY SCHEMA — every row MUST use these EXACT keys "
+                f"(no renames, no synonyms): {existing_schema}.\n"
+                "If a value is unknown for a row, return null for that key. "
+                "Do not add extra keys."
+            )
         if continuation_hint:
             prompt_parts.append(f"\nAvoid candidates from this prior coverage: {continuation_hint}")
         prompt = "\n".join(prompt_parts)

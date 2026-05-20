@@ -711,6 +711,23 @@ async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
         )
         return {"error": val_err}, 0.0
 
+    # For schema-unpredictable sources (web_harvest, llm) the LLM picks
+    # its own row keys. table_extend reuses the table's column_map from
+    # the first fetch, so if the LLM picks DIFFERENT keys on the
+    # extend, every mapped cell goes empty except the few keys that
+    # happen to match. Pipe the existing source_field paths into
+    # query_params so the adapter can constrain its prompt to those
+    # exact keys.
+    if source in ("web_harvest", "llm"):
+        cols_for_schema = json.loads(columns) if isinstance(columns, str) else (columns or [])
+        existing_schema = [
+            c.get("source_field") or c.get("name")
+            for c in cols_for_schema
+            if (c.get("source_field") or c.get("name"))
+        ]
+        if existing_schema:
+            new_query_params = {**new_query_params, "__existing_schema": existing_schema}
+
     try:
         async with phase_span_async(ctx, "table_extend/adapter_fetch", source=source, n=n):
             if source.startswith("apify_actor:"):

@@ -221,8 +221,18 @@ async def _fullenrich_bulk_enrich(
     # FE's response nests results under `contact_info`, not `contact`.
     # Was reading the wrong key; every successful lookup looked empty.
     contact_info = item.get("contact_info") or {}
-    credits = float(((last_result.get("cost") or {}).get("credits") or 0))
-    return {"contact_info": contact_info}, credits
+    # FE returns its cost as `cost.credits` — those are FE's INTERNAL
+    # credits (not USD, not our credits). Pro plan: ~$55 per 1000
+    # credits → $0.055/credit. Cell agent's total_cost is denominated in
+    # USD, so we MUST convert here. Before this conversion existed,
+    # every FE email lookup was being billed as $1 USD (raw credit
+    # count) — a 20x overcharge confirmed against project c978ed19
+    # where 10 enrichments all clustered at $1.25-$1.50 because the
+    # $1.00 FE line dominated.
+    raw_fe_credits = float(((last_result.get("cost") or {}).get("credits") or 0))
+    fe_credit_to_usd = float(os.getenv("FULLENRICH_COST_PER_CREDIT", "0.055"))
+    cost_usd = raw_fe_credits * fe_credit_to_usd
+    return {"contact_info": contact_info}, cost_usd
 
 
 async def _fullenrich_enrich_email(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
