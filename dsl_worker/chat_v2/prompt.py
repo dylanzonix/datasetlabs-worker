@@ -45,13 +45,16 @@ Pick by data shape, not a priority list.
 - **`fullenrich_people`** — people search by company + title + seniority + geo + tech stack. Paid per match (~0.25 credits/row).
 - **`google_maps`** — local orgs / places with geographic scope. Spatial subdivision server-side for >60-result asks.
 - **`apify_actor:<actor_id>`** — the Apify store is a marketplace of ~30k scrapers covering most named sites and directories on the public web: Reddit, Quora, Indeed, LinkedIn (jobs/people/companies), Twitter/X, Hacker News, ProductHunt, Crunchbase, Glassdoor, AngelList, GitHub, Stack Overflow, TikTok, Instagram, app stores, e-commerce stores, real estate, scholarly databases, gov registries, niche industry directories, etc. When the user names a specific site / product / directory / platform, search Apify first — don't translate the named source into apollo/FE keywords. Use `apify_search_actors` to discover, `apify_actor_details` to read the input schema before `table_create`.
-- **`web_harvest`** — *fragmented* open-web data: pull from many different sites, none of which is a complete directory. Bounded research subagent on a topic. Wrong choice when one site has the answer.
-- **`browser_use`** — programmatic browser. Use for **single-site directory / listing pages** when no Apify actor covers them. BU clicks through pagination, expands rows, and bypasses JS-rendering / antibot. **Apify FIRST when an actor exists** — actors are faster and cheaper for the same data. **BU SECOND when the data lives on one site** (`speedrun.a16z.com/companies`, a company "team" page, a city directory). Not for single-fact lookups (use web_search). Not for cross-site fragmented research (use web_harvest).
+- **`web_harvest`** — research across the open web when **no specific directory site exists** for the data. The answer lives in scattered blog posts, news articles, press releases, random pages — not structured anywhere. Wrong choice when you can name the site(s) where the data lives.
+- **`browser_use`** — programmatic browser for **directory / listing pages on a specific site** when no Apify actor covers it. **Apify FIRST when an actor exists** (faster, cheaper). BU handles pagination, JS-rendered pages, antibot. Not for single-fact lookups (use web_search). Not for open-ended research without a target site (use web_harvest).
 
-**Decision tree for list-of-things sources:** is there one site that has the full list?
-- yes + Apify actor exists → apify
-- yes + no actor → **browser_use** (don't fall back to web_harvest just because it's familiar)
-- no, the answer is fragmented across many sites/articles → web_harvest
+**Decision tree for list-of-things sources:** can you name the directory site(s) where this data lives?
+- one site, Apify actor exists → apify
+- one site, no actor → **browser_use**
+- **multiple named directory sites** (e.g. `gsaauctions.gov` + `usmarshals.gov` + `treasury.gov` for federal auctions, or `linkedin.com` + `twitter.com` + `reddit.com` for posts) → **N separate tables, one per site**, apify/BU each. NOT one web_harvest blob.
+- no canonical directory anywhere — answer only lives in scattered blog/news/articles → web_harvest
+
+If unsure, do one or two `web_search` calls first to identify the directory site(s). If scouting surfaces specific listing pages, that's apify/BU territory.
 - **`file`** — uploaded tabular files (CSV/XLSX). Only works for files the user uploaded; the sandbox `code_exec` runs in is isolated from the file source. **Don't** write a CSV via `code_exec` and then try `source="file"` — the file lives in a sandbox the file adapter can't see, you'll get `0 rows; nothing to commit`.
 - **`llm`** — pure model-generated rows. No retrieval. Use when the answer IS the model's structured guess: ideation, brainstorming, archetype lists, angle/hook lists, taxonomy/category seeds, "come up with N ideas for X." Pair with downstream tables when the LLM rows become inputs ("come up with 20 ICP ideas → find companies matching each"). Wrong choice when an actual list exists in the world — use the right retrieval source instead. Don't reach for `llm` to invent rows that should be looked up (companies, people, posts, products).
 
