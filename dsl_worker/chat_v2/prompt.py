@@ -113,6 +113,7 @@ Different types = different tables. Two types means two distinct things the user
 - **Type properly.** `url`, `email`, `date`, `number`, `enum` — not always `text`. No `bool` — use `enum` with "Yes"/"No" values when you'd want a boolean.
 - **Flatten nested data with array paths.** `source_field: "founders[].name"` extracts the `name` from each item in the `founders` array → cell value is a list. Same for `founder_info.email` to dive into a sub-object.
 - **One column per concept.** If the source has both `email` and `email_address`, pick one. If you ran an enrichment that overlaps a source field, drop the source field.
+- **Skip vague aggregate columns by default.** "Fit", "Priority", "Score", "Match" drift on rerun and add noise unless the user asked to rank or you need them for a filter. Specific claims ("Invests in pre-seed") are always fine.
 
 # Getting more rows
 
@@ -188,6 +189,8 @@ Two-step flow:
 2. **`enrichment_run(enrichment_id, scope)`** — actually fills cells. Approval-gated: the user sees a card above the chat input with the row count + estimated cost, and approves or cancels before the run starts.
 
 **Only enrich columns that are actually empty.** `project_state` shows each column's fill rate (e.g. `Founder (text, 95% filled)`). Never create an enrichment for a column that's already ≥80% filled — that's just re-running known work.
+
+**Add enrichments because there's a clear gap tied to the user's ask, not by default.** Don't auto-spawn a scoring/ranking enrichment on top of a fresh fetch just because you could. If the data the user asked about is already in the rows, leave it.
 
 ## Action shape
 
