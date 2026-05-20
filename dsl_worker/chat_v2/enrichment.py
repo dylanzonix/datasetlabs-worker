@@ -921,13 +921,17 @@ def _resolve_scope_rows(
     Scope types:
       row_ids:      {type, row_ids: [...]}
       first_n:      {type, first_n: 10}
-      filtered:     {type, filters: [{column, op, value}, ...]} — same
-                    {column, op, value} shape as filter_set. Filters are
-                    AND'd together, evaluated in Python via the same _match
-                    semantics used everywhere else (no hidden state — the
-                    scope's filters are self-contained, NOT a reference to
-                    whatever table_filters happens to have at exec time).
-      all_unfilled: {type} — every row missing at least one target column.
+      filtered:     {type, filters: [{column, op, value}, ...], first_n?: N}
+                    same {column, op, value} shape as filter_set. Filters
+                    are AND'd together, evaluated in Python via the same
+                    _match semantics used everywhere else. Optional
+                    `first_n` caps the result to the first N rows (after
+                    seq-ordering) — used for "do 10 more empty rows" style
+                    asks where the agent expresses BOTH a filter AND a
+                    batch size.
+      all_unfilled: {type, first_n?: N} — every row missing at least one
+                    target column. Optional `first_n` caps the result so
+                    "run 10 more unfilled" is expressible directly.
     """
     base_sql = "SELECT id::text, row, raw_row FROM samples WHERE table_id=:tid AND deleted_at IS NULL"
     params: Dict[str, Any] = {"tid": table_id}
@@ -1006,6 +1010,23 @@ def _resolve_scope_rows(
             any_unfilled = any(not row_data.get(c) for c in target_cols)
             if any_unfilled:
                 out.append((sid, row_data, raw_row))
+
+    # Apply first_n cap if the scope carried one. Honored on filtered +
+    # all_unfilled so the agent can express "10 more empty rows" by
+    # combining a filter (or all_unfilled) with first_n. Until 2026-05-20
+    # this was silently dropped: the agent passed first_n=10 with a
+    # filtered scope and got the full 86-row match instead. Skip for
+    # row_ids (caller named the rows explicitly) and the bare first_n
+    # branch (already applied a SQL LIMIT).
+    if scope_type in ("filtered", "all_unfilled"):
+        cap_raw = scope.get("first_n")
+        if cap_raw is not None:
+            try:
+                cap = int(cap_raw)
+                if cap > 0:
+                    out = out[:cap]
+            except (TypeError, ValueError):
+                pass
     return out
 
 

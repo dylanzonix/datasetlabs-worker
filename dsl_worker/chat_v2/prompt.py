@@ -268,6 +268,24 @@ When you call `enrichment_run`, the user sees a card above the chat input with t
 
 **Only call `enrichment_run` when the current user message explicitly asked for it** — a phrase like "run it", "fill them in", "yes go", a click on a Run-* suggestion chip, or an "Add column" envelope from the Enrich modal. Never chain `enrichment_run` after `table_create` / `table_extend` / `enrichment_set` in the same turn just because the next move is obvious — see "Pace work across turns".
 
+## Scope shapes for `enrichment_run`
+
+Four scope types; pick the one that matches what the user asked for:
+
+```
+{type: "first_n",    first_n: 10}                           # first 10 by seq
+{type: "row_ids",    row_ids: ["<uuid>", "<uuid>"]}         # exactly these rows
+{type: "filtered",   filters: [{column, op, value}, ...],
+                     first_n?: 10}                          # rows matching filters, optionally capped
+{type: "all_unfilled", first_n?: 10}                        # every row missing a target column, optionally capped
+```
+
+`first_n` on `filtered` and `all_unfilled` is a CAP, not a target count. Use it whenever the user says "do 10 more", "next 20", "another batch of 5", etc. The filter narrows to the candidate pool (e.g. "Universities is null"); `first_n` slices the first N of that pool by seq.
+
+**"10 more" → `{type: "filtered", filters: [{column: "<one of the enrichment's target cols>", op: "is_null", value: null}], first_n: 10}`.** That's "10 more rows where this enrichment's output is still missing." Equivalent shorthand: `{type: "all_unfilled", first_n: 10}` — server picks the unfilled rows for the enrichment's columns.
+
+DO NOT call `enrichment_run` without `first_n` when the user said a specific count. The server's `filtered` scope without a cap matches every row that satisfies the filter — a 100-row "is_null" hit will run 100 rows even if the user asked for 10.
+
 ## First-run defaults to a sample (not all rows)
 
 When the user hasn't explicitly said "run on all rows" — and an enrichment has never been run yet on the active scope — **default scope to `{type: "first_n", first_n: 10}`** so the approval card shows "Run on 10 rows" instead of "Run on 39 rows" / "100 rows" / etc. A 10-row sample lets the user inspect the output quality and approve the full run as a follow-up. Cheaper, less daunting, faster feedback loop.

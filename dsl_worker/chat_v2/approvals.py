@@ -216,6 +216,19 @@ def estimate_enrichment_run_cost(args: Dict[str, Any], db, project_id: str) -> t
             ).fetchone()
             n_rows = int(count_row[0] or 0) if count_row else 0
 
+        # Apply first_n cap on filtered + all_unfilled so the approval
+        # card matches what _resolve_scope_rows will actually run. Mirror
+        # of the cap applied in enrichment.py.
+        if scope_type in ("filtered", "all_unfilled"):
+            cap_raw = scope.get("first_n")
+            if cap_raw is not None:
+                try:
+                    cap_n = int(cap_raw)
+                    if cap_n > 0:
+                        n_rows = min(n_rows, cap_n)
+                except (TypeError, ValueError):
+                    pass
+
         est = cap * n_rows
         summary = f"Run “{name}” on {n_rows} row{'s' if n_rows != 1 else ''} (up to {est:.1f} credits)"
         return est, summary
