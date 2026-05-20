@@ -1026,6 +1026,11 @@ def _infer_source_from_tool_calls(
 
     Used as a fallback when the cell agent fills a value but forgets to
     declare `sources` in `final_result`.
+
+    Special case: when the source tool is apify_call_actor, append the
+    specific actor_id so the FE can render a clickable link to
+    apify.com/{actor_id} instead of a generic "Apify actor" tag with
+    no drill-through.
     """
     for entry in reversed(tool_calls_log):
         name = entry.get("name") or ""
@@ -1035,13 +1040,21 @@ def _infer_source_from_tool_calls(
         result_preview = entry.get("result_preview") or ""
         if cost <= 0 and "error" in result_preview.lower():
             continue
-        return {"type": "source_record", "source": _normalize_tool_to_kind(name)}
+        kind = _normalize_tool_to_kind(name)
+        # Apify: append the actor_id so the FE can resolve a specific
+        # actor URL. Citation becomes "apify_actor:username/actor-name".
+        if name == "apify_call_actor":
+            actor_id = (entry.get("args") or {}).get("actor_id")
+            if isinstance(actor_id, str) and actor_id:
+                kind = f"apify_actor:{actor_id}"
+        return {"type": "source_record", "source": kind}
     return None
 
 
 def _coerce_sources_keys(
     raw_sources: Any,
     canonical_columns: List[str],
+    tool_calls_log: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Normalize the LLM's `sources` arg into {canonical_col: [citation, ...]}.
 
@@ -1049,12 +1062,27 @@ def _coerce_sources_keys(
       - {type: "url", value: "https://..."}              — web hits, real URLs
       - {type: "source_record", source: "<kind>"}        — paid APIs, service-level
 
+    For apify_call_actor sources we resolve to "apify_actor:<actor_id>"
+    using the most recent apify call in tool_calls_log, so the FE can
+    render a clickable link to that specific actor on apify.com instead
+    of a generic "Apify actor" tag.
+
     `source_field` is intentionally dropped from source_record citations: the
     FE's drill-through panel queries the sample's raw_row, which doesn't
     exist for enrichment. Cell-trace drill-through is future work.
     """
     if not isinstance(raw_sources, dict) or not raw_sources or not canonical_columns:
         return {}
+
+    # Pre-resolve the most recent apify actor_id once so we don't walk
+    # tool_calls_log for every column × every citation.
+    last_apify_actor_id: Optional[str] = None
+    for entry in reversed(tool_calls_log or []):
+        if entry.get("name") == "apify_call_actor":
+            aid = (entry.get("args") or {}).get("actor_id")
+            if isinstance(aid, str) and aid:
+                last_apify_actor_id = aid
+                break
 
     def _norm(s: str) -> str:
         return "".join(ch for ch in s.lower() if ch.isalnum())
@@ -1086,9 +1114,19 @@ def _coerce_sources_keys(
             # source_field (no drill-through endpoint for enrichment yet).
             src = c.get("source")
             if src:
+                kind = _normalize_tool_to_kind(src)
+                # Apify: append the specific actor_id from the run log
+                # so the FE links to apify.com/{actor_id}. The LLM may
+                # also include actor_id directly on the citation —
+                # honor that if present.
+                if kind == "apify_actor":
+                    explicit_aid = c.get("actor_id") if isinstance(c.get("actor_id"), str) else None
+                    aid = explicit_aid or last_apify_actor_id
+                    if aid:
+                        kind = f"apify_actor:{aid}"
                 normalized.append({
                     "type": "source_record",
-                    "source": _normalize_tool_to_kind(src),
+                    "source": kind,
                 })
         if normalized:
             out[col] = normalized
@@ -1318,7 +1356,7 @@ async def run_cell_agent(
                         if isinstance(data, dict) and "values" in data:
                             final_values = data["values"]
                             final_sources = _build_sources_with_fallback(
-                                _coerce_sources_keys(data.get("sources"), list(final_values.keys())),
+                                _coerce_sources_keys(data.get("sources"), list(final_values.keys()), tool_calls_log),
                                 final_values,
                             )
                             return final_values, final_sources, total_cost, "filled"
@@ -1350,7 +1388,7 @@ async def run_cell_agent(
                     # actual column name. _coerce_value_keys maps those back.
                     final_values = _coerce_value_keys(raw_values, columns_to_fill)
                     declared_sources = _coerce_sources_keys(
-                        args.get("sources"), list(final_values.keys())
+                        args.get("sources"), list(final_values.keys()), tool_calls_log
                     )
                     final_sources = _build_sources_with_fallback(
                         declared_sources, final_values
