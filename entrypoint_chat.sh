@@ -5,7 +5,7 @@ set -e
 PORT="${PORT:-8040}"
 WORKERS="${UVICORN_WORKERS:-1}"
 
-exec uvicorn dsl_worker.chat_api.app:app \
+exec uvicorn dsl_worker.chat.app:app \
     --host 0.0.0.0 \
     --port "$PORT" \
     --workers "$WORKERS" \

@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # costs LLM tokens and clock time. The wording is deliberate: short,
 # imperative, and uses concrete numeric ceilings so the model can
 # self-check against them. Tune the numbers here (not at the caller),
-# because every caller — chat_v2 browser_use source, web_search_agent,
+# because every caller — chat browser_use source, web_search_agent,
 # the bulk_browser path — benefits equally from a tighter floor.
 def _build_efficiency_guard(
     *,
@@ -450,7 +450,7 @@ class BUClient:
 
 
 # ---------------------------------------------------------------------------
-# Module-level wrapper for chat_v2 source adapter
+# Module-level wrapper for chat source adapter
 # ---------------------------------------------------------------------------
 
 
@@ -464,7 +464,7 @@ async def bu_extract_rows(
     action_budget: int = 30,
     include_url_check: bool = False,
 ) -> Tuple[List[Dict[str, Any]], float]:
-    """Convenience wrapper used by `sources_v2/browser_use.py`.
+    """Convenience wrapper used by `sources/browser_use.py`.
 
     BU's native `extract` takes one composite task; this folds the
     starting URL and a candidate-description into the task so the

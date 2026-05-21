@@ -1,4 +1,4 @@
-"""Per-phase timing breakdown for a chat_v2 run.
+"""Per-phase timing breakdown for a chat run.
 
 Usage:
     python -m scripts.analyze_run <run_id>
