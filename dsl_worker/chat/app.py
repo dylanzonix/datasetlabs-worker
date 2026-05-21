@@ -14,7 +14,10 @@ import warnings
 
 from dotenv import load_dotenv
 
-load_dotenv(".env")
+# override=True so an empty/stale shell env var (e.g. APIFY_API_KEY="" from
+# a prior session) doesn't shadow the value in .env. Without this, every
+# adapter that reads its key via os.getenv at import sees "" and goes inert.
+load_dotenv(".env", override=True)
 
 # Silence noisy Pydantic discriminated-union warnings emitted by the OpenAI
 # SDK when serializing Response objects that contain `web_search_call`

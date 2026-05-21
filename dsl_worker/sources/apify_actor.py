@@ -352,6 +352,11 @@ class ApifyActorAdapter(SourceAdapter):
         Final yield has exhausted=True.
         """
         if not self.api_key:
+            # Surface this loudly — silently returning 0 rows makes it look
+            # like every Apify actor is broken when really we just don't
+            # have credentials. The startup warning at __init__ is easy to
+            # miss; this fires per-call so a bad env config doesn't hide.
+            log.error("apify_actor: APIFY_API_KEY not set — call to %r returning 0 rows", source_full)
             yield {"rows": [], "exhausted": True, "cost_credits": 0.0}
             return
 
