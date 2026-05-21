@@ -217,7 +217,7 @@ action: {
   Use when the answer is derivable from row content alone (no API, no web search).
   Examples: "is this post a complaint (Yes/No)", "apartment or house", "sentiment of bio", "Is This A Match (Yes/No)".
 
-- **`research`** → gpt-5.5 + all tools (web_search, FE, Apollo, browser_use). The cell agent goes outside the row to find the answer.
+- **`research`** → gpt-5.4-mini + all tools (web_search, FE, Apollo, browser_use). The cell agent goes outside the row to find the answer.
   Use for anything that needs a lookup, a web call, or a tool. The cell agent figures out depth at runtime — no separate "low/medium/high" effort knob; rely on the credit cap to bound spend.
   Examples: "verified email" (FE), "current_technologies" (Apollo), "what does this company sell" (web_search + read), "find founder LinkedIn" (search + verify).
 

@@ -155,7 +155,7 @@ def _enrichment_set_schema() -> Dict[str, Any]:
                             "Two tiers. "
                             "`classify` = nano model, NO tools — decides a label from the row's existing text "
                             "(e.g. 'is this a SaaS company yes/no', 'sentiment of bio'). "
-                            "`research` = gpt-5.5 + all tools (web search, FE, Apollo, browser_use) — "
+                            "`research` = gpt-5.4-mini + all tools (web search, FE, Apollo, browser_use) — "
                             "fills cells by looking outside the row. Use this for anything that needs a lookup or web call."
                         ),
                     },

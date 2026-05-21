@@ -251,7 +251,10 @@ async def enrichment_run(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
     phase_marker(ctx, "enrichment_run/start", enrichment_id=enrichment_id, scope_type=scope.get("type"))
     stats = await _run_enrichment_on_rows(ctx, table_id, enrichment_id, scope, overwrite)
     phase_marker(ctx, "enrichment_run/done", rows_filled=stats.get("rows_filled"), rows_attempted=stats.get("rows_attempted"))
-    cost = stats["total_cost_credits"]
+    # total_cost_usd = full raw spend (backend tracking); total_charge_usd
+    # = what we actually bill (full on success, 10% subsidy on failure).
+    charge_usd = stats["total_charge_usd"]
+    cost_credits_full = stats["total_cost_usd"] * 10.0
 
     ctx.db.execute(
         sa_text(
@@ -263,7 +266,7 @@ async def enrichment_run(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
             WHERE id = :eid
             """
         ),
-        {"eid": enrichment_id, "n": stats["rows_filled"], "cost": cost},
+        {"eid": enrichment_id, "n": stats["rows_filled"], "cost": cost_credits_full},
     )
     ctx.db.commit()
 
@@ -283,7 +286,7 @@ async def enrichment_run(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
         "sample_filled_row": stats["sample_filled_row"],
         "sample_not_found_row": stats["sample_not_found_row"],
         "sample_missing_deps_row": stats["sample_missing_deps_row"],
-    }, cost * 0.10
+    }, charge_usd
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +305,7 @@ async def _run_enrichment_on_rows(
 
     Returns a stats dict the orchestrator uses to build its rich tool result:
       rows_attempted, rows_filled, rows_not_found, rows_hit_budget, rows_errored,
-      total_cost_credits, sample_filled_row, sample_not_found_row.
+      total_cost_usd, total_charge_usd, sample_filled_row, sample_not_found_row.
     """
     empty_stats = {
         "rows_attempted": 0,
@@ -311,7 +314,8 @@ async def _run_enrichment_on_rows(
         "rows_hit_budget": 0,
         "rows_errored": 0,
         "rows_skipped_missing_deps": 0,
-        "total_cost_credits": 0.0,
+        "total_cost_usd": 0.0,
+        "total_charge_usd": 0.0,
         "sample_filled_row": None,
         "sample_not_found_row": None,
         "sample_missing_deps_row": None,
@@ -337,7 +341,8 @@ async def _run_enrichment_on_rows(
         rows = _resolve_scope_rows(ctx.db, table_id, scope, columns, overwrite)
     phase_marker(ctx, "enrichment_run/scope_resolved", rows=len(rows))
 
-    total_cost = 0.0
+    total_cost = 0.0          # actual OpenAI/tool USD across all cells (for backend tracking)
+    total_charge_usd = 0.0    # what gets billed: full USD on success, 10% subsidy on failure
     filled_count = 0
     not_found_count = 0
     hit_budget_count = 0
@@ -685,6 +690,17 @@ async def _run_enrichment_on_rows(
             continue
 
         total_cost += cost
+        # Subsidy gate: full charge only when the cell actually produced
+        # something the user can use. status=="filled" with all-null values
+        # means the agent ran but couldn't find an answer — bill 10%, same
+        # as hit_budget / soft error. Keeps the user from paying full price
+        # for a row they got nothing for.
+        produced_value = (
+            status == "filled"
+            and isinstance(new_fields, dict)
+            and any(v not in (None, "") for v in new_fields.values())
+        )
+        total_charge_usd += cost if produced_value else cost * 0.10
         completed += 1
 
         if isinstance(original_row, str):
@@ -928,7 +944,7 @@ async def _run_enrichment_on_rows(
         except Exception:
             pass
         try:
-            ctx.partial_cost_usd += float(total_cost)
+            ctx.partial_cost_usd += float(total_charge_usd)
         except Exception:
             pass
         raise
@@ -941,7 +957,8 @@ async def _run_enrichment_on_rows(
         "rows_hit_budget": hit_budget_count,
         "rows_errored": errored_count,
         "rows_skipped_missing_deps": skipped_missing_deps_count,
-        "total_cost_credits": total_cost,
+        "total_cost_usd": total_cost,
+        "total_charge_usd": total_charge_usd,
         "sample_filled_row": sample_filled_row,
         "sample_not_found_row": sample_not_found_row,
         "sample_missing_deps_row": sample_missing_deps_row,

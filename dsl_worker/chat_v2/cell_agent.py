@@ -10,14 +10,14 @@ Spawned per row for every enrichment. Each cell agent gets:
 Research levels — two values, picked per enrichment:
 
   - "classify"  gpt-5.4-nano  | no tools — decide a label from row text
-  - "research"  gpt-5.5       | all tools — go find more data (web /
+  - "research"  gpt-5.4-mini  | all tools — go find more data (web /
                                 FE / Apollo / browser_use / etc.)
 
 The split is binary: does the cell agent need to look OUTSIDE this row's
-data? If yes → research. If no → classify. The middle tiers (mini, etc.)
-proved awkward in practice — for paid integrations the LLM cost is a
-rounding error vs the tool fee, so picking 5.5 everywhere we research
-buys reliability at imperceptible cost.
+data? If yes → research. If no → classify. mini is the workhorse: the
+long system prompt + tool defs repeat across every cell so the cache hit
+rate is high, input cost is 70% lower than gpt-5.5, and for paid
+integrations the LLM cost is a rounding error vs the tool fee anyway.
 
 Legacy aliases cover every prior rename pass (none/low/medium/high,
 classify/lookup/search/investigate, fast/smart/expert, etc.) — all
@@ -60,14 +60,18 @@ log = logging.getLogger(__name__)
 #
 #   FREE_TOOLS        — non-billing (final_result, discovery, code_exec,
 #       web_search). No pre-check.
+#
+# All values are USD — same unit as total_cost. Tuned to typical actual
+# bills: FE email/company ~$0.27 per success ($0.055/FE-cr × 5 cr),
+# FE phone ~$2.75, gmaps place_details ~$0.017.
 FIXED_COST_TOOLS = {
-    "fullenrich_enrich_email":  0.5,   # FE charges per successful contact
-    "fullenrich_enrich_phone":  5.0,   # FE phone is expensive
-    "fullenrich_enrich_company": 0.5,
+    "fullenrich_enrich_email":  0.30,
+    "fullenrich_enrich_phone":  3.00,
+    "fullenrich_enrich_company": 0.05,
     # apollo_org_enrich removed — organizations/enrich is request-quota
     # limited (Apollo's response headers confirm: x-rate-limit-* not
     # credit-* ). Treat as free; pre-call budget gate doesn't refuse it.
-    "google_maps_place_details": 0.3,
+    "google_maps_place_details": 0.05,
 }
 
 # Hard floor — refuse to call BU if remaining budget is below this, since
@@ -80,11 +84,12 @@ APIFY_MIN_BUDGET = 0.50
 
 CAPPED_TOOLS = {"browser_use", "apify_call_actor"}
 
-# Legacy reference — kept so external imports don't break.
+# Legacy reference — kept so external imports don't break. USD-denominated
+# now that total_cost is USD; numbers tuned to typical observed bills.
 TOOL_COST_ESTIMATES = dict(FIXED_COST_TOOLS)
 TOOL_COST_ESTIMATES.update({
-    "browser_use": 5.0,
-    "apify_call_actor": 1.0,
+    "browser_use": 0.50,
+    "apify_call_actor": 0.10,
     "apify_search_actors": 0.0,
     "apify_actor_details": 0.0,
     "web_search": 0.0,
@@ -99,12 +104,12 @@ TOOL_COST_ESTIMATES.update({
 
 RESEARCH_CONFIG = {
     # Two tiers. The split is binary: "process row data only" vs "go find
-    # more data via web/integrations". Mini tier was awkward in practice —
-    # for paid integrations the LLM cost is a rounding error vs the tool
-    # fee, so we just use the smart model everywhere we do research and
-    # buy reliability for $0.005/row.
+    # more data via web/integrations". `default_cap` is in CREDITS — the
+    # orchestrator hands per_row_credit_cap in credits and we convert to
+    # USD at the boundary in _resolve_research so all internal math uses
+    # USD (matches total_cost).
     "classify": {"model": "gpt-5.4-nano", "effort": "medium", "default_cap": 0.3, "tools": []},
-    "research": {"model": "gpt-5.5",      "effort": "medium", "default_cap": 5.0, "tools": "all"},
+    "research": {"model": "gpt-5.4-mini", "effort": "medium", "default_cap": 10.0, "tools": "all"},
 }
 
 # Every old name (across every prior rename pass + the latest collapse)
@@ -133,11 +138,12 @@ LEGACY_ALIASES = {
 
 
 def _resolve_research(action: Dict[str, Any], per_row_cap: Optional[float]) -> Dict[str, Any]:
-    """Return resolved config: {model, effort, cap, tools, name}.
+    """Return resolved config: {model, effort, cap, cap_credits, tools, name}.
 
-    Reads `research` (or legacy `tier`) from the action. Cap defaults from
-    the research level when caller passes None — fixes the prior bug where
-    enrichment.py always passed 5 and trampled per-tier defaults.
+    Reads `research` (or legacy `tier`) from the action. `per_row_cap` is
+    in CREDITS (1 cr = $0.10) — that's how the orchestrator names it
+    (per_row_credit_cap). Internal cap is USD so it can be compared to
+    total_cost.
     """
     requested = (action.get("research") or action.get("tier") or "research").lower()
     requested = LEGACY_ALIASES.get(requested, requested)
@@ -145,8 +151,9 @@ def _resolve_research(action: Dict[str, Any], per_row_cap: Optional[float]) -> D
         log.warning("cell_agent: unknown research %r, defaulting to research", requested)
         requested = "research"
     cfg = RESEARCH_CONFIG[requested].copy()
-    cap = float(per_row_cap) if per_row_cap and per_row_cap > 0 else cfg["default_cap"]
-    cfg["cap"] = cap
+    cap_credits = float(per_row_cap) if per_row_cap and per_row_cap > 0 else cfg["default_cap"]
+    cfg["cap_credits"] = cap_credits
+    cfg["cap"] = cap_credits * 0.10
     cfg["name"] = requested
     return cfg
 
@@ -322,7 +329,7 @@ async def _fullenrich_enrich_company(args: Dict[str, Any], ctx: ToolContext) -> 
         if r.status_code != 200:
             return {"error": f"FE HTTP {r.status_code}"}, 0.0
         data = (r.json() or {}).get("data") or {}
-    return data, 0.5
+    return data, 0.05
 
 
 async def _apollo_org_enrich(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
@@ -372,7 +379,7 @@ async def _google_maps_place_details(args: Dict[str, Any], ctx: ToolContext) -> 
         if r.status_code != 200:
             return {"error": f"gmaps HTTP {r.status_code}"}, 0.0
         result = (r.json() or {}).get("result") or {}
-    return result, 0.3
+    return result, 0.03
 
 
 async def _apify_call_actor(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
@@ -464,7 +471,7 @@ async def _apify_call_actor(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dic
                         try:
                             ctx.partial_cost_usd = float(
                                 getattr(ctx, "partial_cost_usd", 0.0)
-                            ) + partial_usd * 10.0
+                            ) + partial_usd
                         except Exception:
                             pass
             except Exception:
@@ -476,7 +483,7 @@ async def _apify_call_actor(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dic
             await heartbeat
         except asyncio.CancelledError:
             pass
-    return {"items": items[:5]}, cost_usd * 10.0
+    return {"items": items[:5]}, cost_usd
 
 
 from dsl_worker.chat_v2.light_tools import (
@@ -1259,7 +1266,7 @@ async def run_cell_agent(
 ) -> Tuple[Dict[str, Any], Dict[str, List[Dict[str, Any]]], float, str]:
     """Per-row Responses-API loop with research-level routing.
 
-    Returns (new_fields_dict, sources_per_column, total_cost_credits, status).
+    Returns (new_fields_dict, sources_per_column, total_cost_usd, status).
       status ∈ {"filled", "hit_budget", "error"}
         - filled: cell agent emitted final_result (values may still be null
           if the answer genuinely didn't exist)
@@ -1562,6 +1569,6 @@ async def run_cell_agent(
             tool_calls_log,
             final_values if final_values else None,
             error_str,
-            total_cost,
+            total_cost * 10.0,
             duration_ms,
         )
