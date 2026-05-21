@@ -630,6 +630,13 @@ async def _drive_agent(
         run_state.emit_event(db, run, "status", {"content": "Thinking…"})
 
         tool_log: List[Dict[str, Any]] = []
+        # Tool names we deliberately hide from the chat UI — their pills
+        # never appear in the live SSE stream OR the persisted assistant
+        # message. Use for internal mechanics whose name/args/result would
+        # confuse or leak signal to the user. load_skill exposes
+        # internal playbook names + bodies; those are agent IP, not
+        # user-facing content.
+        _HIDDEN_TOOLS_FROM_CHAT = {"load_skill"}
         total_cost_ref = {"value": 0.0}
         # Cents already deducted from the account during this turn via
         # incremental cost_update events. The end-of-turn flush charges
@@ -670,6 +677,11 @@ async def _drive_agent(
                 elif etype == "tool_call_start":
                     tc_id = evt.get("tool_call_id") or ""
                     name = evt.get("name") or "?"
+                    # Suppress hidden tools entirely — no tool_log entry,
+                    # no SSE pill, no DB row. The internal agent loop
+                    # still runs them; we just don't surface them.
+                    if name in _HIDDEN_TOOLS_FROM_CHAT:
+                        return
                     args_preview = json.dumps(evt.get("args") or {}, default=str)
                     tool_log.append({
                         "id": tc_id,
@@ -682,6 +694,8 @@ async def _drive_agent(
                         "args_preview": args_preview,
                     })
                 elif etype == "tool_call_result":
+                    if (evt.get("name") or "") in _HIDDEN_TOOLS_FROM_CHAT:
+                        return
                     tc_id = evt.get("tool_call_id") or ""
                     summary = evt.get("result_preview") or ""
                     cost = float(evt.get("cost_usd") or 0.0)
