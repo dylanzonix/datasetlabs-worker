@@ -542,33 +542,41 @@ def _filters_to_where_sql(filters):
             params[p] = arr
         elif op_lower in (">=", "gte"):
             try:
-                fragments.append(f"NULLIF({json_text},'')::numeric >= :{p}")
-                params[p] = float(val)
+                num = float(val)
             except (TypeError, ValueError):
                 # Fall back to lexical (works for ISO dates too)
                 fragments.append(f"{json_text} >= :{p}")
                 params[p] = str(val)
+            else:
+                fragments.append(f"NULLIF({json_text},'')::numeric >= :{p}")
+                params[p] = num
         elif op_lower in ("<=", "lte"):
             try:
-                fragments.append(f"NULLIF({json_text},'')::numeric <= :{p}")
-                params[p] = float(val)
+                num = float(val)
             except (TypeError, ValueError):
                 fragments.append(f"{json_text} <= :{p}")
                 params[p] = str(val)
+            else:
+                fragments.append(f"NULLIF({json_text},'')::numeric <= :{p}")
+                params[p] = num
         elif op_lower in (">", "gt"):
             try:
-                fragments.append(f"NULLIF({json_text},'')::numeric > :{p}")
-                params[p] = float(val)
+                num = float(val)
             except (TypeError, ValueError):
                 fragments.append(f"{json_text} > :{p}")
                 params[p] = str(val)
+            else:
+                fragments.append(f"NULLIF({json_text},'')::numeric > :{p}")
+                params[p] = num
         elif op_lower in ("<", "lt"):
             try:
-                fragments.append(f"NULLIF({json_text},'')::numeric < :{p}")
-                params[p] = float(val)
+                num = float(val)
             except (TypeError, ValueError):
                 fragments.append(f"{json_text} < :{p}")
                 params[p] = str(val)
+            else:
+                fragments.append(f"NULLIF({json_text},'')::numeric < :{p}")
+                params[p] = num
         elif op_lower == "between" and isinstance(val, list) and len(val) == 2:
             lo, hi = val
             # If both look numeric → numeric range. Otherwise lexical (handles
