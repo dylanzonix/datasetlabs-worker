@@ -726,14 +726,18 @@ def _final_result_tool_def() -> Dict[str, Any]:
                 "sources": {
                     "type": "object",
                     "description": (
-                        "Optional map of column_name → list of source citations "
-                        "describing where each value came from. Each citation is "
-                        "{source, source_field?}: `source` is the tool you used "
-                        "(e.g. fullenrich_enrich_phone, apollo_org_enrich, "
-                        "web_search, browser_use); `source_field` is the JSON "
-                        "path into that tool's result (e.g. "
-                        "\"phone_numbers[0].sanitized\"). Omit if no external "
-                        "tool produced the value."
+                        "Map of column_name → list of source citations. "
+                        "Two citation shapes, mix freely:\n"
+                        "  (a) Web hit — {\"type\":\"url\",\"value\":\"https://...\"}. "
+                        "Use for ANY page/URL you actually used (web_search "
+                        "results, browser_use sessions). Cite the real URL, "
+                        "never OpenAI's internal annotation pointers.\n"
+                        "  (b) Paid/structured service — {\"source\":\"<tool>\"} "
+                        "where `<tool>` is fullenrich_enrich_phone, "
+                        "apollo_org_enrich, google_maps_place_details, "
+                        "apify_call_actor, etc. No value/field needed.\n"
+                        "Omit `sources` only when the value came purely from "
+                        "reasoning over the row's existing fields."
                     ),
                 },
             },
