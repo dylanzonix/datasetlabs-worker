@@ -1436,6 +1436,36 @@ async def run_cell_agent(
                     except Exception:
                         pass
 
+            # Cap gate AFTER processing this response's items (which may
+            # include many hosted web_search_call items + the LLM call
+            # cost itself). The top-of-iteration check only fires on the
+            # NEXT iteration — by which time the model has often emitted
+            # final_result and we return "filled" without ever tripping.
+            # Result: cells routinely overshot cap by 30-50% because a
+            # single response could pile up 10+ web_searches + reasoning
+            # tokens without any cap enforcement.
+            #
+            # If we're over cap and the model emitted final_result, take
+            # only that — drop other queued tools so we don't spend more.
+            # Otherwise bail.
+            if total_cost >= tier_cfg["cap"]:
+                final_fc = next((fc for fc in function_calls if fc.name == "final_result"), None)
+                if final_fc is None:
+                    error_str = "budget cap reached after response (no final_result)"
+                    log.info(
+                        "cell agent cap hit mid-response (research=%s cost=%.4f cap=%.4f) — stopping",
+                        tier_cfg["name"], total_cost, tier_cfg["cap"],
+                    )
+                    return final_values, final_sources, total_cost, "hit_budget"
+                # Over cap WITH final_result available — drop other tools
+                # so they don't add more cost; only the LLM's answer remains.
+                log.info(
+                    "cell agent cap hit mid-response but final_result present "
+                    "(research=%s cost=%.4f cap=%.4f) — accepting final_result only",
+                    tier_cfg["name"], total_cost, tier_cfg["cap"],
+                )
+                function_calls = [final_fc]
+
             if not function_calls:
                 content = "".join(text_parts).strip()
                 if content:
