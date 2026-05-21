@@ -21,6 +21,7 @@ let us survive reconnects but adds plumbing we can defer.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -158,14 +159,21 @@ def estimate_enrichment_run_cost(args: Dict[str, Any], db, project_id: str) -> t
 
         row = db.execute(
             sa_text(
-                "SELECT e.name, e.per_row_credit_cap, e.table_id::text "
-                "FROM enrichments e WHERE e.id=:eid AND e.deleted_at IS NULL"
+                "SELECT e.name, e.per_row_credit_cap, e.table_id::text, "
+                "       e.columns, t.name AS table_name "
+                "FROM enrichments e JOIN tables t ON t.id=e.table_id "
+                "WHERE e.id=:eid AND e.deleted_at IS NULL"
             ),
             {"eid": eid},
         ).fetchone()
         if not row:
             return 0.0, "Run enrichment"
-        name, cap, table_id = row[0], float(row[1] or 1.0), row[2]
+        name, cap, table_id, columns_raw, table_name = row[0], float(row[1] or 1.0), row[2], row[3], row[4]
+        try:
+            cols = columns_raw if isinstance(columns_raw, list) else json.loads(columns_raw or "[]")
+        except Exception:
+            cols = []
+        col_names = [c.get("name") for c in cols if isinstance(c, dict) and c.get("name")]
 
         # Resolve scope → row count. Mirrors the scope handling in
         # enrichment._resolve_scope_rows so the approval card's "Run on N
@@ -230,7 +238,54 @@ def estimate_enrichment_run_cost(args: Dict[str, Any], db, project_id: str) -> t
                     pass
 
         est = cap * n_rows
-        summary = f"Run “{name}” on {n_rows} row{'s' if n_rows != 1 else ''} (up to {est:.1f} credits)"
+        # Build a rich summary: table name, columns, filter (if any) so the
+        # user can see exactly what's about to run rather than a bare
+        # "Run X on N rows" label.
+        table_part = f" on **{table_name}**" if table_name else ""
+        col_part = ""
+        if col_names:
+            if len(col_names) == 1:
+                col_part = f" — fills **{col_names[0]}**"
+            elif len(col_names) <= 3:
+                col_part = f" — fills **{', '.join(col_names)}**"
+            else:
+                col_part = f" — fills **{', '.join(col_names[:2])} +{len(col_names) - 2} more**"
+        filter_part = ""
+        if scope_type == "filtered":
+            raw_filters = scope.get("filters") or []
+            terms: list[str] = []
+            for f in raw_filters:
+                if not isinstance(f, dict):
+                    continue
+                col = f.get("column") or f.get("column_name") or f.get("field")
+                op = (f.get("op") or f.get("operator") or "").lower()
+                value = f.get("value")
+                if not col:
+                    continue
+                value_text = ""
+                if isinstance(value, (list, tuple)):
+                    value_text = ", ".join(str(x) for x in value)
+                elif isinstance(value, dict):
+                    inc = value.get("include") or []
+                    if inc:
+                        value_text = ", ".join(str(x) for x in inc)
+                elif value is not None:
+                    value_text = str(value)
+                if value_text:
+                    terms.append(f"{col} = {value_text}")
+                else:
+                    terms.append(col)
+            if terms:
+                filter_part = f" (filter: {'; '.join(terms[:3])})"
+        scope_part = (
+            f"{n_rows} row{'s' if n_rows != 1 else ''}"
+            if scope_type != "row_ids" or n_rows != 1
+            else "1 row"
+        )
+        summary = (
+            f"Run “{name}”{table_part}, {scope_part}{filter_part}"
+            f"{col_part} — up to {est:.1f} credits"
+        )
         return est, summary
     except Exception as e:
         log.warning("estimate_enrichment_run_cost failed: %s", e)

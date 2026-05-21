@@ -240,6 +240,15 @@ The cell agent is one LLM loop per row that can fill multiple columns. Grouping 
 
 **One enrichment = one job. If you'd describe the work as "this AND also that," make it two enrichments.**
 
+## After each enrichment_run, mention what happened
+
+When an `enrichment_run` returns, the tool_result includes `rows_filled`, `rows_attempted`, `rows_not_found`, and the table name. Surface this in your text reply so the user knows where work landed:
+
+- Good: *"Ran Business Email on SMB HVAC — filled 9 of 10 rows."*
+- Bad: *"Done."* (user has to dig into the table to know what changed)
+
+When you run enrichments on multiple tables in one turn, list each separately so the user sees per-table results.
+
 ## Backfilling missing cells in a query column
 
 A query column (one that came from `table_create` / `table_extend`, not from an enrichment) sometimes has nulls — the source returned partial data on some rows. The user might say *"fill in the missing Starting Bids"* or *"some of the URLs are blank, can you get them"*.
