@@ -93,29 +93,35 @@ class RunEnrichmentBody(BaseModel):
 
 
 class PatchEnrichmentBody(BaseModel):
-    # New: research level. Legacy `tier` accepted via alias below.
-    research: Optional[str] = None  # fast | smart | expert | standard | deep
-    tier: Optional[str] = None      # legacy: classify | lookup | research
+    # Canonical research levels — must match cell_agent.RESEARCH_CONFIG keys.
+    # Legacy values (high/medium/low/none and older tier names) are
+    # normalized via _LEGACY_TIER_TO_RESEARCH so old clients keep working.
+    research: Optional[str] = None  # classify | research | deep
+    tier: Optional[str] = None      # legacy alias for research
     per_row_credit_cap: Optional[float] = None
 
 
-_RESEARCH_VALUES = {"none", "low", "medium", "high"}
+_RESEARCH_VALUES = {"classify", "research", "deep"}
+# Maps every old name across every rename pass to the current canonical
+# triple. Mirrors cell_agent.LEGACY_ALIASES so the read path and the
+# write path agree.
 _LEGACY_TIER_TO_RESEARCH = {
+    # v4 (none/low/medium/high)
+    "none":        "classify",
+    "low":         "research",
+    "medium":      "research",
+    "high":        "deep",
     # v3 (classify/lookup/search/investigate)
-    "classify":    "none",
-    "lookup":      "low",
-    "search":      "medium",
-    "investigate": "high",
+    "lookup":      "research",
+    "search":      "research",
+    "investigate": "deep",
     # v2 (light)
-    "light":       "low",
+    "light":       "research",
     # v1 (fast/smart/standard/deep/expert)
-    "fast":        "none",
-    "smart":       "low",
-    "expert":      "medium",
-    "standard":    "medium",
-    "deep":        "high",
-    # v0 (research as the highest tier)
-    "research":    "high",
+    "fast":        "classify",
+    "smart":       "research",
+    "expert":      "deep",
+    "standard":    "research",
 }
 
 
@@ -150,11 +156,15 @@ def patch_enrichment(
     cap = row[1]
 
     # Resolve research target: prefer new field, fall back to legacy tier alias.
+    # Run BOTH fields through the alias map so a client that sends a stale
+    # value (e.g. "high" or "expert") still hits a canonical level.
     research: Optional[str] = None
     if body.research is not None:
-        research = body.research.lower()
+        raw = body.research.lower()
+        research = _LEGACY_TIER_TO_RESEARCH.get(raw, raw)
     elif body.tier is not None:
-        research = _LEGACY_TIER_TO_RESEARCH.get(body.tier.lower(), body.tier.lower())
+        raw = body.tier.lower()
+        research = _LEGACY_TIER_TO_RESEARCH.get(raw, raw)
     if research is not None:
         if research not in _RESEARCH_VALUES:
             raise HTTPException(
