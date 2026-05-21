@@ -630,6 +630,16 @@ CELL_TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any], ToolContext], Awaitable[
 
 CELL_SYSTEM_PROMPT = """You are a cell agent: fill specific columns for ONE row of a table.
 
+# CRITICAL: end with `final_result`
+
+Every turn MUST end with a `final_result({values: {...}})` call. No exceptions.
+
+- If you found the value → call `final_result` with it.
+- If the value doesn't exist or you give up → call `final_result` with `null` for that column. Null is a valid, expected outcome.
+- If you ran out of ideas → call `final_result` with whatever you have (null for the rest).
+
+Stopping without `final_result` means the cell stays blank in the user's table, your tool work + cost is wasted, and the user sees no signal about what happened. This is the single hardest rule in this prompt.
+
 # Inputs (JSON)
 
 - `row_visible_to_user` — the row's already-filled fields as shown in the user's table.
@@ -639,7 +649,7 @@ CELL_SYSTEM_PROMPT = """You are a cell agent: fill specific columns for ONE row 
 
 # Finishing
 
-Always end with `final_result({values: {col_name: value, ...}})` where `col_name` is the EXACT name from `columns_to_fill`. Do NOT invent keys like `label`, `value`, `answer`, `result`.
+End with `final_result({values: {col_name: value, ...}})` where `col_name` is the EXACT name from `columns_to_fill`. Do NOT invent keys like `label`, `value`, `answer`, `result`.
 
 Set a column to `null` when the value genuinely doesn't exist. Null is fine. Don't fabricate.
 

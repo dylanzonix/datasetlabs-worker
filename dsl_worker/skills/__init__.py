@@ -59,6 +59,26 @@ class Skill:
 
 
 _skills_cache: Optional[Dict[str, Skill]] = None
+_skills_cache_dir_mtime: Optional[float] = None
+
+
+def _dir_mtime() -> float:
+    """Max mtime across the skills directory + all .md files in it.
+
+    Cheap (a handful of stat calls), and changes when any skill file is
+    edited / added / removed. Used to invalidate the in-process cache so
+    `.md` edits land without restarting the worker — uvicorn --reload
+    watches Python files only.
+    """
+    if not SKILLS_DIR.exists():
+        return 0.0
+    times = [SKILLS_DIR.stat().st_mtime]
+    for p in SKILLS_DIR.glob("*.md"):
+        try:
+            times.append(p.stat().st_mtime)
+        except OSError:
+            continue
+    return max(times) if times else 0.0
 
 
 def _parse_skill_file(path: Path) -> Optional[Skill]:
@@ -94,9 +114,20 @@ def _parse_skill_file(path: Path) -> Optional[Skill]:
 
 
 def _load_skills(force: bool = False) -> Dict[str, Skill]:
-    """Load all skill files into a {name: Skill} map. Cached after first call."""
-    global _skills_cache
-    if _skills_cache is not None and not force:
+    """Load all skill files into a {name: Skill} map.
+
+    Cached in-process, but the cache is invalidated when any `.md` file
+    in the skills directory changes. The mtime check is cheap (a few
+    stat calls per request) and lets `.md` edits land without restarting
+    the worker.
+    """
+    global _skills_cache, _skills_cache_dir_mtime
+    current_mtime = _dir_mtime()
+    if (
+        not force
+        and _skills_cache is not None
+        and _skills_cache_dir_mtime == current_mtime
+    ):
         return _skills_cache
     out: Dict[str, Skill] = {}
     if SKILLS_DIR.exists():
@@ -105,6 +136,7 @@ def _load_skills(force: bool = False) -> Dict[str, Skill]:
             if skill is not None:
                 out[skill.name] = skill
     _skills_cache = out
+    _skills_cache_dir_mtime = current_mtime
     return out
 
 
