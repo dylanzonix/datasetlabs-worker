@@ -109,7 +109,7 @@ RESEARCH_CONFIG = {
     # USD at the boundary in _resolve_research so all internal math uses
     # USD (matches total_cost).
     "classify": {"model": "gpt-5.4-nano", "effort": "medium", "default_cap": 0.3, "tools": []},
-    "research": {"model": "gpt-5.4-mini", "effort": "medium", "default_cap": 10.0, "tools": "all"},
+    "research": {"model": "gpt-5.4-mini", "effort": "medium", "default_cap": 3.0, "tools": "all"},
 }
 
 # Every old name (across every prior rename pass + the latest collapse)
