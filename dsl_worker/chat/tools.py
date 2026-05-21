@@ -354,6 +354,22 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     if val_err:
         return {"error": val_err}, 0.0
 
+    # Hard rail: browser_use and apify_actor:* don't honor a pre-declared
+    # schema — they produce whatever JSON keys the page/actor emits.
+    # Accepting `columns` here historically caused silent null cells when
+    # the agent's idealized source_fields (`url`, `category`) didn't match
+    # the source's actual keys (`listing_url`, `category_code`). Force the
+    # two-step flow: fetch first, see the preview, then column_map_set.
+    if raw_columns and (source == "browser_use" or source.startswith("apify_actor:")):
+        return {
+            "error": (
+                f"{source} can't pre-declare columns — the row shape comes from "
+                "the page/actor, not from your schema. Call table_create without "
+                "`columns`, inspect the returned sample/schema preview, then call "
+                "column_map_set with source_fields that match the actual keys."
+            ),
+        }, 0.0
+
     # web_harvest is the LLM-driven research source. By default the LLM
     # picks whatever JSON keys it wants and the agent reconciles
     # afterward via column_map_set. When the agent passes `columns`
@@ -361,10 +377,6 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     # query_params.__existing_schema so the adapter prompt locks the
     # LLM to those exact keys. Skipping column_map_set entirely is
     # then safe — the schema matches what the agent asked for.
-    # Limited to web_harvest by design: BU and apify dictate their own
-    # row shape from the page/actor; constraining them with a synthetic
-    # schema would just drop fields. LLM source has its own
-    # columns_hint path.
     if source == "web_harvest" and raw_columns:
         schema_keys = [
             (c.get("source_field") or c.get("name"))

@@ -114,6 +114,7 @@ Different types = different tables. Two types means two distinct things the user
 ## Picking columns
 
 - **Pick for the user, not for the source.** "Find YC SaaS founders" wants ~5 columns: Company, Founder Name, Founder Email, Batch, Website. Not 25 columns of every field the actor emits.
+- **If a column needs digging beyond what's on the listing/search page, make it an enrichment — not a harvest column.**
 - **Title Case is fine.** `name: "Founder Email"` is preferred over `founder_email`. FE renders both, but the storage name is what shows in exports.
 - **Type properly.** `url`, `email`, `date`, `number`, `enum` — not always `text`. No `bool` — use `enum` with "Yes"/"No" values when you'd want a boolean.
 - **Flatten nested data with array paths.** `source_field: "founders[].name"` extracts the `name` from each item in the `founders` array → cell value is a list. Same for `founder_info.email` to dive into a sub-object.
@@ -606,6 +607,8 @@ url: "https://..."
 task: "..."           # extraction task scoped by SHAPE, not item count
 candidate_description: "..."
 ```
+**No `columns` upfront for BU or apify** — the page/actor dictates the row shape. Fetch first, then `column_map_set` against the real keys in the preview.
+
 **Don't cap by item count.** BU is bounded by navigation actions (~50 scrolls/clicks per session before reliability degrades), not by rows. Tell it to get *all* of them within the natural scope of the page. For a directory like speedrun.a16z.com/companies (240 entries) or a typical listings page, all visible cards fit in well under 50 nav actions. Do NOT write "first 100" or "up to N" — that's leaving rows on the table. Say "extract every founder card visible after scrolling to the end" or "every result for this query."
 
 **Keep tasks SHALLOW.** Reliability drops past ~50 nav actions. Good task: *"Scroll to load all company cards on the page and extract company_name + profile_url for each. Don't open individual cards."* Bad task: *"Open each company card and extract founder + company + cohort + role from each detail page."* — that's many page loads per row → minutes → may hang.
