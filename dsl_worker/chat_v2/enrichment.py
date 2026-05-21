@@ -796,10 +796,16 @@ async def _run_enrichment_on_rows(
                 for downstream_cn in downstream_unblocks.get(cn, []):
                     status_clear.append(downstream_cn)
 
-        # Cost delta: only the columns whose values we just wrote.
+        # Cost delta: attribute the run's cost to every target column
+        # the cell agent worked on, whether or not it produced a value.
+        # Previously we only wrote __cell_cost__ when new_fields was
+        # populated — so hit_budget cells (and other no-value paths)
+        # showed no cost in the detail panel even though the user was
+        # being billed (10% subsidy on non-fill, full on fill).
         cost_delta: Dict[str, float] = {}
-        if isinstance(new_fields, dict) and new_fields:
-            for cn in new_fields.keys():
+        if cost > 0:
+            keys = list(new_fields.keys()) if isinstance(new_fields, dict) and new_fields else list(target_cols)
+            for cn in keys:
                 cost_delta[cn] = float(cost)
 
         # Sources delta: only persist sources for columns that actually
