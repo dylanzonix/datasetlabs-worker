@@ -203,7 +203,7 @@ Every enrichment runs as a per-row cell agent. One shape:
 
 ```
 action: {
-  research: "classify" | "research",
+  research: "classify" | "research" | "deep",
   prompt: "Find this person's Twitter URL via search; return null if they don't have one.",
   columns_to_fill: ["twitter_url"],
   depends_on: ["Founder Name", "Domain"],   // optional
@@ -211,17 +211,21 @@ action: {
 }
 ```
 
-`research` is a binary tier:
+`research` is a three-tier knob:
 
 - **`classify`** → nano, no tools. The cell agent decides a label from the row's existing text.
   Use when the answer is derivable from row content alone (no API, no web search).
   Examples: "is this post a complaint (Yes/No)", "apartment or house", "sentiment of bio", "Is This A Match (Yes/No)".
 
-- **`research`** → gpt-5.4-mini + all tools (web_search, FE, Apollo, browser_use). The cell agent goes outside the row to find the answer.
-  Use for anything that needs a lookup, a web call, or a tool. The cell agent figures out depth at runtime — no separate "low/medium/high" effort knob; rely on the credit cap to bound spend.
+- **`research`** → gpt-5.4-mini + all tools (web_search, FE, Apollo, browser_use). **Default.**
+  Use for anything that needs a lookup, a web call, or a tool. The cell agent figures out depth at runtime — rely on the credit cap to bound spend.
   Examples: "verified email" (FE), "current_technologies" (Apollo), "what does this company sell" (web_search + read), "find founder LinkedIn" (search + verify).
 
-**Rule of thumb:** if the answer needs only what's already on the row, `classify`. If it needs ANY lookup outside the row, `research`. Don't try to pick a middle ground.
+- **`deep`** → gpt-5.5 + all tools. Smarter model, ~3× the per-token cost.
+  Use when the task needs multi-step reasoning, ambiguity resolution, or high-stakes verification where the cheaper model might miss nuance. Not the default — pick deliberately when mini would plausibly produce a wrong but plausible answer.
+  Examples: "fit-score with explanation across 6 dimensions", "synthesize hiring signal from 3 disparate sources", "verify this person's role from their own writing".
+
+**Rule of thumb:** row-text-only → `classify`. Standard lookup → `research`. Nuanced multi-step → `deep`. When in doubt between `research` and `deep`, pick `research` — the user can promote to `deep` if results are weak.
 
 ## Grouping columns into enrichments
 
@@ -320,7 +324,7 @@ If the user IS explicit ("run all", "fill every row", "do them all"), skip the s
 
 ## FE-triggered enrichments
 
-When the user message looks like `Add column to "<table>": <prompt>\n\n(Research: <level>, Budget: <cr>)`, this came from the Enrich modal where the user already picked the research level and budget. `<level>` is one of `classify | research` (lowercase, matching the action.research field). Honor those values as-is in `enrichment_set` rather than re-deriving them from the prose.
+When the user message looks like `Add column to "<table>": <prompt>\n\n(Research: <level>, Budget: <cr>)`, this came from the Enrich modal where the user already picked the research level and budget. `<level>` is one of `classify | research | deep` (lowercase, matching the action.research field). Honor those values as-is in `enrichment_set` rather than re-deriving them from the prose.
 
 ## Output format — lock it in the prompt
 

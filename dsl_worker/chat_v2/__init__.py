@@ -152,13 +152,17 @@ def _enrichment_set_schema() -> Dict[str, Any]:
                 "properties": {
                     "research": {
                         "type": "string",
-                        "enum": ["classify", "research"],
+                        "enum": ["classify", "research", "deep"],
                         "description": (
-                            "Two tiers. "
+                            "Three tiers. "
                             "`classify` = nano model, NO tools — decides a label from the row's existing text "
                             "(e.g. 'is this a SaaS company yes/no', 'sentiment of bio'). "
                             "`research` = gpt-5.4-mini + all tools (web search, FE, Apollo, browser_use) — "
-                            "fills cells by looking outside the row. Use this for anything that needs a lookup or web call."
+                            "DEFAULT. Most lookups (email, phone, single-fact, basic synthesis). "
+                            "`deep` = gpt-5.5 + all tools — smarter model. Use when the task needs "
+                            "multi-step reasoning, ambiguity resolution (sketchy/borderline cases), "
+                            "or higher-stakes verification. Don't reach for it by default; pick when "
+                            "mini would plausibly miss nuance."
                         ),
                     },
                     "prompt": {"type": "string", "description": "Natural-language instruction the per-row agent follows."},

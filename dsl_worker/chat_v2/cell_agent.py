@@ -103,37 +103,42 @@ TOOL_COST_ESTIMATES.update({
 
 
 RESEARCH_CONFIG = {
-    # Two tiers. The split is binary: "process row data only" vs "go find
-    # more data via web/integrations". `default_cap` is in CREDITS — the
-    # orchestrator hands per_row_credit_cap in credits and we convert to
-    # USD at the boundary in _resolve_research so all internal math uses
-    # USD (matches total_cost).
+    # Three tiers. The first split is binary ("process row data only" vs
+    # "go find more data"); the second split inside research is "default
+    # mini" vs "smarter 5.5 for nuance/multi-step." `default_cap` is in
+    # CREDITS — the orchestrator hands per_row_credit_cap in credits and
+    # we convert to USD at the boundary in _resolve_research so all
+    # internal math uses USD (matches total_cost). Per-enrichment caps
+    # passed at action time override these defaults.
     "classify": {"model": "gpt-5.4-nano", "effort": "medium", "default_cap": 0.3, "tools": []},
     "research": {"model": "gpt-5.4-mini", "effort": "medium", "default_cap": 3.0, "tools": "all"},
+    "deep":     {"model": "gpt-5.5",      "effort": "medium", "default_cap": 5.0, "tools": "all"},
 }
 
 # Every old name (across every prior rename pass + the latest collapse)
-# normalizes to one of the two canonical tiers. Old enrichment rows in
-# the DB keep working, agent slips are tolerated.
+# normalizes to one of the three canonical tiers. Old enrichment rows
+# in the DB keep working, agent slips are tolerated. `deep` is now a
+# real tier (not aliased to research) — same for `expert` / `investigate`
+# which route to deep so the smarter model handles them.
 LEGACY_ALIASES = {
     # v4 (none/low/medium/high) — current rename. Anything that needed
-    # tools collapses to "research"; tool-less stays "classify".
+    # tools collapses to "research"; tool-less stays "classify";
+    # explicit-high routes to deep since the user asked for more depth.
     "none":   "classify",
     "low":    "research",
     "medium": "research",
-    "high":   "research",
+    "high":   "deep",
     # v3 (classify/lookup/search/investigate)
     "lookup":      "research",
     "search":      "research",
-    "investigate": "research",
+    "investigate": "deep",
     # v2 (light)
     "light":       "research",
     # v1 (fast/smart/standard/deep/expert)
     "fast":     "classify",
     "smart":    "research",
-    "expert":   "research",
+    "expert":   "deep",
     "standard": "research",
-    "deep":     "research",
 }
 
 
