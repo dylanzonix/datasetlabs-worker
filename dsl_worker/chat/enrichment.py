@@ -798,15 +798,16 @@ async def _run_enrichment_on_rows(
 
         # Cost delta: attribute the run's cost to every target column
         # the cell agent worked on, whether or not it produced a value.
-        # Previously we only wrote __cell_cost__ when new_fields was
-        # populated — so hit_budget cells (and other no-value paths)
-        # showed no cost in the detail panel even though the user was
-        # being billed (10% subsidy on non-fill, full on fill).
+        # `cost` is in USD (cell agent's total_cost). The FE expects
+        # __cell_cost__ in CREDITS (1 cr = $0.10), so convert here.
+        # Without the *10, a 5.5-credit run shows up in the detail panel
+        # as "0.55" and a hit_budget cell with cap=5 looks like it
+        # tripped at 0.55 credits — completely misleading.
         cost_delta: Dict[str, float] = {}
         if cost > 0:
             keys = list(new_fields.keys()) if isinstance(new_fields, dict) and new_fields else list(target_cols)
             for cn in keys:
-                cost_delta[cn] = float(cost)
+                cost_delta[cn] = float(cost) * 10.0
 
         # Sources delta: only persist sources for columns that actually
         # got a value this run.
@@ -957,7 +958,9 @@ async def _run_enrichment_on_rows(
             "new_fields": new_fields if isinstance(new_fields, dict) else None,
             "status": status,
             "cell_status": existing_status or None,
-            "cost": cost,
+            # Convert USD → credits to match __cell_cost__ persistence.
+            # FE merges this straight onto the row's sidecar.
+            "cost": float(cost) * 10.0,
         })
     except asyncio.CancelledError:
         # User cancelled mid-fill. Cancel any still-running cell

@@ -176,6 +176,10 @@ def patch_enrichment(
         action.pop("tier", None)
     if body.per_row_credit_cap is not None:
         cap = body.per_row_credit_cap
+        # Mirror to action JSON so the two stay in sync. Runtime reads
+        # the DB column, but downstream diagnostics + future readers
+        # expect action.per_row_credit_cap to match what's in effect.
+        action["per_row_credit_cap"] = float(cap)
 
     db.execute(
         sa_text(
