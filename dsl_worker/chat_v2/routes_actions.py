@@ -133,18 +133,21 @@ def patch_enrichment(
     (aliased to research). Always writes the new field on the action.
     """
     _verify(project_id, user.user_id, db)
+    # Use the central resolver so a short_id like 'e1' that exists on
+    # multiple projects can't cross-project leak. Also handles the new
+    # composite t<X>e<Y> format.
+    from dsl_worker.chat_v2.tools import resolve_enrichment_id
+    eid_uuid = resolve_enrichment_id(db, str(project_id), enrichment_id)
+    if not eid_uuid:
+        raise HTTPException(404, "Enrichment not found")
     row = db.execute(
-        sa_text(
-            "SELECT id::text, action, per_row_credit_cap FROM enrichments "
-            "WHERE (short_id = :eid OR id::text = :eid) AND deleted_at IS NULL"
-        ),
-        {"eid": enrichment_id},
+        sa_text("SELECT action, per_row_credit_cap FROM enrichments WHERE id=:id"),
+        {"id": eid_uuid},
     ).fetchone()
     if not row:
         raise HTTPException(404, "Enrichment not found")
-    eid_uuid = row[0]
-    action = row[1] if isinstance(row[1], dict) else json.loads(row[1] or "{}")
-    cap = row[2]
+    action = row[0] if isinstance(row[0], dict) else json.loads(row[0] or "{}")
+    cap = row[1]
 
     # Resolve research target: prefer new field, fall back to legacy tier alias.
     research: Optional[str] = None
@@ -528,18 +531,12 @@ def list_cell_traces(
     """Recent per-cell traces for an enrichment — tier, model, tool calls,
     final values, error, cost, duration. Read-only debug view."""
     _verify(project_id, user.user_id, db)
-    # Resolve enrichment_id (accepts short_id like "e1" or uuid)
-    eid_row = db.execute(
-        sa_text(
-            "SELECT e.id::text FROM enrichments e JOIN tables t ON t.id=e.table_id "
-            "WHERE t.project_id=:p AND (e.id::text=:eid OR e.short_id=:eid) "
-            "AND e.deleted_at IS NULL LIMIT 1"
-        ),
-        {"p": str(project_id), "eid": enrichment_id},
-    ).fetchone()
-    if not eid_row:
+    # Use the central resolver so t1e2 composite ids work and bare e<N>
+    # collisions tie-break consistently.
+    from dsl_worker.chat_v2.tools import resolve_enrichment_id
+    eid = resolve_enrichment_id(db, str(project_id), enrichment_id)
+    if not eid:
         raise HTTPException(404, "enrichment not found")
-    eid = eid_row[0]
     rows = db.execute(
         sa_text(
             """

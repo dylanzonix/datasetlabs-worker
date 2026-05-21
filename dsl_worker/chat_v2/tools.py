@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -89,8 +90,20 @@ def resolve_table_id(db: Session, project_id: str, id_or_short: str) -> Optional
     return row[0] if row else None
 
 
+_TXEY_RE = re.compile(r"^(t\d+)(e\d+)$")
+
+
 def resolve_enrichment_id(db: Session, project_id: str, id_or_short: str) -> Optional[str]:
-    """Look up an enrichment's UUID from UUID or short_id (e1, e2…)."""
+    """Look up an enrichment's UUID from UUID or short_id.
+
+    Three input shapes:
+      - UUID (contains '-') → exact match
+      - t<N>e<N> (e.g. 't1e2') → composite; disambiguates by table
+      - e<N> (legacy) → project-wide. If two enrichments share the
+        short_id across tables (the bug fixed by adopting t<X>e<Y>),
+        prefer the most recently created — that's almost always what
+        the agent meant since it just configured it.
+    """
     if not id_or_short:
         return None
     if "-" in id_or_short:
@@ -101,14 +114,38 @@ def resolve_enrichment_id(db: Session, project_id: str, id_or_short: str) -> Opt
             ),
             {"id": id_or_short, "pid": project_id},
         ).fetchone()
-    else:
+        return row[0] if row else None
+
+    # Composite t<X>e<Y> short_id — disambiguate by table.
+    m = _TXEY_RE.match(id_or_short)
+    if m:
+        table_short, enr_short = m.group(1), m.group(2)
+        # Match by full short_id (e.g. "t1e2") OR by the enrichment-only
+        # part stored against the right table — covers both new rows
+        # (full composite stored) and legacy rows where short_id was just
+        # the e<N> piece.
         row = db.execute(
             sa_text(
                 "SELECT e.id::text FROM enrichments e JOIN tables t ON t.id=e.table_id "
-                "WHERE e.short_id=:sid AND t.project_id=:pid AND e.deleted_at IS NULL"
+                "WHERE t.project_id=:pid AND t.short_id=:tshort AND e.deleted_at IS NULL "
+                "AND (e.short_id=:full OR e.short_id=:eshort) "
+                "ORDER BY e.created_at DESC LIMIT 1"
             ),
-            {"sid": id_or_short, "pid": project_id},
+            {"pid": project_id, "tshort": table_short, "full": id_or_short, "eshort": enr_short},
         ).fetchone()
+        return row[0] if row else None
+
+    # Legacy bare e<N>. Tie-break by most recent so an agent that just
+    # configured the enrichment lands on its own row, not an older
+    # collision from a different table.
+    row = db.execute(
+        sa_text(
+            "SELECT e.id::text FROM enrichments e JOIN tables t ON t.id=e.table_id "
+            "WHERE e.short_id=:sid AND t.project_id=:pid AND e.deleted_at IS NULL "
+            "ORDER BY e.created_at DESC LIMIT 1"
+        ),
+        {"sid": id_or_short, "pid": project_id},
+    ).fetchone()
     return row[0] if row else None
 
 
@@ -141,27 +178,55 @@ def _next_short_id(db: Session, project_id: str) -> str:
 
 
 def _next_enrichment_short_id(db: Session, table_id: str) -> str:
-    """Return the next free 'e<N>' for this table. Per-table advisory lock
-    so parallel enrichment_set on the same table can't collide on
-    (table_id, short_id) unique. Salt 2 keeps this distinct from the
-    project-level table lock (salt 1) and the version lock (salt 0)."""
+    """Return the next free 't<X>e<N>' for this table.
+
+    Composite IDs (e.g. 't1e2') eliminate the bare-e<N> collision that
+    occurred when the same number existed on two tables in one project:
+    the project-wide resolver picked whichever row PostgreSQL served
+    first, which was almost never the one the agent meant. Per-table
+    numbering is preserved — 't1e3' means "the 3rd enrichment on t1".
+
+    Per-table advisory lock prevents parallel enrichment_set on the
+    same table from colliding on (table_id, short_id) unique. Salt 2
+    keeps this distinct from the project-level table lock (salt 1) and
+    the version lock (salt 0).
+    """
     db.execute(
         sa_text("SELECT pg_advisory_xact_lock(hashtextextended(:tid, 2))"),
         {"tid": str(table_id)},
     )
+    # Find the highest existing enrichment number on this table —
+    # accept both legacy "e<N>" and composite "t<X>e<N>" rows so the
+    # next free number doesn't collide with either format.
     row = db.execute(
         sa_text(
             "SELECT short_id FROM enrichments WHERE table_id=:tid "
-            "ORDER BY (CASE WHEN short_id ~ '^e[0-9]+$' THEN CAST(substring(short_id, 2) AS int) ELSE 0 END) DESC LIMIT 1"
+            "ORDER BY ("
+            "  CASE "
+            "    WHEN short_id ~ '^t[0-9]+e[0-9]+$' THEN CAST(substring(short_id FROM 'e([0-9]+)$') AS int) "
+            "    WHEN short_id ~ '^e[0-9]+$' THEN CAST(substring(short_id, 2) AS int) "
+            "    ELSE 0 "
+            "  END"
+            ") DESC LIMIT 1"
         ),
         {"tid": table_id},
     ).fetchone()
-    if not row or not row[0] or not row[0].startswith("e"):
-        return "e1"
-    try:
-        return f"e{int(row[0][1:]) + 1}"
-    except (ValueError, IndexError):
-        return "e1"
+    # Look up this table's short_id (t1, t2, …) for the prefix.
+    tshort_row = db.execute(
+        sa_text("SELECT short_id FROM tables WHERE id=:tid"),
+        {"tid": table_id},
+    ).fetchone()
+    tshort = (tshort_row[0] if tshort_row and tshort_row[0] else "t1")
+    next_n = 1
+    if row and row[0]:
+        s = row[0]
+        try:
+            # Strip the t<X> prefix if present, then drop the leading "e".
+            n_part = s.rsplit("e", 1)[-1]
+            next_n = int(n_part) + 1
+        except (ValueError, IndexError):
+            next_n = 1
+    return f"{tshort}e{next_n}"
 
 
 def _record_query_run(

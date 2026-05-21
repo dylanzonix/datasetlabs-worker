@@ -191,7 +191,13 @@ def build_project_state(db: Session, project_id: str, max_tables: int = 10) -> s
         for (esid, ename, tsid, tname, cols, cap, last_filled, last_cost) in enrichments:
             cols_list = json.loads(cols) if isinstance(cols, str) else (cols or [])
             col_names = ", ".join(c["name"] for c in cols_list[:6])
-            parts.append(f"  - [{esid}] {ename} on table [{tsid}] {tname}")
+            # Render as the composite form (t<X>e<Y>) regardless of how
+            # the row is stored — the resolver accepts either, and a
+            # composite handle is unambiguous when the agent calls
+            # enrichment_run later. Legacy bare-e<N> rows get rewritten
+            # for display only; the DB short_id is left alone.
+            display_id = esid if esid.startswith(tsid + "e") else f"{tsid}{esid}"
+            parts.append(f"  - [{display_id}] {ename} on table [{tsid}] {tname}")
             parts.append(f"      Fills: {col_names}; cap: {cap} cr/row")
             if last_filled is not None:
                 cost_s = f", {float(last_cost):.1f} cr" if last_cost is not None else ""
