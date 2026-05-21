@@ -18,6 +18,7 @@ from dsl_worker.chat_v2.tools import HANDLERS as _table_handlers, ToolContext
 from dsl_worker.chat_v2.light_tools import HANDLERS as _light_handlers
 from dsl_worker.chat_v2.enrichment import HANDLERS as _enrichment_handlers
 from dsl_worker.chat_v2.comments import HANDLERS as _comment_handlers
+from dsl_worker.chat_v2.background_tasks import HANDLERS as _bg_handlers
 from dsl_worker.chat_v2.prompt import build_system_prompt
 from dsl_worker.chat_v2.project_state import build_project_state
 
@@ -27,6 +28,7 @@ HANDLERS = {
     **_light_handlers,
     **_enrichment_handlers,
     **_comment_handlers,
+    **_bg_handlers,
 }
 
 
@@ -247,8 +249,22 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
     """OpenAI function tool definitions for the orchestrator surface."""
     tool_descriptions = {
         # Tables
-        "table_create": "Create a table from a source. Fetches rows and commits them with raw passthrough columns (every top-level source key becomes a snake_case text column). If the fetch fails or returns 0 rows, nothing is written — try a different actor/query. Always follow with column_map_set to clean up names, types, and formats unless the raw columns are already what the user wants. Args: source, query_params, name (2-5 words, Title Case).",
-        "table_extend": "Pull MORE rows into an EXISTING table with a non-overlapping next slice. Args: table_id, query_params (the new slice — e.g. next batch / page / date window). Reuses the table's existing column map automatically.",
+        "table_create": (
+            "Create a table from a source. Fetches rows and commits them with raw passthrough columns "
+            "(every top-level source key becomes a snake_case text column). If the fetch fails or returns "
+            "0 rows, nothing is written — try a different actor/query. Always follow with column_map_set "
+            "to clean up names, types, and formats unless the raw columns are already what the user wants. "
+            "Args: source, query_params, name (2-5 words, Title Case). "
+            "Optional `wait: false` returns immediately with {status:'running', task_id:'bt<N>'} and "
+            "runs the fetch in a background task — use this when you're emitting multiple table_creates "
+            "in parallel so subsequent iterations aren't blocked on the slowest source."
+        ),
+        "table_extend": (
+            "Pull MORE rows into an EXISTING table with a non-overlapping next slice. "
+            "Args: table_id, query_params (the new slice — e.g. next batch / page / date window). "
+            "Reuses the table's existing column map automatically. "
+            "Optional `wait: false` backgrounds the fetch — same semantics as table_create."
+        ),
         "table_delete": "Delete a table and all its rows + enrichments. Approval-gated.",
         # Apify discovery
         "apify_search_actors": (
@@ -285,7 +301,28 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
             "and 'all_unfilled' runs every unfilled row — a 100-row hit will run all 100 "
             "even if the user asked for 10. Shape: "
             "{type: 'all_unfilled', first_n: 10} (server picks the unfilled rows for the "
-            "enrichment's target columns automatically)."
+            "enrichment's target columns automatically).\n\n"
+            "Optional `wait: false` returns immediately with {status:'running', task_id:'bt<N>'} once "
+            "the user has approved. The cell loop runs in the background — use this when the agent has "
+            "more work to do on other tables / enrichments while this run completes. Monitor via "
+            "task_status / task_wait. Approval is gated upstream; background mode does NOT bypass the "
+            "cost confirmation card."
+        ),
+        # Background-task monitoring
+        "task_status": (
+            "Instant peek at one or more background tasks (the ones started via wait=false on "
+            "table_create / table_extend / enrichment_run). Args: {task_ids: ['bt1', 'bt2', ...]}. "
+            "Returns per-task status (running / complete / error / cancelled), cost so far, "
+            "started_at, finished_at, and a result preview. Use this BETWEEN other tool calls when you "
+            "just want to check on progress without blocking."
+        ),
+        "task_wait": (
+            "Block until one or all of the listed background tasks finish (or until timeout). "
+            "Args: {task_ids: ['bt1', ...], mode: 'all'|'any' (default 'all'), timeout_s: number "
+            "(default 300, max 600)}. Returns the same per-task state shape as task_status, plus "
+            "`all_done` and `timed_out`. Use this when you need a result before proceeding — e.g. "
+            "you backgrounded 3 table_creates and the next move depends on what they returned. "
+            "On timeout, re-call to keep waiting, or call task_status to peek without blocking."
         ),
         # Filters
         "filter_set": (

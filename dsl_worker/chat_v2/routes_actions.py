@@ -656,3 +656,43 @@ async def list_running_cells(
     _verify(project_id, user.user_id, db)
     from dsl_worker.chat_v2.cell_runs import REGISTRY as CELL_RUNS
     return {"cells": await CELL_RUNS.list_for_project(str(project_id))}
+
+
+@router.get("/projects/{project_id}/background-tasks")
+async def list_background_tasks(
+    project_id: UUID,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Running background tasks for this project — the wait=false tools
+    spawned via the chat agent loop. Lets the FE rehydrate running
+    indicators on page refresh + show a "tasks in flight" chip while
+    bg work is still going. Mirrors /enrichments/running for the
+    new background_tasks subsystem.
+
+    Returns {tasks: [{task_id, kind, task_key, started_at,
+    partial_cost_credits, run_id}, ...]} — same shape the agent sees
+    via task_status for status='running' rows.
+    """
+    _verify(project_id, user.user_id, db)
+    from dsl_worker.chat_v2.background_tasks import list_running_rows
+    return {"tasks": list_running_rows(db, str(project_id))}
+
+
+@router.post("/projects/{project_id}/background-tasks/{task_id}/cancel")
+async def cancel_background_task(
+    project_id: UUID,
+    task_id: str,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Cancel a single background task by short_id or uuid. The bg
+    task's CancelledError handler captures partial cost + updates the
+    chat_background_tasks row to status='cancelled'."""
+    _verify(project_id, user.user_id, db)
+    from dsl_worker.chat_v2.background_tasks import REGISTRY as BG_REGISTRY
+    bg = await BG_REGISTRY.lookup_by_short_or_uuid(str(project_id), task_id)
+    if bg is None or bg.task.done():
+        return {"ok": True, "cancelled": False}
+    bg.task.cancel()
+    return {"ok": True, "cancelled": True}

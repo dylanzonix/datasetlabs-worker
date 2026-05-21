@@ -299,7 +299,30 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     raw passthrough (every top-level row key becomes a column). The agent
     can then call `column_map_set` to rename / flatten nested fields after
     seeing the actual data.
+
+    Optional `wait` (default true). When false, the call returns immediately
+    with `{status: "running", task_id: "bt<N>"}` and the fetch + commit runs
+    as a tracked background task. Agent monitors via `task_status` /
+    `task_wait`. The `wait` arg is popped before recursing so the spawned
+    task runs the sync path.
     """
+    args = dict(args)
+    wait = bool(args.pop("wait", True))
+    if not wait:
+        from dsl_worker.chat_v2 import background_tasks as _bg
+        nm = (args.get("name") or args.get("table_name") or "").strip()
+        src = args.get("source") or "?"
+        summary = f"Creating table {nm!r} from {src}" if nm else f"Creating table from {src}"
+        spawn_result = await _bg.spawn(
+            handler=table_create,
+            args=args,
+            ctx=ctx,
+            kind="table_create",
+            task_key=None,
+            summary=summary,
+        )
+        return spawn_result, 0.0
+
     name = (args.get("name") or args.get("table_name") or "").strip()
     source = args.get("source")
     query_params = args.get("query_params") or {}
@@ -783,7 +806,28 @@ async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     does NOT track cursors or merge with prior params; the most recent
     query_params is stored on the table purely as a historical record the
     LLM can reference via project_state when deciding the next query.
+
+    Optional `wait` (default true). Same semantics as table_create — when
+    false, returns immediately with a task_id and the fetch runs in
+    background.
     """
+    args = dict(args)
+    wait = bool(args.pop("wait", True))
+    if not wait:
+        from dsl_worker.chat_v2 import background_tasks as _bg
+        # Resolve table_id once so task_key carries the canonical UUID
+        # (FE can correlate the running indicator to the table card).
+        canonical_tid = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
+        spawn_result = await _bg.spawn(
+            handler=table_extend,
+            args=args,
+            ctx=ctx,
+            kind="table_extend",
+            task_key=canonical_tid,
+            summary=f"Extending table {args.get('table_id') or '?'}",
+        )
+        return spawn_result, 0.0
+
     table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
     new_query_params = args.get("query_params") or {}
     n = int(args.get("n") or 100)

@@ -447,11 +447,35 @@ def cancel_v2_run(run_id: UUID) -> bool:
     assistant message + cancelled-status event before exiting — so the
     user can't dodge billing by cancelling mid-call.
 
+    Also cancels any background tasks (wait=false table_creates,
+    enrichment_runs, etc.) spawned by this run — Stop = stop everything,
+    so the user doesn't keep accruing spend on backgrounded work after
+    clicking Stop. Background tasks have their own CancelledError handlers
+    that capture partial cost and update chat_background_tasks.status.
+
     Falls back to a DB-only status flip via legacy.request_cancel if
     the registry has no task (worker restarted between start and cancel,
     or the run already finished). In that case the orphan reaper picks
     up the stale state.
     """
+    # Cancel any backgrounded tasks tied to this chat run first. They
+    # run independently of the main agent task; without this, Stop would
+    # only halt the LLM loop and leave the bg tasks burning credits.
+    # Fire-and-forget on the running loop — the cancel itself is async
+    # (REGISTRY's lock) but we don't need to await it from this sync
+    # function; the bg tasks' CancelledError handlers settle their own
+    # cost into the chat_background_tasks row.
+    try:
+        from dsl_worker.chat_v2.background_tasks import REGISTRY as _BG
+        asyncio.create_task(_BG.cancel_run(str(run_id)))
+    except RuntimeError:
+        # No running loop (cancel called from a non-async context — e.g.
+        # the orphan reaper). Bg tasks can still finish on their own;
+        # the row will flip to 'complete' or 'error' when they do.
+        pass
+    except Exception:
+        log.exception("cancel_v2_run: bg cancel failed for %s", run_id)
+
     task = _active_tasks.get(run_id)
     if task is not None and not task.done():
         task.cancel()

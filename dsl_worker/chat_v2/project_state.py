@@ -203,6 +203,49 @@ def build_project_state(db: Session, project_id: str, max_tables: int = 10) -> s
                 cost_s = f", {float(last_cost):.1f} cr" if last_cost is not None else ""
                 parts.append(f"      Last run: {last_filled} rows{cost_s}")
 
+    # Running background tasks — surface so the agent sees what's in flight
+    # each iteration without polling. The model decides whether to wait on
+    # them (task_wait) or proceed with other work; without this section the
+    # model would forget about backgrounded tools and never reconcile their
+    # results. Guarded so a stale local DB (migration not yet applied)
+    # doesn't crash project_state — the section just stays empty.
+    bg_rows: List[Any] = []
+    try:
+        bg_rows = db.execute(
+            sa_text(
+                """
+                SELECT short_id, kind, task_key, started_at, partial_cost_credits
+                FROM chat_background_tasks
+                WHERE project_id = :pid AND status = 'running'
+                ORDER BY started_at ASC
+                """
+            ),
+            {"pid": project_id},
+        ).fetchall()
+    except Exception:
+        # Most likely: table doesn't exist yet (alembic upgrade pending).
+        # Rollback so the rest of project_state can still query.
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    if bg_rows:
+        parts.append("\nRunning background tasks (use task_status or task_wait):")
+        now_ts = dt.datetime.now(dt.timezone.utc)
+        for (bsid, kind, tk, started_at, partial) in bg_rows:
+            elapsed_s = None
+            if started_at is not None:
+                try:
+                    elapsed_s = (now_ts - started_at).total_seconds()
+                except Exception:
+                    elapsed_s = None
+            elapsed_txt = f" ({_human_ago(elapsed_s)} running)" if elapsed_s else ""
+            tk_txt = f" on {tk}" if tk else ""
+            cost_txt = ""
+            if partial is not None and float(partial) > 0:
+                cost_txt = f", {float(partial):.1f} cr so far"
+            parts.append(f"  - [{bsid}] {kind}{tk_txt}{elapsed_txt}{cost_txt}")
+
     body = "\n".join(parts)
     return f"<project_state>\n{body}\n</project_state>"
 

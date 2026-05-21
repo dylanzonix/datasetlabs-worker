@@ -234,6 +234,32 @@ def _format_enrichment_seed_body(name: str, action: Dict[str, Any]) -> str:
 
 
 async def enrichment_run(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
+    """Run an enrichment over a scope of rows.
+
+    Optional `wait` (default true). When false, returns immediately with
+    `{status: "running", task_id: "bt<N>"}` after the approval gate has
+    already resolved — approval happens upstream in the agent loop, so
+    background mode doesn't bypass cost confirmation. The cell loop runs
+    as a tracked background asyncio.Task; agent monitors via
+    `task_status` / `task_wait`.
+    """
+    args = dict(args)
+    wait = bool(args.pop("wait", True))
+    if not wait:
+        from dsl_worker.chat_v2 import background_tasks as _bg
+        canonical_eid = resolve_enrichment_id(
+            ctx.db, ctx.project_id, args.get("enrichment_id")
+        )
+        spawn_result = await _bg.spawn(
+            handler=enrichment_run,
+            args=args,
+            ctx=ctx,
+            kind="enrichment_run",
+            task_key=canonical_eid,
+            summary=f"Running enrichment {args.get('enrichment_id') or '?'}",
+        )
+        return spawn_result, 0.0
+
     enrichment_id = resolve_enrichment_id(ctx.db, ctx.project_id, args.get("enrichment_id"))
     scope = args.get("scope") or {"type": "all_unfilled"}
     overwrite = bool(args.get("overwrite", False))
