@@ -12,6 +12,18 @@ Usage:
 
 from __future__ import annotations
 
+# Load .env BEFORE any submodule import — adapters in dsl_worker.sources
+# read their API keys via os.getenv at module import (e.g. ApifyActorAdapter
+# captures self.api_key in __init__). Without this load happening first, a
+# key that exists only in .env (not the shell env) reads as None at import
+# and the adapter stays inert for the life of the process. app.py also
+# calls load_dotenv but it runs AFTER this package init — too late.
+import os as _os
+from dotenv import load_dotenv as _load_dotenv
+# Path is relative to whatever cwd uvicorn was started from. Worker's
+# canonical cwd is the worker repo root which has .env at its top.
+_load_dotenv(".env", override=True)
+
 from typing import Any, Dict, List
 
 from dsl_worker.chat.tools import HANDLERS as _table_handlers, ToolContext
