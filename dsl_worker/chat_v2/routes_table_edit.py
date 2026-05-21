@@ -721,6 +721,7 @@ def add_column(
 
 class PatchColumnBody(BaseModel):
     hidden: Optional[bool] = None
+    pinned: Optional[bool] = None
     width: Optional[int] = None
     order: Optional[int] = None
     description: Optional[str] = None
@@ -871,6 +872,8 @@ def patch_column(
     col = dict(cols[idx])
     if body.hidden is not None:
         col["hidden"] = bool(body.hidden)
+    if body.pinned is not None:
+        col["pinned"] = bool(body.pinned)
     if body.width is not None:
         col["width"] = max(40, int(body.width))
     if body.description is not None:
