@@ -42,6 +42,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from openai import AsyncOpenAI
 from sqlalchemy import text as sa_text
 
+from dsl_worker.billing.pricing import get_pricing_config
 from dsl_worker.billing.tracked_client import TrackedOpenAIClient
 from dsl_worker.chat.tools import ToolContext
 
@@ -1382,19 +1383,94 @@ async def run_cell_agent(
                 )
                 return final_values, final_sources, total_cost, status
 
+            # Stream the Responses API so we can abort mid-flight when a
+            # hosted web_search burst would push us over cap. Non-stream
+            # mode bills 10+ searches in one round-trip before any cap
+            # check fires; with streaming, each web_search_call.done
+            # event lets us add cost + check cap + close the stream to
+            # prevent the remaining queued searches from running.
+            response = None
+            streamed_search_ids: set[str] = set()
+            aborted_over_cap = False
             try:
-                response, cost = await client.responses_create(
-                    model=tier_cfg["model"],
-                    input=input_items,
-                    tools=tool_defs,
-                    reasoning={"effort": tier_cfg["effort"]},
-                    prompt_cache_key=cache_key,
-                )
-                total_cost += cost.total_cost_usd
+                stream_kwargs = {
+                    "model": tier_cfg["model"],
+                    "input": input_items,
+                    "tools": tool_defs,
+                    "reasoning": {"effort": tier_cfg["effort"]},
+                    "prompt_cache_key": cache_key,
+                }
+                raw = client.raw_client
+                async with raw.responses.stream(**stream_kwargs) as stream:
+                    async for event in stream:
+                        etype = getattr(event, "type", None)
+                        if etype == "response.output_item.done":
+                            done_item = getattr(event, "item", None)
+                            if done_item is not None and getattr(done_item, "type", None) == "web_search_call":
+                                item_id = getattr(done_item, "id", None) or ""
+                                if item_id and item_id in streamed_search_ids:
+                                    continue
+                                if item_id:
+                                    streamed_search_ids.add(item_id)
+                                query = ""
+                                action = getattr(done_item, "action", None)
+                                if action is not None:
+                                    query = getattr(action, "query", "") or ""
+                                total_cost += WEB_SEARCH_CALL_COST_USD
+                                tool_calls_log.append({
+                                    "name": "web_search",
+                                    "args": {"query": query},
+                                    "result_preview": f"native (status={getattr(done_item, 'status', '?')})",
+                                    "cost": WEB_SEARCH_CALL_COST_USD,
+                                })
+                                # Abort the stream the moment a web_search
+                                # pushes us over cap — the model's queued
+                                # searches won't run, saving the burst spend.
+                                if total_cost >= tier_cfg["cap"]:
+                                    aborted_over_cap = True
+                                    log.info(
+                                        "cell agent aborting stream mid-burst "
+                                        "(research=%s cost=%.4f cap=%.4f, %d searches)",
+                                        tier_cfg["name"], total_cost, tier_cfg["cap"],
+                                        len(streamed_search_ids),
+                                    )
+                                    await stream.close()
+                                    break
+                    if not aborted_over_cap:
+                        response = await stream.get_final_response()
             except Exception as e:
                 error_str = f"LLM call failed: {e}"[:500]
                 log.warning("cell agent LLM call failed (research=%s): %s", tier_cfg["name"], e)
                 return final_values, final_sources, total_cost, "error"
+
+            # Mid-stream cap abort: don't attempt to read partial output.
+            # OpenAI billed us for compute up to the close; we already
+            # accounted for the web_search fees as they came in.
+            if aborted_over_cap:
+                error_str = "budget cap reached during web_search burst"
+                return final_values, final_sources, total_cost, "hit_budget"
+
+            # Add LLM token cost from the final response (web_search fees
+            # were already accumulated mid-stream).
+            try:
+                pricing = get_pricing_config()
+                usage = getattr(response, "usage", None)
+                in_tok = getattr(usage, "input_tokens", 0) if usage else 0
+                out_tok = getattr(usage, "output_tokens", 0) if usage else 0
+                cached_tok = 0
+                details = getattr(usage, "input_tokens_details", None) if usage else None
+                if details is not None:
+                    cached_tok = getattr(details, "cached_tokens", 0) or 0
+                non_cached = max(in_tok - cached_tok, 0)
+                cost = pricing.calculate_cost(
+                    model=tier_cfg["model"],
+                    input_tokens=non_cached,
+                    output_tokens=out_tok,
+                    cached_input_tokens=cached_tok,
+                )
+                total_cost += cost.total_cost_usd
+            except Exception as e:
+                log.warning("cell agent failed to compute token cost: %s", e)
 
             function_calls: List[Any] = []
             text_parts: List[str] = []
@@ -1411,60 +1487,15 @@ async def run_cell_agent(
                             text_parts.append(c.text)
                     input_items.append(item.model_dump(exclude_none=True))
                 elif itype == "web_search_call":
-                    # Hosted tool already ran server-side. Bill the
-                    # per-call fee (TrackedClient only sums token cost)
-                    # and log it to tool_calls_log so cell_traces shows
-                    # it just like any other tool the cell agent used.
-                    query = ""
-                    try:
-                        action = getattr(item, "action", None)
-                        if action is not None:
-                            query = getattr(action, "query", "") or ""
-                    except Exception:
-                        pass
-                    total_cost += WEB_SEARCH_CALL_COST_USD
-                    tool_calls_log.append({
-                        "name": "web_search",
-                        "args": {"query": query},
-                        "result_preview": f"native (status={getattr(item, 'status', '?')})",
-                        "cost": WEB_SEARCH_CALL_COST_USD,
-                    })
+                    # Already accounted for mid-stream above. Skip the
+                    # double-count, just record the item in input_items
+                    # for the next-iteration history.
                     input_items.append(item.model_dump(exclude_none=True))
                 else:
                     try:
                         input_items.append(item.model_dump(exclude_none=True))
                     except Exception:
                         pass
-
-            # Cap gate AFTER processing this response's items (which may
-            # include many hosted web_search_call items + the LLM call
-            # cost itself). The top-of-iteration check only fires on the
-            # NEXT iteration — by which time the model has often emitted
-            # final_result and we return "filled" without ever tripping.
-            # Result: cells routinely overshot cap by 30-50% because a
-            # single response could pile up 10+ web_searches + reasoning
-            # tokens without any cap enforcement.
-            #
-            # If we're over cap and the model emitted final_result, take
-            # only that — drop other queued tools so we don't spend more.
-            # Otherwise bail.
-            if total_cost >= tier_cfg["cap"]:
-                final_fc = next((fc for fc in function_calls if fc.name == "final_result"), None)
-                if final_fc is None:
-                    error_str = "budget cap reached after response (no final_result)"
-                    log.info(
-                        "cell agent cap hit mid-response (research=%s cost=%.4f cap=%.4f) — stopping",
-                        tier_cfg["name"], total_cost, tier_cfg["cap"],
-                    )
-                    return final_values, final_sources, total_cost, "hit_budget"
-                # Over cap WITH final_result available — drop other tools
-                # so they don't add more cost; only the LLM's answer remains.
-                log.info(
-                    "cell agent cap hit mid-response but final_result present "
-                    "(research=%s cost=%.4f cap=%.4f) — accepting final_result only",
-                    tier_cfg["name"], total_cost, tier_cfg["cap"],
-                )
-                function_calls = [final_fc]
 
             if not function_calls:
                 content = "".join(text_parts).strip()
