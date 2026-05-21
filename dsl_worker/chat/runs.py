@@ -934,6 +934,57 @@ async def _drive_agent(
         except Exception:
             log.exception("collecting suggestions for applied_changes failed")
 
+        # Rebuild the interleaved segments list (mid-iteration text +
+        # tool batches) from chat_run_events in seq order, mirroring how
+        # the FE useChat live-stream consumer builds m.segments. Without
+        # this, refreshing after a turn loses every mid-iteration narration
+        # line — the ChatMessage.content only carries the FINAL iteration's
+        # text, and the toolLog renders flat without the interleaved text
+        # the user already saw live. Matches the live segment shape:
+        # {kind:"text", content, final?} | {kind:"tools", toolIds}.
+        try:
+            from dsl_api.models import ChatRunEvent
+            ord_rows = (
+                db.query(ChatRunEvent.type, ChatRunEvent.payload)
+                .filter(
+                    ChatRunEvent.run_id == run_id,
+                    ChatRunEvent.type.in_(["text_segment", "tool_call"]),
+                )
+                .order_by(ChatRunEvent.seq.asc())
+                .all()
+            )
+            segments: List[Dict[str, Any]] = []
+            for etype, payload in ord_rows:
+                if not isinstance(payload, dict):
+                    continue
+                if etype == "text_segment":
+                    txt = (payload.get("text") or "").strip()
+                    if not txt:
+                        continue
+                    segments.append({"kind": "text", "content": payload.get("text") or "", "final": False})
+                elif etype == "tool_call":
+                    tcid = payload.get("id")
+                    if not tcid:
+                        continue
+                    # Group consecutive tool_calls into one "tools" segment
+                    # so the FE renders the parallel batch as a single row
+                    # of chips (matches the live build at useChat.ts:1466).
+                    if segments and segments[-1]["kind"] == "tools":
+                        segments[-1]["toolIds"].append(tcid)
+                    else:
+                        segments.append({"kind": "tools", "toolIds": [tcid]})
+            # Append the final assistant text as the trailing final-text
+            # segment if we have any narration / tools above it. The FE
+            # also has the standalone ChatMessage.content to fall back on,
+            # but stashing the final segment here keeps the segments list
+            # self-contained (FE doesn't need to splice on m.content).
+            if final_text:
+                segments.append({"kind": "text", "content": final_text, "final": True})
+            if segments:
+                ac["segments"] = segments
+        except Exception:
+            log.exception("rebuilding segments for applied_changes failed")
+
         # Persist the assistant message + ledger + terminal event. On
         # cancel paths the shared `db` session may be in an inconsistent
         # state (an in-flight tool's transaction was cut short between
