@@ -118,7 +118,7 @@ async def run_turn(
     decisions, matching the Claude Code behavior.
     """
     client = _build_client()
-    model = os.getenv("OPENAI_MODEL", "gpt-5.4")
+    model = os.getenv("OPENAI_MODEL", "gpt-5.5")
     effort = os.getenv("CHAT_V2_REASONING_EFFORT", "medium")
 
     async def _emit_progress(msg: str) -> None:
