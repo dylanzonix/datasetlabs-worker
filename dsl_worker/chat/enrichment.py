@@ -829,6 +829,11 @@ async def _run_enrichment_on_rows(
         if isinstance(_orig_status, dict):
             existing_status = dict(_orig_status)
 
+        # Fresh tags after the per-row update — read once after commit and
+        # pass through to cell_filled so the FE has the merged sources +
+        # status + verification state without a refetch.
+        fresh_tags: Optional[Dict[str, Any]] = None
+
         has_any_change = bool(value_delta or status_set or status_clear or cost_delta or sources_to_persist)
         if has_any_change:
             try:
@@ -924,6 +929,26 @@ async def _run_enrichment_on_rows(
                 merged = final
                 existing_status = final_status
                 ctx.db.commit()
+                # Re-read tags AFTER commit so the SSE event carries
+                # the freshly-merged tags.sources for this row. The FE
+                # wholesale-replaces row.tags on cell_filled, so we
+                # need to send the FULL tags state, not just the delta —
+                # otherwise sibling tag subkeys (fill_status,
+                # email_verification, prior columns' sources) get
+                # clobbered or the new sources never paint until refresh.
+                try:
+                    fresh_tags_row = ctx.db.execute(
+                        sa_text("SELECT tags FROM samples WHERE id=:sid"),
+                        {"sid": sample_id},
+                    ).fetchone()
+                    if fresh_tags_row and fresh_tags_row[0] is not None:
+                        fresh_tags = fresh_tags_row[0]
+                        if isinstance(fresh_tags, str):
+                            fresh_tags = json.loads(fresh_tags or "{}")
+                    else:
+                        fresh_tags = None
+                except Exception:
+                    fresh_tags = None
                 # Schedule Scrubby verify for any email values just
                 # written. Tasks are pinned in email_verify_hook so they
                 # outlive this function; they emit email_verifying /
@@ -961,6 +986,12 @@ async def _run_enrichment_on_rows(
             # Convert USD → credits to match __cell_cost__ persistence.
             # FE merges this straight onto the row's sidecar.
             "cost": float(cost) * 10.0,
+            # Fresh row.tags snapshot after commit so the FE replaces
+            # row.tags wholesale and sees the just-merged sources +
+            # any other tag subkeys (fill_status, email_verification)
+            # without a refresh. Omitted when nothing changed in this
+            # call (no write happened, no fresh read needed).
+            "_tags": fresh_tags,
         })
     except asyncio.CancelledError:
         # User cancelled mid-fill. Cancel any still-running cell
