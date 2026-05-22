@@ -89,6 +89,12 @@ class WorkerSettings(BaseSettings):
     fullenrich_api_key: str = ""
     fullenrich_cost_per_credit: float = 0.055  # ~$55/1000 credits (Pro plan)
 
+    # TablePage.ai — embed-able dataset visualizations.
+    # Auth header isn't strictly required by their API today (anyone can
+    # upload), but the key is sent for quota attribution on their side.
+    # Rate limit: 10 uploads/day per bot. Max upload 25 MB.
+    tablepage_api_key: str = ""
+
     pipeline_version: str = "v13"
 
     # Langfuse observability (optional — leave blank to disable)

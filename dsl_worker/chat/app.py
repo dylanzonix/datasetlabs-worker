@@ -38,6 +38,7 @@ from dsl_worker.chat import routes_health, run_state, tracing
 from dsl_worker.chat.routes import router as chat_router
 from dsl_worker.chat.routes_actions import router as chat_actions_router
 from dsl_worker.chat.routes_table_edit import router as chat_table_edit_router
+from dsl_worker.chat.routes_tablepage import router as chat_tablepage_router
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -98,6 +99,7 @@ app.include_router(routes_health.router)
 app.include_router(chat_router)
 app.include_router(chat_actions_router)
 app.include_router(chat_table_edit_router)
+app.include_router(chat_tablepage_router)
 
 
 @app.on_event("startup")
