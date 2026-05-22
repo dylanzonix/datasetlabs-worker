@@ -472,6 +472,10 @@ def _force_persist_terminal(
             log.warning("force_persist_v2: run %s vanished", run_id)
             return
         if run.assistant_message_id is None:
+            # Defensive — the new flow creates the assistant message
+            # up front. We should never hit this on a normally-driven
+            # run; the branch is kept as a last-ditch save in case the
+            # early-create commit failed for some reason.
             msg = ChatMessage(
                 project_id=project_id,
                 role="assistant",
@@ -482,15 +486,24 @@ def _force_persist_terminal(
             fresh.add(msg)
             fresh.flush()
             run.assistant_message_id = msg.id
-            # Settle the residual — incremental cost_update charges
-            # already debited charged_cents mid-turn on a separate
-            # session, so this fresh-session flush only owes the delta.
-            residual_cents = spend_cents - charged_cents
-            _charge_run_credits(
-                fresh, user_id, residual_cents, project_id, reason="chat_run"
-            )
-            fresh.commit()
-            fresh.refresh(run)
+        else:
+            # Normal path: incremental persist already created + updated
+            # the row during the turn. Replace with the canonical final
+            # state (overrides any drift from per-event rebuilds).
+            fresh.query(ChatMessage).filter(ChatMessage.id == run.assistant_message_id).update({
+                "content": final_text,
+                "applied_changes": applied_changes,
+            })
+
+        # Settle the residual — incremental cost_update charges
+        # already debited charged_cents mid-turn on a separate
+        # session, so this fresh-session flush only owes the delta.
+        residual_cents = spend_cents - charged_cents
+        _charge_run_credits(
+            fresh, user_id, residual_cents, project_id, reason="chat_run"
+        )
+        fresh.commit()
+        fresh.refresh(run)
 
         if run.status not in RUN_TERMINAL_STATUSES:
             if cancelled:
@@ -635,7 +648,106 @@ async def _drive_agent(
         # reasoning token.
         run_state.emit_event(db, run, "status", {"content": "Thinking…"})
 
+        # Create the assistant message row up front, link it to the run,
+        # and commit. Subsequent on_event calls UPDATE this same row
+        # with incremental content + segments as text/tool events fire,
+        # so a worker kill or crash mid-turn leaves the user-visible
+        # state in DB rather than only in chat_run_events. Without this
+        # the assistant bubble only got materialized at end-of-turn and
+        # any pre-completion crash erased the whole reply on refresh.
+        early_msg = ChatMessage(
+            project_id=project_id,
+            role="assistant",
+            content="",
+            run_id=run_id,
+            applied_changes={"segments": []},
+        )
+        db.add(early_msg)
+        db.flush()
+        run.assistant_message_id = early_msg.id
+        db.commit()
+        db.refresh(run)
+        assistant_msg_id = early_msg.id
+
         tool_log: List[Dict[str, Any]] = []
+
+        def _persist_assistant_incremental(ldb_local) -> None:
+            """Rebuild content + applied_changes.segments from the run's
+            chat_run_events log and UPDATE the assistant ChatMessage
+            row in-place. Called after every text_segment / tool_call /
+            tool_result event in on_event so a worker kill leaves the
+            user-visible state durable in DB. Mirrors the end-of-turn
+            segment build at line ~982 so the FE sees the same shape on
+            refresh whether or not the turn completed normally.
+
+            Best-effort: any DB failure is logged + swallowed; the
+            end-of-turn flush will rebuild from scratch and overwrite
+            whatever's there.
+            """
+            try:
+                from dsl_api.models import ChatRunEvent
+                ord_rows = (
+                    ldb_local.query(ChatRunEvent.type, ChatRunEvent.payload)
+                    .filter(
+                        ChatRunEvent.run_id == run_id,
+                        ChatRunEvent.type.in_(["text_segment", "tool_call", "tool_result"]),
+                    )
+                    .order_by(ChatRunEvent.seq.asc())
+                    .all()
+                )
+                segments: List[Dict[str, Any]] = []
+                text_parts: List[str] = []
+                tool_meta: Dict[str, Dict[str, Any]] = {}
+                for etype, payload in ord_rows:
+                    if not isinstance(payload, dict):
+                        continue
+                    if etype == "text_segment":
+                        txt = payload.get("text") or ""
+                        if not txt.strip():
+                            continue
+                        segments.append({"kind": "text", "content": txt, "final": False})
+                        text_parts.append(txt)
+                    elif etype == "tool_call":
+                        tcid = payload.get("id")
+                        if not tcid:
+                            continue
+                        tool_meta[tcid] = {
+                            "id": tcid,
+                            "name": payload.get("name"),
+                            "args_preview": payload.get("args_preview"),
+                        }
+                        if segments and segments[-1]["kind"] == "tools":
+                            segments[-1]["toolIds"].append(tcid)
+                        else:
+                            segments.append({"kind": "tools", "toolIds": [tcid]})
+                    elif etype == "tool_result":
+                        tcid = payload.get("id")
+                        if tcid and tcid in tool_meta:
+                            tool_meta[tcid]["summary"] = payload.get("summary")
+                            tool_meta[tcid]["cost"] = payload.get("cost")
+                            tool_meta[tcid]["duration_ms"] = payload.get("duration_ms")
+                # Append the running final-text snapshot as the trailing
+                # "final" segment so a kill before the official
+                # final_message event still leaves what the user saw.
+                running_final = final_text_ref["value"]
+                if running_final:
+                    segments.append({"kind": "text", "content": running_final, "final": True})
+                content_str = "\n\n".join(text_parts + ([running_final] if running_final else []))
+                ac: Dict[str, Any] = {
+                    "segments": segments,
+                    "tool_log": list(tool_meta.values()),
+                }
+                ldb_local.query(ChatMessage).filter(ChatMessage.id == assistant_msg_id).update({
+                    "content": content_str,
+                    "applied_changes": ac,
+                })
+                ldb_local.commit()
+            except Exception:
+                log.exception("incremental assistant-message persist failed (run=%s); end-of-turn flush will rebuild", run_id)
+                try:
+                    ldb_local.rollback()
+                except Exception:
+                    pass
         # Tool names we deliberately hide from the chat UI — their pills
         # never appear in the live SSE stream OR the persisted assistant
         # message. Use for internal mechanics whose name/args/result would
@@ -715,6 +827,7 @@ async def _drive_agent(
                         "name": name,
                         "args_preview": args_preview,
                     })
+                    _persist_assistant_incremental(ldb)
                 elif etype == "tool_call_result":
                     if (evt.get("name") or "") in _HIDDEN_TOOLS_FROM_CHAT:
                         return
@@ -735,6 +848,7 @@ async def _drive_agent(
                         "cost": cost,
                         "duration_ms": duration_ms,
                     })
+                    _persist_assistant_incremental(ldb)
                 elif etype == "llm_call_complete":
                     # Surface to SSE so a live FE timing overlay (or a
                     # future per-iteration timing chip) can render
@@ -755,6 +869,7 @@ async def _drive_agent(
                     # variants) AND persist a text_checkpoint for
                     # reconnects.
                     run_state.replace_text_content(ldb, lrun, text)
+                    _persist_assistant_incremental(ldb)
                 elif etype == "text_segment":
                     # Mid-iteration text from the agent — the iteration
                     # had both message text AND function calls. The
@@ -772,6 +887,11 @@ async def _drive_agent(
                         "iteration": evt.get("iteration"),
                         "text": seg_text,
                     })
+                    # Incremental persist: rebuild the assistant
+                    # message's content + applied_changes.segments from
+                    # the event log right now so a worker crash before
+                    # end-of-turn leaves the user-visible state in DB.
+                    _persist_assistant_incremental(ldb)
                 elif etype == "cost_update":
                     # Running cost from agent.py after each LLM call or
                     # tool. Keeps total_cost_ref up to date so the
@@ -1040,16 +1160,17 @@ async def _drive_agent(
             terminal_payload["stop_reason"] = "cancel"
 
         try:
-            assistant_msg = ChatMessage(
-                project_id=project_id,
-                role="assistant",
-                content=final_text,
-                run_id=run_id,
-                applied_changes=ac,
-            )
-            db.add(assistant_msg)
-            db.flush()
-            run.assistant_message_id = assistant_msg.id
+            # The assistant message row was created up front (right
+            # after the "Thinking…" status event) and updated
+            # incrementally as text_segment / tool_call / tool_result
+            # events fired. End-of-turn just UPDATES with the
+            # canonical final text + the full segments rebuild —
+            # source of truth, overrides any drift from the
+            # incremental persists.
+            db.query(ChatMessage).filter(ChatMessage.id == assistant_msg_id).update({
+                "content": final_text,
+                "applied_changes": ac,
+            })
 
             # Settle the residual — incremental cost_update charges
             # already debited charged_cents_ref["value"] mid-turn.
