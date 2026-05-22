@@ -42,6 +42,22 @@ from dsl_worker.chat.routes_table_edit import router as chat_table_edit_router
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
+# Bump the default thread executor — Python's default is min(32, cpu+4),
+# which on a typical 4-core box gives ~8 threads. Several hot paths use
+# asyncio.to_thread for blocking psycopg2 calls (heartbeat, future
+# emit_event wrapper). Under 6+ concurrent projects firing events at
+# ~5-10/sec, the default executor saturates and to_thread calls queue
+# up — that's what feels like "the server is laggy." Bump to 64.
+import concurrent.futures as _cf
+import asyncio as _asyncio
+def _install_bigger_executor() -> None:
+    try:
+        loop = _asyncio.get_event_loop()
+        loop.set_default_executor(_cf.ThreadPoolExecutor(max_workers=64, thread_name_prefix="dsl-worker"))
+    except Exception:
+        pass
+_install_bigger_executor()
+
 # Silence noisy third-party SDK INFO logs that flood the worker terminal:
 #   • azure.core http policy dumps full request/response headers per blob op
 #     (artifacts module reads/writes a LOT of blobs)

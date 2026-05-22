@@ -26,6 +26,7 @@ from uuid import UUID
 
 import httpx
 from sqlalchemy import text as sa_text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.sql import func
 
 from dsl_api.config import settings as dsl_api_settings
@@ -673,7 +674,23 @@ async def _drive_agent(
             # call. Legacy emit_event needs a clean session.
             ldb = SessionLocal()
             try:
-                lrun = ldb.query(ChatRun).filter(ChatRun.id == run_id).first()
+                # Retry the initial chat_runs lookup ONCE on stale-conn —
+                # Supabase pgbouncer occasionally drops sockets mid-query
+                # and pool_pre_ping can't catch it (the connection was
+                # alive at checkout, dies on the wire). Closing the
+                # session returns the bad conn to the pool where pre_ping
+                # on next checkout will discard it.
+                try:
+                    lrun = ldb.query(ChatRun).filter(ChatRun.id == run_id).first()
+                except OperationalError:
+                    log.warning("on_event chat_runs query failed (stale conn) — retrying with fresh session")
+                    try:
+                        ldb.rollback()
+                    except Exception:
+                        pass
+                    ldb.close()
+                    ldb = SessionLocal()
+                    lrun = ldb.query(ChatRun).filter(ChatRun.id == run_id).first()
                 if lrun is None:
                     return
                 if etype == "reasoning":
