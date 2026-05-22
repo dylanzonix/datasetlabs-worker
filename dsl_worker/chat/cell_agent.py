@@ -245,6 +245,18 @@ async def _fullenrich_bulk_enrich(
     raw_fe_credits = float(((last_result.get("cost") or {}).get("credits") or 0))
     fe_credit_to_usd = float(os.getenv("FULLENRICH_COST_PER_CREDIT", "0.055"))
     cost_usd = raw_fe_credits * fe_credit_to_usd
+    # TEMP diagnostic: dump the FE response shape so we can see exactly
+    # what `cost.credits` represents. The user's plan ($79.50 / 1500
+    # credits = ~5¢/credit, advertised as "1500 emails") implies 1 credit
+    # per successful email match. We're measuring 18 credits/call on
+    # calls that returned email=null — that's a contradiction worth
+    # resolving. Remove this log once we know the answer.
+    log.warning(
+        "[FE_DIAG] cost.credits=%s contact_info_keys=%s top_level_keys=%s",
+        raw_fe_credits,
+        sorted((contact_info or {}).keys()),
+        sorted(last_result.keys()),
+    )
     return {"contact_info": contact_info}, cost_usd
 
 
