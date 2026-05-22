@@ -1868,15 +1868,15 @@ def _commit_rows(
             )
         except Exception:
             log.exception("email_verify_hook.schedule_bulk_for_rows raised in _commit_rows; suppressed")
-        # URL verification: sample 5 URLs per column from this batch,
-        # firecrawl + Haiku judge, then stamp the aggregate verdict on
-        # every row in the batch. Bimodal failure mode (rare outliers
-        # OR ~100% broken) makes sampling near-as-accurate as full
-        # verification at 1/20th the firecrawl cost.
+        # URL verification: per-URL firecrawl + LLM tool-use judge.
+        # The hook short-circuits on `source` for upstream-trusted
+        # sources (apify_actor:* etc.) so we don't burn firecrawl
+        # credits on URLs the scraper already validated.
         try:
             url_verify_hook.schedule_bulk_for_rows(
                 run_id=run_id,
                 rows=pending_verify,
+                source=source,
             )
         except Exception:
             log.exception("url_verify_hook.schedule_bulk_for_rows raised in _commit_rows; suppressed")

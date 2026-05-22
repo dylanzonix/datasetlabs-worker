@@ -1058,7 +1058,11 @@ def _resolve_scope_rows(
                     target column. Optional `first_n` caps the result so
                     "run 10 more unfilled" is expressible directly.
     """
-    base_sql = "SELECT id::text, row, raw_row FROM samples WHERE table_id=:tid AND deleted_at IS NULL"
+    # `tags` carries failed_urls / failed_emails — values previously
+    # verified as broken. We strip those from raw_row before handing
+    # to the cell agent so a re-run can't just regurgitate the same
+    # bad URL it pulled from hidden_source_fields last time.
+    base_sql = "SELECT id::text, row, raw_row, tags FROM samples WHERE table_id=:tid AND deleted_at IS NULL"
     params: Dict[str, Any] = {"tid": table_id}
     scope_type = scope.get("type", "all_unfilled")
 
@@ -1106,14 +1110,14 @@ def _resolve_scope_rows(
                 norm_filters.append((col, op, value))
             all_rows = db.execute(sa_text(base_sql + " ORDER BY seq"), params).fetchall()
             rows = []
-            for sid, row_data, raw_row in all_rows:
+            for sid, row_data, raw_row, tags in all_rows:
                 if not isinstance(row_data, dict):
                     continue
                 keep = all(
                     _match(row_data.get(c), op, v) for c, op, v in norm_filters
                 )
                 if keep:
-                    rows.append((sid, row_data, raw_row))
+                    rows.append((sid, row_data, raw_row, tags))
     else:  # all_unfilled
         rows = db.execute(
             sa_text(base_sql + " ORDER BY seq"),
@@ -1124,11 +1128,12 @@ def _resolve_scope_rows(
     # enrichment's target columns has no value.
     target_cols = [c["name"] for c in enrichment_columns]
     out: List[Tuple[str, Dict[str, Any], Dict[str, Any]]] = []
-    for sid, row_data, raw_row in rows:
+    for sid, row_data, raw_row, tags in rows:
         if not isinstance(row_data, dict):
             row_data = {}
         if not isinstance(raw_row, dict):
             raw_row = {}
+        raw_row = _scrub_failed_values(raw_row, tags)
         if overwrite:
             out.append((sid, row_data, raw_row))
         else:
@@ -1153,6 +1158,62 @@ def _resolve_scope_rows(
             except (TypeError, ValueError):
                 pass
     return out
+
+
+def _collect_failed_values(tags: Any) -> set:
+    """Collect every value previously verified as broken on this row.
+
+    Reads ``tags.failed_urls`` and ``tags.failed_emails`` (both shaped
+    ``{column: [value, ...]}``) and flattens them into a single set of
+    case-insensitive strings. The set is used by ``_scrub_failed_values``
+    to remove these values from ``raw_row`` before the cell agent sees
+    it — otherwise the agent reads the broken URL out of
+    ``row_hidden_source_fields`` and silently returns it without
+    actually researching, defeating the point of a re-run.
+    """
+    if not isinstance(tags, dict):
+        return set()
+    out: set = set()
+    for bucket_key in ("failed_urls", "failed_emails"):
+        bucket = tags.get(bucket_key)
+        if not isinstance(bucket, dict):
+            continue
+        for vals in bucket.values():
+            if not isinstance(vals, list):
+                continue
+            for v in vals:
+                if isinstance(v, str) and v:
+                    out.add(v.casefold())
+    return out
+
+
+def _scrub_failed_values(raw_row: Dict[str, Any], tags: Any) -> Dict[str, Any]:
+    """Return a shallow copy of ``raw_row`` with previously-failed values
+    removed. Top-level strings whose case-insensitive form is in the
+    banned set are dropped entirely (key removed); list values get
+    those entries filtered out, and the key is dropped if the list ends
+    up empty. Other types pass through untouched.
+    """
+    banned = _collect_failed_values(tags)
+    if not banned or not isinstance(raw_row, dict):
+        return raw_row
+    cleaned: Dict[str, Any] = {}
+    for k, v in raw_row.items():
+        if isinstance(v, str):
+            if v.casefold() in banned:
+                continue
+            cleaned[k] = v
+        elif isinstance(v, list):
+            kept = [
+                item
+                for item in v
+                if not (isinstance(item, str) and item.casefold() in banned)
+            ]
+            if kept:
+                cleaned[k] = kept
+        else:
+            cleaned[k] = v
+    return cleaned
 
 
 async def _execute_action(
