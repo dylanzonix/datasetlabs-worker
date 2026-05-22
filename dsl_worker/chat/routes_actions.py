@@ -39,6 +39,7 @@ from dsl_worker.chat.tools import (
 from dsl_worker.chat.enrichment import enrichment_run
 from dsl_worker.chat.approvals import REGISTRY as APPROVALS
 from dsl_worker.chat.cancels import REGISTRY as CANCELS
+from dsl_worker.chat.option_picks import REGISTRY as OPTION_PICKS
 
 
 router = APIRouter(prefix="/v2")
@@ -756,6 +757,54 @@ async def respond_to_approval(
     if not found:
         return {"ok": True, "approved": body.approved, "found": False}
     return {"ok": True, "approved": body.approved, "found": True}
+
+
+# ---- Plan option picks ----------------------------------------------------
+# `plan_options` is a blocking-style tool the agent calls to ask the user
+# to pick between 2-4 options before continuing. Same shape as approvals
+# except the resolution is the chosen option key, not a bool.
+
+
+@router.get("/projects/{project_id}/plan_option_picks")
+async def list_plan_option_picks(
+    project_id: UUID,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _verify(project_id, user.user_id, db)
+    return {"picks": await OPTION_PICKS.list_for_project(str(project_id))}
+
+
+class PlanOptionResponse(BaseModel):
+    chosen: str
+
+
+@router.post("/projects/{project_id}/plan_option_picks/{pick_id}/respond")
+async def respond_to_plan_option(
+    project_id: UUID,
+    pick_id: str,
+    body: PlanOptionResponse,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Resolve a pending plan_options pick. The chosen key flows back
+    through the awaiting future inside the plan_options tool handler;
+    the agent's next iteration sees `{chosen: '<key>'}` as the tool
+    result and proceeds with that choice."""
+    _verify(project_id, user.user_id, db)
+    pending = await OPTION_PICKS.peek(pick_id)
+    if pending is None:
+        return {"ok": True, "chosen": body.chosen, "found": False}
+    # Validate against the registered option keys so a stale FE can't
+    # smuggle in a key the agent doesn't expect.
+    valid_keys = {o.get("key") for o in pending.options if isinstance(o, dict)}
+    if body.chosen not in valid_keys:
+        raise HTTPException(
+            400,
+            f"chosen={body.chosen!r} is not one of {sorted(k for k in valid_keys if k)}",
+        )
+    await OPTION_PICKS.resolve(pick_id, body.chosen)
+    return {"ok": True, "chosen": body.chosen, "found": True}
 
 
 # ---- Cancel ---------------------------------------------------------------

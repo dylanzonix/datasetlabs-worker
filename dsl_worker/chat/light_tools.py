@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, Tuple
+import asyncio
+from typing import Any, Dict, List, Tuple
 
 import httpx
 
@@ -384,6 +385,103 @@ async def load_skill(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, 
 
 
 # ---------------------------------------------------------------------------
+# plan_options
+# ---------------------------------------------------------------------------
+
+
+async def plan_options(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
+    """Pause the agent to ask the user to pick between 2–4 explicit options.
+
+    Use ONLY when picking wrong would meaningfully diverge from the
+    user's intent — most table-creation asks have one obvious shape and
+    should not call this. The FE shows a small button card; on click,
+    `/plan_option_picks/{id}/respond` resolves the Future and this
+    handler returns ``{"chosen": "<key>"}`` to the agent so it can
+    proceed with that choice.
+
+    args: {
+      question: str — the question shown to the user (one short line)
+      options:  [{label: str, key: str, description?: str}, ...]
+                exactly 2–4 entries. `key` is what comes back in the
+                tool result.
+    }
+    """
+    question = (args.get("question") or "").strip()
+    raw_options = args.get("options") or []
+    if not question:
+        return {"error": "question is required"}, 0.0
+    if not isinstance(raw_options, list):
+        return {"error": "options must be a list"}, 0.0
+
+    cleaned: List[Dict[str, Any]] = []
+    seen_keys = set()
+    for o in raw_options:
+        if not isinstance(o, dict):
+            continue
+        label = (o.get("label") or "").strip()
+        key = (o.get("key") or "").strip()
+        if not label or not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        item: Dict[str, Any] = {"label": label[:80], "key": key[:60]}
+        desc = (o.get("description") or "").strip()
+        if desc:
+            item["description"] = desc[:240]
+        cleaned.append(item)
+    if len(cleaned) < 2 or len(cleaned) > 4:
+        return {
+            "error": "options must contain 2-4 entries with {label, key} each"
+        }, 0.0
+
+    if ctx.run_id is None:
+        # No chat run = no SSE channel = no way to ask the user. Bail
+        # so the agent isn't stuck on a Future nobody can resolve.
+        return {"error": "plan_options is only valid inside an active chat run"}, 0.0
+
+    from dsl_worker.chat.option_picks import REGISTRY as OPTION_PICKS
+
+    pending = await OPTION_PICKS.request(
+        project_id=ctx.project_id,
+        question=question,
+        options=cleaned,
+    )
+
+    # Emit via run_state.emit_event the way other in-band tool events
+    # do — branch_ctxs don't carry an emit_event callback. Persisting
+    # the event also means the FE can replay-rehydrate on reconnect.
+    try:
+        from dsl_worker.chat import run_state
+        from dsl_api.models import ChatRun
+        run_obj = ctx.db.query(ChatRun).filter(ChatRun.id == ctx.run_id).first()
+        if run_obj is not None:
+            run_state.emit_event(ctx.db, run_obj, "plan_options_required", {
+                "pick_id": pending.id,
+                "question": question,
+                "options": cleaned,
+            })
+    except Exception:
+        log.exception("plan_options_required emit failed; continuing")
+
+    try:
+        chosen = await pending.future
+    except asyncio.CancelledError:
+        # Make sure the registry entry doesn't dangle if the agent
+        # loop gets cancelled mid-await.
+        await OPTION_PICKS.resolve(pending.id, "")
+        raise
+
+    if not chosen:
+        # cleanup_chat_run resolves with empty string when the chat
+        # run ends without a user pick — surface that to the agent.
+        return {
+            "chosen": "",
+            "note": "User did not pick an option before the run ended. Don't retry; wait for direction.",
+        }, 0.0
+
+    return {"chosen": chosen}, 0.0
+
+
+# ---------------------------------------------------------------------------
 # Registry merge point
 # ---------------------------------------------------------------------------
 
@@ -396,5 +494,6 @@ HANDLERS = {
     # importer but is no longer dispatched by the chat HANDLERS map.
     "code_exec": code_exec,
     "suggest_replies": suggest_replies,
+    "plan_options": plan_options,
     "load_skill": load_skill,
 }

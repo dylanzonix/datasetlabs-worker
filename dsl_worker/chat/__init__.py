@@ -385,6 +385,20 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
         # tool_descriptions so we don't double-list it with an empty
         # function shape.
         "suggest_replies": "Emit chip suggestions for the user's next move. Call at end of turn.",
+        "plan_options": (
+            "Pause the turn to ask the user to pick between 2-4 explicit "
+            "options before continuing. The call BLOCKS until the user "
+            "clicks a button on the FE card; tool returns {chosen: '<key>'} "
+            "for the selected option. "
+            "Args: {question: str, options: [{label: str, key: str, "
+            "description?: str}, ...]} — 2 to 4 options. "
+            "USE SPARINGLY. Only when picking wrong would meaningfully "
+            "diverge from the user's intent (e.g. 'GSA auctions' could be "
+            "Treasury / IRS / US Marshals — different sites, different "
+            "column shapes; the user has to pick). Don't ask if the right "
+            "answer can be inferred from context, the message itself, or "
+            "an existing table — that's friction."
+        ),
         "load_skill": (
             "Load the playbook for a named skill from the directory listed under "
             "'# Skills' in the system prompt. Returns the full body of that skill "
