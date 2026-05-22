@@ -281,6 +281,8 @@ When a research-tier enrichment's prompt embeds a classification ("Is this compa
 
 Each downstream step skips rows where upstream is null/No automatically via `depends_on`.
 
+**If an enrichment needs a derived field (Domain, LinkedIn URL, Founder Name, etc.) AND that field isn't already a column on the table, define it as its OWN enrichment first** and `depends_on` it from the downstream step. Concrete case: Verified Email on a Google Maps table — gmaps doesn't return Domain, so the recipe is `Domain` (research-tier, web_search) → `Verified Email` (research-tier, FE with domain). Don't lump "find domain AND email" into one enrichment: the cell agent rediscovers the domain on every row (wasted spend) AND FE gets called without a domain to anchor the waterfall so every email returns null.
+
 ## Dependencies — `depends_on`
 
 When an enrichment needs other columns as inputs, list them in `action.depends_on`. Rows where ANY listed column is empty get skipped at run time — no credits spent on rows that are guaranteed to fail.
