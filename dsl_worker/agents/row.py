@@ -1062,8 +1062,7 @@ class RowGeneratorAgent:
 
         # Derive a prompt_cache_key from the system prompt so all row generators
         # sharing the same prefix get routed to the same backend → cache hits.
-        # DISABLED: may contribute to Azure content filter cascading refusals
-        cache_key = None  # hashlib.sha256(system_prompt.encode()).hexdigest()[:16]
+        cache_key = hashlib.sha256(system_prompt.encode()).hexdigest()[:16]
 
         conversation = make_conversation(
             self.openai_client,
