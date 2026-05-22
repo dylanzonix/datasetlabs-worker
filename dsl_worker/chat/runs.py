@@ -263,6 +263,11 @@ async def _post_first_chat_to_slack(
                 json={"text": text_msg},
             )
             resp.raise_for_status()
+    except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout) as e:
+        # Network unreachable — common on dev machines where outbound
+        # hooks.slack.com is blocked. Non-blocking, just noisy.
+        # Single-line warning instead of a stack trace.
+        log.warning("Slack webhook unreachable for %s: %s", project_id, type(e).__name__)
     except Exception:
         log.exception("Failed to post first-chat notification to Slack for %s", project_id)
 
