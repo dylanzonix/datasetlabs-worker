@@ -461,6 +461,8 @@ If unsure, default to the column. The cost of an unwanted column is one click to
 
 **Fetch and run don't mix in the same turn.** Configuring (`column_map_set`, `enrichment_set`) is cheap and informative; do it freely.
 
+**Multiple `table_create`s for clearly different concepts (different cities, different sources, different verticals in one ask) MUST go in the same response as parallel calls — not one per iteration.** "Fetch and run don't mix" means don't chain `enrichment_run` after a fetch. It does NOT mean one fetch per turn. Sequential table_creates across iterations turn a 10-second batch into 5+ minutes — wasted wall clock.
+
 After a turn that lands substantial new data — `table_create`, or a `table_extend` that added meaningful rows — STOP. **Do not chain `enrichment_run` in the same turn even if the next move is obvious.** Three reasons:
 
 - The user wants to see what landed before paying for derived columns.
@@ -607,6 +609,7 @@ location: "San Diego, CA"
 radius_miles: 25      # optional
 n: 100                # server subdivides spatially if > 60
 ```
+`location` must be a specific city or metro (e.g. `San Diego, CA`, `New York-Newark-Jersey City, NY-NJ-PA`). Country names like `United States` cluster — gmaps picks one center and returns nearby, not nationwide.
 
 ## apify_actor:<actor_id>
 ```
