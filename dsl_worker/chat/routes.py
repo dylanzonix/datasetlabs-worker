@@ -382,11 +382,19 @@ def list_table_rows(
     if sort_col:
         # Try numeric sort first via NULLIF + cast; fall back to text. Sorting
         # missing values last regardless of direction.
+        # Strip currency symbols, commas, and whitespace before the cast so a
+        # column typed `number` whose cells got stored as "$1,234" or "1,234"
+        # still sorts numerically. Without this strip, a single $-prefixed
+        # row triggers cast failure → lexical fallback → "$2,000,000" sorts
+        # before "$300" because '2' < '3' as a string.
         sort_col_esc = sort_col.replace("'", "''")
         direction_sql = "ASC" if sort_dir.lower() == "asc" else "DESC"
+        # Allow digits, decimal point, and leading minus; everything else
+        # (currency, commas, units, spaces) stripped.
+        numeric_strip = f"regexp_replace(row->>'{sort_col_esc}', '[^0-9.\\-]', '', 'g')"
         order_clause = (
             f"(row->>'{sort_col_esc}' IS NULL) ASC, "
-            f"NULLIF(row->>'{sort_col_esc}', '')::numeric {direction_sql} NULLS LAST, "
+            f"NULLIF({numeric_strip}, '')::numeric {direction_sql} NULLS LAST, "
             f"row->>'{sort_col_esc}' {direction_sql} NULLS LAST, "
             f"seq"
         )
