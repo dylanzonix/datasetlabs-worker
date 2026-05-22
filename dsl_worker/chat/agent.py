@@ -43,6 +43,12 @@ log = logging.getLogger(__name__)
 
 MAX_TURN_ITERATIONS = 30  # hard safety cap on tool-call rounds per turn
 
+# Fn calls that are pure UI side-effects (no information for the LLM to
+# respond to). When an iteration's fn_calls are ALL of these, the turn
+# is semantically over — don't re-run the LLM or it'll regenerate the
+# same text it already streamed.
+_TERMINATOR_FN_CALLS = {"suggest_replies"}
+
 
 StreamEvent = Dict[str, Any]
 EventCallback = Optional[Callable[[StreamEvent], Awaitable[None]]]
@@ -693,6 +699,18 @@ async def run_turn(
                 bdb.close()
             except Exception:
                 log.exception("branch db close failed")
+
+        # UI-only side-effect tools (suggest_replies) don't represent
+        # work the LLM should respond to — they just emit SSE events for
+        # the FE. When the only fn_calls in this iteration were those,
+        # the turn is semantically over. Letting the loop run again just
+        # gives the LLM a free turn with no new info and it regenerates
+        # the same intro text (observed in prod, project 70e437bc).
+        # Text was already streamed + finalized as a text_segment above,
+        # so we don't emit final_message here.
+        if all(fc.name in _TERMINATOR_FN_CALLS for fc in function_calls):
+            final_text = mid_text_raw
+            break
     else:
         log.warning(
             "agent loop hit MAX_TURN_ITERATIONS=%d for project %s",
