@@ -312,10 +312,11 @@ async def post_run_enrichment(
 
 
 class PromoteQueryColumnsBody(BaseModel):
-    # When set, only adopt this column (plus any other query columns on the
-    # same table — they share retrieval). Omit to adopt every query column.
-    # The server always groups all query columns into one ghost so multi-cell
-    # missing rows fill in a single trip.
+    # When set, adopt ONLY this column into the ghost — narrow scope so
+    # the cell agent only refetches one field per row. Omit to adopt
+    # every query column at once (one ghost, fills everything per row).
+    # Each scope produces its own ghost: a single-column ghost and the
+    # all-columns ghost coexist; lookup matches on adopted column-set.
     column: Optional[str] = None
 
 
@@ -360,58 +361,65 @@ async def post_promote_query_columns(
     source = row[1] or ""
     cols = row[2] if isinstance(row[2], list) else (json.loads(row[2]) if row[2] else [])
 
-    query_cols = [c for c in cols if isinstance(c, dict) and not c.get("enrichment_id")]
-    if not query_cols:
+    all_query_cols = [c for c in cols if isinstance(c, dict) and not c.get("enrichment_id")]
+    if not all_query_cols:
         # Nothing to adopt — caller should just use the existing enrichment.
         raise HTTPException(400, "No query columns on this table to promote")
 
-    # If a ghost already exists for this table, reuse it (idempotent).
-    existing_ghost = db.execute(
+    # Single-column scope: narrow the adopt set to just the requested
+    # column. Avoids the "click Run on URL → enrichment scopes in Name
+    # + Price too" surprise. The caller still gets a usable enrichment
+    # focused on the one field they're trying to backfill.
+    if body.column:
+        target_query_cols = [
+            c for c in all_query_cols if c.get("name") == body.column
+        ]
+        if not target_query_cols:
+            raise HTTPException(
+                400,
+                f"Column {body.column!r} is not a query column on this table",
+            )
+    else:
+        target_query_cols = all_query_cols
+    target_col_set = {c["name"] for c in target_query_cols if c.get("name")}
+
+    # Find an existing ghost whose adopted columns match this scope
+    # exactly. A single-column ghost and an all-columns ghost can
+    # coexist on the same table — they serve different intents.
+    all_ghosts = db.execute(
         sa_text(
-            "SELECT id::text, short_id FROM enrichments "
+            "SELECT id::text, short_id, columns FROM enrichments "
             "WHERE table_id=:tid AND deleted_at IS NULL "
             "AND COALESCE(action->>'ghost', '') = '1' "
-            "ORDER BY created_at ASC LIMIT 1"
+            "ORDER BY created_at ASC"
         ),
         {"tid": tid},
-    ).fetchone()
+    ).fetchall()
+    existing_ghost = None
+    for gid, gsid, gcols_raw in all_ghosts:
+        gcols = gcols_raw if isinstance(gcols_raw, list) else (
+            json.loads(gcols_raw) if gcols_raw else []
+        )
+        ghost_set = {c.get("name") for c in gcols if isinstance(c, dict) and c.get("name")}
+        if ghost_set == target_col_set:
+            existing_ghost = (gid, gsid, gcols)
+            break
 
     if existing_ghost:
-        eid = existing_ghost[0]
-        short_id = existing_ghost[1]
-        # Re-adopt: pick up any query columns added since the ghost was
-        # created (e.g. user ran fetch_more, source returned a new field).
-        _ensure_columns_on_table(db, tid, query_cols, enrichment_id=eid)
-        # Sync the enrichment's own columns JSON to include the freshly
-        # adopted ones.
-        ghost_cols_row = db.execute(
-            sa_text("SELECT columns FROM enrichments WHERE id=:eid"),
-            {"eid": eid},
-        ).fetchone()
-        ghost_cols = ghost_cols_row[0] if isinstance(ghost_cols_row[0], list) else (
-            json.loads(ghost_cols_row[0]) if ghost_cols_row[0] else []
-        )
-        ghost_names = {c.get("name") for c in ghost_cols if isinstance(c, dict)}
-        added = False
-        for qc in query_cols:
-            if qc.get("name") not in ghost_names:
-                ghost_cols.append({"name": qc["name"], "type": qc.get("type", "text")})
-                added = True
-        if added:
-            db.execute(
-                sa_text("UPDATE enrichments SET columns=CAST(:c AS jsonb) WHERE id=:eid"),
-                {"c": json.dumps(ghost_cols), "eid": eid},
-            )
+        eid, short_id, ghost_cols = existing_ghost
+        # Defensive: re-stamp enrichment_id on the table's column defs
+        # in case it was lost (e.g. someone edited columns directly).
+        _ensure_columns_on_table(db, tid, target_query_cols, enrichment_id=eid)
         db.commit()
         return {"enrichment_id": eid, "short_id": short_id, "columns": ghost_cols}
 
     # Fresh ghost. Synthesize an action prompt from the table's source +
     # column list. Generic on purpose — the cell agent figures out
     # retrieval from row context.
-    col_names = [c["name"] for c in query_cols if c.get("name")]
+    col_names = [c["name"] for c in target_query_cols if c.get("name")]
     col_list_md = "\n".join(
         f"- **{c['name']}** ({c.get('type', 'text')})"
-        for c in query_cols if c.get("name")
+        for c in target_query_cols if c.get("name")
     )
     source_hint = f" The table was originally populated from `{source}`." if source else ""
     prompt = (
@@ -432,7 +440,7 @@ async def post_promote_query_columns(
     }
     enrichment_columns = [
         {"name": c["name"], "type": c.get("type", "text")}
-        for c in query_cols if c.get("name")
+        for c in target_query_cols if c.get("name")
     ]
     db.execute(
         sa_text(
@@ -449,7 +457,7 @@ async def post_promote_query_columns(
             "cap": 2.0,
         },
     )
-    _ensure_columns_on_table(db, tid, query_cols, enrichment_id=eid)
+    _ensure_columns_on_table(db, tid, target_query_cols, enrichment_id=eid)
     db.commit()
 
     return {"enrichment_id": eid, "short_id": short_id, "columns": enrichment_columns}
@@ -615,12 +623,137 @@ async def respond_to_approval(
     user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    """Resolve a pending approval.
+
+    Two flavors:
+    - Blocking (table_delete / row_delete): the agent loop is awaiting
+      `pending.future`. We just `resolve()` and let the loop continue.
+    - Non-blocking (enrichment_run): the agent loop already moved on
+      with a `{scheduled: true}` stub. The actual enrichment hasn't run
+      yet — if approved, we fire it here (synchronously, like the
+      `/enrichments/{eid}/run` REST endpoint does) and return the
+      fresh `updated_rows` so the FE can patch cells without a refetch.
+      Denied → we just resolve and return; agent already shaped its
+      reply around "queued, awaiting your call."
+    """
     _verify(project_id, user.user_id, db)
+    pending = await APPROVALS.peek(approval_id)
+    if pending is None:
+        # Double-click or chat run ended — no-op, FE shouldn't surface
+        # a confusing error.
+        return {"ok": True, "approved": body.approved, "found": False}
+
+    if pending.tool == "enrichment_run":
+        # Always resolve (clears the registry entry) regardless of
+        # approval outcome.
+        await APPROVALS.resolve(approval_id, body.approved)
+        if not body.approved:
+            return {"ok": True, "approved": False, "found": True}
+
+        # Fire the enrichment now. Mirrors post_run_enrichment's flow
+        # (REST path, run_id=None, returns updated_rows for FE patching).
+        args = dict(pending.args or {})
+        scope = args.get("scope") or {"type": "all_unfilled"}
+        eid = args.get("enrichment_id")
+        if not eid:
+            return {"ok": False, "error": "enrichment_id missing on approval"}
+
+        ctx = ToolContext(
+            db=db, project_id=str(project_id), user_id=str(user.user_id), run_id=None
+        )
+        canonical_eid = (
+            __import__("dsl_worker.chat.tools", fromlist=["resolve_enrichment_id"]).resolve_enrichment_id(
+                db, str(project_id), eid
+            )
+            or str(eid)
+        )
+        import asyncio as _asyncio
+        task: _asyncio.Task = _asyncio.create_task(
+            enrichment_run(
+                {
+                    "enrichment_id": str(eid),
+                    "scope": scope,
+                    "overwrite": bool(args.get("overwrite", False)),
+                },
+                ctx,
+            )
+        )
+        await CANCELS.register(str(project_id), canonical_eid, task)
+        cost = 0.0
+        cancelled = False
+        try:
+            result, cost = await task
+        except _asyncio.CancelledError:
+            cancelled = True
+            cost = float(getattr(ctx, "partial_cost_usd", 0.0) or 0.0)
+            result = {"cancelled": True}
+        finally:
+            await CANCELS.unregister(str(project_id), canonical_eid, task)
+
+        # Charge credits — same path post_run_enrichment uses.
+        spend_cents = int(round(float(cost or 0.0) * 100))
+        if spend_cents > 0:
+            try:
+                account = (
+                    db.query(Account).filter(Account.user_id == user.user_id).first()
+                )
+                if account:
+                    consume_credits(
+                        db,
+                        account,
+                        spend_cents / CENTS_PER_CREDIT,
+                        project_id=project_id,
+                        reason="enrichment_run_approval",
+                    )
+                    db.commit()
+                else:
+                    log.warning(
+                        "enrichment_run_approval: no account for user %s", user.user_id
+                    )
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+
+        # Pull the affected rows so the FE can applyCellEdits without
+        # a refetch. Same logic as post_run_enrichment.
+        updated_rows: List[Dict[str, Any]] = []
+        if not cancelled and isinstance(scope, dict) and scope.get("type") == "row_ids":
+            row_ids = scope.get("row_ids") or []
+            if row_ids:
+                try:
+                    from sqlalchemy import bindparam
+                    stmt = (
+                        sa_text(
+                            "SELECT id::text, row, tags "
+                            "FROM samples WHERE id::text IN :ids AND deleted_at IS NULL"
+                        ).bindparams(bindparam("ids", expanding=True))
+                    )
+                    rows = db.execute(stmt, {"ids": list(row_ids)}).fetchall()
+                    for r in rows:
+                        payload: Dict[str, Any] = {"id": r[0]}
+                        row_data = r[1] if isinstance(r[1], dict) else (json.loads(r[1]) if r[1] else {})
+                        payload.update(row_data)
+                        if r[2]:
+                            payload["tags"] = r[2] if isinstance(r[2], dict) else json.loads(r[2])
+                        updated_rows.append(payload)
+                except Exception:
+                    log.exception("respond_to_approval: failed to fetch updated rows for FE patch")
+
+        return {
+            "ok": True,
+            "approved": True,
+            "found": True,
+            "result": result,
+            "cost_usd": cost,
+            "cancelled": cancelled,
+            "updated_rows": updated_rows,
+        }
+
+    # Blocking path (table_delete / row_delete): old behavior.
     found = await APPROVALS.resolve(approval_id, body.approved)
     if not found:
-        # Approval already resolved (double-click) or no longer pending
-        # (chat run ended) — treat as a no-op rather than 404 so the FE
-        # doesn't surface a confusing error.
         return {"ok": True, "approved": body.approved, "found": False}
     return {"ok": True, "approved": body.approved, "found": True}
 

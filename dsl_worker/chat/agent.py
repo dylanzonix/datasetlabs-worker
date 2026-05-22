@@ -159,6 +159,13 @@ async def run_turn(
     cache_key = hashlib.sha256(system_prompt.encode()).hexdigest()[:32]
 
     tool_calls_made: List[Dict[str, Any]] = []
+    # Enrichment-run approvals are non-blocking: registered when the
+    # agent calls enrichment_run, then emitted as a single batch at
+    # end-of-turn so the user sees one summary card instead of a
+    # mid-iteration freeze. table_delete / row_delete keep the old
+    # blocking pattern — those are fast yes/no decisions, not
+    # multi-minute cost approvals.
+    pending_enrichment_chips: List[Dict[str, Any]] = []
     total_cost_usd = 0.0
     final_text = ""
 
@@ -493,14 +500,50 @@ async def run_turn(
 
             if not handler:
                 tool_result = {"error": f"unknown tool {name}"}
+            elif name == "enrichment_run":
+                # NON-BLOCKING enrichment approval. Register the pending
+                # approval, attach the chip metadata to the per-turn
+                # list, and return a "scheduled" stub to the agent. The
+                # actual run only fires when the user clicks Approve on
+                # the end-of-turn chip — handled in respond_to_approval.
+                # Skipping the mid-turn await + emit is what unblocks
+                # the agent loop and prevents the "worker hangs on user
+                # decision" wedge that caused the earlier crash.
+                est_cost, summary = estimate_enrichment_run_cost(
+                    args, bctx.db, bctx.project_id
+                )
+                pending = await APPROVALS.request(
+                    project_id=bctx.project_id,
+                    tool=name,
+                    args=args,
+                    estimated_cost_credits=est_cost,
+                    summary=summary,
+                )
+                pending_enrichment_chips.append({
+                    "approval_id": pending.id,
+                    "tool": name,
+                    "args": args,
+                    "estimated_cost_credits": est_cost,
+                    "summary": summary,
+                })
+                tool_result = {
+                    "scheduled": True,
+                    "approval_id": pending.id,
+                    "estimated_cost_credits": est_cost,
+                    "summary": summary,
+                    "note": (
+                        "Enrichment queued — pending user approval. It "
+                        "will NOT run during this turn. Don't claim "
+                        "results; phrase your reply as 'I've queued X — "
+                        "approve below to run.'"
+                    ),
+                }
             elif name in APPROVAL_REQUIRED:
+                # Blocking approval for the rest of APPROVAL_REQUIRED
+                # (table_delete / row_delete). These are fast yes/no
+                # decisions, so awaiting the future is fine.
                 async with approval_lock:
-                    if name == "enrichment_run":
-                        est_cost, summary = estimate_enrichment_run_cost(
-                            args, bctx.db, bctx.project_id
-                        )
-                    else:
-                        est_cost, summary = 0.0, f"Run {name}"
+                    est_cost, summary = 0.0, f"Run {name}"
                     pending = await APPROVALS.request(
                         project_id=bctx.project_id,
                         tool=name,
@@ -655,6 +698,21 @@ async def run_turn(
             "agent loop hit MAX_TURN_ITERATIONS=%d for project %s",
             MAX_TURN_ITERATIONS, project_id,
         )
+
+    # Emit deferred enrichment approval chips at end-of-turn. The agent
+    # already saw `{scheduled: true}` for each one and shaped its reply
+    # around that; now the FE renders the chips as a turn summary so the
+    # user can approve / decline without the worker holding a Future
+    # open across the user's decision window.
+    for chip in pending_enrichment_chips:
+        await emit({
+            "type": "approval_required",
+            "approval_id": chip["approval_id"],
+            "tool": chip["tool"],
+            "args": chip["args"],
+            "estimated_cost_credits": chip["estimated_cost_credits"],
+            "summary": chip["summary"],
+        })
 
     await emit({
         "type": "turn_complete",

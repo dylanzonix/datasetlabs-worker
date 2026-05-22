@@ -90,6 +90,13 @@ class ApprovalRegistry:
         log.info("approval requested: %s tool=%s cost~%.2f", pending.id, tool, estimated_cost_credits)
         return pending
 
+    async def peek(self, approval_id: str) -> Optional[PendingApproval]:
+        """Look up a pending approval without resolving it. Caller needs
+        the original tool args (e.g. to fire the deferred enrichment_run
+        when the user approves the end-of-turn chip)."""
+        async with self._lock:
+            return self._pending.get(approval_id)
+
     async def resolve(self, approval_id: str, approved: bool) -> bool:
         """Resolve a pending approval. Returns True if the approval was
         found (and resolved), False if not. Idempotent — second call to
