@@ -205,8 +205,32 @@ async def _fullenrich_bulk_enrich(
         "name": "cell_enrich",
         "data": [{**contact, "enrich_fields": enrich_fields}],
     }
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(f"{BASE}/api/v2/contact/enrich/bulk", headers=headers, json=body)
+    # FE's submit endpoint occasionally takes >30s to ack — observed in
+    # prod logs with httpx.ReadTimeout. Retry once with a longer ceiling
+    # before giving up; otherwise the cell agent sees an opaque timeout,
+    # retries at the LLM level (burns web_search budget on fallback), and
+    # eventually hits its per-row cap with no email found. Single retry
+    # bounds the slow path to ~2×timeout = ~60s worst case.
+    r = None
+    last_err: Optional[Exception] = None
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.post(
+                    f"{BASE}/api/v2/contact/enrich/bulk",
+                    headers=headers, json=body,
+                )
+            break
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+            last_err = e
+            log.warning(
+                "FE submit timeout on attempt %d: %s — retrying" if attempt == 0
+                else "FE submit timeout on attempt %d: %s — giving up",
+                attempt + 1, e,
+            )
+            await asyncio.sleep(2)
+    if r is None:
+        return {"error": f"FE submit timeout after retry: {last_err}"}, 0.0
     if r.status_code != 200:
         return {"error": f"FE submit HTTP {r.status_code}: {r.text[:200]}"}, 0.0
     eid = (r.json() or {}).get("enrichment_id")
