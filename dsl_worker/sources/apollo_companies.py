@@ -188,12 +188,17 @@ class ApolloCompaniesAdapter(SourceAdapter):
                 all_rows.extend(orgs)
                 pagination = data.get("pagination") or {}
                 total_entries = pagination.get("total_entries")
+                total_pages = pagination.get("total_pages")
+                # Apollo can return slightly fewer than per_page (often 98-99
+                # at per_page=100) even mid-stream — they appear to dedupe or
+                # filter within a page. So we CANNOT use "len(orgs) < per_page"
+                # as end-of-results: that fired on every Apollo pull and
+                # silently capped them at ~98 rows. Correct end-of-results
+                # signal is the pagination block itself.
                 page += 1
-                # Apollo caps at 500 pages (50k records); also stop when fewer
-                # rows came back than requested.
-                if len(orgs) < body["per_page"]:
+                if total_pages is not None and page > total_pages:
                     break
-                if page > 500:
+                if page > 500:  # Apollo's hard cap (50k records)
                     break
 
         # Trim to exactly n requested
