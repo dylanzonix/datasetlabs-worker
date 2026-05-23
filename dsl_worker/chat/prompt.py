@@ -575,6 +575,7 @@ When you call `enrichment_set` to classify rows into relevant/irrelevant, hire/n
 # Source filter cards (the 80% common params per source)
 
 ## apollo_companies
+**Default `n=1000` on apollo_companies.** Apollo search is free on our plan (no per-record charge), so always pass a high `n` unless the user explicitly asks for a sample. The agent gets more headroom for downstream filtering / dedup at zero data cost. Drop `n` only if the user said "show me a few" or similar.
 ```
 organization_locations: ["San Francisco", "California"]
 organization_not_locations: ["..."]
