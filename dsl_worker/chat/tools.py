@@ -64,6 +64,21 @@ class ToolContext:
     partial_cost_usd: float = 0.0
 
 
+# Sources where pulling 1000 rows is effectively free (covered by the
+# plan's flat search quota, not the per-record credit pool). Everything
+# else pays per row (Apify per-item, FullEnrich credits, Google Maps
+# per-call, etc.) so we keep the default safety net at 100 to avoid
+# surprise spend when the agent omits `n`.
+_FREE_HIGH_N_SOURCES = {"apollo_companies", "apollo_people"}
+
+
+def _default_n_for_source(source: Optional[str]) -> int:
+    if not source:
+        return 100
+    kind = source.split(":", 1)[0]
+    return 1000 if kind in _FREE_HIGH_N_SOURCES else 100
+
+
 def resolve_table_id(db: Session, project_id: str, id_or_short: str) -> Optional[str]:
     """Look up a table's UUID from either its UUID or its short_id (t1, t2…).
 
@@ -327,12 +342,13 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     source = args.get("source")
     query_params = args.get("query_params") or {}
     raw_columns = args.get("columns") or []
-    n = int(args.get("n") or 1000)
 
     if not source:
         return {"error": "source is required"}, 0.0
     if source.split(":", 1)[0] not in list_sources():
         return {"error": f"unknown source {source!r}", "available": list_sources()}, 0.0
+
+    n = int(args.get("n") or _default_n_for_source(source))
 
     if not name:
         src_label = source.split(":", 1)[0].replace("_", " ").title()
@@ -842,7 +858,6 @@ async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
 
     table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
     new_query_params = args.get("query_params") or {}
-    n = int(args.get("n") or 1000)
 
     if not table_id:
         return {"error": "table_id is required"}, 0.0
@@ -854,6 +869,11 @@ async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     if not row:
         return {"error": f"table {table_id} not found"}, 0.0
     source, columns = row[0], row[1]
+
+    # Source-aware default: Apollo search is free so default high; paid
+    # sources (Apify per-item, FullEnrich credits, Google Maps per-call)
+    # keep the safety net at 100. Agent can still pass explicit n.
+    n = int(args.get("n") or _default_n_for_source(source))
 
     adapter = get_adapter(source)
     val_err = adapter.validate_query_params(new_query_params)
