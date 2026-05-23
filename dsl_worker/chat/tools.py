@@ -327,7 +327,7 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     source = args.get("source")
     query_params = args.get("query_params") or {}
     raw_columns = args.get("columns") or []
-    n = int(args.get("n") or 100)
+    n = int(args.get("n") or 1000)
 
     if not source:
         return {"error": "source is required"}, 0.0
@@ -842,7 +842,7 @@ async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
 
     table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
     new_query_params = args.get("query_params") or {}
-    n = int(args.get("n") or 100)
+    n = int(args.get("n") or 1000)
 
     if not table_id:
         return {"error": "table_id is required"}, 0.0
