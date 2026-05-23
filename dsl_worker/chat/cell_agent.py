@@ -63,12 +63,18 @@ log = logging.getLogger(__name__)
 #       web_search). No pre-check.
 #
 # All values are USD — same unit as total_cost. Tuned to typical actual
-# bills: FE email/company ~$0.27 per success ($0.055/FE-cr × 5 cr),
-# FE phone ~$2.75, gmaps place_details ~$0.017.
+# bills observed in cell_traces:
+#   FE email      ~$0.06 per call (1 FE-cr × $0.055; verified 5/21+ batch)
+#   FE phone      ~$0.55 per call (10 FE-cr × $0.055 per FE docs)
+#   FE company    ~$0.06 per call (1 FE-cr per email match)
+#   gmaps         ~$0.017 per place_details
+# Pre-2026-05-21 we observed FE billing 18 credits per email call (~$1)
+# but that appears to have been an FE-side billing bug they fixed; if it
+# recurs, raise these estimates back up + audit cell_traces.cost_credits.
 FIXED_COST_TOOLS = {
-    "fullenrich_enrich_email":  0.30,
-    "fullenrich_enrich_phone":  3.00,
-    "fullenrich_enrich_company": 0.05,
+    "fullenrich_enrich_email":  0.07,
+    "fullenrich_enrich_phone":  0.60,
+    "fullenrich_enrich_company": 0.07,
     # apollo_org_enrich removed — organizations/enrich is request-quota
     # limited (Apollo's response headers confirm: x-rate-limit-* not
     # credit-* ). Treat as free; pre-call budget gate doesn't refuse it.
