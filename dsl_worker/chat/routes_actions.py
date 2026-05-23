@@ -40,6 +40,7 @@ from dsl_worker.chat.enrichment import enrichment_run
 from dsl_worker.chat.approvals import REGISTRY as APPROVALS
 from dsl_worker.chat.cancels import REGISTRY as CANCELS
 from dsl_worker.chat.option_picks import REGISTRY as OPTION_PICKS
+from dsl_worker.chat.routes import _enforce_balance
 
 
 router = APIRouter(prefix="/v2")
@@ -79,6 +80,7 @@ async def post_fetch_more(
     """User-initiated fetch_more. Calls table_extend with empty query_params
     delta — server uses stored cursor / query_params on the table."""
     _verify(project_id, user.user_id, db)
+    _enforce_balance(db, user.user_id)
     ctx = ToolContext(db=db, project_id=str(project_id), user_id=str(user.user_id), run_id=None)
     result, cost = await table_extend(
         {"table_id": str(table_id), "query_params": {}, "n": body.n}, ctx
@@ -208,6 +210,7 @@ async def post_run_enrichment(
     db: Session = Depends(get_db),
 ):
     _verify(project_id, user.user_id, db)
+    _enforce_balance(db, user.user_id)
     scope: Dict[str, Any] = {"type": body.scope_type}
     if body.first_n is not None:
         scope["first_n"] = body.first_n

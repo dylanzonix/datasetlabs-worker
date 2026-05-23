@@ -74,6 +74,39 @@ def _verify_project(project_id: UUID, user_id: UUID, db: Session) -> Project:
     return p
 
 
+# Float-dust tolerance: balances below this are treated as zero. We don't
+# block at e.g. < 1cr because a turn that spends $0.001 should still be
+# allowed if the user has 0.5 credits left — incremental debiting will
+# settle it. The point is to refuse new work when the wallet is empty.
+_BALANCE_FLOOR_CREDITS = 0.01
+
+
+def _enforce_balance(db: Session, user_id: UUID) -> None:
+    """Block billable work when the user is out of credits. FE expects 402
+    here (see useChat.ts: "Fired when the backend rejects a chat run with
+    402"). Without this gate, runs proceed and consume_credits silently
+    fails on each pool — spend accrues on the project ledger while the
+    user pays $0."""
+    from dsl_api.models import Account
+    from dsl_api.credits import get_total_credits
+    account = db.query(Account).filter(Account.user_id == str(user_id)).first()
+    if account is None:
+        raise HTTPException(
+            status_code=402,
+            detail={"error": "no_account", "message": "Account not found."},
+        )
+    available = get_total_credits(db, account)
+    if available <= _BALANCE_FLOOR_CREDITS:
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "error": "insufficient_balance",
+                "message": "Out of credits. Top up to continue.",
+                "balance_credits": float(available),
+            },
+        )
+
+
 # ---- Routes ---------------------------------------------------------------
 
 
@@ -128,6 +161,7 @@ async def create_run(
     asyncio task; the SSE tail at .../events streams its events. Survives
     client disconnect — refresh + reattach is supported."""
     _verify_project(project_id, user.user_id, db)
+    _enforce_balance(db, user.user_id)
     try:
         run = await chat_runs.start_run(
             project_id=project_id,
