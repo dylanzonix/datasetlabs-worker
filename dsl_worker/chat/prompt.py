@@ -331,6 +331,17 @@ You must include `per_row_credit_cap` on every `enrichment_set` call. The agent 
 
 Don't talk to the user about cost. The UI shows them an estimate.
 
+## Targeting scope: which rows actually need this enrichment?
+
+Before calling `enrichment_run`, pick the scope deliberately. The default isn't always right.
+
+- **Table has active filters** (check `Filter:` lines in project_state) → use `scope: {type: "filtered", filters: [...copy from project_state]}`. The user filtered for a reason; respect it. Never use `first_n` when filters are applied unless the user explicitly says "run on all rows ignoring my filter."
+- **Funnel mid-build** (e.g. just ran a Fit-Score classify, now want to run FE email on the "Excellent" rows) → enrich only the qualified survivors. Two ways: (a) `filter_set` first so the table reflects what's qualified, then run on `filtered` scope, or (b) rely on the enrichment's `depends_on` to auto-skip rows where the upstream column is empty / "No" (no credits burned on skips).
+- **User explicitly asked for first N** → `first_n`.
+- **Default for a fresh enrichment with no other signal** → `{all_unfilled, first_n: 10}` — sample first, user approves the full run after.
+
+Always ask: of the rows in this table, which ones does the user actually want filled *right now*? "First 10" is almost never the right answer when filters are active or when you're partway through a funnel.
+
 ## enrichment_run is non-blocking + approval-gated
 
 `enrichment_run` schedules a cell-fill — it does **not** run during this turn. The call returns immediately with `{scheduled: true, approval_id, estimated_cost_credits, summary, note}`. At end-of-turn the user sees an approval card (one per scheduled enrichment, batched as a turn summary). On Approve → the worker runs the enrichment in the background and cells stream into the table; on Decline → nothing runs.
