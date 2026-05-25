@@ -542,6 +542,8 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
             fmt = c.get("format")
             if fmt:
                 entry["format"] = fmt
+            if c.get("pinned"):
+                entry["pinned"] = True
             columns_for_db.append(entry)
     else:
         # Raw passthrough: every top-level key in the rows becomes a column.
@@ -1081,6 +1083,8 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
                 fmt = v.get("format")
                 if fmt:
                     entry["format"] = fmt
+                if v.get("pinned"):
+                    entry["pinned"] = True
                 columns_for_db.append(entry)
             else:
                 return {"error": f"mapping[{src!r}] must be a string or {{name, type}}; got {type(v).__name__}"}, 0.0
@@ -1100,6 +1104,8 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
             fmt = item.get("format")
             if fmt:
                 entry["format"] = fmt
+            if item.get("pinned"):
+                entry["pinned"] = True
             columns_for_db.append(entry)
     else:
         return {"error": f"mapping must be dict or list; got {type(raw_mapping).__name__}"}, 0.0

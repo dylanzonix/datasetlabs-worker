@@ -86,6 +86,16 @@ def _column_item_schema(*, include_source_field: bool) -> Dict[str, Any]:
                 "counts, scores, etc."
             ),
         },
+        "pinned": {
+            "type": "boolean",
+            "description": (
+                "Optional. When true, the column is frozen to the left so it stays "
+                "visible as the user scrolls horizontally. Use sparingly — at most "
+                "ONE pinned column per table by default (the row identifier — Name, "
+                "Company, Title, Place, etc.). Pinning more than one eats horizontal "
+                "space and defeats the point. Default false."
+            ),
+        },
     }
     required = ["name"]
     if include_source_field:
