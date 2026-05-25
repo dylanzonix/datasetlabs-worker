@@ -6,203 +6,141 @@ applies_to: [cell_agent]
 
 ## Finding a person at a company
 
-The row gives you a company / org / business name (and usually a
-domain or website). The column wants the *person* — a decision-maker,
-manager, founder, owner, billing contact, etc.
+The row gives you a company name (and usually a domain). The column wants
+the *person* — founder, CEO, VP Sales, head of recruiting, owner, etc.
 
-**Use `fullenrich_search_people` first. Don't default to web_search.**
-FE is a structured LinkedIn-derived people index — you get name, title,
-seniority, employer, LinkedIn URL directly. Web_search means parsing
-snippets, which is slower, more expensive across multiple calls, and
-prone to fabricated LinkedIn slugs from misleading SERP fragments.
+**Use `fullenrich_search_people` first.** LinkedIn-derived structured DB;
+single call returns name + title + seniority + LinkedIn URL directly.
+Web_search is the fallback when FE has nothing.
 
-### See also: find_emails
+### The cost shape
 
-Once you've found the person, the same row likely has an Email
-column too. Read `find_emails` for the email-side flow — finding
-the person and finding their email are usually one connected pass:
-search → pick → enrich.
+FE charges 0.25 credit (~$0.013) per RETURNED person. So `limit` IS the
+cost knob. Default limit=3 is enough for almost every per-row lookup;
+~$0.04/call. Skip the urge to set limit=10 to "be safe" — that's $0.13
+per call and rarely catches anything limit=3 missed.
 
-### Cost discipline — `limit` is the cost knob
+### Pick filters by what the column wants
 
-FE charges ~1 credit (~$0.055) per RETURNED person, NOT per call. So
-the `limit` on `fullenrich_search_people` IS your bill.
+The picker is **about the column's intent**, not about FE's options:
 
-- **Column wants ONE specific person** (founder / CEO / owner): `limit=2-3`.
-  You want a small candidate pool to pick from, not a directory dump.
-- **Column wants any person at a given level** (e.g. "any SDR-level role"):
-  `limit=5-10`. Slightly bigger pool so you have title-matching options.
-- **Never `limit=25` or higher** for a per-row lookup. That's a $1+ row
-  for a single founder name — completely out of proportion.
+**Specific role** (Founder, CEO, VP Sales, CMO, CTO, Recruiter, Head of X, etc.)
 
-The cell handler hard-caps `limit` at 10. Even at 10, that's $0.55 — so
-default to 3 and only bump when you have a reason.
+```
+fullenrich_search_people(
+  company_names=["<company>"],
+  titles=["Founder","Co-Founder","CEO","Owner"]    # or whatever role you want
+  limit=3,
+)
+```
 
-### Critical rule: keep FE filters MINIMAL
+Pass title VARIANTS, not just one. For "VP Sales" pass
+`["VP Sales","Vice President Sales","VP of Sales","Chief Revenue Officer","Head of Sales"]`.
+FE matches the literal string; the same person at the same job has 3-4 ways
+they may have written it.
 
-The dominant failure mode across past projects (51dbf993 Apartment
-Operator Leads, 1219684b Florida GYN, 64f9b81c NY NJ Med Spa) was
-over-filtering `fullenrich_search_people` so it returned 0:
+For founder specifically use the broad set
+`["Founder","Co-Founder","CEO","Owner","Managing Partner","President"]`
+since the actual founder's current title can be any of these.
 
-  - `company_names=[<list>] + titles=["Property Manager",...] + locations=[...] + industries=[...]` → **0 results**
-  - `company_domains=[<list>] + titles=[...] + seniority=[...] + headcount range` → **0 results**
+**Any senior person** (column says "decision-maker" / "key contact" without naming a role)
 
-**Lesson:** every additional filter narrows the index. For a
-"find a person at THIS company" lookup, start with `company_names`
-or `company_domains` ALONE — no titles, no seniority, no industries.
-Look at what comes back, then narrow downstream (in your head, not in
-the API).
+```
+fullenrich_search_people(
+  company_names=["<company>"],
+  seniority=["C-Level","VP","Director"],
+  limit=5,
+)
+```
 
-If you must add a filter, add ONE — most often `locations` to narrow
-a national parent to the row's city / region. Don't combine three on
-the first call.
+Seniority filter beats `titles` when you don't have a specific title in mind —
+seniority is FE's structured classification, doesn't depend on the string match.
 
-### Strip corporate suffixes from company names
+**Specific named person** (column wants something about a person already named on the row)
 
-FE matches `company_names` against the LinkedIn-listed employer name,
-which often omits the suffix the user has. Project efc17fa4 (Apartment
-Operator Leads):
+Skip search entirely — go straight to `fullenrich_enrich_email`
+with first_name + last_name + domain.
 
-  - `company_names=["Village Green Companies"]` → **0 results**
-  - `company_names=["Village Green"]` → **18 results**, 7 of them
-    Property Managers in Columbus, all at the actual employer domain
-    `villagegreenmgt.com`.
+### Read the results — the wrapper post-filters but you still pick
 
-Before the FE call, strip these from the row's company string:
-"Companies", "Company", "Group", "Holdings", "Properties", "Inc",
-"Inc.", "LLC", "Corp", "Corporation", "Ltd", "Limited". If the bare
-form returns 0, then try the original. Almost never the other way
-around.
+The wrapper auto-drops results whose CURRENT employer name doesn't contain
+your `company_names` string. This catches the noisy cross-company matches
+(e.g. searching "Purple Sales" returns Sam Balzan at "Purple Sales" PLUS a
+"Kimberly Soldau at Purple Zebra Sales" — the wrapper drops Kimberly).
+You still pick from the filtered list:
 
-### Tool order — by company TYPE
+- Multiple founders → pick the one whose title matches what the column wants
+  (Co-Founder + CEO over plain Co-Founder, etc.)
+- Title-match for a description-specific role (e.g. property-specific PM
+  over a regional VP) wins.
+- If results look reasonable, commit the first qualifying one. Don't
+  web_search to "verify" — FE returned the linkedin URL and title; that
+  IS the verification.
 
-The right path depends on what kind of company is in the row.
+### When the first call comes back empty (or wrong)
 
-#### B2B / professional / tech / SaaS / large org companies
+In order of cheapness:
 
-**FullEnrich is the whole game here.** FE indexes LinkedIn-derived data
-and is strong on white-collar B2B targets.
+1. **Try `company_domains`** if you have the domain
+   ```
+   fullenrich_search_people(company_domains=["<domain>"], titles=[...], limit=3)
+   ```
+   Different index path. Often hits when name search missed (especially
+   when the company name in your row differs from how they self-list on
+   LinkedIn — e.g. "Acme Companies" in your data vs "Acme" on LinkedIn).
 
-1. `fullenrich_search_people(company_names=["<bare org name>"], limit=3)`
-   — single call, no other filters. Strip corporate suffixes per the
-   rule above.
-2. **Pick from the result list** based on the column's intent (most
-   senior person, person whose title says "Manager", etc.). Each result
-   has `title` and `seniority`.
-3. If you got the person but `linkedin_url` is null, commit the name +
-   title; leave LinkedIn null. Don't burn web_search trying to guess a
-   slug — see the "no fabricated slugs" warning below.
-4. If the column also wants Email, chain `fullenrich_enrich_email` on
-   the chosen person (`first_name`, `last_name`, `domain`, and pass
-   `linkedin_url` if FE returned one — it gates a deeper waterfall).
+2. **Try stripping the suffix** off the name (LLC, Inc, Corp, Companies,
+   Group, Holdings, Co.) — but only AFTER the full name and the domain
+   have both missed. Stripping pre-emptively can introduce false matches
+   (e.g. "NU Advisory" matches both the real company AND a different
+   "NU Advisory Office").
 
-If `company_names` returned 0, try `company_domains=["<the domain>"]`
-once. If both return 0, FE has no LinkedIn entry for this company —
-fall to the local-business path below.
+3. **Drop the title filter** — call again with `company_names` alone +
+   `limit=5`. The company is in FE but no one is titled with your
+   target role. Look at what comes back; sometimes the founder is
+   listed under a non-obvious title ("Principal", "Partner", "Director
+   of Operations"). If you see someone clearly senior in the results,
+   commit them.
 
-#### Local businesses / single-location practices / consumer-facing shops
+4. **Web_search once**. `"<company>" founder` or `"<company>" "<role>"`.
+   If web surfaces an identifiable name, commit it. Don't fabricate a
+   LinkedIn slug from a search snippet — only commit a LinkedIn URL if
+   you got it from FE or from clicking through to a real linkedin.com
+   page that explicitly names the person.
 
-**FE will usually return 0 for these.** Med spas, single-location
-gyms, dentists, OB-GYN practices, salons, restaurants, single-property
-apartment complexes, small law firms — typically not LinkedIn-indexed
-at the company level.
+5. **Null is the right answer** when steps 1-4 produce nothing. In
+   `reason`, name what you tried so the next iteration knows which
+   approach failed.
 
-Fallback path:
+### Small companies and local businesses
 
-1. **One targeted `web_search`** for `"<business name>" owner` or
-   `"<business name>" medical director` / `founder`. The name often
-   appears in directory listings, LinkedIn snippets, or the "About"
-   page. ONE search; if it doesn't surface a name, move on.
-2. If web_search surfaced a name, commit the name. Leave LinkedIn /
-   email null unless web_search ALSO clearly surfaced them on a
-   verifiable page (a real LinkedIn URL from the search result, not
-   a fabricated slug from the snippet).
-3. If web_search surfaced nothing identifiable, null.
+FE indexes white-collar B2B targets well. Local businesses
+(single-location med spas, dentists, small property managers,
+restaurants) frequently return 0 on `fullenrich_search_people` because
+they're not in LinkedIn's company graph. Skip steps 1-3 and go
+directly to web_search with a name-targeted query, then commit
+whatever name surfaces.
 
-#### Multi-property operators / brand vs. parent company
+### Multi-property operators / brand vs parent
 
-Apartment complexes, hotel chains, franchise locations, dealerships
-— the company name in the row (e.g. "The View on Grant", "Lane
-Lofts") is a *property* or *brand*, not the LinkedIn-indexed
-company. The actual employer of the property/community manager is
-the parent management company (e.g. "Coastal Ridge", "Flaherty &
-Collins Properties", "Wilcox Communities").
-
-The pattern (project 51dbf993):
-
-1. Find the parent management company first. Often surfaces from
-   `google_maps_place_details` (the website's About page links to
-   the operator) or a single web_search for `"<property name>"
-   management company`.
-2. Then `fullenrich_search_people(company_names=["<parent>"], limit=5)`
-   — slightly bigger pool because there will be multiple managers
-   across properties. Filter by location if the parent is national.
-3. Pick the person whose *current title* matches the column's intent
-   AND who appears to cover this property (sometimes evident from
-   `title` mentioning the specific community).
-
-A single property manager often manages multiple properties; matching
-"this exact property" is a bonus, not a requirement. If the user
-asked for "decision-maker at this complex" and we surface a regional
-PM at the parent, that IS the decision-maker.
-
-**Prefer property-specific candidates over generic regional contacts.**
-When FE search at the parent returns multiple managers, read each
-one's title — many property managers have a title that names the
-specific community they run. A title-match for THIS row's property
-name, address, or unit count is strictly better than a regional/
-portfolio contact who doesn't mention any specific community.
-
-Per-cell rule:
-1. Read every result's `title` — pick a description-match for THIS
-   row before falling to anyone else.
-2. If no match, prefer the lowest-seniority person whose title is
-   `Property Manager` / `Community Manager` / `General Manager` over
-   a `Regional` / `Portfolio` / `VP` title.
-3. Only commit a regional/portfolio contact (Director / VP / EVP)
-   when steps 1 and 2 yield nothing. When you do, note it in
-   `reason`: "no property-specific manager found in FE; using
-   regional portfolio contact at <parent>" — that signals to the
-   user this row is weaker than ones with site-level managers.
-
-### Don't fabricate LinkedIn URLs from web snippets
-
-When FE returns the person but no LinkedIn URL, do NOT construct a
-slug from a web_search snippet. Project efc17fa4 committed a wrong
-`linkedin.com/in/angela-piek` slug fabricated from a SERP fragment;
-the correct profile was `linkedin.com/in/angela-piek-arm-5bb24213`.
-A LinkedIn URL must come from a result FE returned OR from clicking
-through to a real linkedin.com page that explicitly belongs to the
-named person. Otherwise leave it null.
+For apartment complexes, hotel chains, franchise locations: the row's
+"company" is usually a property/brand. The actual employer is the
+parent management company. Find the parent first
+(`google_maps_place_details` or one web_search for `"<property>"
+management company`), then `fullenrich_search_people` against the
+parent with location filter to narrow to the right region.
 
 ### Don't fan out org-level info into per-person columns
 
-Already covered in the cell-agent base prompt, but it bites here in
-particular: if the FE result returns the COMPANY's main phone or
-`info@` mailbox (not a personal one), do NOT paste it into the
-per-person Email/Phone columns. Per-person columns require per-person
-evidence. Generic mailboxes belong in a *Company Email* column.
+If FE returns a company main phone or `info@` mailbox, don't paste
+it into per-person Email/Phone columns. Per-person columns need
+per-person evidence. Company contacts belong in a *Company Email*
+column.
 
-### Cost-aware bail criteria
+### Typical cost shape
 
-- 1 FE search_people call with `limit=3` → ~$0.15 if 3 hits, free if 0.
-- 1 FE enrich_email on the chosen person → ~$0.055 on a hit.
-- 1 web_search for local-business fallback → ~$0.025.
-- Browser_use is rarely worth it for finding a person — bail and
-  commit null with a reason that names what you tried.
-
-The right total spend for "find decision-maker + email" on a B2B
-target is **$0.05–$0.20** (FE search + FE enrich), not $0.30+ of
-web_searches.
-
-### When null IS the right answer
-
-- FE search by `company_names` AND by `company_domains` returned 0,
-  AND
-- One web_search for `"<company>" owner|founder|manager` surfaced no
-  identifiable person.
-
-Then null. Commit the name column null and skip the email/LinkedIn
-columns (don't fabricate). In `reason`, name the company filters and
-the web_search you tried — that's how the next iteration knows
-which approach to drop.
+- 1 FE search at limit=3 → $0.04. Most cells finish here.
+- 2 FE searches (titles → domain fallback) → $0.08.
+- + 1-2 web_searches if FE missed entirely → $0.05-0.075.
+- Realistic per-cell total: $0.04-$0.15.
+- Set `per_row_credit_cap: 3` for these enrichments to leave margin.

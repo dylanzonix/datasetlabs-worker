@@ -468,8 +468,14 @@ async def _fullenrich_search_people(args: Dict[str, Any], ctx: ToolContext) -> T
     if not filters:
         return {"error": "at least one of company_names/company_domains/titles is required"}, 0.0
 
-    # Tight default; hard cap. Each result is 0.25 FE-credit ≈ $0.013.
-    limit = int(args.get("limit") or 2)
+    # Default limit=3 — empirically the sweet spot for "find a person at
+    # this company" lookups. limit=1 nails clean cases but misses when
+    # cross-company noise crowds out the right match (e.g. searching
+    # "Sales Hatch" returns 2 wrong-company people before the actual
+    # Sales Hatch one). limit=3 catches the right person after the
+    # post-filter drops mismatched employers. Each result is 0.25
+    # FE-credit ≈ $0.013, so limit=3 = ~$0.04. Hard-capped at 10.
+    limit = int(args.get("limit") or 3)
     limit = max(1, min(limit, 10))
 
     body = {**filters, "limit": limit, "offset": 0}
@@ -940,7 +946,7 @@ You have several sources. Pick the one that BEST FITS what the column wants — 
 
 ## Sources by what the column wants
 
-- **A person at a company** (founder, owner, decision-maker, manager) → `fullenrich_search_people`. LinkedIn-derived people DB — one call returns name + title + LinkedIn URL. Don't web_search snippets for people when this is available.
+- **A person at a company** (founder, owner, decision-maker, manager) → `fullenrich_search_people`. LinkedIn-derived people DB — one call (limit=3, with a `titles=[...]` filter for the role you want) returns name + title + LinkedIn URL. See `find_person_at_company` skill for the filter recipe.
 - **A verified email** for a known person (you have first_name + last_name + domain) → `fullenrich_enrich_email`. Pass `linkedin_url` when the row has it — gates a deeper waterfall.
 - **A verified phone** → `fullenrich_enrich_phone`. ~5 cr, only when the column explicitly asks for phone.
 - **Company data** (revenue, headcount, funding, tech stack, location) → `apollo_org_enrich` (free on our plan) or `fullenrich_enrich_company`.
@@ -1125,9 +1131,10 @@ _CELL_TOOL_DEFS: List[Dict[str, Any]] = [
             "white-collar targets**: structured results with title, seniority, "
             "linkedin URL, employer — no snippet parsing.\n\n"
             "**Cost: 0.25 FE-credit (~$0.013) per RETURNED person, not per call.** "
-            "So `limit` IS the cost knob. Default to limit=1-2 when picking ONE "
-            "specific person (founder/CEO); bump to 5-10 only when picking from "
-            "a real candidate pool. Hard-capped at 10.\n\n"
+            "So `limit` IS the cost knob. Default limit=3 is the empirical sweet "
+            "spot — captures the right person after the wrapper's employer-name "
+            "post-filter drops cross-company noise. Bump to 5 only when picking "
+            "from a real candidate pool. Hard-capped at 10.\n\n"
             "**Keep filters MINIMAL.** Start with `company_names` ALONE — adding "
             "titles/seniority/locations on the first call often returns 0. Strip "
             "corporate suffixes (Inc, LLC, Corp, Companies, Group) before passing "
