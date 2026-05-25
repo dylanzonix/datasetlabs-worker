@@ -862,7 +862,7 @@ def list_enrichments(
                    e.id::text AS uuid
             FROM enrichments e
             WHERE e.table_id = :tid AND e.deleted_at IS NULL
-            ORDER BY e.created_at
+            ORDER BY e.position, e.created_at
             """
         ),
         {"tid": tid},

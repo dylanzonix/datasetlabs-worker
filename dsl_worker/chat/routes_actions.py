@@ -348,7 +348,7 @@ async def post_promote_query_columns(
     """
     _verify(project_id, user.user_id, db)
 
-    from dsl_worker.chat.tools import resolve_table_id, _next_enrichment_short_id
+    from dsl_worker.chat.tools import resolve_table_id, _next_enrichment_short_id, _resolve_enrichment_position
     from dsl_worker.chat.enrichment import _ensure_columns_on_table
 
     tid = resolve_table_id(db, str(project_id), table_id)
@@ -437,6 +437,7 @@ async def post_promote_query_columns(
 
     eid = str(__import__("uuid").uuid4())
     short_id = _next_enrichment_short_id(db, tid)
+    position = _resolve_enrichment_position(db, tid)
     action = {
         "research": "research",
         "prompt": prompt,
@@ -448,8 +449,8 @@ async def post_promote_query_columns(
     ]
     db.execute(
         sa_text(
-            "INSERT INTO enrichments (id, table_id, short_id, name, columns, action, per_row_credit_cap, created_at) "
-            "VALUES (:eid, :tid, :sid, :name, CAST(:cols AS jsonb), CAST(:action AS jsonb), :cap, now())"
+            "INSERT INTO enrichments (id, table_id, short_id, name, columns, action, per_row_credit_cap, position, created_at) "
+            "VALUES (:eid, :tid, :sid, :name, CAST(:cols AS jsonb), CAST(:action AS jsonb), :cap, :pos, now())"
         ),
         {
             "eid": eid,
@@ -459,6 +460,7 @@ async def post_promote_query_columns(
             "cols": json.dumps(enrichment_columns),
             "action": json.dumps(action),
             "cap": 2.0,
+            "pos": position,
         },
     )
     _ensure_columns_on_table(db, tid, target_query_cols, enrichment_id=eid)

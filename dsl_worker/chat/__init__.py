@@ -154,6 +154,14 @@ def _enrichment_set_schema() -> Dict[str, Any]:
             "table_id": {"type": "string", "description": "Table to enrich."},
             "enrichment_id": {"type": "string", "description": "Pass when refining an existing enrichment."},
             "name": {"type": "string", "description": "Short name shown in column header."},
+            "insert_before": {
+                "type": "string",
+                "description": (
+                    "Optional. Existing enrichment short_id (e.g. 't1e2') the new one should be inserted BEFORE. "
+                    "Use when this enrichment should run as a gate before downstream ones — e.g. you want to add "
+                    "a qualification check ahead of contact-info lookups already created. Omit to append at the end."
+                ),
+            },
             "columns": {
                 "type": "array",
                 "description": "One or more columns to add and fill. [{name, type, format?}].",

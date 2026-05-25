@@ -436,11 +436,11 @@ def duplicate_table(
                 """
                 INSERT INTO enrichments
                   (id, table_id, short_id, name, columns, action,
-                   per_row_credit_cap, created_at)
+                   per_row_credit_cap, position, created_at)
                 VALUES
                   (gen_random_uuid(), :tid, :sid, :name,
                    CAST(:cols AS jsonb), CAST(:action AS jsonb),
-                   :cap, now())
+                   :cap, :pos, now())
                 """
             ),
             {
@@ -450,6 +450,7 @@ def duplicate_table(
                 "cols": json.dumps(e[1] if isinstance(e[1], (dict, list)) else (e[1] or [])),
                 "action": json.dumps(e[2] if isinstance(e[2], (dict, list)) else (e[2] or {})),
                 "cap": e[3],
+                "pos": i,
             },
         )
     db.commit()

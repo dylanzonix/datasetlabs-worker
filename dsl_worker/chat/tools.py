@@ -244,6 +244,56 @@ def _next_enrichment_short_id(db: Session, table_id: str) -> str:
     return f"{tshort}e{next_n}"
 
 
+def _resolve_enrichment_position(
+    db: Session,
+    table_id: str,
+    *,
+    insert_before: Optional[str] = None,
+) -> int:
+    """Pick the position slot for a new enrichment on this table.
+
+    Default: append (max(position) + 1).
+    If `insert_before` (an existing enrichment short_id like "t1e2") is
+    given, return that enrichment's position and shift it + every later
+    one by +1 so the new row slots in at the requested spot. Same
+    advisory lock as _next_enrichment_short_id so the shift + the new
+    INSERT are atomic.
+    """
+    db.execute(
+        sa_text("SELECT pg_advisory_xact_lock(hashtextextended(:tid, 2))"),
+        {"tid": str(table_id)},
+    )
+    if insert_before:
+        target = db.execute(
+            sa_text(
+                "SELECT position FROM enrichments "
+                "WHERE table_id=:tid AND short_id=:sid AND deleted_at IS NULL"
+            ),
+            {"tid": table_id, "sid": insert_before},
+        ).fetchone()
+        if target and target[0] is not None:
+            pos = int(target[0])
+            db.execute(
+                sa_text(
+                    "UPDATE enrichments SET position = position + 1 "
+                    "WHERE table_id=:tid AND position >= :pos AND deleted_at IS NULL"
+                ),
+                {"tid": table_id, "pos": pos},
+            )
+            return pos
+        # insert_before referenced a missing enrichment — fall through and
+        # append rather than failing; the agent gets the new row at the
+        # end which is still a valid placement.
+    row = db.execute(
+        sa_text(
+            "SELECT COALESCE(MAX(position), 0) FROM enrichments "
+            "WHERE table_id=:tid AND deleted_at IS NULL"
+        ),
+        {"tid": table_id},
+    ).fetchone()
+    return int(row[0] or 0) + 1
+
+
 def _record_query_run(
     db: Session,
     *,

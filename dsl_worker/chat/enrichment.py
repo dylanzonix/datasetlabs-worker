@@ -39,6 +39,7 @@ from dsl_worker.chat.tools import (
     resolve_enrichment_id,
     resolve_table_id,
     _next_enrichment_short_id,
+    _resolve_enrichment_position,
 )
 from dsl_worker.chat import email_verify_hook
 from dsl_worker.chat.instrumentation import phase_marker, phase_span, time_commit
@@ -135,11 +136,26 @@ async def enrichment_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
     else:
         enrichment_id = str(uuid.uuid4())
         short_id = _next_enrichment_short_id(db, table_id)
+        # Resolve insert_before to a short_id (agent may have used 'e1',
+        # 't1e1', or a uuid — normalize through resolve_enrichment_id).
+        insert_before_raw = args.get("insert_before")
+        insert_before_sid: Optional[str] = None
+        if insert_before_raw:
+            ib_uuid = resolve_enrichment_id(db, ctx.project_id, insert_before_raw)
+            if ib_uuid:
+                ib_row = db.execute(
+                    sa_text("SELECT short_id FROM enrichments WHERE id=:eid"),
+                    {"eid": ib_uuid},
+                ).fetchone()
+                insert_before_sid = ib_row[0] if ib_row else None
+        position = _resolve_enrichment_position(
+            db, table_id, insert_before=insert_before_sid,
+        )
         db.execute(
             sa_text(
                 """
-                INSERT INTO enrichments (id, table_id, short_id, name, columns, action, per_row_credit_cap, created_at)
-                VALUES (:eid, :tid, :sid, :name, CAST(:cols AS jsonb), CAST(:action AS jsonb), :cap, now())
+                INSERT INTO enrichments (id, table_id, short_id, name, columns, action, per_row_credit_cap, position, created_at)
+                VALUES (:eid, :tid, :sid, :name, CAST(:cols AS jsonb), CAST(:action AS jsonb), :cap, :pos, now())
                 """
             ),
             {
@@ -150,6 +166,7 @@ async def enrichment_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
                 "cols": json.dumps(columns),
                 "action": json.dumps(action),
                 "cap": per_row_credit_cap,
+                "pos": position,
             },
         )
         # Add the enrichment columns to the table's column list if not already present.
