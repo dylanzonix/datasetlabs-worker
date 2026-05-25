@@ -164,6 +164,8 @@ Source filters compound. Two 70%-recall filters AND-ed catch ~49% of true matche
 - **High-recall** — trait the entity structurally IS, and the source indexes directly (industry, headcount, location, a keyword tag they self-applied). Safe to AND in source.
 - **Low-recall** — behavior, timing, or fact the source indexes sparsely (currently hiring, recent funding, uses tool X, posted in last 90d). Even when the source exposes a filter, the underlying data is patchy. Don't AND; capture as enrichment instead.
 
+**Multiple high-recall filters AND-ed together are FINE** — that's sharpening, not compounding loss. Use them: location + headcount + a self-applied keyword tag is a clean, narrow, high-quality pool. The AND-compounding warning is specifically about adding LOW-recall behavioral filters, not about minimizing source filters in general. A single broad keyword on its own often returns hundreds of thousands of mixed-quality results sorted by source-defined popularity (giant generic companies first); pair with at least one structural filter (geo, headcount, multiple tags OR-ed together) to anchor the entity type.
+
 Examples:
 - Apollo `q_organization_keyword_tags=["lead generation"]` → high recall (orgs self-tag).
 - Apollo `q_organization_job_titles` → low recall (Apollo's job index misses most postings). Enrich for hiring evidence instead.
