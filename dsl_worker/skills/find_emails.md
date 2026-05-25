@@ -6,11 +6,11 @@ applies_to: [cell_agent]
 
 ## Finding someone's work email
 
-### See also: find_people
+### See also: find_person_at_company
 
 If the row tells you a *company / org / business* but no *person*, the
 column you're filling is implicitly a person + email lookup. Read
-`find_people` first — it covers how to surface a name (which then
+`find_person_at_company` first — it covers how to surface a name (which then
 unlocks this email-finding flow). Don't web_search the website hoping
 an email shows up; emails on practice / med-spa / property pages are
 almost always `info@` (which is a different column from a personal

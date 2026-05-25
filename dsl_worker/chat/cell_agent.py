@@ -385,13 +385,13 @@ async def _fullenrich_search_people(args: Dict[str, Any], ctx: ToolContext) -> T
 
     Per-row variant — returns a compact list of candidates inline (no
     file writing). The cell agent picks the right person from the list
-    and commits the value. Used by the `find_people` skill.
+    and commits the value. Used by the `find_person_at_company` skill.
 
-    Cost shape: FE charges ~1 credit (~$0.055) per RETURNED person, NOT
-    per call. So `limit` is the cost knob — keep it small (2-3) when
-    the column wants ONE specific person (founder, owner, CEO), bump
-    only when picking from a candidate pool. Hard-capped at 10 to
-    prevent accidental large pulls on per-row enrichment.
+    Cost shape: FE charges 0.25 credit (~$0.013) per RETURNED person,
+    NOT per call. So `limit` is the cost knob — at limit=5 that's
+    ~$0.065. Keep it small (1-3) when the column wants ONE specific
+    person (founder, owner, CEO); bump only when picking from a real
+    candidate pool. Hard-capped at 10.
     """
     import httpx
     api_key = os.getenv("FULLENRICH_API_KEY")
@@ -425,8 +425,8 @@ async def _fullenrich_search_people(args: Dict[str, Any], ctx: ToolContext) -> T
     if not filters:
         return {"error": "at least one of company_names/company_domains/titles is required"}, 0.0
 
-    # Tight default; hard cap. Each result is ~$0.055.
-    limit = int(args.get("limit") or 3)
+    # Tight default; hard cap. Each result is 0.25 FE-credit ≈ $0.013.
+    limit = int(args.get("limit") or 2)
     limit = max(1, min(limit, 10))
 
     body = {**filters, "limit": limit, "offset": 0}
@@ -441,7 +441,12 @@ async def _fullenrich_search_people(args: Dict[str, Any], ctx: ToolContext) -> T
     data = r.json() or {}
     people = data.get("people") or []
     meta = data.get("metadata") or {}
-    credits_used = float(meta.get("credits_used") or len(people))
+    # FE's Search API charges 0.25 credit per RETURNED person. When the
+    # response includes credits_used, trust it; otherwise fall back to
+    # len(people) * 0.25 (not len(people) — the per-result rate is 0.25,
+    # not 1; treating it as 1 was 4x too high and would gate the call out
+    # of any tight per_row_credit_cap).
+    credits_used = float(meta.get("credits_used") if meta.get("credits_used") is not None else len(people) * 0.25)
     cost_usd = credits_used * 0.055
 
     # Optional post-filter: FE's API has been observed to bleed
@@ -850,7 +855,7 @@ Do NOT pick `browser_use` predictively. Even if the instruction mentions a URL, 
 
 Use these when the row already has the inputs and the column wants the matching field. They're direct lookups, not searches:
 
-- **`fullenrich_search_people`** — search FullEnrich for people at a company by name/domain. Use when the column wants a person (founder, owner, decision-maker) and the row only gives a company. STRICTLY BETTER than web_search for B2B targets. Cost: ~$0.05 per RETURNED person — keep `limit` small (default 3). Start with `company_names` alone; add filters only on a second narrowing call. See the `find_people` skill for full recipe.
+- **`fullenrich_search_people`** — search FullEnrich for people at a company by name/domain. Use when the column wants a person (founder, owner, decision-maker) and the row only gives a company. STRICTLY BETTER than web_search for B2B targets. Cost: ~$0.013 per RETURNED person — keep `limit` small (default 2). Start with `company_names` alone; add filters only on a second narrowing call. See the `find_person_at_company` skill for full recipe.
 - **`fullenrich_enrich_email`** — verified business email. Inputs: `first_name`, `last_name`, `domain`. ~0.5 cr.
 - **`fullenrich_enrich_phone`** — verified phone. Same inputs. **~5 cr — expensive**, only when the column explicitly asks for phone.
 - **`fullenrich_enrich_company`** — company-level enrichment. Input: `domain`. ~0.5 cr.
@@ -1034,10 +1039,10 @@ _CELL_TOOL_DEFS: List[Dict[str, Any]] = [
             "company name/domain. **Strictly better than web_search for B2B / "
             "white-collar targets**: structured results with title, seniority, "
             "linkedin URL, employer — no snippet parsing.\n\n"
-            "**Cost: ~1 credit (~$0.05) per RETURNED person, not per call.** "
-            "So `limit` IS the cost knob. Default to limit=2-3 when picking ONE "
+            "**Cost: 0.25 FE-credit (~$0.013) per RETURNED person, not per call.** "
+            "So `limit` IS the cost knob. Default to limit=1-2 when picking ONE "
             "specific person (founder/CEO); bump to 5-10 only when picking from "
-            "a candidate pool. Hard-capped at 10.\n\n"
+            "a real candidate pool. Hard-capped at 10.\n\n"
             "**Keep filters MINIMAL.** Start with `company_names` ALONE — adding "
             "titles/seniority/locations on the first call often returns 0. Strip "
             "corporate suffixes (Inc, LLC, Corp, Companies, Group) before passing "

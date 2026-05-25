@@ -1,6 +1,6 @@
 ---
-name: find_people
-description: Finding a person (decision maker, manager, founder, owner, contact) at a company.
+name: find_person_at_company
+description: Given a company, find a specific person (founder, owner, decision-maker, contact, manager) who works there.
 applies_to: [cell_agent]
 ---
 
