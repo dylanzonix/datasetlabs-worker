@@ -319,13 +319,13 @@ async def _fullenrich_enrich_email(args: Dict[str, Any], ctx: ToolContext) -> Tu
     if linkedin_url:
         contact["linkedin_url"] = linkedin_url
     result, credits = await _fullenrich_bulk_enrich(
-        api_key, contact, ["contact.emails"], timeout_s=120,
+        api_key, contact, ["contact.emails"], timeout_s=600,
     )
     if "error" in result:
         return result, credits
     ci = result.get("contact_info") or {}
-    # Prefer the highest-confidence single answer FE picked, fall back
-    # to the first entry in work_emails[].
+    # Prefer the highest-confidence single answer FullEnrich picked,
+    # fall back to the first entry in work_emails[].
     mp = ci.get("most_probable_work_email") or {}
     email = mp.get("email")
     status = mp.get("status")
@@ -357,7 +357,7 @@ async def _fullenrich_enrich_phone(args: Dict[str, Any], ctx: ToolContext) -> Tu
     if linkedin_url:
         contact["linkedin_url"] = linkedin_url
     result, credits = await _fullenrich_bulk_enrich(
-        api_key, contact, ["contact.phones"], timeout_s=180,
+        api_key, contact, ["contact.phones"], timeout_s=600,
     )
     if "error" in result:
         return result, credits
@@ -398,15 +398,18 @@ async def _fullenrich_enrich_company(args: Dict[str, Any], ctx: ToolContext) -> 
     domain = args.get("domain")
     if not domain:
         return {"error": "domain is required"}, 0.0
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(
-            "https://app.fullenrich.com/api/v2/company/search",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "domains": [{"value": domain, "exact_match": False, "exclude": False}],
-                "limit": 1,
-            },
-        )
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(
+                "https://app.fullenrich.com/api/v2/company/search",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "domains": [{"value": domain, "exact_match": False, "exclude": False}],
+                    "limit": 1,
+                },
+            )
+    except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+        return {"error": f"FE company/search timeout: {e}"}, 0.0
     if r.status_code != 200:
         return {"error": f"FE HTTP {r.status_code}: {r.text[:200]}"}, 0.0
     data = r.json() or {}
@@ -491,14 +494,17 @@ async def _fullenrich_search_people(args: Dict[str, Any], ctx: ToolContext) -> T
     limit = max(1, min(limit, 10))
 
     body = {**filters, "limit": limit, "offset": 0}
-    async with httpx.AsyncClient(timeout=45) as client:
-        r = await client.post(
-            "https://app.fullenrich.com/api/v2/people/search",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json=body,
-        )
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(
+                "https://app.fullenrich.com/api/v2/people/search",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=body,
+            )
+    except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+        return {"error": f"FullEnrich people/search timeout: {e}"}, 0.0
     if r.status_code != 200:
-        return {"error": f"FE HTTP {r.status_code}: {r.text[:200]}"}, 0.0
+        return {"error": f"FullEnrich HTTP {r.status_code}: {r.text[:200]}"}, 0.0
     data = r.json() or {}
     people = data.get("people") or []
     meta = data.get("metadata") or {}
@@ -581,15 +587,18 @@ async def _apollo_org_enrich(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Di
     domain = args.get("domain")
     if not domain:
         return {"error": "domain is required"}, 0.0
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(
-            "https://api.apollo.io/api/v1/organizations/enrich",
-            params={"domain": domain},
-            headers={"X-Api-Key": api_key},
-        )
-        if r.status_code != 200:
-            return {"error": f"apollo HTTP {r.status_code}"}, 0.0
-        org = (r.json() or {}).get("organization") or {}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(
+                "https://api.apollo.io/api/v1/organizations/enrich",
+                params={"domain": domain},
+                headers={"X-Api-Key": api_key},
+            )
+    except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+        return {"error": f"Apollo organizations/enrich timeout: {e}"}, 0.0
+    if r.status_code != 200:
+        return {"error": f"Apollo HTTP {r.status_code}"}, 0.0
+    org = (r.json() or {}).get("organization") or {}
     # Apollo /organizations/enrich returns ~56 fields. Surface the ones
     # likely to fill enrichment columns directly; skip the noisy
     # internal IDs (industry_tag_id, snippets_loaded, etc.) and
@@ -644,14 +653,17 @@ async def _google_maps_place_details(args: Dict[str, Any], ctx: ToolContext) -> 
     place_id = args.get("place_id")
     if not (api_key and place_id):
         return {"error": "GOOGLE_API_KEY + place_id required"}, 0.0
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(
-            "https://maps.googleapis.com/maps/api/place/details/json",
-            params={"key": api_key, "place_id": place_id},
-        )
-        if r.status_code != 200:
-            return {"error": f"gmaps HTTP {r.status_code}"}, 0.0
-        result = (r.json() or {}).get("result") or {}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                "https://maps.googleapis.com/maps/api/place/details/json",
+                params={"key": api_key, "place_id": place_id},
+            )
+    except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+        return {"error": f"Google Maps place_details timeout: {e}"}, 0.0
+    if r.status_code != 200:
+        return {"error": f"Google Maps HTTP {r.status_code}"}, 0.0
+    result = (r.json() or {}).get("result") or {}
     return result, 0.03
 
 
