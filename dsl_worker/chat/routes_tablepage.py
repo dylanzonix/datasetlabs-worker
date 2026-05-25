@@ -4,12 +4,15 @@ Two endpoints — both mounted under /v2 via this module's `router`:
 
   POST /v2/projects/{pid}/tables/{tid}/tablepage/push
     Dumps the table's current rows + visible columns as CSV, uploads to
-    TablePage via /api/bot-upload-json, stores the returned slug on the
-    table row. Returns { slug, url, uploaded_at }.
+    TablePage's /api/upload endpoint with visibility=private, then mints
+    a 24h share token via /api/d/{slug}/share-token. Stores the slug on
+    the table row; the share URL is regenerated on demand (it has an
+    expiring token baked in).
 
   GET  /v2/projects/{pid}/tables/{tid}/tablepage
-    Returns the persisted slug + last-uploaded timestamp + a live TP
-    `ready` probe so the UI knows when the iframe will render insights.
+    Returns the persisted slug, last-uploaded timestamp, a freshly-minted
+    share URL, and a live TP `ready` probe so the UI knows when the
+    iframe will render insights.
 
 Why this layer exists at all:
 - TablePage's API has no update-by-slug or delete-by-key. Every push
@@ -18,9 +21,9 @@ Why this layer exists at all:
   re-uploading every time.
 - The TP API key is stored server-side (TABLEPAGE_API_KEY env). We
   never expose it to the browser.
-- TP rate-limits uploads to 10/day per bot; the UI only triggers this
-  on explicit user click ("Push to TablePage") so the limit is hard to
-  burn through during normal use.
+- Share tokens expire (24h default). We regenerate on each GET so the
+  iframe always has a valid URL without us needing to schedule refreshes
+  or store rotating tokens in the DB.
 """
 
 from __future__ import annotations
@@ -47,12 +50,12 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/v2")
 
 TABLEPAGE_BASE = "https://data.tablepage.ai"
-UPLOAD_PATH = "/api/bot-upload-json"
+UPLOAD_PATH = "/api/upload"
+SHARE_TOKEN_PATH_TMPL = "/api/d/{slug}/share-token"
 STATUS_PATH_TMPL = "/api/d/{slug}/status"
+SHARE_EXPIRES_HOURS = 24
 
 # Row-level sidecars we add to samples.row internally — strip from CSV.
-# (__cell_status__, __cell_cost__ are the two reserved keys; anything
-# starting with __ is excluded as a guard against future additions.)
 _RESERVED_ROW_KEYS_PREFIX = "__"
 
 # Hard ceiling. TablePage's own limit is 25 MB; we cut earlier to leave
@@ -62,27 +65,17 @@ _MAX_CSV_BYTES = 20 * 1024 * 1024
 
 
 def _stringify_cell(v: Any) -> str:
-    """Render any JSONB cell value into a CSV-friendly string.
-
-    None → empty string. Numbers / bools render via str(). Lists/dicts
-    serialize to JSON so structured cells survive the round trip
-    (TablePage will treat them as text, but at least the data is
-    preserved instead of dropped)."""
     if v is None:
         return ""
     if isinstance(v, bool):
         return "Yes" if v else "No"
     if isinstance(v, (str, int, float)):
         return str(v)
-    # list / dict → compact JSON. TP treats as text; user can still see it.
     import json
     return json.dumps(v, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
 def _slugify_filename(name: str) -> str:
-    """Make a CSV filename TP-safe. TP slugifies internally but the
-    filename also flows into the public URL prefix, so reduce to a
-    reasonable shape upfront."""
     if not name:
         return "table.csv"
     s = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-")
@@ -94,17 +87,11 @@ def _slugify_filename(name: str) -> str:
 
 
 def _build_csv(columns: list[Dict[str, Any]], rows: list[Dict[str, Any]]) -> str:
-    """Build a CSV from the table's column list + row dicts. Column
-    order follows the table's columns array (which already encodes the
-    user-visible order including any reorder). Hidden columns are
-    omitted — TablePage shouldn't render a column the user has hidden
-    in our UI."""
     visible_cols = [
         c for c in columns
         if isinstance(c, dict) and c.get("name") and not c.get("hidden")
     ]
     if not visible_cols:
-        # Fall back to whatever keys the first row has, minus reserved.
         if rows:
             keys = sorted(
                 k for k in rows[0].keys()
@@ -126,10 +113,6 @@ def _build_csv(columns: list[Dict[str, Any]], rows: list[Dict[str, Any]]) -> str
 
 
 def _verify_project_owns_user(db: Session, project_id: UUID, user_id: UUID) -> None:
-    """Subset of routes.py:_verify_project — minimal ownership check.
-
-    We keep a local copy to avoid importing the larger routes.py module
-    here (and the circular-import risk that comes with it)."""
     row = db.execute(
         sa_text(
             "SELECT 1 FROM projects "
@@ -142,8 +125,6 @@ def _verify_project_owns_user(db: Session, project_id: UUID, user_id: UUID) -> N
 
 
 def _resolve_table_uuid(db: Session, project_id: str, id_or_short: str) -> Optional[str]:
-    """Accept either a UUID or short_id (e.g. 't1'); return the UUID."""
-    # Cheap UUID heuristic — full validation happens via the query.
     if len(id_or_short) == 36 and id_or_short.count("-") == 4:
         row = db.execute(
             sa_text(
@@ -163,6 +144,39 @@ def _resolve_table_uuid(db: Session, project_id: str, id_or_short: str) -> Optio
     return row[0] if row else None
 
 
+def _mint_share_url(slug: str) -> Optional[str]:
+    """Call TablePage's share-token endpoint to mint a fresh 24h share URL.
+
+    Returns the share_url on success, None on any failure (caller falls
+    back to the bare /d/{slug} URL — works but only for public datasets).
+    """
+    if not settings.tablepage_api_key:
+        return None
+    try:
+        r = httpx.post(
+            f"{TABLEPAGE_BASE}{SHARE_TOKEN_PATH_TMPL.format(slug=slug)}",
+            headers={
+                "Authorization": f"Bearer {settings.tablepage_api_key}",
+                "Content-Type": "application/json",
+            },
+            json={"expires_hours": SHARE_EXPIRES_HOURS},
+            timeout=15.0,
+        )
+    except httpx.HTTPError as e:
+        log.warning("tablepage share-token network error for slug=%s: %s", slug, e)
+        return None
+    if r.status_code != 200:
+        log.warning(
+            "tablepage share-token non-200 for slug=%s: status=%s body=%s",
+            slug, r.status_code, r.text[:300],
+        )
+        return None
+    data = r.json() or {}
+    # Wei's docs say the response yields a share_url field. Tolerate a
+    # couple of alternative key names in case the API shape evolves.
+    return data.get("share_url") or data.get("url") or data.get("shareUrl")
+
+
 @router.post("/projects/{project_id}/tables/{table_id}/tablepage/push")
 def push_to_tablepage(
     project_id: UUID,
@@ -170,14 +184,11 @@ def push_to_tablepage(
     user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Push current table state to TablePage.ai. Manual-only trigger.
+    """Push current table state to TablePage.ai (private) + mint share URL.
 
-    Always uploads ALL rows (no filter applied) — the visualization is
-    of the dataset, not a slice. Hidden columns are excluded.
-
-    Returns the new slug + embed URL. On TP failure, returns a 502 with
-    the upstream error so the FE can show a clear message instead of a
-    generic 500.
+    Always uploads ALL rows. Hidden columns are excluded. Visibility is
+    forced to private — no public TP page is created. The iframe in the
+    UI uses the minted share URL.
     """
     if not settings.tablepage_api_key:
         raise HTTPException(503, "TablePage integration not configured")
@@ -220,14 +231,16 @@ def push_to_tablepage(
         )
 
     filename = _slugify_filename(table_name)
+
+    # Multipart upload to /api/upload with visibility=private.
+    files = {"file": (filename, csv_bytes, "text/csv")}
+    data = {"visibility": "private"}
     try:
         r = httpx.post(
             f"{TABLEPAGE_BASE}{UPLOAD_PATH}",
-            headers={
-                "Authorization": f"Bearer {settings.tablepage_api_key}",
-                "Content-Type": "application/json",
-            },
-            json={"filename": filename, "content": csv_text},
+            headers={"Authorization": f"Bearer {settings.tablepage_api_key}"},
+            files=files,
+            data=data,
             timeout=60.0,
         )
     except httpx.HTTPError as e:
@@ -241,8 +254,8 @@ def push_to_tablepage(
         )
         raise HTTPException(502, f"TablePage upload failed ({r.status_code})")
 
-    data = r.json()
-    slug = data.get("slug")
+    resp = r.json() or {}
+    slug = resp.get("slug")
     if not slug:
         raise HTTPException(502, "TablePage response missing slug")
 
@@ -255,10 +268,17 @@ def push_to_tablepage(
     )
     db.commit()
 
+    share_url = _mint_share_url(slug)
+    # If share-token minting failed, fall back to the bare /d/{slug} URL.
+    # For private datasets the embed won't render content without a token,
+    # so the FE should treat a missing share_url as a hard error. We still
+    # return the slug so the next GET can retry the token mint.
+    embed_url = f"{share_url}&embed=1" if share_url else None
+
     return {
         "slug": slug,
-        "url": data.get("url") or f"{TABLEPAGE_BASE}/d/{slug}",
-        "embed_url": f"{TABLEPAGE_BASE}/d/{slug}?embed=1",
+        "share_url": share_url,
+        "embed_url": embed_url,
         "rows_uploaded": len(rows),
     }
 
@@ -270,12 +290,11 @@ def get_tablepage_state(
     user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Return persisted slug + a live TP `ready` probe.
+    """Return persisted slug + fresh share URL + a live TP `ready` probe.
 
-    `ready=true` means TablePage has finished its automatic analysis +
-    chart generation, so the iframe will render insights instead of a
-    spinner. The FE polls this endpoint every few seconds after a push
-    until ready=true.
+    The share URL is minted on every call (24h expiry baked in by TP)
+    so the iframe always has a valid token without us needing to track
+    expiry server-side.
     """
     _verify_project_owns_user(db, project_id, user.user_id)
     tid = _resolve_table_uuid(db, str(project_id), table_id)
@@ -296,10 +315,13 @@ def get_tablepage_state(
         return {
             "slug": None,
             "uploaded_at": None,
-            "url": None,
+            "share_url": None,
             "embed_url": None,
             "ready": False,
         }
+
+    share_url = _mint_share_url(slug)
+    embed_url = f"{share_url}&embed=1" if share_url else None
 
     ready = False
     try:
@@ -310,15 +332,12 @@ def get_tablepage_state(
         if s.status_code == 200:
             ready = bool((s.json() or {}).get("ready"))
     except httpx.HTTPError:
-        # Surface the persisted slug even when TP is unreachable —
-        # the embed iframe handles its own loading state, so the FE
-        # can still render. ready=false just means "we don't know."
         pass
 
     return {
         "slug": slug,
         "uploaded_at": uploaded_at.isoformat() if uploaded_at else None,
-        "url": f"{TABLEPAGE_BASE}/d/{slug}",
-        "embed_url": f"{TABLEPAGE_BASE}/d/{slug}?embed=1",
+        "share_url": share_url,
+        "embed_url": embed_url,
         "ready": ready,
     }
