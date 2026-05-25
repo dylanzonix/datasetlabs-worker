@@ -971,7 +971,7 @@ You have several sources. Pick the one that BEST FITS what the column wants — 
 ## Sources by what the column wants
 
 - **A person at a company** (founder, owner, decision-maker, manager) → `fullenrich_search_people`. LinkedIn-derived people DB — one call (limit=3, with a `titles=[...]` filter for the role you want) returns name + title + LinkedIn URL. See `find_person_at_company` skill for the filter recipe.
-- **A verified email** for a known person (you have first_name + last_name + domain) → `fullenrich_enrich_email`. Pass `linkedin_url` when the row has it — gates a deeper waterfall.
+- **A verified email** for a known person (you have first_name + last_name + domain) → `fullenrich_enrich_email`. Pass `linkedin_url` when the row has it — gates a deeper waterfall. If FullEnrich returns null, commit null — never pattern-guess `firstname@domain` as the answer. See `find_emails` skill.
 - **A verified phone** → `fullenrich_enrich_phone`. ~5 cr, only when the column explicitly asks for phone.
 - **Company data** (revenue, headcount, funding, tech stack, location) → `apollo_org_enrich` (free on our plan) or `fullenrich_enrich_company`.
 - **A local-business detail** (the row has a `place_id` from a prior Google Maps pull) → `google_maps_place_details`.
@@ -1209,9 +1209,16 @@ _CELL_TOOL_DEFS: List[Dict[str, Any]] = [
             "Verified business email lookup via FullEnrich. Use when the row has "
             "first_name + last_name + domain and the column wants email. "
             "~1 cr per successful match (no charge on miss). "
-            "**Pass `linkedin_url` whenever the row has it** — FE's waterfall is "
-            "dramatically better with a LinkedIn URL; many contacts return empty "
-            "without it but DELIVERABLE with it."
+            "**Pass `linkedin_url` whenever the row has it** — FullEnrich's "
+            "waterfall is dramatically better with a LinkedIn URL; many "
+            "contacts return empty without it but DELIVERABLE with it.\n\n"
+            "**CRITICAL: if FullEnrich returns email=null, do NOT commit a "
+            "`firstname@domain` pattern guess as the answer.** Those addresses "
+            "LOOK like emails but they're guesses; users send campaigns and they "
+            "bounce. Commit null instead. One targeted web_search to find a "
+            "VERIFIED email on a real page is fine; pattern-guessing is not.\n\n"
+            "Load the `find_emails` skill for the full recipe (when to bail, "
+            "what CATCH_ALL vs DELIVERABLE means, etc.)."
         ),
         "parameters": {
             "type": "object",
