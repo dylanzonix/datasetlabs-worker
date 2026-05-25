@@ -244,8 +244,20 @@ async def _fullenrich_bulk_enrich(
     while elapsed < timeout_s:
         await asyncio.sleep(poll_interval_s)
         elapsed += poll_interval_s
-        async with httpx.AsyncClient(timeout=15) as client:
-            g = await client.get(f"{BASE}/api/v2/contact/enrich/bulk/{eid}", headers=headers)
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                g = await client.get(f"{BASE}/api/v2/contact/enrich/bulk/{eid}", headers=headers)
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+            # FE's poll endpoint sometimes lags past the 15s socket timeout
+            # — that's a transient backend slowdown, not a real failure.
+            # Without this catch the entire bulk enrich died on a single
+            # slow poll: stack bubbled out as 'cell tool
+            # fullenrich_enrich_email raised: httpx.ReadTimeout', cell
+            # agent treated it as a tool failure, model burned web_searches
+            # trying to recover. Just skip this poll and try again next
+            # iteration; the bulk job is still running FE-side.
+            log.warning("FE poll timeout (eid=%s elapsed=%ds) — retrying next interval: %s", eid, elapsed, e)
+            continue
         if g.status_code != 200:
             continue
         last_result = g.json() or {}
