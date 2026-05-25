@@ -361,6 +361,15 @@ async def _fullenrich_enrich_phone(args: Dict[str, Any], ctx: ToolContext) -> Tu
 
 
 async def _fullenrich_enrich_company(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
+    """Domain → company info via FullEnrich.
+
+    FE has no dedicated /company/enrich endpoint (the old wrapper hit
+    /api/v1/company/enrich which 404s on every call). Use /company/search
+    with a domain filter — same result for our purposes, returns the
+    LinkedIn-derived company record (description, year founded,
+    headcount, HQ address, company LinkedIn URL, industry).
+    Cost: 0.25 FE-credit (~$0.013) per returned company.
+    """
     import httpx
     api_key = os.getenv("FULLENRICH_API_KEY")
     if not api_key:
@@ -370,14 +379,39 @@ async def _fullenrich_enrich_company(args: Dict[str, Any], ctx: ToolContext) -> 
         return {"error": "domain is required"}, 0.0
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
-            "https://app.fullenrich.com/api/v1/company/enrich",
+            "https://app.fullenrich.com/api/v2/company/search",
             headers={"Authorization": f"Bearer {api_key}"},
-            json={"domain": domain},
+            json={
+                "domains": [{"value": domain, "exact_match": False, "exclude": False}],
+                "limit": 1,
+            },
         )
-        if r.status_code != 200:
-            return {"error": f"FE HTTP {r.status_code}"}, 0.0
-        data = (r.json() or {}).get("data") or {}
-    return data, 0.05
+    if r.status_code != 200:
+        return {"error": f"FE HTTP {r.status_code}: {r.text[:200]}"}, 0.0
+    data = r.json() or {}
+    cos = data.get("companies") or []
+    if not cos:
+        return {"company": None, "found": False}, 0.0
+    c = cos[0]
+    hq = ((c.get("locations") or {}).get("headquarters") or {})
+    linkedin = ((c.get("social_profiles") or {}).get("professional_network") or {}).get("url")
+    return {
+        "found": True,
+        "name": c.get("name"),
+        "domain": c.get("domain"),
+        "description": (c.get("description") or "")[:800] or None,
+        "year_founded": c.get("year_founded"),
+        "headcount": c.get("headcount"),
+        "headcount_range": c.get("headcount_range"),
+        "company_type": c.get("company_type"),
+        "industry": (c.get("industry") or {}).get("main_industry"),
+        "specialties": c.get("specialties") or None,
+        "hq_city": hq.get("city"),
+        "hq_region": hq.get("region"),
+        "hq_country": hq.get("country"),
+        "hq_address": hq.get("line1"),
+        "linkedin_url": linkedin,
+    }, 0.25 * 0.055
 
 
 async def _fullenrich_search_people(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
@@ -473,24 +507,35 @@ async def _fullenrich_search_people(args: Dict[str, Any], ctx: ToolContext) -> T
     for p in people:
         cur = (p.get("employment") or {}).get("current") or {}
         co = cur.get("company") or {}
-        # FE puts the person's LinkedIn URL under
-        # social_profiles.professional_network.url — NOT at a top-level
-        # `linkedin_url` field. The previous wrapper read the wrong path
-        # and returned None for every search, which made cells fall back
-        # to 2-3 web_searches per row to "find" a URL that was sitting
-        # right there in the FE response the whole time.
-        sp = p.get("social_profiles") or {}
-        prof = sp.get("professional_network") or {}
-        person_linkedin = prof.get("url")
+        # Person's LinkedIn URL lives under social_profiles, NOT a
+        # top-level linkedin_url field. Same shape for the employer's
+        # LinkedIn under company.social_profiles.
+        person_prof = ((p.get("social_profiles") or {}).get("professional_network") or {})
+        company_prof = ((co.get("social_profiles") or {}).get("professional_network") or {})
+        # job_functions is FE's STRUCTURED role classification — e.g.
+        # {function: "Executive & Leadership", sub_function: "Founder/Owner"}.
+        # More reliable than parsing the free-form title when the cell
+        # needs to confirm "is this actually a founder vs a senior IC".
+        job_functions = cur.get("job_functions") or []
         compact.append({
             "first_name": p.get("first_name"),
             "last_name": p.get("last_name"),
+            "full_name": p.get("full_name"),
             "title": cur.get("title"),
+            "description": (cur.get("description") or "")[:500] or None,
             "seniority": cur.get("seniority"),
-            "linkedin_url": person_linkedin,
+            "job_functions": job_functions if job_functions else None,
+            "start_at": cur.get("start_at"),
+            "is_current": cur.get("is_current"),
+            "linkedin_url": person_prof.get("url"),
             "location": p.get("location"),
             "employer_name": co.get("name"),
             "employer_domain": co.get("domain"),
+            "employer_industry": (co.get("industry") or {}).get("main_industry"),
+            "employer_headcount": co.get("headcount"),
+            "employer_headcount_range": co.get("headcount_range"),
+            "employer_year_founded": co.get("year_founded"),
+            "employer_linkedin_url": company_prof.get("url"),
         })
 
     return {
@@ -518,19 +563,51 @@ async def _apollo_org_enrich(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Di
         if r.status_code != 200:
             return {"error": f"apollo HTTP {r.status_code}"}, 0.0
         org = (r.json() or {}).get("organization") or {}
+    # Apollo /organizations/enrich returns ~56 fields. Surface the ones
+    # likely to fill enrichment columns directly; skip the noisy
+    # internal IDs (industry_tag_id, snippets_loaded, etc.) and
+    # high-volume sub-arrays the agent rarely needs (full funding_events
+    # list, suborganizations). When the agent needs something not
+    # listed below, it should ask for what column it's filling — we can
+    # extend this map without changing the contract.
     return {
         "name": org.get("name"),
+        "primary_domain": org.get("primary_domain"),
+        "website_url": org.get("website_url"),
         "estimated_num_employees": org.get("estimated_num_employees"),
         "industry": org.get("industry"),
+        "secondary_industries": org.get("secondary_industries"),
+        "keywords": (org.get("keywords") or [])[:30],
+        "naics_codes": org.get("naics_codes"),
+        "sic_codes": org.get("sic_codes"),
+        "annual_revenue": org.get("annual_revenue"),
         "annual_revenue_printed": org.get("annual_revenue_printed"),
+        "total_funding": org.get("total_funding"),
         "total_funding_printed": org.get("total_funding_printed"),
         "latest_funding_stage": org.get("latest_funding_stage"),
         "latest_funding_round_date": org.get("latest_funding_round_date"),
+        "publicly_traded_exchange": org.get("publicly_traded_exchange"),
+        "publicly_traded_symbol": org.get("publicly_traded_symbol"),
         "founded_year": org.get("founded_year"),
         "linkedin_url": org.get("linkedin_url"),
-        "short_description": (org.get("short_description") or "")[:500],
+        "twitter_url": org.get("twitter_url"),
+        "facebook_url": org.get("facebook_url"),
+        "angellist_url": org.get("angellist_url"),
+        "crunchbase_url": org.get("crunchbase_url"),
+        "logo_url": org.get("logo_url"),
+        "phone": org.get("sanitized_phone") or org.get("primary_phone") or org.get("phone"),
+        "street_address": org.get("street_address"),
+        "city": org.get("city"),
+        "state": org.get("state"),
+        "postal_code": org.get("postal_code"),
+        "country": org.get("country"),
+        "raw_address": org.get("raw_address"),
+        "short_description": (org.get("short_description") or "")[:500] or None,
         "current_technologies": [t.get("name") for t in (org.get("current_technologies") or [])][:30],
+        "technology_names": (org.get("technology_names") or [])[:30],
         "departmental_head_count": org.get("departmental_head_count"),
+        "retail_location_count": org.get("retail_location_count"),
+        "alexa_ranking": org.get("alexa_ranking"),
     }, 0.0  # organizations/enrich is request-quota-limited, not credit-billed
 
 
