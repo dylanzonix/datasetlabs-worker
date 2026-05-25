@@ -350,14 +350,23 @@ async def _fullenrich_enrich_phone(args: Dict[str, Any], ctx: ToolContext) -> Tu
     if "error" in result:
         return result, credits
     ci = result.get("contact_info") or {}
-    mp = ci.get("most_probable_work_phone") or {}
-    phone = mp.get("phone")
+    # FE's actual response shape:
+    #   most_probable_phone: {"number": "+33...", "region": "FR"}
+    #   phones: [{"number": "...", "region": "..."}, ...]
+    # The previous wrapper read `most_probable_work_phone` + `work_phones`
+    # + `personal_phones` — none of those keys exist in the response.
+    # Every phone enrichment was returning null even when FE had the
+    # phone. Read the actual field names + key (`number`, not `phone`).
+    mp = ci.get("most_probable_phone") or {}
+    phone = mp.get("number")
+    region = mp.get("region")
     if not phone:
-        for p in (ci.get("work_phones") or []) + (ci.get("personal_phones") or []):
-            if isinstance(p, dict) and p.get("phone"):
-                phone = p.get("phone")
+        for p in (ci.get("phones") or []):
+            if isinstance(p, dict) and p.get("number"):
+                phone = p.get("number")
+                region = p.get("region")
                 break
-    return {"phone": phone}, credits
+    return {"phone": phone, "region": region}, credits
 
 
 async def _fullenrich_enrich_company(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
