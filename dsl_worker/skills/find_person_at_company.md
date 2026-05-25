@@ -13,6 +13,28 @@ the *person* — founder, CEO, VP Sales, head of recruiting, owner, etc.
 single call returns name + title + seniority + LinkedIn URL directly.
 Web_search is the fallback when FE has nothing.
 
+### Trust FE as authoritative. Commit on the first hit.
+
+When `fullenrich_search_people` returns a `best_match` whose title is
+what the column wants (founder/CEO/owner/managing partner for a founder
+column; VP Sales for a sales column; etc.) and who's at the matching
+company — **commit them. Stop.** Don't call FE again "to see more." Don't
+web_search "to verify the LinkedIn URL" — FE returned the URL; that IS
+the verification. Don't web_search "to confirm the title" — FE returned
+the title.
+
+The dominant cost overrun across past projects is the model getting a
+clean FE hit on call 1 and then doing 2-5 extra calls (more FE, more web)
+to "verify" the answer it already has. Each web_search is ~$0.025 and
+chains add up. A clean founder lookup is **one FE call → commit, ~$0.04**.
+Don't pile on.
+
+You DO get to second-guess FE when:
+- `best_match` is null (no matching-company result) — try the fallbacks below.
+- `best_match` exists but title clearly doesn't match what the column wants
+  (e.g. column wants "Founder" and best_match is "Director of Marketing" —
+  FE may not have a founder indexed; try fallbacks).
+
 ### The cost shape
 
 FE charges 0.25 credit (~$0.013) per RETURNED person. So `limit` IS the

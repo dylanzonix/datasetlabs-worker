@@ -553,11 +553,42 @@ async def _fullenrich_search_people(args: Dict[str, Any], ctx: ToolContext) -> T
             "employer_linkedin_url": company_prof.get("url"),
         })
 
+    # Surface the strongest candidate as `best_match` instead of leaving
+    # it buried in `people[0]`. Naming the top result explicitly nudges
+    # the model to commit it rather than treating the response as "here's
+    # a few options, let me search more for comparison." A senior-title
+    # heuristic picks the best — anyone whose title contains founder/
+    # owner/ceo/president/managing partner wins; otherwise just the first
+    # post-filtered result.
+    SENIOR_HINTS = ("founder", "co-founder", "cofounder", "owner", "ceo",
+                    "chief executive", "president", "managing partner",
+                    "managing director")
+    best_idx: Optional[int] = None
+    for i, p in enumerate(compact):
+        t = (p.get("title") or "").lower()
+        if any(h in t for h in SENIOR_HINTS):
+            best_idx = i
+            break
+    if best_idx is None and compact:
+        best_idx = 0
+    best_match = compact[best_idx] if best_idx is not None else None
+    others = [p for i, p in enumerate(compact) if i != best_idx]
     return {
-        "people": compact,
+        "best_match": best_match,
+        "other_candidates": others,
         "count": len(compact),
         "total_in_db": meta.get("total"),
         "credits_used": credits_used,
+        "guidance": (
+            "If best_match has the role the column wants (founder/CEO/owner/etc.) "
+            "and is at the matching company, commit it. No need to search again or "
+            "web_search to verify — FE returned the LinkedIn URL and title; that IS "
+            "the verification."
+        ) if best_match else (
+            "No matching-company results. The company may not be in FE's LinkedIn "
+            "index, or your filter is too tight. Try one alternate (domain instead of "
+            "name, or drop titles), then fall to web_search or commit null."
+        ),
     }, cost_usd
 
 
