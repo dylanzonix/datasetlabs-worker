@@ -837,34 +837,24 @@ Omit `sources` entirely when the value came purely from reasoning over `row_visi
 - **Dates** → ISO 8601: `"2026-05-15"` or `"2026-05-15T10:30:00Z"`.
 - **URLs** → only commit a URL you actually visited and verified. Don't construct URLs from name slugs or guess identifiers; if you didn't open and read the page, return null.
 
-# Picking a tool
+# Picking a source
 
 If you have no tools at all, the answer must come from `row_visible_to_user` + `row_hidden_source_fields` alone. Reason carefully and call `final_result` directly.
 
-## Web data — strict escalation order
+You have several sources. Pick the one that BEST FITS what the column wants — don't default to web_search if a structured source covers the type. Multiple sources can succeed; if your first pick comes back empty, fall to another.
 
-Pick by *accessibility*, not by what the instruction sounds like. The rule is empirical: try the cheaper tool, if it gets the answer you're done, if not escalate.
+## Sources by what the column wants
 
-1. **`web_search`** — ALWAYS try this first. Native OpenAI web search, cheap, fast. Works for the vast majority of public web pages including most static / server-rendered content. Don't try to predict whether it'll work — just call it.
-2. **`apify_call_actor`** — only if `web_search` didn't return the data you need AND there's a platform-specific actor that covers the source (Reddit, LinkedIn, Twitter/X, Instagram, etc.). Use `apify_search_actors` + `apify_actor_details` to discover. Bounded to `maxItems=5` at cell level — for per-row lookups, not bulk fetching.
-3. **`browser_use`** — last resort. Only after both `web_search` and apify have failed (or there's no apify actor for the source). Real headless browser, expensive ($0.50–$3+ per session, sometimes more). This is for the cases where nothing else can reach the data — JS-only content with no server fallback, login walls, form interactions, infinite-scroll pages.
+- **A person at a company** (founder, owner, decision-maker, manager) → `fullenrich_search_people`. LinkedIn-derived people DB — one call returns name + title + LinkedIn URL. Don't web_search snippets for people when this is available.
+- **A verified email** for a known person (you have first_name + last_name + domain) → `fullenrich_enrich_email`. Pass `linkedin_url` when the row has it — gates a deeper waterfall.
+- **A verified phone** → `fullenrich_enrich_phone`. ~5 cr, only when the column explicitly asks for phone.
+- **Company data** (revenue, headcount, funding, tech stack, location) → `apollo_org_enrich` (free on our plan) or `fullenrich_enrich_company`.
+- **A local-business detail** (the row has a `place_id` from a prior Google Maps pull) → `google_maps_place_details`.
+- **Posts / comments / listings on a specific platform** (Reddit, X, LinkedIn, Instagram, Hacker News, etc.) → `apify_call_actor` with a platform-specific actor. Discover via `apify_search_actors` → `apify_actor_details`. Bounded to `maxItems=5` at cell level.
+- **Computation / parsing / regex** on existing row data → `code_exec`. Python sandbox, no network.
+- **An arbitrary fact on a web page** not covered above (a one-off detail, news, an "About" page lookup) → `web_search`. Cheap and fast for static / server-rendered content. The catch-all when no structured source fits — not the default.
 
-Do NOT pick `browser_use` predictively. Even if the instruction mentions a URL, even if the page sounds JS-heavy — try `web_search` first. It's cheap, and most of the time it works.
-
-## Known per-row API calls
-
-Use these when the row already has the inputs and the column wants the matching field. They're direct lookups, not searches:
-
-- **`fullenrich_search_people`** — search FullEnrich for people at a company by name/domain. Use when the column wants a person (founder, owner, decision-maker) and the row only gives a company. STRICTLY BETTER than web_search for B2B targets. Cost: ~$0.013 per RETURNED person — keep `limit` small (default 2). Start with `company_names` alone; add filters only on a second narrowing call. See the `find_person_at_company` skill for full recipe.
-- **`fullenrich_enrich_email`** — verified business email. Inputs: `first_name`, `last_name`, `domain`. ~0.5 cr.
-- **`fullenrich_enrich_phone`** — verified phone. Same inputs. **~5 cr — expensive**, only when the column explicitly asks for phone.
-- **`fullenrich_enrich_company`** — company-level enrichment. Input: `domain`. ~0.5 cr.
-- **`apollo_org_enrich`** — Apollo company data (headcount, revenue, funding, tech stack, etc.). Input: `domain`. ~1 cr.
-- **`google_maps_place_details`** — local business info. Input: `place_id` (must already be on the row from a prior Google Maps fetch).
-
-## Computation / parsing
-
-- **`code_exec`** — Python sandbox. For string parsing, math, regex, transforms on row data. No external network — pure compute only.
+If the first-choice source returns empty or wrong, escalate: tighten / loosen the filter on the same source, then fall to `web_search`. `browser_use` is a true last resort ($0.50+ per session) — only after web_search and apify have failed, or for login walls / JS-only pages with no other access. Never pick `browser_use` predictively from the instruction text.
 """
 
 
