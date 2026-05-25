@@ -380,6 +380,113 @@ async def _fullenrich_enrich_company(args: Dict[str, Any], ctx: ToolContext) -> 
     return data, 0.05
 
 
+async def _fullenrich_search_people(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
+    """Search FullEnrich for people at a company (LinkedIn-derived).
+
+    Per-row variant — returns a compact list of candidates inline (no
+    file writing). The cell agent picks the right person from the list
+    and commits the value. Used by the `find_people` skill.
+
+    Cost shape: FE charges ~1 credit (~$0.055) per RETURNED person, NOT
+    per call. So `limit` is the cost knob — keep it small (2-3) when
+    the column wants ONE specific person (founder, owner, CEO), bump
+    only when picking from a candidate pool. Hard-capped at 10 to
+    prevent accidental large pulls on per-row enrichment.
+    """
+    import httpx
+    api_key = os.getenv("FULLENRICH_API_KEY")
+    if not api_key:
+        return {"error": "FULLENRICH_API_KEY not configured"}, 0.0
+
+    # Build the filter shape FE's /people/search wants. Same param names
+    # as the orchestrator-side namespace (company_names, company_domains,
+    # titles, person_locations, seniority) so the skill instructions
+    # transfer 1:1.
+    def _str_filter(values: Any) -> Optional[List[Dict[str, Any]]]:
+        if not values:
+            return None
+        if isinstance(values, str):
+            values = [values]
+        out = [{"value": str(v), "exact_match": False, "exclude": False}
+               for v in values if str(v).strip()]
+        return out or None
+
+    filters: Dict[str, Any] = {}
+    for arg_key, api_key_name in [
+        ("company_names", "current_company_names"),
+        ("company_domains", "current_company_domains"),
+        ("titles", "current_position_titles"),
+        ("locations", "person_locations"),
+        ("seniority", "current_position_seniority_level"),
+    ]:
+        f = _str_filter(args.get(arg_key))
+        if f:
+            filters[api_key_name] = f
+    if not filters:
+        return {"error": "at least one of company_names/company_domains/titles is required"}, 0.0
+
+    # Tight default; hard cap. Each result is ~$0.055.
+    limit = int(args.get("limit") or 3)
+    limit = max(1, min(limit, 10))
+
+    body = {**filters, "limit": limit, "offset": 0}
+    async with httpx.AsyncClient(timeout=45) as client:
+        r = await client.post(
+            "https://app.fullenrich.com/api/v2/people/search",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json=body,
+        )
+    if r.status_code != 200:
+        return {"error": f"FE HTTP {r.status_code}: {r.text[:200]}"}, 0.0
+    data = r.json() or {}
+    people = data.get("people") or []
+    meta = data.get("metadata") or {}
+    credits_used = float(meta.get("credits_used") or len(people))
+    cost_usd = credits_used * 0.055
+
+    # Optional post-filter: FE's API has been observed to bleed
+    # cross-company results when company_names/domains is the filter.
+    # Drop rows whose CURRENT employer doesn't include the requested
+    # company string. Same logic as the orchestrator handler.
+    wanted_names = [str(v).strip().lower() for v in (args.get("company_names") or []) if str(v).strip()]
+    wanted_domains = [str(v).strip().lower() for v in (args.get("company_domains") or []) if str(v).strip()]
+    if wanted_names or wanted_domains:
+        kept = []
+        for p in people:
+            cur = (p.get("employment") or {}).get("current") or {}
+            co = cur.get("company") or {}
+            cname = (co.get("name") or "").lower()
+            cdom = (co.get("domain") or "").lower()
+            if any(w in cname for w in wanted_names) or any(w in cdom for w in wanted_domains):
+                kept.append(p)
+        people = kept
+
+    # Compact response — the cell agent doesn't need FE's full payload,
+    # just enough to pick a person and pass the chosen one's name/domain
+    # into a downstream enrich_contacts call.
+    compact = []
+    for p in people:
+        cur = (p.get("employment") or {}).get("current") or {}
+        co = cur.get("company") or {}
+        compact.append({
+            "first_name": p.get("first_name"),
+            "last_name": p.get("last_name"),
+            "title": cur.get("title"),
+            "seniority": cur.get("seniority"),
+            "linkedin_url": p.get("linkedin_url"),
+            "location": p.get("location"),
+            "employer_name": co.get("name"),
+            "employer_domain": co.get("domain"),
+        })
+
+    return {
+        "people": compact,
+        "count": len(compact),
+        "total_in_db": meta.get("total"),
+        "credits_used": credits_used,
+    }, cost_usd
+
+
 async def _apollo_org_enrich(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
     import httpx
     api_key = os.getenv("APOLLO_API_KEY")
@@ -660,6 +767,7 @@ async def _load_skill_cell(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict
 
 
 CELL_TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any], ToolContext], Awaitable[Tuple[Dict[str, Any], float]]]] = {
+    "fullenrich_search_people": _fullenrich_search_people,
     "fullenrich_enrich_email": _fullenrich_enrich_email,
     "fullenrich_enrich_phone": _fullenrich_enrich_phone,
     "fullenrich_enrich_company": _fullenrich_enrich_company,
@@ -742,6 +850,7 @@ Do NOT pick `browser_use` predictively. Even if the instruction mentions a URL, 
 
 Use these when the row already has the inputs and the column wants the matching field. They're direct lookups, not searches:
 
+- **`fullenrich_search_people`** — search FullEnrich for people at a company by name/domain. Use when the column wants a person (founder, owner, decision-maker) and the row only gives a company. STRICTLY BETTER than web_search for B2B targets. Cost: ~$0.05 per RETURNED person — keep `limit` small (default 3). Start with `company_names` alone; add filters only on a second narrowing call. See the `find_people` skill for full recipe.
 - **`fullenrich_enrich_email`** — verified business email. Inputs: `first_name`, `last_name`, `domain`. ~0.5 cr.
 - **`fullenrich_enrich_phone`** — verified phone. Same inputs. **~5 cr — expensive**, only when the column explicitly asks for phone.
 - **`fullenrich_enrich_company`** — company-level enrichment. Input: `domain`. ~0.5 cr.
@@ -912,6 +1021,63 @@ _CELL_TOOL_DEFS: List[Dict[str, Any]] = [
                 },
             },
             "required": ["url", "task"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "fullenrich_search_people",
+        "description": (
+            "Search FullEnrich (LinkedIn-derived people DB) for people at a "
+            "specific company. Use when the column wants a *person* (founder, "
+            "owner, decision-maker, manager) and the row only gives you a "
+            "company name/domain. **Strictly better than web_search for B2B / "
+            "white-collar targets**: structured results with title, seniority, "
+            "linkedin URL, employer — no snippet parsing.\n\n"
+            "**Cost: ~1 credit (~$0.05) per RETURNED person, not per call.** "
+            "So `limit` IS the cost knob. Default to limit=2-3 when picking ONE "
+            "specific person (founder/CEO); bump to 5-10 only when picking from "
+            "a candidate pool. Hard-capped at 10.\n\n"
+            "**Keep filters MINIMAL.** Start with `company_names` ALONE — adding "
+            "titles/seniority/locations on the first call often returns 0. Strip "
+            "corporate suffixes (Inc, LLC, Corp, Companies, Group) before passing "
+            "company_names. Returns 0 → try `company_domains`. Both 0 → company "
+            "not in FE's LinkedIn index (typically local businesses); fall to "
+            "web_search."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "company_names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Company name(s). Strip Inc/LLC/Corp/Companies/Group/Holdings before passing.",
+                },
+                "company_domains": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional. Domain fallback when company_names returns 0.",
+                },
+                "titles": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional. ONLY add as a second-call narrowing pass after a no-titles search returned >10.",
+                },
+                "locations": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional. City/region to narrow national parents to a footprint.",
+                },
+                "seniority": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional. C-Level, VP, Director, Manager, Senior, Entry. Rarely needed.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max people to return. Defaults to 3. Each result costs ~$0.05; keep small.",
+                },
+            },
             "additionalProperties": False,
         },
     },
