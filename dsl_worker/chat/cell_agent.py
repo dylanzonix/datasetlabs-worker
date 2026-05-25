@@ -473,12 +473,21 @@ async def _fullenrich_search_people(args: Dict[str, Any], ctx: ToolContext) -> T
     for p in people:
         cur = (p.get("employment") or {}).get("current") or {}
         co = cur.get("company") or {}
+        # FE puts the person's LinkedIn URL under
+        # social_profiles.professional_network.url — NOT at a top-level
+        # `linkedin_url` field. The previous wrapper read the wrong path
+        # and returned None for every search, which made cells fall back
+        # to 2-3 web_searches per row to "find" a URL that was sitting
+        # right there in the FE response the whole time.
+        sp = p.get("social_profiles") or {}
+        prof = sp.get("professional_network") or {}
+        person_linkedin = prof.get("url")
         compact.append({
             "first_name": p.get("first_name"),
             "last_name": p.get("last_name"),
             "title": cur.get("title"),
             "seniority": cur.get("seniority"),
-            "linkedin_url": p.get("linkedin_url"),
+            "linkedin_url": person_linkedin,
             "location": p.get("location"),
             "employer_name": co.get("name"),
             "employer_domain": co.get("domain"),
