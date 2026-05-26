@@ -25,18 +25,32 @@ fullenrich_enrich_email(
 )
 ```
 
-The response gives `{email, verification_status}`. Outcomes:
+The response gives `{email, verification_status, commit}`.
 
-- **email + status=DELIVERABLE** → commit the email. Done.
-- **email + status=CATCH_ALL** → commit the email; this is the company's
-  catch-all — works for outreach but isn't strictly verified.
-- **email + status=INVALID** → commit null. FullEnrich found a candidate
-  address but it bounces.
-- **email=null** → FullEnrich's waterfall didn't find a personal email.
-  You can do ONE targeted web_search (`"<full name>" "<company>" email`)
-  if the row strongly implies an email should exist. If web_search
-  surfaces a real verified email on a page you can cite, commit it.
-  Otherwise commit null.
+**If `commit: true` — commit the email. Don't web_search to verify.**
+
+The wrapper sets `commit: true` for the two FullEnrich statuses that
+are safe to send (DELIVERABLE = 1% bounce, HIGH_PROBABILITY = 9%
+bounce). The most common non-DELIVERABLE return is HIGH_PROBABILITY
+(FullEnrich found the email via its waterfall but couldn't 100%
+verify the mailbox actively accepts mail). Treat both the same:
+commit the email, done. Don't web_search to "confirm" — the wrapper
+already told you it's safe. Past failure: model got HIGH_PROBABILITY,
+didn't trust it, burned 4 web_searches + a browser_use, committed
+null. The email was right the whole time.
+
+**If `commit: false`** the candidate is either missing, INVALID
+(verified bounce, ~100%), or CATCH_ALL (server accepts everything,
+~26% bounce — too risky for cold outbound at scale). Treat as no
+email found. ONE targeted web_search (`"<full name>" "<company>"
+email`) is fine if you want one more angle. Commit only what
+web_search surfaces on a real cite-able page. Otherwise null.
+
+Full status reference (per FullEnrich docs):
+- DELIVERABLE — 1% bounce, safe (commit:true)
+- HIGH_PROBABILITY — 9% bounce, usually safe (commit:true)
+- CATCH_ALL — 26% bounce, too risky for cold outbound (commit:false)
+- INVALID — verified bounce (commit:false)
 
 ### NEVER commit a pattern guess as verified
 

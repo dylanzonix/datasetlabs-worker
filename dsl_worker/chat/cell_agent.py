@@ -335,9 +335,30 @@ async def _fullenrich_enrich_email(args: Dict[str, Any], ctx: ToolContext) -> Tu
                 email = e.get("email")
                 status = e.get("status")
                 break
+    # Map FullEnrich's verification_status enum to a clear commit signal
+    # so the model doesn't have to interpret it. Per FE's official docs
+    # (help.fullenrich.com/en/articles/9377499):
+    #   DELIVERABLE       — 1%  bounce — safe to send
+    #   HIGH_PROBABILITY  — 9%  bounce — usually safe
+    #   CATCH_ALL         — 26% bounce — "depends"
+    #   INVALID           —     bounce — do not send
+    #
+    # For cold outbound at scale, anything above ~2% bounce kills the
+    # sender's deliverability (ISPs flag the domain). So commit only on
+    # DELIVERABLE + HIGH_PROBABILITY. CATCH_ALL and INVALID return as
+    # commit:false so the cell agent treats them as no-email-found.
+    #
+    # Without this explicit map the model silently dropped
+    # HIGH_PROBABILITY results (FE's most common non-DELIVERABLE return)
+    # as "not verified enough" and committed null after burning
+    # web_searches trying to verify, even when FE returned the right
+    # email at 9% bounce.
+    SAFE_STATUSES = {"DELIVERABLE", "HIGH_PROBABILITY"}
+    should_commit = email is not None and (status or "").upper() in SAFE_STATUSES
     return {
         "email": email,
         "verification_status": status,
+        "commit": should_commit,
     }, credits
 
 
@@ -1212,13 +1233,19 @@ _CELL_TOOL_DEFS: List[Dict[str, Any]] = [
             "**Pass `linkedin_url` whenever the row has it** — FullEnrich's "
             "waterfall is dramatically better with a LinkedIn URL; many "
             "contacts return empty without it but DELIVERABLE with it.\n\n"
-            "**CRITICAL: if FullEnrich returns email=null, do NOT commit a "
-            "`firstname@domain` pattern guess as the answer.** Those addresses "
-            "LOOK like emails but they're guesses; users send campaigns and they "
-            "bounce. Commit null instead. One targeted web_search to find a "
-            "VERIFIED email on a real page is fine; pattern-guessing is not.\n\n"
-            "Load the `find_emails` skill for the full recipe (when to bail, "
-            "what CATCH_ALL vs DELIVERABLE means, etc.)."
+            "**Response semantics:** the wrapper returns `{email, "
+            "verification_status, commit}`. If `commit: true`, JUST COMMIT THE "
+            "EMAIL — don't web_search to 'verify' it, don't second-guess the "
+            "status. FullEnrich runs a multi-provider waterfall; if it surfaces "
+            "an email with anything other than INVALID, it's usable (DELIVERABLE, "
+            "HIGH_PROBABILITY, and CATCH_ALL all count). The model previously "
+            "wasted budget on web_search trying to confirm HIGH_PROBABILITY "
+            "results that were already the right answer.\n\n"
+            "**If `commit: false`** (no email or INVALID status), do NOT pattern-"
+            "guess `firstname@domain` and commit it as the answer. Those LOOK "
+            "like emails but bounce. Commit null. One targeted web_search to find "
+            "a VERIFIED email on a real page is fine before nulling.\n\n"
+            "See the `find_emails` skill for fuller recipe."
         ),
         "parameters": {
             "type": "object",
