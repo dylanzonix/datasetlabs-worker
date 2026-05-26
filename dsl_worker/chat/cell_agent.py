@@ -340,21 +340,22 @@ async def _fullenrich_enrich_email(args: Dict[str, Any], ctx: ToolContext) -> Tu
     # (help.fullenrich.com/en/articles/9377499):
     #   DELIVERABLE       — 1%  bounce — safe to send
     #   HIGH_PROBABILITY  — 9%  bounce — usually safe
-    #   CATCH_ALL         — 26% bounce — "depends"
+    #   CATCH_ALL         — 26% bounce — depends
     #   INVALID           —     bounce — do not send
     #
-    # For cold outbound at scale, anything above ~2% bounce kills the
-    # sender's deliverability (ISPs flag the domain). So commit only on
-    # DELIVERABLE + HIGH_PROBABILITY. CATCH_ALL and INVALID return as
-    # commit:false so the cell agent treats them as no-email-found.
+    # Commit everything FE surfaced EXCEPT INVALID. CATCH_ALL gets
+    # committed because email_verify_hook fires Scrubby (real-time SMTP
+    # probe) on every email-column commit; Scrubby is more rigorous than
+    # FE's CATCH_ALL classification and will null any cell that actually
+    # bounces, so the high-bounce risk on raw CATCH_ALL is contained.
     #
     # Without this explicit map the model silently dropped
     # HIGH_PROBABILITY results (FE's most common non-DELIVERABLE return)
     # as "not verified enough" and committed null after burning
     # web_searches trying to verify, even when FE returned the right
     # email at 9% bounce.
-    SAFE_STATUSES = {"DELIVERABLE", "HIGH_PROBABILITY"}
-    should_commit = email is not None and (status or "").upper() in SAFE_STATUSES
+    INVALID_STATUSES = {"INVALID"}
+    should_commit = email is not None and (status or "").upper() not in INVALID_STATUSES
     return {
         "email": email,
         "verification_status": status,

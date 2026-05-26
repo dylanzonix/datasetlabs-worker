@@ -39,17 +39,18 @@ already told you it's safe. Past failure: model got HIGH_PROBABILITY,
 didn't trust it, burned 4 web_searches + a browser_use, committed
 null. The email was right the whole time.
 
-**If `commit: false`** the candidate is either missing, INVALID
-(verified bounce, ~100%), or CATCH_ALL (server accepts everything,
-~26% bounce — too risky for cold outbound at scale). Treat as no
-email found. ONE targeted web_search (`"<full name>" "<company>"
-email`) is fine if you want one more angle. Commit only what
-web_search surfaces on a real cite-able page. Otherwise null.
+**If `commit: false`** the candidate is either missing or INVALID
+(verified bounce). Treat as no email found. ONE targeted web_search
+(`"<full name>" "<company>" email`) is fine if you want one more
+angle. Commit only what web_search surfaces on a real cite-able
+page. Otherwise null.
 
 Full status reference (per FullEnrich docs):
 - DELIVERABLE — 1% bounce, safe (commit:true)
 - HIGH_PROBABILITY — 9% bounce, usually safe (commit:true)
-- CATCH_ALL — 26% bounce, too risky for cold outbound (commit:false)
+- CATCH_ALL — 26% bounce on raw FE; we commit anyway because Scrubby
+  (real-time SMTP probe) fires automatically after every email cell
+  and nulls anything that actually bounces (commit:true)
 - INVALID — verified bounce (commit:false)
 
 ### NEVER commit a pattern guess as verified
