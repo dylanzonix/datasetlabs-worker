@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
 
 log = logging.getLogger(__name__)
@@ -661,22 +661,95 @@ def _filters_to_where_sql(filters):
     return fragments, params
 
 
-@router.get("/projects/{project_id}/tables/{table_id}/distinct")
-def table_column_distinct(
-    project_id: UUID,
+def _distinct_from_materialized(
+    db: Session,
     table_id: str,
-    column: str = Query(..., min_length=1),
-    limit: int = 200,
-    user: CurrentUser = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """Distinct values + counts for one column across the *unfiltered* table.
-    Used by the filter UI so that a value the user just filtered out still
-    appears in the checkbox list (and shows its count)."""
-    _verify_project(project_id, user.user_id, db)
-    tid = _resolve_table_uuid(db, str(project_id), table_id)
-    if not tid:
-        raise HTTPException(404, "Table not found")
+    columns: List[str],
+    limit: int,
+) -> Optional[Dict[str, Dict[str, Any]]]:
+    """Read top-N distinct values per column from table_column_value.
+
+    The TOP-N list comes from the materialized table (fast). The
+    empty_count is computed via a direct COUNT against samples — sum
+    of materialized counts is unreliable when a column was filled via
+    a write path that bypassed materialize-on-write (legacy cell
+    writes pre-hook, or any path we haven't instrumented yet).
+    `total` is total rows.
+
+    Returns None when the table has zero materialized rows AND zero
+    samples — i.e. caller should still fall through to the live scan
+    for the values list. For tables with samples but no materialized
+    rows, we return per-column dicts with empty values lists; the FE
+    still gets correct empty_count + total.
+    """
+    rows = db.execute(
+        sa_text(
+            "SELECT column_name, value, count FROM table_column_value "
+            "WHERE table_id = CAST(:tid AS uuid) "
+            "  AND column_name = ANY(:cols)"
+        ),
+        {"tid": table_id, "cols": columns},
+    ).fetchall()
+    total_row = db.execute(
+        sa_text(
+            "SELECT COUNT(*) FROM samples "
+            "WHERE table_id = CAST(:tid AS uuid) AND deleted_at IS NULL"
+        ),
+        {"tid": table_id},
+    ).fetchone()
+    table_total = int(total_row[0]) if total_row else 0
+
+    # Nothing materialized AND no rows → live-scan fallback. If there
+    # ARE rows but no materialized values, we still return a result
+    # (top-N list will be empty, but empty_count is computed below
+    # and is accurate). That's better than falling back to the slow
+    # GROUP BY scan for a brand-new table.
+    if not rows and table_total == 0:
+        return None
+
+    bucket: Dict[str, List[Tuple[str, int]]] = {c: [] for c in columns}
+    for col, val, cnt in rows:
+        if col in bucket:
+            bucket[col].append((val, int(cnt)))
+
+    # Compute empty_count via a direct COUNT per column. We do this
+    # because materialize-on-write has gaps (cells written before the
+    # hook landed, or via write paths we haven't instrumented). A
+    # filter dropdown showing "996 empty" when there are 145 emails is
+    # worse than a slightly slower call. One COUNT per column on a
+    # samples table with table_id index is ~5-15ms.
+    empty_counts: Dict[str, int] = {}
+    for col in columns:
+        col_esc = col.replace("'", "''")
+        empty_row = db.execute(
+            sa_text(
+                f"SELECT COUNT(*) FROM samples "
+                f"WHERE table_id = CAST(:tid AS uuid) AND deleted_at IS NULL "
+                f"  AND (row->>'{col_esc}' IS NULL OR row->>'{col_esc}' = '')"
+            ),
+            {"tid": table_id},
+        ).fetchone()
+        empty_counts[col] = int(empty_row[0]) if empty_row else 0
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for col in columns:
+        sorted_vals = sorted(bucket[col], key=lambda p: (-p[1], p[0]))[:limit]
+        out[col] = {
+            "values": [{"value": v, "count": c} for v, c in sorted_vals],
+            "empty_count": empty_counts[col],
+            "total": table_total,
+        }
+    return out
+
+
+def _distinct_live_scan(
+    db: Session,
+    table_id: str,
+    column: str,
+    limit: int,
+) -> Dict[str, Any]:
+    """Fallback path for tables whose materialized rows haven't been
+    backfilled yet. Same query as the original endpoint."""
     col_esc = column.replace("'", "''")
     rows = db.execute(
         sa_text(
@@ -684,9 +757,9 @@ def table_column_distinct(
             f"FROM samples WHERE table_id = :tid AND deleted_at IS NULL "
             f"GROUP BY v ORDER BY c DESC, v ASC LIMIT :lim"
         ),
-        {"tid": tid, "lim": limit},
+        {"tid": table_id, "lim": limit},
     ).fetchall()
-    values = []
+    values: List[Dict[str, Any]] = []
     empty_count = 0
     total = 0
     for v, c in rows:
@@ -696,11 +769,64 @@ def table_column_distinct(
         else:
             values.append({"value": v, "count": c})
     return {
-        "column": column,
         "values": values,
         "empty_count": empty_count,
         "total": total,
     }
+
+
+@router.get("/projects/{project_id}/tables/{table_id}/distinct")
+def table_column_distinct(
+    project_id: UUID,
+    table_id: str,
+    column: str = Query(..., min_length=1),
+    limit: int = 200,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Distinct values + counts for one column. Reads from the
+    materialized table_column_value, falls back to a live scan when
+    the table hasn't been backfilled yet."""
+    _verify_project(project_id, user.user_id, db)
+    tid = _resolve_table_uuid(db, str(project_id), table_id)
+    if not tid:
+        raise HTTPException(404, "Table not found")
+    materialized = _distinct_from_materialized(db, tid, [column], limit)
+    if materialized is not None:
+        m = materialized[column]
+        return {"column": column, **m}
+    out = _distinct_live_scan(db, tid, column, limit)
+    return {"column": column, **out}
+
+
+@router.get("/projects/{project_id}/tables/{table_id}/distinct-batch")
+def table_column_distinct_batch(
+    project_id: UUID,
+    table_id: str,
+    columns: str = Query(..., description="Comma-separated column names"),
+    limit: int = 200,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Distinct values for many columns in one round-trip. The filter
+    panel calls this on open so it doesn't fan out N requests as the
+    user expands each accordion."""
+    _verify_project(project_id, user.user_id, db)
+    tid = _resolve_table_uuid(db, str(project_id), table_id)
+    if not tid:
+        raise HTTPException(404, "Table not found")
+    col_list = [c.strip() for c in (columns or "").split(",") if c.strip()]
+    if not col_list:
+        return {"columns": {}}
+    materialized = _distinct_from_materialized(db, tid, col_list, limit)
+    if materialized is not None:
+        return {"columns": materialized}
+    # Fallback: live-scan each column. Slower but still single round-trip
+    # to the FE — the per-column queries run sequentially in this handler.
+    out: Dict[str, Dict[str, Any]] = {}
+    for col in col_list:
+        out[col] = _distinct_live_scan(db, tid, col, limit)
+    return {"columns": out}
 
 
 @router.get("/projects/{project_id}/samples/{sample_id}/source-record")

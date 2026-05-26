@@ -211,20 +211,47 @@ async def _fullenrich_bulk_enrich(
     # retries at the LLM level (burns web_search budget on fallback), and
     # eventually hits its per-row cap with no email found. Single retry
     # bounds the slow path to ~2×timeout = ~60s worst case.
+    #
+    # Also handles HTTP 429 (rate limit). FE limits the SUBMIT endpoint
+    # aggressively when many cells fire at once (25 concurrent cells × N
+    # enrichment_run jobs = bursts that trip the limiter). Until 2026-05-26
+    # we returned the 429 directly to the cell agent, which fell back to
+    # web_search and committed null even though the email was findable on
+    # a normal call. Now we honor Retry-After (capped at 70s) and retry
+    # up to 3 times before giving up.
     r = None
     last_err: Optional[Exception] = None
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             async with httpx.AsyncClient(timeout=60) as client:
                 r = await client.post(
                     f"{BASE}/api/v2/contact/enrich/bulk",
                     headers=headers, json=body,
                 )
+            if r.status_code == 429:
+                # FE message looks like: "Too many requests. Try again in 1m"
+                # Retry-After header is the canonical signal but FE doesn't
+                # always send it; default to 65s which covers the 1m bucket.
+                retry_after_s = 65
+                ra = r.headers.get("Retry-After")
+                if ra:
+                    try:
+                        retry_after_s = min(70, max(5, int(ra)))
+                    except ValueError:
+                        pass
+                log.warning(
+                    "FE submit HTTP 429 on attempt %d — waiting %ds then retrying",
+                    attempt + 1, retry_after_s,
+                )
+                if attempt < 2:
+                    await asyncio.sleep(retry_after_s)
+                    continue
+                # final attempt also failed → fall through to error path below
             break
         except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
             last_err = e
             log.warning(
-                "FE submit timeout on attempt %d: %s — retrying" if attempt == 0
+                "FE submit timeout on attempt %d: %s — retrying" if attempt < 2
                 else "FE submit timeout on attempt %d: %s — giving up",
                 attempt + 1, e,
             )
@@ -239,11 +266,19 @@ async def _fullenrich_bulk_enrich(
     # Poll. Single-contact bulk runs typically finish in 30-60s. Beyond
     # timeout_s, give up and charge nothing (user shouldn't pay for our
     # poll budget running out).
-    elapsed = 0
+    #
+    # Budget against WALL TIME via time.monotonic(), not iteration count.
+    # The old `elapsed += poll_interval_s` undercounted whenever a poll
+    # hit the 15s httpx timeout: each iteration took up to 20s wall time
+    # but only credited 5s of the budget. With FE lagging, that meant
+    # cells could run for 30-40min before the 600s "budget" caught up.
+    # Confirmed against the 11 cells in job 9620671a stuck at 13-18min
+    # (elapsed counter was at ~200s when reaped).
+    import time as _time
+    deadline = _time.monotonic() + timeout_s
     last_result: Dict[str, Any] = {}
-    while elapsed < timeout_s:
+    while _time.monotonic() < deadline:
         await asyncio.sleep(poll_interval_s)
-        elapsed += poll_interval_s
         try:
             async with httpx.AsyncClient(timeout=15) as client:
                 g = await client.get(f"{BASE}/api/v2/contact/enrich/bulk/{eid}", headers=headers)
@@ -256,7 +291,11 @@ async def _fullenrich_bulk_enrich(
             # agent treated it as a tool failure, model burned web_searches
             # trying to recover. Just skip this poll and try again next
             # iteration; the bulk job is still running FE-side.
-            log.warning("FE poll timeout (eid=%s elapsed=%ds) — retrying next interval: %s", eid, elapsed, e)
+            remaining = max(0, int(deadline - _time.monotonic()))
+            log.warning(
+                "FE poll timeout (eid=%s, %ds remaining) — retrying next interval: %s",
+                eid, remaining, e,
+            )
             continue
         if g.status_code != 200:
             continue

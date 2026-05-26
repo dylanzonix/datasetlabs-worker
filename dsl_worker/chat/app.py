@@ -39,6 +39,8 @@ from dsl_worker.chat.routes import router as chat_router
 from dsl_worker.chat.routes_actions import router as chat_actions_router
 from dsl_worker.chat.routes_table_edit import router as chat_table_edit_router
 from dsl_worker.chat.routes_tablepage import router as chat_tablepage_router
+from dsl_worker.chat.routes_enrichment_jobs import router as enrichment_jobs_router
+from dsl_worker.chat.enrichment_jobs import get_coordinator
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -100,6 +102,7 @@ app.include_router(chat_router)
 app.include_router(chat_actions_router)
 app.include_router(chat_table_edit_router)
 app.include_router(chat_tablepage_router)
+app.include_router(enrichment_jobs_router)
 
 
 @app.on_event("startup")
@@ -126,8 +129,16 @@ async def _on_startup() -> None:
     # heartbeat going stale, instead of waiting for the next worker
     # restart (could be hours).
     asyncio.create_task(run_state.orphan_recovery_loop(), name="chat-orphan-reaper")
+    # Durable enrichment job coordinator: claims queued tasks (FOR
+    # UPDATE SKIP LOCKED), runs under Semaphore(25), publishes events.
+    # Browser refresh / network drops survive because state lives in PG.
+    await get_coordinator().start()
 
 
 @app.on_event("shutdown")
 async def _on_shutdown() -> None:
+    try:
+        await get_coordinator().stop()
+    except Exception:
+        log.exception("coordinator shutdown raised; suppressed")
     tracing.flush()

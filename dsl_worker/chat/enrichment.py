@@ -939,6 +939,23 @@ async def _run_enrichment_on_rows(
                         sa_text("UPDATE samples SET row=CAST(:row AS jsonb) WHERE id=:sid"),
                         {"row": json.dumps(final), "sid": sample_id},
                     )
+                # Materialize-on-write: maintain table_column_value counts
+                # so the filter dropdowns stay accurate as agent-triggered
+                # cells fill. Same column set the new coordinator uses.
+                try:
+                    from dsl_worker.chat.enrichment_jobs import (
+                        _column_diff,
+                        _apply_column_value_deltas,
+                    )
+                    deltas = _column_diff(fresh_row, final, target_cols)
+                    if deltas:
+                        _apply_column_value_deltas(ctx.db, table_id, deltas)
+                except Exception:
+                    log.warning(
+                        "materialize column-value deltas failed for %s; suppressed",
+                        sample_id,
+                        exc_info=True,
+                    )
                 # Keep `merged` + `existing_status` for downstream code
                 # (cell_filled SSE payload, email verify hook). `final`
                 # is value_delta layered over a fresh snapshot — what
