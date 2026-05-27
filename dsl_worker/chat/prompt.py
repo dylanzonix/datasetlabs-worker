@@ -609,19 +609,52 @@ When you call `enrichment_set` to classify rows into relevant/irrelevant, hire/n
 ## apollo_companies
 **Default `n=1000` on apollo_companies.** Apollo search is free on our plan (no per-record charge), so always pass a high `n` unless the user explicitly asks for a sample. The agent gets more headroom for downstream filtering / dedup at zero data cost. Drop `n` only if the user said "show me a few" or similar.
 ```
+# Location
 organization_locations: ["San Francisco", "California"]
 organization_not_locations: ["..."]
+
+# Headcount + revenue
 organization_num_employees_ranges: ["11,50", "51,200"]
 revenue_range: {min: 1000000, max: 50000000}
-q_organization_keyword_tags: ["artificial intelligence"]
-currently_using_any_of_technology_uids: ["aws", "react"]
+
+# Industry filters — prefer STRICT industry filters over loose keyword_tags
+# whenever the user names specific industries.
+organization_industries: ["Retail", "Manufacturing"]   # STRICT, Apollo's exact industry names
+organization_industry_tag_ids: ["5567cd47..."]         # if you have hash IDs (rare)
+organization_naics_codes: ["722511"]                   # NAICS code filter (very strict)
+organization_sic_codes: ["7372"]                       # SIC code filter
+q_organization_keyword_tags: ["artificial intelligence"]  # LOOSE — fuzzy keyword match on company descriptions
+
+# Company age
+organization_founded_year_range: {min: "2010", max: "2020"}
+
+# Tech stack
+currently_using_any_of_technology_uids: ["aws", "react"]    # OR semantics
+currently_using_all_of_technology_uids: ["salesforce","hubspot"]  # AND semantics
+
+# Funding
 latest_funding_amount_range: {min, max}
 latest_funding_date_range: {min: "2024-01-01", max: "2026-01-01"}
-q_organization_job_titles: ["DevOps Engineer"]   # active hiring signal
-organization_num_jobs_range: {min: 3, max: 50}   # active hiring signal
+total_funding_range: {min, max}
+organization_latest_funding_stage_cd: ["0"]   # "0"=Seed "1"=Series A "2"=Series B "3"=Series C+
+
+# Active hiring signals
+q_organization_job_titles: ["DevOps Engineer"]
+organization_num_jobs_range: {min: 3, max: 50}
+organization_job_posted_at_range: {min: "2026-01-01", max: "2026-12-31"}
+organization_job_locations: ["San Francisco"]
+
+# By identity
 q_organization_domains_list: ["anthropic.com"]
+q_organization_name: "anthropic"
+organization_ids: ["54a1216..."]                # Apollo's internal org IDs
+
 page: 1, per_page: 100
 ```
+
+**Industry-filter rule of thumb:** when the user says "in Retail / Manufacturing / Auto / etc.", use `organization_industries` with Apollo's industry names. Do NOT use `q_organization_keyword_tags` for industry filtering — that one fuzzy-matches the company's description text and lets unrelated companies (Figma, Coinbase, Pinterest) through because their copy happens to mention the keyword.
+
+**Apollo's public API limitations:** company-type (public/private), growth score, hiring-by-function, and intent signals are visible in Apollo's UI but NOT exposed on the `/mixed_companies/search` endpoint. If a query requires those, add a post-enrichment column (web_search + LLM filter) rather than trying to pass an Apollo filter.
 
 ## fullenrich_people
 Send bare arrays of strings — the server auto-wraps to FE's {value, exact_match, exclude} shape. Use either friendly or canonical names; both work.

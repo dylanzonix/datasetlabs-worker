@@ -49,7 +49,13 @@ DEFAULT_COLUMNS = [
 
 # Fields the agent can use in query_params. Anything not in this set is
 # rejected at validation time with an actionable hint.
+#
+# Each param below has been empirically confirmed via Apollo's API
+# (verified by checking that the param actually changes total_entries).
+# Apollo's public docs list ~17 params; the rest are undocumented but
+# functional — discovered by probing the /mixed_companies/search endpoint.
 ALLOWED_PARAMS = {
+    # --- documented & widely used ---
     "organization_locations",
     "organization_not_locations",
     "organization_num_employees_ranges",
@@ -64,8 +70,31 @@ ALLOWED_PARAMS = {
     "organization_job_posted_at_range",
     "q_organization_domains_list",
     "q_organization_name",
+    "organization_ids",
+    "organization_job_locations",
     "page",
     "per_page",
+    # --- undocumented but empirically working (added 2026-05-26) ---
+    # Strict industry filters — vastly more precise than the loose
+    # q_organization_keyword_tags. Use these whenever the user names
+    # a specific industry/sector. ID-form takes Apollo hash IDs.
+    "organization_industries",
+    "organization_industry_tag_ids",
+    # Founding-year window. {min: "2010", max: "2020"} string years.
+    "organization_founded_year_range",
+    # NAICS / SIC industry codes — public standardized classification.
+    # Strict and reliable when the user supplies/asks for code-based
+    # industry targeting.
+    "organization_naics_codes",
+    "organization_sic_codes",
+    # Latest funding stage as Apollo string code (e.g. "0"=Seed,
+    # "1"=Series A, "2"=Series B, ...). Use sparingly until we ship a
+    # friendly name → code resolver.
+    "organization_latest_funding_stage_cd",
+    # AND-semantics tech filter — every company must use every listed
+    # technology. Pair with the OR variant (currently_using_any_of_...)
+    # when you want strict-fit vs broad-match.
+    "currently_using_all_of_technology_uids",
 }
 
 
@@ -107,7 +136,8 @@ class ApolloCompaniesAdapter(SourceAdapter):
             "organization_num_employees_ranges": "Headcount",
             "revenue_range": "Revenue",
             "q_organization_keyword_tags": "Keywords",
-            "currently_using_any_of_technology_uids": "Tech stack",
+            "currently_using_any_of_technology_uids": "Tech stack (any of)",
+            "currently_using_all_of_technology_uids": "Tech stack (all of)",
             "latest_funding_amount_range": "Latest funding amount",
             "latest_funding_date_range": "Latest funding date",
             "total_funding_range": "Total funding",
@@ -116,6 +146,14 @@ class ApolloCompaniesAdapter(SourceAdapter):
             "organization_job_posted_at_range": "Jobs posted",
             "q_organization_domains_list": "Domains",
             "q_organization_name": "Name match",
+            "organization_ids": "Apollo org IDs",
+            "organization_job_locations": "Job posting locations",
+            "organization_industries": "Industries",
+            "organization_industry_tag_ids": "Industry tag IDs",
+            "organization_founded_year_range": "Founded year",
+            "organization_naics_codes": "NAICS codes",
+            "organization_sic_codes": "SIC codes",
+            "organization_latest_funding_stage_cd": "Funding stage",
         }
         for k, v in qp.items():
             if k in ("page", "per_page"):
