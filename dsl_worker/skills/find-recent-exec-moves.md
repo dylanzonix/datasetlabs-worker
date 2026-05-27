@@ -23,32 +23,64 @@ The winning source: the new exec's own LinkedIn announcement. They almost always
 
 ### Call shape
 
+**Two-step pattern.** `apify_actor:harvestapi/linkedin-post-search` rejects pre-declared `columns=[...]` on `table_create` — its row shape comes from the actor, not your schema. So:
+
 ```
+# Step 1: fetch with no columns. LinkedIn search recency only stays
+# clean at maxPosts <= 30/query — past that the actor digs into
+# relevance-ranked OLD viral posts (6mo+ ago) that defeat the whole
+# "recent" intent. Get more breadth via MORE queries, not more per
+# query.
 table_create(
   source="apify_actor:harvestapi/linkedin-post-search",
   query_params={
-    "searchQueries": [
-      "joined as Chief Financial Officer",
-      "joined as Chief Operating Officer",
-      "joined as Chief Technology Officer",
-      "joined as Chief Human Resources Officer",
-      "thrilled to announce hired CFO",
-      "excited to share new CFO",
-      "I am pleased to announce I joined"
-    ],
-    "maxPosts": 100,
-    "maxItems": 1000
+    "input": {
+      "searchQueries": [
+        "joined as Chief Financial Officer",
+        "joined as Chief Operating Officer",
+        "joined as Chief Technology Officer",
+        "joined as Chief Human Resources Officer",
+        "joined as Chief Marketing Officer",
+        "joined as Chief Revenue Officer",
+        "joined as Chief People Officer",
+        "joined as General Counsel",
+        "thrilled to share I've joined",
+        "excited to share I've joined",
+        "I am pleased to announce I joined",
+        "starting a new position as Chief",
+        "I'm thrilled to announce I joined"
+      ],
+      "maxPosts": 30,
+      "postedLimit": "3months",
+      "profileScraperMode": "short",
+      "scrapeReactions": false,
+      "scrapeComments": false
+    },
+    "maxItems": 400
   },
+  name="Recent C-Suite Move Announcements"
+)
+
+# Step 2: AFTER the fetch lands, run column_map_set to clean up the
+# raw schema. The actor returns ~25 fields per post; map only what
+# downstream enrichments need.
+column_map_set(
+  table_id="t1",
   columns=[
-    {"name": "Author Name",     "source_field": "author.name",         "type": "text"},
-    {"name": "Author Position", "source_field": "author.position",     "type": "text"},
+    {"name": "Author Name",     "source_field": "author.name",         "type": "text", "pinned": true},
     {"name": "Author LinkedIn", "source_field": "author.linkedinUrl",  "type": "url"},
+    {"name": "Author Type",     "source_field": "author.type",         "type": "enum"},
     {"name": "Post Date",       "source_field": "postedAt.date",       "type": "date"},
     {"name": "Post Content",    "source_field": "content",             "type": "text"},
     {"name": "Post URL",        "source_field": "linkedinUrl",         "type": "url"},
   ],
-  name="Recent C-Suite Move Announcements"
 )
+
+# Step 3 (recommended): filter Post Date >= today - 90 days and
+# filter Author Type = 'profile' (drops corporate-page reposts /
+# news-bot accounts that don't represent real exec moves).
+filter_set(table_id="t1", column="Post Date", op="gte", value="<90-days-ago ISO>")
+filter_set(table_id="t1", column="Author Type", op="is_any_of", value=["profile"])
 ```
 
 Hard input: `searchQueries` is an **array** (plural) — the actor returns 400 if you pass `search` or `query` singular. The actor IGNORES strict freshness filters like `postedLimit`; sort by `Post Date` desc + filter post-fetch.
@@ -129,19 +161,21 @@ Once Author Name + Company Domain are known, add a FullEnrich email column — s
 
 ### Cost model
 
-For a 1000-row pull (default):
-- Apify post search: $0.002 × 1000 = **$2.00**
-- Classify filter: $0.0002 × 1000 = **$0.20**
-- Filter result: ~400 real moves (40% signal)
-- Research (current company / start date): $0.05 × 400 = **$20.00**
-- Apollo enrich (qualify): free, ×400
-- FullEnrich email: $0.05 × 400 = **$20.00**
+For a 400-row pull (default; 13 queries × 30 posts):
+- Apify post search: $0.002 × 400 = **$0.80**
+- Classify filter: $0.0002 × 400 = **$0.08**
+- Filter result: ~160 real moves (40% signal); after Post Date >= 90d filter, ~80-100
+- Research (current company / start date): $0.05 × 100 = **$5.00**
+- Apollo enrich (qualify): free, ×100
+- FullEnrich email: $0.05 × 100 = **$5.00**
 
-Total ≈ **$42 for ~400 qualified recent-move leads with founder LinkedIn + verified email**.
+Total ≈ **$11 for ~80-100 qualified recent-move leads with founder LinkedIn + verified email**.
 
-If the user needs a smaller / cheaper sample, drop `maxPosts` to 30 and `maxItems` to 300 (the prior default) → ~80 qualified leads for ~$8.50.
+### Why we don't scale by raising `maxPosts`
 
-Diminishing returns: past ~1000-2000 posts LinkedIn's search ordering degrades and the noise filter has to work harder. Bumping `maxItems` higher than 2000 rarely returns proportionally more qualified moves.
+Burned by this once (project bbcbdbc2): bumping `maxPosts` from 30 → 100 returned 508 posts of which **zero were in the last 90 days**. LinkedIn's search ranks by relevance × engagement past the first ~30 results, so deeper paginating surfaces 6+ month-old viral posts that match the keywords but defeat the "recent" intent.
+
+Scale via more `searchQueries`, not more per query. Each query is a fresh LinkedIn search whose top 30 are recency-dominant. 20 queries × 30 = 600 posts all in the recency zone; far better than 5 queries × 200 = 1000 posts mostly stale.
 
 ### Quirks to know
 
