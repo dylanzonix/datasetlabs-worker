@@ -355,6 +355,27 @@ def _record_query_run(
 # ---------------------------------------------------------------------------
 
 
+def _initial_dedup_key_column(adapter, rows: List[Dict[str, Any]]) -> Optional[str]:
+    """Pick the dedup_key_column to stamp on a freshly created table.
+
+    Prefers the adapter's class-level `default_dedup_key_column`, but most
+    apify_actor adapters don't override it (because the dedup key is per-
+    actor, not per-class). Falls back to scanning the first row for an
+    obvious unique key like "id" or "url" so multi-query Apify pulls don't
+    insert duplicates when the same item matches several searches.
+    """
+    if adapter.default_dedup_key_column:
+        return adapter.default_dedup_key_column
+    if not rows or not isinstance(rows[0], dict):
+        return None
+    keys = rows[0].keys()
+    if "id" in keys:
+        return "id"
+    if "url" in keys:
+        return "url"
+    return None
+
+
 async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
     """Create a table from a source. Atomic: fetches rows, commits in one
     step. If the fetch fails or returns 0 rows, nothing is written.
@@ -597,7 +618,7 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
             "source": source,
             "query_params": json.dumps(query_params),
             "cols": json.dumps(columns_for_db),
-            "dedup_key_column": adapter.default_dedup_key_column,
+            "dedup_key_column": _initial_dedup_key_column(adapter, res_rows),
             "fetch_status": initial_status,
             "rows_n": len(res_rows),
             "cost": res_cost,
