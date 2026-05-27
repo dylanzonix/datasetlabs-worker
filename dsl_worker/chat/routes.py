@@ -463,17 +463,25 @@ def list_table_rows(
             rows = db.execute(sa_text(fallback_sql), base_params).fetchall()
         else:
             raise
-    # Total = filtered count (so the FE pagination matches what user sees).
-    # Unfiltered count exposed separately for context.
-    total_sql = (
-        f"SELECT COUNT(*) FROM samples "
-        f"WHERE table_id = :tid AND deleted_at IS NULL{where_extra}"
-    )
-    total = db.execute(sa_text(total_sql), {"tid": tid, **filter_params}).scalar() or 0
-    unfiltered_total = db.execute(
-        sa_text("SELECT COUNT(*) FROM samples WHERE table_id = :tid AND deleted_at IS NULL"),
-        {"tid": tid},
-    ).scalar() or 0
+    # Filtered + unfiltered count in ONE query (FILTER aggregate). Was two
+    # separate round-trips per page load — same partial index scan, twice.
+    # When there's no filter, both counts are identical so we skip the
+    # filtered side entirely.
+    if filters:
+        count_sql = (
+            f"SELECT COUNT(*) FILTER (WHERE TRUE{where_extra}) AS filtered_total, "
+            f"COUNT(*) AS unfiltered_total "
+            f"FROM samples WHERE table_id = :tid AND deleted_at IS NULL"
+        )
+        count_row = db.execute(sa_text(count_sql), {"tid": tid, **filter_params}).fetchone()
+        total = (count_row[0] if count_row else 0) or 0
+        unfiltered_total = (count_row[1] if count_row else 0) or 0
+    else:
+        unfiltered_total = db.execute(
+            sa_text("SELECT COUNT(*) FROM samples WHERE table_id = :tid AND deleted_at IS NULL"),
+            {"tid": tid},
+        ).scalar() or 0
+        total = unfiltered_total
     # tags carries per-cell `sources` citations (source-row commits write
     # this in _commit_rows; enrichment/fill also writes here) and fill_status
     # / email_verification metadata — keep it on the wire so CellDetailPanel
@@ -712,24 +720,31 @@ def _distinct_from_materialized(
         if col in bucket:
             bucket[col].append((val, int(cnt)))
 
-    # Compute empty_count via a direct COUNT per column. We do this
-    # because materialize-on-write has gaps (cells written before the
-    # hook landed, or via write paths we haven't instrumented). A
-    # filter dropdown showing "996 empty" when there are 145 emails is
-    # worse than a slightly slower call. One COUNT per column on a
-    # samples table with table_id index is ~5-15ms.
-    empty_counts: Dict[str, int] = {}
-    for col in columns:
-        col_esc = col.replace("'", "''")
+    # Compute empty_count via direct COUNT per column. Materialize-on-write
+    # has gaps (cells written before the hook landed, or via write paths
+    # we haven't instrumented), so we re-derive here for trustworthiness.
+    # Fold every column's COUNT into ONE query with FILTER aggregates —
+    # was N separate scans of samples, each its own round-trip; now one
+    # scan, one round-trip.
+    empty_counts: Dict[str, int] = {col: 0 for col in columns}
+    if columns:
+        filter_clauses: List[str] = []
+        for i, col in enumerate(columns):
+            col_esc = col.replace("'", "''")
+            filter_clauses.append(
+                f"COUNT(*) FILTER (WHERE row->>'{col_esc}' IS NULL OR row->>'{col_esc}' = '') AS c{i}"
+            )
         empty_row = db.execute(
             sa_text(
-                f"SELECT COUNT(*) FROM samples "
-                f"WHERE table_id = CAST(:tid AS uuid) AND deleted_at IS NULL "
-                f"  AND (row->>'{col_esc}' IS NULL OR row->>'{col_esc}' = '')"
+                "SELECT " + ", ".join(filter_clauses) + " "
+                "FROM samples "
+                "WHERE table_id = CAST(:tid AS uuid) AND deleted_at IS NULL"
             ),
             {"tid": table_id},
         ).fetchone()
-        empty_counts[col] = int(empty_row[0]) if empty_row else 0
+        if empty_row is not None:
+            for i, col in enumerate(columns):
+                empty_counts[col] = int(empty_row[i] or 0)
 
     out: Dict[str, Dict[str, Any]] = {}
     for col in columns:
