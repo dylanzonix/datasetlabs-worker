@@ -36,7 +36,8 @@ table_create(
       "excited to share new CFO",
       "I am pleased to announce I joined"
     ],
-    "maxItems": 200
+    "maxPosts": 100,
+    "maxItems": 1000
   },
   columns=[
     {"name": "Author Name",     "source_field": "author.name",         "type": "text"},
@@ -128,15 +129,19 @@ Once Author Name + Company Domain are known, add a FullEnrich email column — s
 
 ### Cost model
 
-For a 200-row pull:
-- Apify post search: $0.002 × 200 = **$0.40**
-- Classify filter: $0.0002 × 200 = **$0.04**
-- Filter result: ~80 real moves (40% signal)
-- Research (current company / start date): $0.05 × 80 = **$4.00**
-- Apollo enrich (qualify): free, ×80
-- FullEnrich email: $0.05 × 80 = **$4.00**
+For a 1000-row pull (default):
+- Apify post search: $0.002 × 1000 = **$2.00**
+- Classify filter: $0.0002 × 1000 = **$0.20**
+- Filter result: ~400 real moves (40% signal)
+- Research (current company / start date): $0.05 × 400 = **$20.00**
+- Apollo enrich (qualify): free, ×400
+- FullEnrich email: $0.05 × 400 = **$20.00**
 
-Total ≈ **$8.50 for ~80 qualified recent-move leads with founder LinkedIn + verified email**.
+Total ≈ **$42 for ~400 qualified recent-move leads with founder LinkedIn + verified email**.
+
+If the user needs a smaller / cheaper sample, drop `maxPosts` to 30 and `maxItems` to 300 (the prior default) → ~80 qualified leads for ~$8.50.
+
+Diminishing returns: past ~1000-2000 posts LinkedIn's search ordering degrades and the noise filter has to work harder. Bumping `maxItems` higher than 2000 rarely returns proportionally more qualified moves.
 
 ### Quirks to know
 
