@@ -26,6 +26,7 @@ from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import text as sa_text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from dsl_api.db import SessionLocal
@@ -985,33 +986,62 @@ class Coordinator:
                 pass
 
     def _maybe_finalize_job(self, db: Session, job_id: str) -> None:
-        """If all tasks are terminal, mark the job done and emit job_done."""
-        row = db.execute(
-            sa_text(
-                "SELECT total_tasks, done_tasks, failed_tasks, status "
-                "FROM enrichment_jobs WHERE id=CAST(:jid AS uuid) FOR UPDATE"
-            ),
-            {"jid": job_id},
-        ).fetchone()
-        if not row:
-            return
-        total, done, failed, status = row
-        if status in ("done", "failed", "cancelled"):
-            return
-        if (done + failed) >= total and total > 0:
-            db.execute(
-                sa_text(
-                    "UPDATE enrichment_jobs "
-                    "SET status='done', ended_at=now() "
-                    "WHERE id=CAST(:jid AS uuid)"
-                ),
-                {"jid": job_id},
-            )
-            db.commit()
-            emit_event(
-                db, job_id, "job_done",
-                {"total": total, "done": done, "failed": failed},
-            )
+        """If all tasks are terminal, mark the job done and emit job_done.
+
+        Uses a single atomic UPDATE...RETURNING with the terminal check
+        in the WHERE clause. The previous "SELECT FOR UPDATE then UPDATE"
+        pattern deadlocked when multiple workers (pc1 + nlpfollower on
+        dev, or two replicas on prod) finalized the same job at the same
+        moment: each had already touched the job row (counter increment
+        in _mark_task_done) and held a foreign-key shared lock from the
+        task UPDATE, then both raced for the FOR UPDATE → cycle.
+
+        Atomic UPDATE eliminates the lock-acquisition window. Either we
+        win the race (the row matched, RETURNING gives us the snapshot,
+        emit job_done) or we lose (no row returned, someone else
+        finalized — silent no-op). PG still occasionally raises a
+        DeadlockDetected on related FK/index locks, so retry up to 3x.
+        """
+        for attempt in range(3):
+            try:
+                row = db.execute(
+                    sa_text(
+                        "UPDATE enrichment_jobs "
+                        "SET status='done', ended_at=now() "
+                        "WHERE id=CAST(:jid AS uuid) "
+                        "  AND status NOT IN ('done', 'failed', 'cancelled') "
+                        "  AND total_tasks > 0 "
+                        "  AND (done_tasks + failed_tasks) >= total_tasks "
+                        "RETURNING total_tasks, done_tasks, failed_tasks"
+                    ),
+                    {"jid": job_id},
+                ).fetchone()
+                db.commit()
+                if row:
+                    total, done, failed = row
+                    emit_event(
+                        db, job_id, "job_done",
+                        {"total": total, "done": done, "failed": failed},
+                    )
+                return
+            except OperationalError as e:
+                # PG deadlock detector picked us as the victim. Roll back
+                # the half-committed work and retry with fresh locks.
+                msg = str(e).lower()
+                if "deadlock" not in msg or attempt >= 2:
+                    log.exception("finalize_job failed for %s", job_id)
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+                    return
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                # Tiny jitter so we don't immediately re-collide with
+                # the same peer.
+                time.sleep(0.05 * (attempt + 1))
 
     # ---- watchdog ----------------------------------------------------
 
