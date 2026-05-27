@@ -14,6 +14,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
+import asyncio
 import httpx
 
 from dsl_worker.sources.base import FetchResult, SourceAdapter, SourceDescription, register
@@ -223,11 +224,28 @@ class ApolloCompaniesAdapter(SourceAdapter):
                     "page": page,
                     "per_page": min(per_page, target - len(all_rows)),
                 }
-                resp = await client.post(
-                    f"{APOLLO_BASE}/mixed_companies/search",
-                    headers={"X-Api-Key": self.api_key, "Content-Type": "application/json"},
-                    json=body,
-                )
+                # Retry transient timeouts/network errors. Apollo
+                # occasionally hangs the first page; one retry avoids
+                # killing the whole fetch (and avoids the orchestrator
+                # hallucinating a "filter must be wrong" theory because
+                # the error came back empty).
+                resp = None
+                last_err: Optional[Exception] = None
+                for attempt in range(3):
+                    try:
+                        resp = await client.post(
+                            f"{APOLLO_BASE}/mixed_companies/search",
+                            headers={"X-Api-Key": self.api_key, "Content-Type": "application/json"},
+                            json=body,
+                        )
+                        break
+                    except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as e:
+                        last_err = e
+                        if attempt == 2:
+                            break
+                        await asyncio.sleep(1.5 * (attempt + 1))
+                if resp is None:
+                    raise last_err if last_err is not None else RuntimeError("apollo_companies: no response")
                 if resp.status_code != 200:
                     log.warning("apollo_companies HTTP %s: %s", resp.status_code, resp.text[:200])
                     break

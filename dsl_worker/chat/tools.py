@@ -500,7 +500,7 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
                 raise
             except Exception as e:
                 log.exception("table_create stream-first-batch failed: %s", e)
-                return {"error": f"source fetch failed: {e}"}, 0.0
+                return {"error": f"source fetch failed: {type(e).__name__}: {e}"}, 0.0
         else:
             try:
                 if source.startswith("apify_actor:"):
@@ -516,7 +516,7 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
                 raise
             except Exception as e:
                 log.exception("table_create fetch failed: %s", e)
-                return {"error": f"source fetch failed: {e}"}, 0.0
+                return {"error": f"source fetch failed: {type(e).__name__}: {e}"}, 0.0
     phase_marker(ctx, "table_create/fetch_returned", rows=len(res_rows), cost=res_cost)
 
     if not res_rows:
@@ -985,7 +985,7 @@ async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
             status="error",
             error=str(e),
         )
-        return {"error": f"source fetch failed: {e}"}, 0.0
+        return {"error": f"source fetch failed: {type(e).__name__}: {e}"}, 0.0
 
     # Commit rows using existing column mapping
     cols = json.loads(columns) if isinstance(columns, str) else (columns or [])
@@ -1860,16 +1860,22 @@ def _commit_rows(
     # Generate sample_ids client-side so we can hand them to the verify
     # hook after commit (was using `gen_random_uuid()` server-side, which
     # didn't return the new id without an extra round-trip).
+    #
+    # Build the full insert payload in memory, then issue ONE multi-row
+    # INSERT. The previous loop ran one INSERT per row → N network
+    # round-trips to Supabase. With ~50ms RTT and 1000 rows, table_create
+    # took 50s+ just on commit. A single multi-row INSERT is one
+    # round-trip regardless of batch size (Postgres caps params per query
+    # at 65,535 — at 5 params per row we can pack ~13k rows; we chunk
+    # at 1000 to stay well under).
     pending_verify: List[Tuple[str, Dict[str, Any]]] = []
+    insert_payloads: List[Dict[str, Any]] = []
     skipped_dup_count = 0
     for r in rows:
         mapped: Dict[str, Any] = {}
         for c in normalized_map:
             mapped[c["name"]] = _extract_source_value(r, c["source_field"])
 
-        # Skip if this row's dedup_key value matches an existing row OR
-        # another row in this same batch (the actor sometimes repeats
-        # items within a single response).
         if dedup_key:
             key_val = mapped.get(dedup_key)
             if key_val not in (None, "") and str(key_val) in existing_dedup_values:
@@ -1882,24 +1888,47 @@ def _commit_rows(
             {"sources": cell_sources_template} if cell_sources_template else None
         )
         sample_id = str(uuid.uuid4())
+        insert_payloads.append({
+            "sid": sample_id,
+            "seq": next_seq,
+            "row": json.dumps(mapped, default=str),
+            "raw": json.dumps(r, default=str) if store_raw else None,
+            "tags": json.dumps(tags_payload) if tags_payload else None,
+        })
+        next_seq += 1
+        pending_verify.append((sample_id, mapped))
+
+    # Chunked multi-row INSERT. project_id / table_id / version_id are
+    # identical for every row in this commit so we hoist them out of the
+    # per-row params; only sid/seq/row/raw/tags vary.
+    CHUNK_SIZE = 500
+    for chunk_start in range(0, len(insert_payloads), CHUNK_SIZE):
+        chunk = insert_payloads[chunk_start:chunk_start + CHUNK_SIZE]
+        if not chunk:
+            continue
+        values_sql_parts: List[str] = []
+        params: Dict[str, Any] = {
+            "pid": str(pid),
+            "tid": table_id,
+            "vid": str(version_id),
+        }
+        for i, row_params in enumerate(chunk):
+            values_sql_parts.append(
+                f"(:sid{i}, :pid, :tid, :vid, :seq{i}, "
+                f"CAST(:row{i} AS jsonb), CAST(:raw{i} AS jsonb), CAST(:tags{i} AS jsonb), now())"
+            )
+            params[f"sid{i}"] = row_params["sid"]
+            params[f"seq{i}"] = row_params["seq"]
+            params[f"row{i}"] = row_params["row"]
+            params[f"raw{i}"] = row_params["raw"]
+            params[f"tags{i}"] = row_params["tags"]
         db.execute(
             sa_text(
                 "INSERT INTO samples (id, project_id, table_id, version_id, seq, row, raw_row, tags, created_at) "
-                "VALUES (:sid, :pid, :tid, :vid, :seq, CAST(:row AS jsonb), CAST(:raw AS jsonb), CAST(:tags AS jsonb), now())"
+                "VALUES " + ", ".join(values_sql_parts)
             ),
-            {
-                "sid": sample_id,
-                "pid": str(pid),
-                "tid": table_id,
-                "vid": str(version_id),
-                "seq": next_seq,
-                "row": json.dumps(mapped, default=str),
-                "raw": json.dumps(r, default=str) if store_raw else None,
-                "tags": json.dumps(tags_payload) if tags_payload else None,
-            },
+            params,
         )
-        next_seq += 1
-        pending_verify.append((sample_id, mapped))
     # Commit to release the advisory lock + flush the batch. Must happen
     # BEFORE we schedule verification — the verify task opens its own
     # SessionLocal and won't see uncommitted rows.
