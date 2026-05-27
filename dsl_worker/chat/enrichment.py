@@ -227,6 +227,35 @@ async def enrichment_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
         except Exception:
             log.exception("enrichment_card_added emit failed; continuing")
 
+    # Classify-tier enrichments auto-run on creation. They're nano,
+    # tool-less, ~$0.0005/row — cheaper than fetching the rows in the
+    # first place. The approval card just adds friction to what is
+    # functionally a "filter the fetch noise" step. Skip the gate, spawn
+    # a background run over all unfilled rows, and surface task_id so
+    # the agent can mention it.
+    research_tier = (action.get("research") or action.get("tier") or "").lower()
+    if research_tier == "classify" and not is_refinement:
+        try:
+            run_args = {
+                "enrichment_id": public_eid,
+                "scope": {"type": "all_unfilled"},
+                "wait": False,
+            }
+            spawn_result, _spawn_cost = await enrichment_run(run_args, ctx)
+            return {
+                "enrichment_id": public_eid,
+                "status": "configured_and_running",
+                "auto_run": True,
+                "background_task": spawn_result,
+                "note": (
+                    "Classify-tier enrichment auto-runs on creation (no "
+                    "approval needed — nano, no tools, dirt cheap). The "
+                    "cells are filling now in the background."
+                ),
+            }, 0.0
+        except Exception:
+            log.exception("classify auto-run failed for %s; user can run manually", public_eid)
+
     return {
         "enrichment_id": public_eid,
         "status": "configured",

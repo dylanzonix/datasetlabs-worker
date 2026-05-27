@@ -42,6 +42,15 @@ log = logging.getLogger(__name__)
 # at a time so total concurrent cells stays bounded.
 GLOBAL_CONCURRENCY = 25
 
+# Classify-tier cells use a SEPARATE, much higher concurrency cap.
+# They run gpt-5.4-nano with no tools (180k RPM / 180M TPM headroom),
+# take ~3s wall-time, cost ~$0.0005/cell. The 25-slot global cap was
+# sized for research/deep tier cells that hit FullEnrich/Apollo/BU.
+# Putting classify in the same lane throttled it to research-cell
+# concurrency for no reason — classify could comfortably run 100+ in
+# parallel without tickling rate limits.
+CLASSIFY_CONCURRENCY = 100
+
 # Coordinator claim loop: ask Postgres for up to this many queued tasks
 # in one round-trip. Keeps the loop responsive without thrashing the DB.
 CLAIM_BATCH = 50
@@ -401,10 +410,14 @@ class Coordinator:
 
     def __init__(self) -> None:
         self._sem = asyncio.Semaphore(GLOBAL_CONCURRENCY)
+        self._classify_sem = asyncio.Semaphore(CLASSIFY_CONCURRENCY)
         self._wake = asyncio.Event()
         self._stop = asyncio.Event()
         self._tasks: List[asyncio.Task] = []
         self._in_flight: set[str] = set()
+        # Tier breakdown so we can size the claim-batch capacity per
+        # semaphore without overshooting either.
+        self._in_flight_classify: set[str] = set()
 
     async def start(self) -> None:
         self._tasks = [
@@ -460,8 +473,18 @@ class Coordinator:
 
         Synchronous because we use psycopg2 row-level locks. Runs in a
         thread so the event loop stays free.
+
+        Capacity is the sum of headroom on both semaphores — heavy lane
+        (GLOBAL_CONCURRENCY, all non-classify tiers) and classify lane
+        (CLASSIFY_CONCURRENCY). The actual semaphore acquire in
+        _run_task throttles each tier to its own ceiling; this just
+        caps how many tasks we'll claim per round so we don't grab 100
+        heavy tasks when only 25 can actually run.
         """
-        capacity = max(0, GLOBAL_CONCURRENCY - len(self._in_flight))
+        in_flight_heavy = len(self._in_flight) - len(self._in_flight_classify)
+        capacity_heavy = max(0, GLOBAL_CONCURRENCY - in_flight_heavy)
+        capacity_classify = max(0, CLASSIFY_CONCURRENCY - len(self._in_flight_classify))
+        capacity = capacity_heavy + capacity_classify
         if capacity == 0:
             return []
         limit = min(CLAIM_BATCH, capacity)
@@ -486,7 +509,9 @@ class Coordinator:
                     "FROM claimed "
                     "WHERE t.id = claimed.id "
                     "RETURNING t.id::text, t.job_id::text, t.project_id::text, "
-                    "          t.enrichment_id::text, t.sample_id::text"
+                    "          t.enrichment_id::text, t.sample_id::text, "
+                    "          (SELECT LOWER(COALESCE(e.action->>'research', e.action->>'tier', '')) "
+                    "           FROM enrichments e WHERE e.id = t.enrichment_id) AS research_tier"
                 ),
                 {"n": limit, "wid": WORKER_ID},
             ).fetchall()
@@ -496,13 +521,17 @@ class Coordinator:
             out = []
             for r in rows:
                 tid = r[0]
+                tier = (r[5] or "").lower()
                 self._in_flight.add(tid)
+                if tier == "classify":
+                    self._in_flight_classify.add(tid)
                 out.append({
                     "id": tid,
                     "job_id": r[1],
                     "project_id": r[2],
                     "enrichment_id": r[3],
                     "sample_id": r[4],
+                    "research_tier": tier,
                 })
             # Mark job started_at on first claimed task per job.
             if out:
@@ -525,7 +554,11 @@ class Coordinator:
 
     async def _run_task(self, task: Dict[str, Any]) -> None:
         task_id = task["id"]
-        async with self._sem:
+        # Pick the semaphore by tier — classify gets the high-concurrency
+        # lane, everything else stays on the 25-slot heavy lane.
+        is_classify = (task.get("research_tier") or "").lower() == "classify"
+        sem = self._classify_sem if is_classify else self._sem
+        async with sem:
             heartbeat = asyncio.create_task(
                 self._heartbeat(task_id), name=f"hb-{task_id[:8]}"
             )
@@ -537,6 +570,8 @@ class Coordinator:
             finally:
                 heartbeat.cancel()
                 self._in_flight.discard(task_id)
+                if is_classify:
+                    self._in_flight_classify.discard(task_id)
                 # Wake the claim loop so it can fill the now-free slot.
                 self._wake.set()
 
