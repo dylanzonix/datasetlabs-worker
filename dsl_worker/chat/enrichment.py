@@ -637,7 +637,14 @@ async def _run_enrichment_on_rows(
 
     # Concurrency cap for parallel cell ops. Cells beyond this wait at the
     # semaphore — FE shows them as "Queued" until cell_start fires.
-    sem = asyncio.Semaphore(25)
+    # Classify-tier runs nano + no tools (~3s/cell, ~$0.0005), so it
+    # gets a much higher cap matching CLASSIFY_CONCURRENCY in the
+    # durable-jobs coordinator. Research/deep stay at 25 — they hit
+    # FullEnrich/Apollo/BU and the rate limits / latencies make higher
+    # concurrency pointless there.
+    research_tier_local = (action.get("research") or action.get("tier") or "").lower()
+    sem_cap = 100 if research_tier_local == "classify" else 25
+    sem = asyncio.Semaphore(sem_cap)
 
     # Index assigned by start order — useful for the toolLog summary.
     start_seq = {"i": 0}
