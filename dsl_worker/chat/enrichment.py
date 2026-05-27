@@ -233,34 +233,84 @@ async def enrichment_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
     # functionally a "filter the fetch noise" step. Skip the gate, spawn
     # a background run over all unfilled rows, and surface task_id so
     # the agent can mention it.
+    #
+    # GATE: skip auto-run when the enrichment's declared dependencies
+    # aren't filled yet on any row. A classify enrichment whose prompt
+    # references {Exec Name} + {Company Domain} can't produce useful
+    # output until the upstream research enrichment lands those values.
+    # Auto-running it now would burn cells against nulls and produce
+    # all "Missing inputs" failures. Defer until the user (or a chain
+    # of dependent enrichments completing) triggers it explicitly.
     research_tier = (action.get("research") or action.get("tier") or "").lower()
     if research_tier == "classify" and not is_refinement:
-        try:
-            run_args = {
-                "enrichment_id": public_eid,
-                "scope": {"type": "all_unfilled"},
-                "wait": False,
-            }
-            spawn_result, _spawn_cost = await enrichment_run(run_args, ctx)
-            return {
-                "enrichment_id": public_eid,
-                "status": "configured_and_running",
-                "auto_run": True,
-                "background_task": spawn_result,
-                "note": (
-                    "Classify-tier enrichment auto-runs on creation (no "
-                    "approval needed — nano, no tools, dirt cheap). The "
-                    "cells are filling now in the background."
-                ),
-            }, 0.0
-        except Exception:
-            log.exception("classify auto-run failed for %s; user can run manually", public_eid)
+        deps_unmet = _classify_deps_unmet(ctx.db, table_id, action)
+        if deps_unmet:
+            log.info(
+                "classify enrichment %s NOT auto-running: deps unfilled %s",
+                public_eid, deps_unmet,
+            )
+        else:
+            try:
+                run_args = {
+                    "enrichment_id": public_eid,
+                    "scope": {"type": "all_unfilled"},
+                    "wait": False,
+                }
+                spawn_result, _spawn_cost = await enrichment_run(run_args, ctx)
+                return {
+                    "enrichment_id": public_eid,
+                    "status": "configured_and_running",
+                    "auto_run": True,
+                    "background_task": spawn_result,
+                    "note": (
+                        "Classify-tier enrichment auto-runs on creation (no "
+                        "approval needed — nano, no tools, dirt cheap). The "
+                        "cells are filling now in the background."
+                    ),
+                }, 0.0
+            except Exception:
+                log.exception("classify auto-run failed for %s; user can run manually", public_eid)
 
     return {
         "enrichment_id": public_eid,
         "status": "configured",
         "note": "Enrichment defined but not run. Call enrichment_run to fill rows.",
     }, 0.0
+
+
+def _classify_deps_unmet(db, table_id: str, action: Dict[str, Any]) -> List[str]:
+    """Return the list of action.depends_on columns that are unfilled on
+    every row in the table, OR empty list if at least one row has all
+    deps populated (auto-run can proceed).
+
+    Used to gate classify auto-run: a classify enrichment whose prompt
+    references upstream values can't usefully run until those values
+    land. Without this check, a classify "Move Opener" defined right
+    after a research "Move Details" would fire immediately, see all
+    nulls, and produce "Missing inputs" for every row.
+    """
+    deps = (action or {}).get("depends_on") or []
+    if not deps or not isinstance(deps, list):
+        return []
+    # Build a WHERE clause that checks all deps are non-null for at
+    # least one row. If any row has all deps filled, return [] (allow
+    # auto-run). Otherwise return the deps so the caller can log why.
+    where_parts = []
+    params: Dict[str, Any] = {"tid": table_id}
+    for i, col in enumerate(deps):
+        if not isinstance(col, str) or not col.strip():
+            continue
+        key = f"d{i}"
+        where_parts.append(f"(row->>:{key}) IS NOT NULL AND (row->>:{key}) <> ''")
+        params[key] = col
+    if not where_parts:
+        return []
+    sql = (
+        "SELECT 1 FROM samples WHERE table_id = :tid AND deleted_at IS NULL "
+        "AND " + " AND ".join(where_parts) + " LIMIT 1"
+    )
+    row = db.execute(sa_text(sql), params).fetchone()
+    return [] if row else [c for c in deps if isinstance(c, str) and c.strip()]
 
 
 def _format_enrichment_seed_body(name: str, action: Dict[str, Any]) -> str:

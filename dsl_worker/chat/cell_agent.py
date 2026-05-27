@@ -117,7 +117,7 @@ RESEARCH_CONFIG = {
     # we convert to USD at the boundary in _resolve_research so all
     # internal math uses USD (matches total_cost). Per-enrichment caps
     # passed at action time override these defaults.
-    "classify": {"model": "gpt-5.4-nano", "effort": "medium", "default_cap": 0.3, "tools": []},
+    "classify": {"model": "gpt-5.4-nano", "effort": "medium", "default_cap": 0.05, "tools": []},
     "research": {"model": "gpt-5.4-mini", "effort": "medium", "default_cap": 2.0, "tools": "all"},
     "deep":     {"model": "gpt-5.5",      "effort": "medium", "default_cap": 5.0, "tools": "all"},
 }

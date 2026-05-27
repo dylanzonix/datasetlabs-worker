@@ -253,6 +253,7 @@ action: {
 - **`classify`** → nano, no tools. The cell agent decides a label from the row's existing text.
   Use when the answer is derivable from row content alone (no API, no web search).
   Examples: "is this post a complaint (Yes/No)", "apartment or house", "sentiment of bio", "Is This A Match (Yes/No)".
+  Note: don't use classify for outbound messages (openers, personalized DMs) — prefer a smarter model.
 
 - **`research`** → gpt-5.4-mini + all tools (web_search, FE, Apollo, browser_use). **Default.**
   Use for anything that needs a lookup, a web call, or a tool. The cell agent figures out depth at runtime — rely on the credit cap to bound spend.
@@ -343,7 +344,7 @@ You must include `per_row_credit_cap` on every `enrichment_set` call. The agent 
 
 | Research | Typical cap | Notes |
 |---|---|---|
-| `classify` | `0.3` | nano + no tools — barely spends anything |
+| `classify` | `0.05` | nano + no tools — typical spend is ~0.01/row, 0.05 is comfortable headroom |
 | `research` (one cheap call, e.g. Apollo enrich) | `1.0` |  |
 | `research` (FE email) | `1.5` | FE email ≈ 0.5 base + headroom |
 | `research` (web search / single-site read) | `2.0` | default for most research |
