@@ -53,6 +53,12 @@ class FetchResult:
     # the rows have a clear unique field. Only used on first fetch.
     dedup_key_column_hint: Optional[str] = None
 
+    # Optional total-pool size for THIS query, when the source exposes it
+    # (e.g. Apollo returns `pagination.total_entries`). Lets the orchestrator
+    # detect over-narrow filters before committing — "got 11 rows" alone
+    # doesn't say whether the source had 11 or 11,000 that matched.
+    total_entries: Optional[int] = None
+
 
 @dataclass
 class ColumnDef:

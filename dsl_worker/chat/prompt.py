@@ -676,6 +676,24 @@ page: 1, per_page: 100
 
 **Industry-filter rule of thumb:** when the user says "in Retail / Manufacturing / Auto / etc.", use `organization_industries` with Apollo's industry names. Do NOT use `q_organization_keyword_tags` for industry filtering — that one fuzzy-matches the company's description text and lets unrelated companies (Figma, Coinbase, Pinterest) through because their copy happens to mention the keyword.
 
+**Industries are a SPARSE curated taxonomy — be wary for broad B2B / SaaS / software asks.** Apollo's `organization_industries` is a hand-curated tag set with poor coverage on horizontal categories. Examples (verified live):
+
+- US + Series A + 51-200 employees → **126** companies
+- + `organization_industries=["computer software"]` → **11** (loses 90%)
+- + `organization_industries=["information technology and services"]` → **0**
+- + `q_organization_keyword_tags=["saas"]` → **18**
+- + `q_organization_keyword_tags=["b2b"]` → **74**
+
+For broad "B2B SaaS / software" intent, **drop the industry filter entirely** (let DL verify per-row) or use `q_organization_keyword_tags=["saas", "b2b"]` for higher recall. Only use `organization_industries` for industries Apollo curates well: retail, automotive, construction, real estate, financial services, hospital & health care, marketing and advertising, telecommunications. For "B2B" / "SaaS" / "software" / "tech", it's a trap.
+
+**Always read `total_matching_in_source` on the `table_create` result.** Apollo returns it so you can sanity-check the pool BEFORE building enrichments. Thresholds:
+
+- `< 50` → over-narrow. Drop the most restrictive filter (usually `organization_industries`) and re-fetch with `table_extend` or a fresh `table_create`. Don't ship 11 rows when 126 exist.
+- `50-5,000` → ideal working pool.
+- `> 1,000,000` → under-narrow. Add a tighter filter (location, headcount range, funding stage) before users approve scale-up.
+
+If `total_matching_in_source` is `0` after a sensible-looking query, the filter is colliding (often `organization_industries` doesn't include companies tagged the way you'd expect, or `organization_num_employees_ranges` uses an unsupported bucket). Strip filters one at a time to find the culprit, don't just give up.
+
 **Apollo's public API limitations:** company-type (public/private), growth score, hiring-by-function, and intent signals are visible in Apollo's UI but NOT exposed on the `/mixed_companies/search` endpoint. If a query requires those, add a post-enrichment column (web_search + LLM filter) rather than trying to pass an Apollo filter.
 
 ## fullenrich_people

@@ -479,6 +479,7 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
         except Exception:
             pass
 
+    res_total_entries: Optional[int] = None
     async with phase_span_async(ctx, "table_create/adapter_fetch", source=source, n=n):
         if streaming:
             try:
@@ -510,6 +511,7 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
                 else:
                     res = await adapter.fetch(query_params, n, prior_cursor=None)
                 res_rows, res_exhausted, res_cost = res.rows, res.exhausted, res.cost_credits
+                res_total_entries = getattr(res, "total_entries", None)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -694,7 +696,7 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
     # Surface sample rows + the raw field schema so the agent can call
     # column_map_set in the same turn with clean names / nested paths /
     # a dedup key, having seen the actual data.
-    return {
+    result: Dict[str, Any] = {
         "table_id": short_id,
         "name": name,
         "source": source,
@@ -703,7 +705,14 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
         "fetch_status": initial_status,
         "streaming_in_background": initial_status == "streaming",
         "sample_for_mapping": _build_schema_preview(res_rows),
-    }, res_cost * 0.10
+    }
+    # Total pool size from the source, when exposed (e.g. Apollo's
+    # pagination.total_entries). Lets the orchestrator detect over-narrow
+    # filters: "got 11 rows but source had 11 total" → broaden BEFORE
+    # committing the next step.
+    if res_total_entries is not None:
+        result["total_matching_in_source"] = res_total_entries
+    return result, res_cost * 0.10
 
 
 async def _drain_stream_into_table(
@@ -1034,11 +1043,15 @@ async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
         cost_credits=float(res.cost_credits) if res.cost_credits is not None else None,
     )
 
-    return {
+    result_te: Dict[str, Any] = {
         "rows_added": inserted,
         "rows_skipped_duplicates": skipped_dup,
         "rows_returned_by_source": len(res.rows),
-    }, res.cost_credits * 0.10
+    }
+    te_total = getattr(res, "total_entries", None)
+    if te_total is not None:
+        result_te["total_matching_in_source"] = te_total
+    return result_te, res.cost_credits * 0.10
 
 
 # ---------------------------------------------------------------------------

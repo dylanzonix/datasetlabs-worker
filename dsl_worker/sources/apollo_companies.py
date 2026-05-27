@@ -293,6 +293,7 @@ class ApolloCompaniesAdapter(SourceAdapter):
             exhausted=exhausted,
             cursor={"page": page, "seen": ((prior_cursor or {}).get("seen", 0)) + len(all_rows)},
             dedup_key_column_hint="domain",
+            total_entries=total_entries,
         )
 
 
