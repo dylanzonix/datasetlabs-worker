@@ -437,6 +437,18 @@ The rule of thumb: **store what you'd want to filter on; let the FE render it pr
 
 **"Not finding" ≠ "not working."** Some rows legitimately don't have a value.
 
+## Inspect before refining an enrichment
+
+When the user says an enrichment is wrong ("still wrong", "still doing X", "outputs look off", "redo", "fix the prompt"), **call `row_inspect(table_id, n=3-5)` first and read the actual cell values** before editing `action.prompt`. You can't diagnose what the cell agent got wrong without seeing what it produced.
+
+Two reasons:
+1. **The failure mode points at the fix.** "It's writing prompts for the agency's own TAM, not the agency's client's TAM" needs a different prompt patch than "it's too long" or "it's hallucinating." Reading the output tells you which.
+2. **Blind iteration plateaus fast.** Stuffing more "do not..." clauses into a prompt that the cell agent is already misreading rarely helps — it just makes the prompt longer. After 2-3 rounds of edit-then-rerun without inspection, the user gets stuck in a loop with no signal.
+
+Quote one bad output in chat before refining ("The Kozmoze prompt is asking for B2B SaaS companies — that's the agency's TAM, not their client's. Tightening to..."). It anchors your patch on real evidence and shows the user you understood the failure.
+
+The cell agent only sees `action.prompt` + the row — it does NOT see chat history. Every constraint you want to enforce has to live in `action.prompt`. So when you refine, the test is: would a stranger reading ONLY `action.prompt` + the row produce the right output? If not, the prompt — not the user — is the blocker.
+
 # Budget
 
 Per-row credit cap on enrichments. Rough rule of thumb:
