@@ -213,9 +213,96 @@ async def web_search(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, 
 # ---------------------------------------------------------------------------
 
 
+def _apply_sandbox_ops(
+    table_id: str, ops_bytes: bytes, run_id: str | None = None,
+) -> Dict[str, Any]:
+    """Process _dsl_ops.jsonl produced by dsl_tools.add_rows() inside the
+    sandbox.  Only handles add_rows — other op types are ignored.
+
+    Returns a summary dict {rows_inserted: N} or {error: ...}.
+    """
+    import json as _json
+    from dsl_worker.chat.tools import _commit_rows, resolve_table_id
+    from dsl_api.db import SessionLocal
+
+    lines = ops_bytes.decode("utf-8", errors="replace").strip().splitlines()
+    all_items: List[Dict[str, Any]] = []
+    skipped_ops: List[str] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            op = _json.loads(line)
+        except Exception:
+            continue
+        if op.get("op") == "add_rows":
+            items = op.get("items")
+            if isinstance(items, list):
+                all_items.extend(items)
+        elif op.get("op"):
+            skipped_ops.append(op["op"])
+
+    result: Dict[str, Any] = {}
+    if skipped_ops:
+        result["warning"] = (
+            f"dsl_tools ops [{', '.join(skipped_ops)}] are not supported "
+            "from code_exec — use the direct tool instead (row_delete, etc.)"
+        )
+
+    if not all_items:
+        result["rows_inserted"] = 0
+        return result
+
+    db = SessionLocal()
+    try:
+        from sqlalchemy import text as sa_text
+        tbl_cols = db.execute(
+            sa_text("SELECT columns FROM tables WHERE id=:tid"),
+            {"tid": table_id},
+        ).scalar()
+
+        item_keys = set(all_items[0].keys())
+
+        if tbl_cols and isinstance(tbl_cols, list):
+            # Items might use display names ("Company") or source_field
+            # names ("company_name"). Detect which and build the map so
+            # _commit_rows finds the values.
+            display_names = {c["name"] for c in tbl_cols if c.get("name")}
+            source_fields = {c.get("source_field", c["name"]) for c in tbl_cols if c.get("name")}
+
+            if item_keys & display_names:
+                # Items use display names → identity map
+                column_map = [
+                    {"name": c["name"], "source_field": c["name"]}
+                    for c in tbl_cols if c.get("name")
+                ]
+            elif item_keys & source_fields:
+                # Items use source_field names → normal table map
+                column_map = [
+                    {"name": c["name"], "source_field": c.get("source_field", c["name"])}
+                    for c in tbl_cols if c.get("name")
+                ]
+            else:
+                # No overlap — pass items through as-is
+                column_map = [{"name": k, "source_field": k} for k in item_keys]
+        else:
+            column_map = [{"name": k, "source_field": k} for k in item_keys]
+
+        _commit_rows(db, table_id, all_items, column_map, store_raw=False, run_id=run_id)
+        result["rows_inserted"] = len(all_items)
+        return result
+    except Exception as e:
+        log.exception("_apply_sandbox_ops failed: %s", e)
+        result["error"] = str(e)[:300]
+        return result
+    finally:
+        db.close()
+
+
 async def code_exec(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
     code = args.get("code")
     files = args.get("files") or []
+    table_id = args.get("table_id")
     if not code:
         return {"error": "code is required"}, 0.0
     try:
@@ -230,22 +317,58 @@ async def code_exec(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, A
         from dsl_worker.chat import candidates
     except Exception:
         candidates = None
+
+    if table_id and ctx.project_id:
+        from dsl_worker.chat.tools import resolve_table_id
+        from dsl_api.db import SessionLocal
+        _db = SessionLocal()
+        try:
+            table_id = resolve_table_id(_db, str(ctx.project_id), table_id) or table_id
+        finally:
+            _db.close()
+
     try:
         async with SandboxClient(url, timeout=90) as pool:
             session = await pool.create_session()
+
+            # Upload dsl_tools.py so sandbox code can `import dsl_tools`.
+            try:
+                from dsl_worker.infra.dsl_tools_module import DSL_TOOLS_SOURCE
+                await session.upload_content(
+                    DSL_TOOLS_SOURCE.encode("utf-8"), "dsl_tools.py",
+                )
+            except Exception as e:
+                log.warning("code_exec dsl_tools upload failed: %s", e)
+
             # Pre-existing files (so we can detect newly written ones after exec)
             try:
                 pre = {f.name for f in (await session.list_files())}
             except Exception:
                 pre = set()
+
+            # Upload input files. Try candidates store first, then
+            # project_files (user uploads stored in Azure Blob).
             for fn in files:
-                if not candidates or not ctx.project_id:
+                if not ctx.project_id:
                     continue
-                try:
-                    blob_bytes = candidates.read_candidates_bytes(ctx.project_id, fn)
-                    await session.upload_content(blob_bytes, fn)
-                except Exception as e:
-                    log.warning("code_exec file upload %s failed: %s", fn, e)
+                uploaded = False
+                if candidates:
+                    try:
+                        blob_bytes = candidates.read_candidates_bytes(ctx.project_id, fn)
+                        await session.upload_content(blob_bytes, fn)
+                        uploaded = True
+                    except Exception:
+                        pass
+                if not uploaded:
+                    try:
+                        from dsl_worker.sources.file import _read_project_file_bytes
+                        pf_bytes, pf_name = _read_project_file_bytes(fn, str(ctx.project_id))
+                        if pf_bytes:
+                            await session.upload_content(pf_bytes, pf_name or fn)
+                            uploaded = True
+                    except Exception as e:
+                        log.warning("code_exec file upload %s failed: %s", fn, e)
+
             result = await session.exec_python(code, timeout=60)
 
             # Capture newly-written files and stash them in the candidate
@@ -262,9 +385,6 @@ async def code_exec(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, A
                             data = await session.download_file(name)
                             blob = getattr(data, "content", None) or data
                             if isinstance(blob, bytes):
-                                # Upload bytes directly as one JSONL row (it's
-                                # not really jsonl but write_candidates wants
-                                # an iterable of dicts; bypass by writing raw)
                                 from dsl_worker.chat.candidates import (
                                     _candidate_blob_path,
                                 )
@@ -282,6 +402,20 @@ async def code_exec(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, A
                 except Exception as e:
                     log.warning("code_exec post-list failed: %s", e)
 
+            # Process dsl_tools.add_rows() ops written by sandbox code.
+            ops_result: Dict[str, Any] | None = None
+            if table_id:
+                try:
+                    ops_data = await session.download_file("_dsl_ops.jsonl")
+                    ops_blob = getattr(ops_data, "content", None) or ops_data
+                    if isinstance(ops_blob, bytes) and ops_blob.strip():
+                        ops_result = _apply_sandbox_ops(
+                            table_id, ops_blob, run_id=str(ctx.run_id) if ctx.run_id else None,
+                        )
+                except Exception as e:
+                    if "not found" not in str(e).lower() and "404" not in str(e):
+                        log.warning("code_exec ops read failed: %s", e)
+
             raw_stdout = getattr(result, "stdout", "") or ""
             raw_stderr = getattr(result, "stderr", "") or ""
             stdout_truncated = len(raw_stdout) > 8000
@@ -291,7 +425,7 @@ async def code_exec(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, A
             # head loses the error that caused the failure — the exact
             # thing the agent needs to see to fix the snippet.
             stderr_out = raw_stderr[-2000:] if stderr_truncated else raw_stderr
-            return {
+            envelope: Dict[str, Any] = {
                 "ok": bool(getattr(result, "success", False)),
                 "stdout": raw_stdout[:8000],
                 "stderr": stderr_out,
@@ -301,7 +435,10 @@ async def code_exec(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, A
                 "stderr_total_chars": len(raw_stderr),
                 "exit_code": getattr(result, "exit_code", None),
                 "files_captured": captured,
-            }, 0.0
+            }
+            if ops_result:
+                envelope["ops"] = ops_result
+            return envelope, 0.0
     except Exception as e:
         log.exception("code_exec failed: %s", e)
         return {"error": str(e)[:300]}, 0.0

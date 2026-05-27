@@ -57,7 +57,7 @@ Pick by data shape, not a priority list.
 - no directory site AND no upstream structured source you could enumerate first (then per-row research from there) → web_harvest. Most "research" asks have an upstream enumeration path worth checking first: companies via Apollo, places via Google Maps, people via FE, etc. web_harvest surfaces what SERPs surface — not the long tail.
 
 If unsure, do one or two `web_search` calls first to identify the directory site(s). If scouting surfaces specific listing pages, that's apify/BU territory.
-- **`file`** — uploaded tabular files (CSV/XLSX). Only works for files the user uploaded; the sandbox `code_exec` runs in is isolated from the file source. **Don't** write a CSV via `code_exec` and then try `source="file"` — the file lives in a sandbox the file adapter can't see, you'll get `0 rows; nothing to commit`.
+- **`file`** — uploaded tabular files (CSV/XLSX). Only works for files the user uploaded via the upload UI. For non-tabular files (JSON, JSONL, DOCX, TXT, XML), load skill `file-import` first.
 - **`llm`** — pure model-generated rows. No retrieval. Use when the answer IS the model's structured guess: ideation, brainstorming, archetype lists, angle/hook lists, taxonomy/category seeds, "come up with N ideas for X." Pair with downstream tables when the LLM rows become inputs ("come up with 20 ICP ideas → find companies matching each"). Wrong choice when an actual list exists in the world — use the right retrieval source instead. Don't reach for `llm` to invent rows that should be looked up (companies, people, posts, products).
 
 Integrations are preferred over open-web when they cover the data — more structured, more thorough at scale, more cost-efficient.
@@ -771,7 +771,7 @@ Get the full list shallow first. If you need detail per row, do it via cell_agen
 
 ## file
 ```
-file_id: "..."        # from user upload only — code_exec output is NOT accessible to file source
+file_id: "..."        # from user upload only
 ```
 
 ## llm

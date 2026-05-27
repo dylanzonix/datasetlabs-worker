@@ -1277,8 +1277,13 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
         # value stays in `mapped[new_name]`. Without this sweep, INVALID
         # emails remain visible in cells + exports — the user has to
         # know what Scrubby said, which defeats the verify gate.
-        ev_now = next_tags.get("email_verification") or {}
-        if isinstance(ev_now, dict):
+        for bucket_name, reason_text in (
+            ("email_verification", "Email failed verification — Scrubby marked it Invalid."),
+            ("url_verification", "URL failed verification — page does not match the expected entity."),
+        ):
+            ev_now = next_tags.get(bucket_name) or {}
+            if not isinstance(ev_now, dict):
+                continue
             for col_name, verdict in ev_now.items():
                 if not isinstance(verdict, dict):
                     continue
@@ -1287,13 +1292,12 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
                 stale = verdict.get("value")
                 if stale and mapped.get(col_name) == stale:
                     mapped[col_name] = None
-                    # Make the empty-cell reason discoverable in the FE.
                     fs = dict(next_tags.get("fill_status") or {})
                     fs.setdefault(col_name, {
                         "status": "null_legitimate",
-                        "reason": "Email failed verification — Scrubby marked it Invalid.",
+                        "reason": reason_text,
                         "cost": 0.0,
-                        "strategy": "scrubby_verify",
+                        "strategy": "firecrawl_verify" if "url" in bucket_name else "scrubby_verify",
                     })
                     next_tags["fill_status"] = fs
         ctx.db.execute(
@@ -1707,17 +1711,46 @@ async def row_inspect(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str,
 
 async def row_delete(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
     table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
+    if not table_id:
+        return {"error": "table_id required"}, 0.0
     row_ids = args.get("row_ids") or []
-    if not (table_id and row_ids):
-        return {"error": "table_id and row_ids required"}, 0.0
-    result = ctx.db.execute(
-        sa_text(
-            "UPDATE samples SET deleted_at=now() WHERE table_id=:tid AND id::text = ANY(:ids)"
-        ),
-        {"tid": table_id, "ids": row_ids},
-    )
-    ctx.db.commit()
-    return {"rows_deleted": result.rowcount or 0}, 0.0
+    filters = args.get("filters") or []
+
+    if row_ids:
+        result = ctx.db.execute(
+            sa_text(
+                "UPDATE samples SET deleted_at=now() WHERE table_id=:tid AND id::text = ANY(:ids)"
+            ),
+            {"tid": table_id, "ids": row_ids},
+        )
+        ctx.db.commit()
+        return {"rows_deleted": result.rowcount or 0}, 0.0
+
+    if filters:
+        all_rows = ctx.db.execute(
+            sa_text("SELECT id::text, row FROM samples WHERE table_id=:tid AND deleted_at IS NULL"),
+            {"tid": table_id},
+        ).fetchall()
+        to_delete: List[str] = []
+        for sid, row in all_rows:
+            if not isinstance(row, dict):
+                continue
+            if all(
+                _match(row.get(f["column"]), f["op"], f["value"])
+                for f in filters
+                if f.get("column") and f.get("op")
+            ):
+                to_delete.append(sid)
+        if not to_delete:
+            return {"rows_deleted": 0, "note": "no rows matched filters"}, 0.0
+        ctx.db.execute(
+            sa_text("UPDATE samples SET deleted_at=now() WHERE id::text = ANY(:ids)"),
+            {"ids": to_delete},
+        )
+        ctx.db.commit()
+        return {"rows_deleted": len(to_delete)}, 0.0
+
+    return {"error": "row_ids or filters required"}, 0.0
 
 
 # ---------------------------------------------------------------------------

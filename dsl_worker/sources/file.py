@@ -28,6 +28,39 @@ log = logging.getLogger(__name__)
 _INT_RE = re.compile(r"^-?\d+$")
 _FLOAT_RE = re.compile(r"^-?\d+\.\d+$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def _read_project_file_bytes(
+    file_id: str, project_id: str,
+) -> tuple[Optional[bytes], Optional[str]]:
+    """Read an uploaded project file's raw bytes from Azure Blob.
+
+    Returns (bytes, filename) or (None, None) if not found.
+    """
+    if not _UUID_RE.match(file_id):
+        return None, None
+    try:
+        from dsl_api.db import SessionLocal
+        from sqlalchemy import text as sa_text
+        db = SessionLocal()
+        try:
+            row = db.execute(
+                sa_text(
+                    "SELECT blob_path, filename FROM project_files "
+                    "WHERE id=:fid AND deleted_at IS NULL AND status='uploaded'"
+                ),
+                {"fid": file_id},
+            ).fetchone()
+        finally:
+            db.close()
+        if row and row[0]:
+            from dsl_api.azure.blob import get_blob_client
+            blob_client = get_blob_client(row[0])
+            return blob_client.download_blob().readall(), row[1]
+    except Exception as e:
+        log.info("_read_project_file_bytes: %s failed: %s", file_id, e)
+    return None, None
 _URL_RE = re.compile(r"^https?://")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -116,30 +149,10 @@ class FileAdapter(SourceAdapter):
             project_id = query_params.get("_project_id")
             blob_bytes: Optional[bytes] = None
             blob_filename: Optional[str] = None
-            uuid_re = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
-            if uuid_re.match(file_id):
-                try:
-                    from dsl_api.db import SessionLocal
-                    from sqlalchemy import text as sa_text
-                    db = SessionLocal()
-                    try:
-                        row = db.execute(
-                            sa_text(
-                                "SELECT blob_path, filename FROM project_files "
-                                "WHERE id=:fid AND deleted_at IS NULL AND status='uploaded'"
-                            ),
-                            {"fid": file_id},
-                        ).fetchone()
-                    finally:
-                        db.close()
-                    if row and row[0]:
-                        from dsl_api.azure.blob import get_blob_client
-                        blob_client = get_blob_client(row[0])
-                        blob_bytes = blob_client.download_blob().readall()
-                        blob_filename = row[1]
-                except Exception as e:
-                    log.info("file source: blob lookup for %s failed: %s", file_id, e)
+            blob_bytes, blob_filename = _read_project_file_bytes(file_id, project_id or "")
+            if blob_bytes is None:
+                pass  # fall through to candidates lookup
 
             if blob_bytes is None and project_id:
                 try:

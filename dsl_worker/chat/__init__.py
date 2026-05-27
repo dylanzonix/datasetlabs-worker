@@ -394,9 +394,16 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
         "sort_clear": "Remove the active sort on a table.",
         # Rows
         "row_inspect": "Read-only peek at rows.",
-        "row_delete": "Delete rows by id. Approval-gated.",
+        "row_delete": "Delete rows. Args: {table_id, row_ids?: [uuid, ...], filters?: [{column, op, value}, ...]}. Either row_ids or filters required. Filters use the same ops as filter_set. Approval-gated.",
         # Utility
-        "code_exec": "Execute a Python snippet in the sandbox.",
+        "code_exec": (
+            "Execute a Python snippet in an isolated sandbox. "
+            "Args: {code, files?, table_id?}. "
+            "files: list of file_id UUIDs (from project uploads) or candidate filenames to inject — "
+            "each file is placed in /workspace/ under its original filename. "
+            "table_id: when set, `import dsl_tools; dsl_tools.add_rows([...])` in the code "
+            "bulk-inserts parsed rows into that table after execution finishes."
+        ),
         # web_search is the OpenAI hosted tool — added directly to the
         # Responses `tools` array in agent.py as {"type": "web_search"},
         # not registered here as a function. Keeping it out of
