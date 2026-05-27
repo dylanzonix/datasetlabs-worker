@@ -201,6 +201,18 @@ class ApolloCompaniesAdapter(SourceAdapter):
         page = int((prior_cursor or {}).get("page", 1))
         target = n
 
+        # Apollo's organization_industries filter is case-sensitive and only
+        # accepts their canonical lowercase strings (e.g. "retail" works,
+        # "Retail" returns 0). The LLM often passes the user's exact casing
+        # ("Retail", "Automotive") which silently returns 0 results. We
+        # lowercase here so the orchestrator doesn't have to remember the
+        # rule. Confirmed empirically against Apollo's API 2026-05-27.
+        query_params = dict(query_params)
+        if isinstance(query_params.get("organization_industries"), list):
+            query_params["organization_industries"] = [
+                str(v).lower() for v in query_params["organization_industries"]
+            ]
+
         all_rows: List[Dict[str, Any]] = []
         total_entries: Optional[int] = None
 

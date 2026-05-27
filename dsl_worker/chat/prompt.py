@@ -619,7 +619,17 @@ revenue_range: {min: 1000000, max: 50000000}
 
 # Industry filters — prefer STRICT industry filters over loose keyword_tags
 # whenever the user names specific industries.
-organization_industries: ["Retail", "Manufacturing"]   # STRICT, Apollo's exact industry names
+# IMPORTANT: organization_industries values MUST be LOWERCASE Apollo
+# canonical names. "Retail" returns 0; "retail" returns 39k. The adapter
+# auto-lowercases as a safety net but write lowercase from the start.
+# Known-working: "retail", "automotive", "construction", "real estate",
+# "financial services", "information technology and services",
+# "computer software", "marketing and advertising", "telecommunications",
+# "transportation/trucking/railroad", "hospital & health care", "education
+# management". If your guess doesn't match Apollo's taxonomy, the call
+# silently returns 0 — when that happens, fall back to keyword_tags AND
+# add a post-enrichment column to filter further.
+organization_industries: ["retail", "automotive"]      # STRICT, lowercase only
 organization_industry_tag_ids: ["5567cd47..."]         # if you have hash IDs (rare)
 organization_naics_codes: ["722511"]                   # NAICS code filter (very strict)
 organization_sic_codes: ["7372"]                       # SIC code filter
