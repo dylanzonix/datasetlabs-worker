@@ -756,9 +756,20 @@ async def _drain_stream_into_table(
     from dsl_api.models import ChatRun
 
     total_committed = first_yielded
+    # Accumulate cost across batches. The streaming-apify adapter's
+    # first yield always carries cost_credits=0 (the run hasn't
+    # terminated yet to compute final cost), so table_create's tool
+    # return was missing it. The TERMINAL yield from the adapter
+    # carries the real run cost; pick it up here and charge the user
+    # after commit. Without this, every apify table_create that went
+    # through the streaming path billed $0 to the user despite real
+    # Apify spend ($0.50-0.90 per typical harvestapi run).
+    accumulated_cost_credits = 0.0
     try:
         async for batch in stream_gen:
             new_rows = batch.get("rows") or []
+            batch_cost = float(batch.get("cost_credits") or 0.0)
+            accumulated_cost_credits += batch_cost
             if not new_rows:
                 if batch.get("exhausted"):
                     break
@@ -833,6 +844,47 @@ async def _drain_stream_into_table(
                 {"id": table_id},
             )
             db.commit()
+            # Persist + charge the accumulated apify cost. This is the
+            # second half of the cost-tracking fix: the adapter's
+            # terminal yield gave us the real USD cost, we accumulated
+            # it across batches; now write it to the table row AND draw
+            # the credits down from the user's account (best-effort —
+            # the chat turn has already returned, so this is the only
+            # path for the streaming-apify cost to land on the user's
+            # ledger).
+            if accumulated_cost_credits > 0:
+                try:
+                    db.execute(
+                        sa_text(
+                            "UPDATE tables SET last_fetch_cost_credits = COALESCE(last_fetch_cost_credits, 0) + :c "
+                            "WHERE id=:id"
+                        ),
+                        {"id": table_id, "c": float(accumulated_cost_credits)},
+                    )
+                    db.commit()
+                except Exception:
+                    log.exception("apify drain: persist last_fetch_cost_credits failed")
+                try:
+                    from dsl_api.models import Account
+                    from dsl_api.credits import consume_credits
+                    owner_row = db.execute(
+                        sa_text(
+                            "SELECT p.user_id::text "
+                            "FROM tables t JOIN projects p ON p.id = t.project_id "
+                            "WHERE t.id = :id"
+                        ),
+                        {"id": table_id},
+                    ).fetchone()
+                    if owner_row and owner_row[0]:
+                        account = db.query(Account).filter(Account.user_id == owner_row[0]).first()
+                        if account:
+                            consume_credits(
+                                db, account, float(accumulated_cost_credits),
+                                project_id=project_id, reason="apify_stream_drain",
+                            )
+                            db.commit()
+                except Exception:
+                    log.exception("apify drain: consume_credits failed (cost still recorded on table row)")
             if run_id is not None:
                 try:
                     run_obj = db.query(ChatRun).filter(ChatRun.id == run_id).first()
@@ -840,6 +892,7 @@ async def _drain_stream_into_table(
                         run_state.emit_event(db, run_obj, "table_stream_complete", {
                             "table_id": table_id,
                             "total": total_committed,
+                            "cost_credits": float(accumulated_cost_credits),
                         })
                 except Exception:
                     log.exception("table_stream_complete emit failed")
