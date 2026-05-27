@@ -276,7 +276,20 @@ class ApifyActorAdapter(SourceAdapter):
                         continue
                     rd = (run_resp.json() or {}).get("data") or {}
                     if rd.get("status") in terminal:
+                        # Apify populates usageTotalUsd a beat AFTER
+                        # status flips. Retry briefly until it lands.
                         cost_usd = _apify_run_cost_usd_from_data(rd)
+                        for cost_attempt in range(5):
+                            if cost_usd > 0:
+                                break
+                            await asyncio.sleep(0.5 * (cost_attempt + 1))
+                            retry_resp = await client.get(
+                                f"{APIFY_BASE}/actor-runs/{run_id}",
+                                params={"token": self.api_key},
+                            )
+                            if retry_resp.status_code == 200:
+                                rd2 = (retry_resp.json() or {}).get("data") or {}
+                                cost_usd = _apify_run_cost_usd_from_data(rd2)
                         break
                     await asyncio.sleep(2.5)
             except asyncio.CancelledError:
@@ -470,14 +483,25 @@ class ApifyActorAdapter(SourceAdapter):
                         except Exception:
                             pass
                     # Fetch real run cost from apify's API and bill it.
-                    final_run_resp = await client.get(
-                        f"{APIFY_BASE}/actor-runs/{run_id}",
-                        params={"token": self.api_key},
-                    )
+                    # Apify populates `usageTotalUsd` asynchronously AFTER
+                    # status flips to SUCCEEDED — querying immediately
+                    # often returns 0 / None. Retry with short backoff
+                    # until it lands. Without this every PAY_PER_EVENT
+                    # actor (harvestapi, etc.) billed $0 to the user
+                    # because we asked too early.
                     cost_usd = 0.0
-                    if final_run_resp.status_code == 200:
-                        rd = (final_run_resp.json() or {}).get("data") or {}
-                        cost_usd = _apify_run_cost_usd_from_data(rd)
+                    for attempt in range(6):
+                        final_run_resp = await client.get(
+                            f"{APIFY_BASE}/actor-runs/{run_id}",
+                            params={"token": self.api_key},
+                        )
+                        if final_run_resp.status_code == 200:
+                            rd = (final_run_resp.json() or {}).get("data") or {}
+                            cost_usd = _apify_run_cost_usd_from_data(rd)
+                            if cost_usd > 0:
+                                break
+                        if attempt < 5:
+                            await asyncio.sleep(0.5 * (attempt + 1))
                     yield {
                         "rows": final_rows,
                         "exhausted": True,
