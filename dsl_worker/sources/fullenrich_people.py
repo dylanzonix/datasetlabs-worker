@@ -276,11 +276,21 @@ class FullEnrichPeopleAdapter(SourceAdapter):
                 if len(people) < body["limit"]:
                     break
 
-        # FE charges per match. Their published pricing varies by plan
-        # (~$0.01-0.05/match for people-search). Use env-tunable per-match
-        # USD; default $0.025/match. 1 our-credit = $0.10 of compute, so
-        # $0.025 → 0.25 credits/match (matches the historical estimate).
-        cost_per_match_usd = float(os.getenv("FULLENRICH_COST_USD_PER_MATCH", "0.025"))
+        # FE charges 0.25 FE credits per search match (published rate). Convert
+        # to USD via the same FULLENRICH_COST_PER_CREDIT env var the cell-agent
+        # FE-enrich path uses (default $0.055/FE credit = ~$55/1k credits Pro
+        # plan). Single source of truth — if FE plan rate changes, both
+        # search and per-cell enrich update together.
+        #
+        # Math: 100 matches × 0.25 FE-credits × $0.055/FE-credit = $1.375
+        # → at 1 DL-credit = $0.10 internal valuation = 13.75 DL credits.
+        # (Old hardcoded $0.025/match assumed $0.10/FE-credit and overcharged
+        # ~2x on this and similar plans.)
+        fe_usd_per_credit = float(os.getenv("FULLENRICH_COST_PER_CREDIT", "0.055"))
+        # FULLENRICH_COST_USD_PER_MATCH env stays as an explicit override for
+        # emergencies; default derives from the per-credit rate.
+        default_per_match_usd = 0.25 * fe_usd_per_credit
+        cost_per_match_usd = float(os.getenv("FULLENRICH_COST_USD_PER_MATCH") or default_per_match_usd)
         cost_credits = len(all_rows) * cost_per_match_usd * 10.0
         return FetchResult(
             rows=all_rows[:n],
