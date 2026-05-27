@@ -135,7 +135,17 @@ async def _scrape_once(
         # Firecrawl side error — retryable.
         return {"url": url, "status": "TIMEOUT", "error": f"firecrawl_http_{resp.status_code}", "code": resp.status_code}
     if resp.status_code >= 400:
-        # 4xx — terminal, this URL is bad regardless of retry.
+        # Firecrawl returns 403 + "do not support this site" for domains
+        # it refuses to scrape (LinkedIn, Reddit, etc.). That's a
+        # firecrawl limitation, not a broken URL — treat as UNSUPPORTED
+        # so the caller maps to UNVERIFIED instead of INVALID.
+        if resp.status_code == 403:
+            try:
+                body = resp.json()
+                if "do not support" in (body.get("error") or "").lower():
+                    return {"url": url, "status": "UNSUPPORTED", "error": "firecrawl_unsupported_site", "code": 403}
+            except Exception:
+                pass
         return {"url": url, "status": "BROKEN", "error": f"firecrawl_http_{resp.status_code}", "code": resp.status_code}
 
     try:
@@ -178,8 +188,9 @@ async def _scrape_one(
     """Return ``{url, status, markdown, title, code, error}``.
 
     ``status`` is one of:
-      • ``"BROKEN"``  — page returned HTTP 4xx or firecrawl rejected it.
-      • ``"EMPTY"``   — scrape succeeded but no readable content.
+      • ``"BROKEN"``      — page returned HTTP 4xx or firecrawl rejected it.
+      • ``"UNSUPPORTED"`` — firecrawl refuses the domain (LinkedIn, Reddit…).
+      • ``"EMPTY"``       — scrape succeeded but no readable content.
       • ``"TIMEOUT"`` — both attempts timed out / transient errors —
         verifier maps this to ``UNVERIFIED`` ("couldn't verify").
       • ``None``      — scrape succeeded; LLM will decide.
@@ -328,20 +339,28 @@ _TOOLS_FOR_JUDGE: List[Dict[str, Any]] = [
 
 _JUDGE_SYSTEM = (
     "You verify that a scraped webpage matches the entity described in "
-    "a table row. Workflow:\n"
-    "  1. find(keyword) — cheap boolean probe. Try the entity's "
-    "distinguishing name first.\n"
+    "a table row. The Column name tells you WHAT the URL represents — "
+    "adjust your expectations accordingly:\n"
+    "  • A column like 'Website' or 'Company Website' = a company "
+    "homepage. VALID if the page belongs to the company in the row, "
+    "even if it doesn't mention a specific person or event.\n"
+    "  • A column like 'Announcement URL' or 'Article' = a specific "
+    "news/event page. VALID if the page covers the specific event or "
+    "entity described in the row.\n"
+    "  • For any other column, use the column name + description (if "
+    "provided) to infer what 'matches' means.\n\n"
+    "Workflow:\n"
+    "  1. find(keyword) — cheap boolean probe. Pick keywords that fit "
+    "the column's purpose: for a company website, search the company "
+    "name; for a person's profile, search the person's name; for an "
+    "announcement, search the specific event details.\n"
     "  2. find_context(keyword) — once find() hits, always confirm "
-    "with this. Read the excerpts: do they describe THIS entity "
-    "(profile, about page, product detail) or do they show the entity "
-    "as one item in a list of many similar items (\"X · Y · Z · ...\", "
-    "\"Browse companies: X, Y, Z\", \"Showing 1-20 of 500\")? The "
-    "second case means the URL points to a DIRECTORY or CATEGORY page, "
-    "not the entity's detail page → INVALID.\n"
+    "with this. Check the excerpts describe THIS entity, not a "
+    "directory listing many entities.\n"
     "  3. decide(status, reason) — exactly one call, ends the loop. "
-    "VALID = the page is clearly the entity's own page. INVALID = "
-    "readable but wrong entity OR a directory/category page rather "
-    "than a detail page. UNVERIFIED = page was unreadable (empty / "
+    "VALID = the page matches what this column is supposed to hold. "
+    "INVALID = readable but clearly the wrong entity/company OR a "
+    "directory page. UNVERIFIED = page was unreadable (empty / "
     "login wall / blocked).\n"
     "Heuristic on count: a SPECIFIC entity name appearing only 1-2 "
     "times on a long page is often just a listing entry. Appearing "
@@ -394,6 +413,7 @@ async def _judge_one(
     markdown: str,
     expected_entity: str,
     column: str,
+    column_description: str = "",
 ) -> Tuple[str, str]:
     """Run the find()/decide() loop for ONE URL. Returns (status, reason).
 
@@ -405,9 +425,11 @@ async def _judge_one(
     md_lower = markdown.lower()
     preview = markdown[:300].replace("\n", " ")
 
+    desc_line = f"Column description: {column_description}\n" if column_description else ""
     user_msg = (
         f"URL: {url}\n"
         f"Column: {column}\n"
+        f"{desc_line}"
         f"Expected entity: {expected_entity or '(none)'}\n"
         f"Page title: {title or '(none)'}\n"
         f"Content length: {len(markdown)} chars\n"
@@ -518,6 +540,7 @@ async def _verify_one_url(
     url: str,
     row: Dict[str, Any],
     url_columns: List[str],
+    column_description: str = "",
 ) -> Tuple[str, str]:
     """Scrape + judge one URL. Returns (status, reason).
 
@@ -531,6 +554,8 @@ async def _verify_one_url(
     s = scraped.get("status")
     if s == "BROKEN":
         return "INVALID", scraped.get("error") or "broken"
+    if s == "UNSUPPORTED":
+        return "UNVERIFIED", scraped.get("error") or "unsupported_site"
     if s == "EMPTY":
         return "UNVERIFIED", scraped.get("error") or "empty"
     if s == "TIMEOUT":
@@ -544,12 +569,13 @@ async def _verify_one_url(
         markdown=scraped.get("markdown", ""),
         expected_entity=expected,
         column=column,
+        column_description=column_description,
     )
 
 
 def _persist_row_verdicts(
     sample_id: str,
-    verdicts: List[Tuple[str, str, str]],  # (column, url, status)
+    verdicts: List[Tuple[str, str, str, str]],  # (column, url, status, reason)
 ) -> Optional[Dict[str, Any]]:
     """Persist all of a row's URL verdicts in ONE tag write.
 
@@ -572,12 +598,15 @@ def _persist_row_verdicts(
         row = dict(sample.row or {})
         row_changed = False
 
-        for column, url, status in verdicts:
-            verifications[column] = {
+        for column, url, status, reason in verdicts:
+            entry: Dict[str, Any] = {
                 "value": url,
                 "status": status,
                 "source": "firecrawl",
             }
+            if reason:
+                entry["reason"] = reason
+            verifications[column] = entry
             if status == "INVALID":
                 if row.get(column) == url:
                     row[column] = None
@@ -630,6 +659,7 @@ async def verify_batch(
     rows_by_column: Dict[str, List[Tuple[str, str, Dict[str, Any]]]],
     url_columns: List[str],
     progress_cb: Optional[ProgressCallback],
+    column_descriptions: Optional[Dict[str, str]] = None,
 ) -> None:
     """Public entry — verify every URL in the batch.
 
@@ -651,6 +681,7 @@ async def verify_batch(
             rows_by_column=rows_by_column,
             url_columns=url_columns,
             progress_cb=progress_cb,
+            column_descriptions=column_descriptions,
         )
     except asyncio.CancelledError:
         log.info("url_verify: batch cancelled — partial verdicts retained")
@@ -665,6 +696,7 @@ async def _verify_batch_impl(
     rows_by_column: Dict[str, List[Tuple[str, str, Dict[str, Any]]]],
     url_columns: List[str],
     progress_cb: Optional[ProgressCallback],
+    column_descriptions: Optional[Dict[str, str]] = None,
 ) -> None:
     if not rows_by_column:
         return
@@ -722,6 +754,7 @@ async def _verify_batch_impl(
                             url=url,
                             row=row,
                             url_columns=url_columns,
+                            column_description=(column_descriptions or {}).get(col, ""),
                         )
                         for col, url, row in items
                     ],
@@ -731,24 +764,24 @@ async def _verify_batch_impl(
                 log.exception("url_verify: gather failed for row %s", sample_id)
                 results = [Exception("gather_failed")] * len(items)
 
-            verdicts: List[Tuple[str, str, str]] = []
+            verdicts: List[Tuple[str, str, str, str]] = []
             for (col, url, _row), res in zip(items, results):
                 if isinstance(res, Exception):
                     log.exception(
                         "url_verify: _verify_one_url raised for %s/%s",
                         sample_id, col, exc_info=res,
                     )
-                    verdicts.append((col, url, "UNVERIFIED"))
+                    verdicts.append((col, url, "UNVERIFIED", "internal_error"))
                 else:
-                    status, _reason = res
-                    verdicts.append((col, url, status))
+                    status, reason = res
+                    verdicts.append((col, url, status, reason))
 
             snapshot = await asyncio.to_thread(_persist_row_verdicts, sample_id, verdicts)
 
             if progress_cb is None:
                 return
             try:
-                for col, url, status in verdicts:
+                for col, url, status, _reason in verdicts:
                     await progress_cb({
                         "type": "url_verified",
                         "row_id": sample_id,

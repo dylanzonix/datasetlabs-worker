@@ -1237,7 +1237,7 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
         # for columns that were dropped in the new mapping are removed;
         # keys for columns that didn't change keep their entry intact.
         new_cols_set = set(new_sf_to_name.values())
-        for bucket_key in ("email_verification", "fill_status", "failed_emails"):
+        for bucket_key in ("email_verification", "url_verification", "fill_status", "failed_emails", "failed_urls"):
             bucket = next_tags.get(bucket_key)
             if not isinstance(bucket, dict) or not bucket:
                 continue
@@ -1991,10 +1991,16 @@ def _commit_rows(
         # sources (apify_actor:* etc.) so we don't burn firecrawl
         # credits on URLs the scraper already validated.
         try:
+            col_descs = {
+                c["name"]: c.get("description", "")
+                for c in normalized_map
+                if c.get("description")
+            }
             url_verify_hook.schedule_bulk_for_rows(
                 run_id=run_id,
                 rows=pending_verify,
                 source=source,
+                column_descriptions=col_descs or None,
             )
         except Exception:
             log.exception("url_verify_hook.schedule_bulk_for_rows raised in _commit_rows; suppressed")

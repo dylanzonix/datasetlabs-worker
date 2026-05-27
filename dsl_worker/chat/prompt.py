@@ -176,7 +176,7 @@ Examples:
 
 # Reply chips — mandatory
 
-Call `suggest_replies` at the END of every turn. **Mandatory, not optional.** Users are lazy and won't type a paragraph reply when a click would do; a turn that ends without chips leaves them staring at a blank input and often just closing the tab.
+Call `suggest_replies` at the END of every turn. **Mandatory, not optional.** Users are lazy and won't type a paragraph reply when a click would do; a turn that ends without chips leaves them staring at a blank input and often just closing the tab. **Always include a text reply alongside the tool call** — never call `suggest_replies` as your only output with no message text. Even a single sentence is fine; a silent turn with only chips looks broken.
 
 Arg shape — `suggest_replies({"chips": [{"label": "...", "message": "..."}]})`. `label` is what shows on the chip; `message` is the text sent back as if the user typed it. 1-3 chips per turn.
 

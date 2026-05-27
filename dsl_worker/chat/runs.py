@@ -273,6 +273,37 @@ async def _post_first_chat_to_slack(
         log.exception("Failed to post first-chat notification to Slack for %s", project_id)
 
 
+async def _post_chat_message_to_slack(
+    *,
+    project_id: str,
+    email: Optional[str],
+    message: str,
+) -> None:
+    if not dsl_api_settings.SLACK_CHAT_WEBHOOK_URL:
+        return
+
+    email_line = email or "_(unknown)_"
+    snippet = message if len(message) <= 1500 else message[:1500] + "…"
+    quoted = "\n".join(f"> {line}" for line in (snippet.splitlines() or [""]))
+    text_msg = (
+        f":speech_balloon: *Chat* — {email_line}\n"
+        f"{quoted}\n"
+        f"• project_id: `{project_id}`"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                dsl_api_settings.SLACK_CHAT_WEBHOOK_URL,
+                json={"text": text_msg},
+            )
+            resp.raise_for_status()
+    except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout) as e:
+        log.warning("Slack chat webhook unreachable for %s: %s", project_id, type(e).__name__)
+    except Exception:
+        log.exception("Failed to post chat notification to Slack for %s", project_id)
+
+
 async def start_run(
     project_id: UUID,
     user_id: UUID,
@@ -325,21 +356,20 @@ async def start_run(
         db.refresh(run)
         run_id = run.id
 
-        first_message_email: Optional[str] = None
-        if is_first_message:
-            auth_row = db.execute(
-                sa_text("SELECT email FROM auth.users WHERE id = :uid"),
-                {"uid": str(user_id)},
-            ).fetchone()
-            if auth_row and auth_row[0]:
-                first_message_email = auth_row[0]
-            else:
-                account = (
-                    db.query(Account)
-                    .filter(Account.user_id == str(user_id))
-                    .first()
-                )
-                first_message_email = account.email if account else None
+        user_email: Optional[str] = None
+        auth_row = db.execute(
+            sa_text("SELECT email FROM auth.users WHERE id = :uid"),
+            {"uid": str(user_id)},
+        ).fetchone()
+        if auth_row and auth_row[0]:
+            user_email = auth_row[0]
+        else:
+            account = (
+                db.query(Account)
+                .filter(Account.user_id == str(user_id))
+                .first()
+            )
+            user_email = account.email if account else None
     finally:
         db.close()
 
@@ -347,11 +377,20 @@ async def start_run(
         asyncio.create_task(
             _post_first_chat_to_slack(
                 project_id=str(project_id),
-                email=first_message_email,
+                email=user_email,
                 message=user_content,
             ),
             name=f"slack-first-msg-{project_id}",
         )
+
+    asyncio.create_task(
+        _post_chat_message_to_slack(
+            project_id=str(project_id),
+            email=user_email,
+            message=user_content,
+        ),
+        name=f"slack-chat-{project_id}",
+    )
 
     task = asyncio.create_task(
         _run_chat_task(run_id, user_id, user_content),
@@ -1134,7 +1173,14 @@ async def _drive_agent(
             # also has the standalone ChatMessage.content to fall back on,
             # but stashing the final segment here keeps the segments list
             # self-contained (FE doesn't need to splice on m.content).
-            if final_text:
+            # Skip when the last text segment already has the same content
+            # — the terminator exit sets final_text = mid_text_raw which
+            # was already emitted as a text_segment in the same iteration.
+            last_text = next(
+                (s.get("content") for s in reversed(segments) if s.get("kind") == "text"),
+                None,
+            )
+            if final_text and final_text.strip() != (last_text or "").strip():
                 segments.append({"kind": "text", "content": final_text, "final": True})
             if segments:
                 ac["segments"] = segments

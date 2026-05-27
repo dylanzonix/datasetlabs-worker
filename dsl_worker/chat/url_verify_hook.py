@@ -168,6 +168,7 @@ def schedule_bulk_for_rows(
     run_id: Optional[Any],
     rows: List[Tuple[str, Dict[str, Any]]],
     source: Optional[str] = None,
+    column_descriptions: Optional[Dict[str, str]] = None,
 ) -> Optional[asyncio.Task]:
     """Fire one URL-verify task for the batch.
 
@@ -238,6 +239,7 @@ def schedule_bulk_for_rows(
             rows_by_column=rows_by_column,
             url_columns=url_cols,
             progress_cb=progress_cb,
+            column_descriptions=column_descriptions,
         )
     )
     _register_background(task)

@@ -706,11 +706,17 @@ async def run_turn(
         # the turn is semantically over. Letting the loop run again just
         # gives the LLM a free turn with no new info and it regenerates
         # the same intro text (observed in prod, project 70e437bc).
-        # Text was already streamed + finalized as a text_segment above,
-        # so we don't emit final_message here.
+        # UNLESS the model produced zero text alongside the tool call —
+        # in that case let the loop continue so it gets the tool result
+        # and has another chance to produce an actual reply.
         if all(fc.name in _TERMINATOR_FN_CALLS for fc in function_calls):
-            final_text = mid_text_raw
-            break
+            if mid_text_raw.strip():
+                final_text = mid_text_raw
+                break
+            log.warning(
+                "agent: terminator-only response with no text for project %s iter %d — continuing",
+                project_id, iteration,
+            )
     else:
         log.warning(
             "agent loop hit MAX_TURN_ITERATIONS=%d for project %s",

@@ -204,10 +204,12 @@ async def enrichment_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
             from dsl_api.models import ChatRun
             run_obj = ctx.db.query(ChatRun).filter(ChatRun.id == ctx.run_id).first()
             if run_obj is not None:
-                table_short = ctx.db.execute(
-                    sa_text("SELECT short_id FROM tables WHERE id=:tid"),
+                _trow = ctx.db.execute(
+                    sa_text("SELECT short_id, name FROM tables WHERE id=:tid"),
                     {"tid": table_id},
-                ).scalar() or table_id
+                ).first()
+                table_short = (_trow[0] if _trow else None) or table_id
+                table_name_val = (_trow[1] if _trow else None) or ""
                 research_tier = action.get("research") or action.get("tier") or None
                 prompt_text = (action.get("prompt") or "").strip()
                 column_names = [c.get("name") for c in columns if isinstance(c, dict) and c.get("name")]
@@ -216,6 +218,7 @@ async def enrichment_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
                     "enrichment_uuid": enrichment_id,
                     "table_id": table_short,
                     "table_uuid": table_id,
+                    "table_name": table_name_val,
                     "name": name,
                     "columns": column_names,
                     "research_tier": research_tier,
