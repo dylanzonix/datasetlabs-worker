@@ -655,6 +655,17 @@ async def tail_events(
             yield ev
         return
 
+    # Marker between Step 1 (DB replay) and Step 2 (live bus tail).
+    # The FE uses this to discard replayed approval_required /
+    # plan_options_required events whose pending state lives in the
+    # in-process registry — if the worker restarted between when the
+    # event was persisted and now, the registry is empty, so re-adding
+    # the card from replay just resurrects a dead approval. Anything
+    # truly still-pending will be re-added by Project.tsx's
+    # listApprovals/listPlanOptionPicks rehydrate (those query the
+    # live registry, not chat_run_events).
+    yield {"type": "replay_complete"}
+
     # Atomic subscribe + snapshot. The snapshot is the cumulative
     # token content the bus has seen this run; yielding it as a
     # `text_checkpoint` lets a reconnecting subscriber bootstrap the
