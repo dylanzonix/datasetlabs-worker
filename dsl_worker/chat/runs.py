@@ -729,7 +729,7 @@ async def _drive_agent(
                     ldb_local.query(ChatRunEvent.type, ChatRunEvent.payload)
                     .filter(
                         ChatRunEvent.run_id == run_id,
-                        ChatRunEvent.type.in_(["text_segment", "tool_call", "tool_result"]),
+                        ChatRunEvent.type.in_(["text_segment", "tool_call", "tool_result", "user_injection"]),
                     )
                     .order_by(ChatRunEvent.seq.asc())
                     .all()
@@ -765,6 +765,20 @@ async def _drive_agent(
                             tool_meta[tcid]["summary"] = payload.get("summary")
                             tool_meta[tcid]["cost"] = payload.get("cost")
                             tool_meta[tcid]["duration_ms"] = payload.get("duration_ms")
+                    elif etype == "user_injection":
+                        # Mid-turn user injects belong in segments so a
+                        # refresh renders them inline (matches the live
+                        # FE build). Without this, the segments-driven
+                        # renderer skips them and the injectedMessages
+                        # fallback only runs when segments is empty —
+                        # so any assistant turn with both text/tools
+                        # AND injects shows the text/tools but loses
+                        # the inject balloons on reload.
+                        segments.append({
+                            "kind": "inject",
+                            "id": payload.get("id") or "",
+                            "content": payload.get("content") or "",
+                        })
                 # Append the running final-text snapshot as the trailing
                 # "final" segment so a kill before the official
                 # final_message event still leaves what the user saw.
@@ -1143,7 +1157,7 @@ async def _drive_agent(
                 db.query(ChatRunEvent.type, ChatRunEvent.payload)
                 .filter(
                     ChatRunEvent.run_id == run_id,
-                    ChatRunEvent.type.in_(["text_segment", "tool_call"]),
+                    ChatRunEvent.type.in_(["text_segment", "tool_call", "user_injection"]),
                 )
                 .order_by(ChatRunEvent.seq.asc())
                 .all()
@@ -1168,6 +1182,14 @@ async def _drive_agent(
                         segments[-1]["toolIds"].append(tcid)
                     else:
                         segments.append({"kind": "tools", "toolIds": [tcid]})
+                elif etype == "user_injection":
+                    # Mid-turn injects belong in segments so refresh keeps
+                    # them inline. Mirrors the incremental rebuild above.
+                    segments.append({
+                        "kind": "inject",
+                        "id": payload.get("id") or "",
+                        "content": payload.get("content") or "",
+                    })
             # Append the final assistant text as the trailing final-text
             # segment if we have any narration / tools above it. The FE
             # also has the standalone ChatMessage.content to fall back on,
