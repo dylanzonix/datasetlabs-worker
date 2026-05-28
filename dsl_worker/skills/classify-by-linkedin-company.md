@@ -27,56 +27,53 @@ For 1000 companies:
 - Classify-tier nano against scraped fields: ~$0.0005 × 1000 = **$0.50**
 - **Total: ~$4.50 vs ~$50-100 for per-row web_search**
 
-## Pattern (two enrichments)
+## Pattern: ONE enrichment, group every column
 
-**Enrichment 1 — LinkedIn Profile** (research-tier, ~$0.005/row including apify cost):
+The whole point of grouping columns into one enrichment is shared retrieval. One apify_call_actor returns tagline + description + industries — and the cell agent can ALSO emit the Yes/No qualification + a reason in the same final_result. Splitting into two enrichments is wasteful (double the approval cards, double the cell-agent overhead, same cost). Group them.
 
 ```
 enrichment_set(
-  name="LinkedIn Profile",
+  name="Is Outbound Agency",          # name reflects the qualification question
   columns=[
-    {"name": "LinkedIn Tagline",     "type": "text"},
-    {"name": "LinkedIn Description", "type": "text"},
-    {"name": "LinkedIn Industries",  "type": "text"},
+    {"name": "LinkedIn Tagline",       "type": "text"},
+    {"name": "LinkedIn Description",   "type": "text"},
+    {"name": "LinkedIn Industries",    "type": "text"},
+    {"name": "Is Outbound Agency",     "type": "enum"},
+    {"name": "Qualification Reason",   "type": "text"},
   ],
   action={
     "research": "research",
     "prompt": (
-      "Call apify_call_actor with actor_id='harvestapi/linkedin-company' and input "
-      "{\"companies\": [Company LinkedIn]} (a single-element list with the row's "
-      "LinkedIn URL). Read the returned row's `tagline`, `description`, and "
-      "`industries` (array of objects — join their names with ', '). Fill the "
-      "three columns. Return null on any field the actor doesn't provide."
+      "Call apify_call_actor with actor_id='harvestapi/linkedin-company' and "
+      "input {\"companies\": [Company LinkedIn]} (a single-element list with "
+      "the row's Company LinkedIn URL). From the returned row, fill: "
+      "LinkedIn Tagline (from `tagline`), LinkedIn Description (from "
+      "`description`), LinkedIn Industries (from `industries` — join the "
+      "name fields with ', '). Then judge whether this is a B2B outbound "
+      "agency / lead-gen / appointment-setting / SDR-as-a-service business. "
+      "Fill Is Outbound Agency = Yes or No, and Qualification Reason with "
+      "one sentence citing the description or industries. If the actor "
+      "returns no data, set every column to null."
     ),
     "depends_on": ["Company LinkedIn"],
-    "per_row_credit_cap": 0.5
+    "per_row_credit_cap": 1.0
   }
 )
 ```
 
-Note: Apollo's `mixed_companies/search` raw rows include a `linkedin_url` field — column_map_set it as "Company LinkedIn" before this enrichment runs. If the row only has Domain, fall back to `apify_call_actor` with the domain — harvestapi/linkedin-company accepts domains too.
+One enrichment, one cell-agent pass per row, one apify call. The three LinkedIn columns are surfaced as reusable columns (re-classify for free on a different question later by adding another classify enrichment that depends_on them). The qualification + reason are filled in the same pass.
 
-**Enrichment 2 — qualification** (classify-tier, ~$0.0005/row):
+**Apollo's `mixed_companies/search` raw rows include a `linkedin_url` field** — column_map_set it as "Company LinkedIn" before this enrichment runs. If the row only has Domain, harvestapi/linkedin-company accepts domains too — swap the input.
 
-```
-enrichment_set(
-  name="Is Outbound Agency",     # or whatever the qualification is
-  columns=[{"name": "Is Outbound Agency", "type": "enum"}],
-  action={
-    "research": "classify",
-    "prompt": (
-      "Read LinkedIn Tagline + LinkedIn Description + LinkedIn Industries. "
-      "Return Yes if this is a B2B outbound agency / lead-gen / appointment-setting / "
-      "SDR-as-a-service business. Return No otherwise. When the three fields are all "
-      "empty, return null."
-    ),
-    "depends_on": ["LinkedIn Description"],
-    "per_row_credit_cap": 0.05
-  }
-)
-```
+Wall-time on 1000 rows at default concurrency: ~3 minutes.
 
-Classify auto-runs once `LinkedIn Description` is populated (dep-readiness gate). Total wall-time: ~2-3 minutes for 1000 rows at typical concurrency.
+## When to split into two enrichments
+
+Only if the user wants to qualify on MULTIPLE different criteria off the same LinkedIn data. Then:
+- Enrichment 1 (research): fills Tagline + Description + Industries
+- Enrichment 2-N (classify): each one judges a different question, all depend_on Description
+
+Otherwise: one enrichment, group everything. Don't make the user click two approval cards for what's logically one operation.
 
 ## Sample harvestapi output
 
