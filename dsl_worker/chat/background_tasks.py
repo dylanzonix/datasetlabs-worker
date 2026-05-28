@@ -35,6 +35,7 @@ from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
 
 from dsl_api.db import SessionLocal
+from dsl_worker.chat.cancels import REGISTRY as CANCELS
 
 
 log = logging.getLogger(__name__)
@@ -336,6 +337,13 @@ async def spawn(
                     pass
                 done_event.set()
                 await REGISTRY.unregister(task_id)
+                if kind == "enrichment_run" and task_key:
+                    try:
+                        await CANCELS.unregister(
+                            ctx.project_id, task_key, asyncio.current_task()
+                        )
+                    except Exception:
+                        pass
 
     task = asyncio.create_task(_runner(), name=f"bg-{kind}-{short_id}")
     bg = BackgroundTask(
@@ -351,6 +359,14 @@ async def spawn(
         done_event=done_event,
     )
     await REGISTRY.register(bg)
+
+    # Also mirror enrichment_run tasks into CANCELS so the bottom-right
+    # Stop button (which polls /enrichments/running and cancels by
+    # (project_id, enrichment_id)) can reach chat-spawned runs. task_key
+    # for enrichment_run is the canonical enrichment_id. The matching
+    # CANCELS.unregister runs in _runner's finally block below.
+    if kind == "enrichment_run" and task_key:
+        await CANCELS.register(ctx.project_id, task_key, task)
 
     # Started event so the FE can render a "task running" chip
     # immediately, before the handler does any work.
