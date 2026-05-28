@@ -31,6 +31,10 @@ For 1000 companies:
 
 The whole point of grouping columns into one enrichment is shared retrieval. One apify_call_actor returns tagline + description + industries — and the cell agent can ALSO emit the Yes/No qualification + a reason in the same final_result. Splitting into two enrichments is wasteful (double the approval cards, double the cell-agent overhead, same cost). Group them.
 
+## Copy the action.prompt VERBATIM
+
+Do NOT paraphrase the prompt below into "use the LinkedIn company profile source" or anything similar. The cell agent freelances when given vague instructions — it will try browser_use (budget-gated, skipped), call apify_search_actors and pick the wrong scraper (data-slayer/linkedin-company-scraper has a different output shape), or emit nulls without calling any tool. Pass through the EXACT `apify_call_actor with actor_id="harvestapi/linkedin-company"` instruction so the cell agent has no room to interpret.
+
 ```
 enrichment_set(
   name="Is Outbound Agency",          # name reflects the qualification question
@@ -46,14 +50,16 @@ enrichment_set(
     "prompt": (
       "Call apify_call_actor with actor_id='harvestapi/linkedin-company' and "
       "input {\"companies\": [Company LinkedIn]} (a single-element list with "
-      "the row's Company LinkedIn URL). From the returned row, fill: "
+      "the row's Company LinkedIn URL). Do NOT use browser_use, web_search, "
+      "apify_search_actors, or any other actor for this — only "
+      "harvestapi/linkedin-company. From the returned row, fill: "
       "LinkedIn Tagline (from `tagline`), LinkedIn Description (from "
       "`description`), LinkedIn Industries (from `industries` — join the "
       "name fields with ', '). Then judge whether this is a B2B outbound "
       "agency / lead-gen / appointment-setting / SDR-as-a-service business. "
       "Fill Is Outbound Agency = Yes or No, and Qualification Reason with "
       "one sentence citing the description or industries. If the actor "
-      "returns no data, set every column to null."
+      "returns no items or an error, set every column to null."
     ),
     "depends_on": ["Company LinkedIn"],
     "per_row_credit_cap": 1.0
