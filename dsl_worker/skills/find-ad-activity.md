@@ -1,8 +1,27 @@
 ---
 name: find-ad-activity
-description: Whether a company runs paid ads and which platforms.
-applies_to: [cell_agent]
+description: Whether a company runs paid ads and which platforms. Includes Apollo-source filter for narrowing the pool upfront.
+applies_to: [orchestrator, cell_agent]
 ---
+
+## Filter at Apollo FIRST when "runs paid ads" is a hard filter
+
+When the user wants companies *that run paid ads* (not just *enriched with ad info*), don't set up a per-row verification enrichment over a broad Apollo pool — that wastes ~$0.05/row to drop 90% of the table. Filter at the Apollo source instead.
+
+Apollo's `currently_using_any_of_technology_uids` accepts ad-tech UIDs and narrows total_entries in one call:
+
+```
+"currently_using_any_of_technology_uids": ["google_ads"]      → ~10% of base pool (the cleanest "running Google Ads" signal)
+"currently_using_any_of_technology_uids": ["doubleclick"]     → ~20% (Google's ad-tech backbone, broader)
+"currently_using_any_of_technology_uids": ["google_ads", "doubleclick", "facebook_pixel"]  → "any paid ads"
+```
+
+Empirical: US + 100-1000 employees + B2B + SDR jobs last 30d = **1,495 companies**. Add `["google_ads"]` → **149 companies** (90% drop, free). Skip this filter and you'd pay ~$3 per Apollo row × ~$0.05 verify = $75 to do the same drop downstream.
+
+When to fall back to the per-row enrichment below:
+- The user explicitly asked to *enrich* an existing table with ad info (column on a non-Apollo table)
+- Apollo returned 0 after applying the tech filter (rare — try `doubleclick` or `facebook_pixel`)
+- The user wants the ad **platforms list** as an output column (per-row enrichment fills the list; the Apollo filter just gates membership)
 
 ## Detecting paid-ad activity for a company
 
