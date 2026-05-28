@@ -41,6 +41,30 @@ log = logging.getLogger(__name__)
 _BACKGROUND_TASKS: set = set()
 
 
+# Sources whose emails are upstream-trusted — skip Scrubby on bulk
+# import. File uploads are the obvious case (user-curated data, paying
+# us to verify what they already gave us is wasted credits + time).
+# Provider-emails from Apollo / FullEnrich already skip Scrubby
+# per-cell via the `provider_emails` set; we mirror them here so
+# import-time bulk batches don't run either.
+_TRUSTED_SOURCES_EXACT = {
+    "file",
+    "apollo_companies",
+    "apollo_people",
+    "fullenrich_people",
+    "google_maps",
+}
+_TRUSTED_SOURCE_PREFIXES = ("apify_actor:",)
+
+
+def _is_trusted_source(source: Optional[str]) -> bool:
+    if not source:
+        return False
+    if source in _TRUSTED_SOURCES_EXACT:
+        return True
+    return any(source.startswith(p) for p in _TRUSTED_SOURCE_PREFIXES)
+
+
 def _register_background(task: asyncio.Task) -> None:
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_BACKGROUND_TASKS.discard)
@@ -122,6 +146,7 @@ def schedule_bulk_for_rows(
     run_id: Optional[Any],
     rows: List[tuple],
     columns: List[Dict[str, Any]],
+    source: Optional[str] = None,
 ) -> Optional[asyncio.Task]:
     """Fire ONE Scrubby /validate_bulk_emails task for a batch of rows.
 
@@ -133,10 +158,21 @@ def schedule_bulk_for_rows(
     `rows`: list of (sample_id, written_values) tuples — same shape
     `schedule_for_row` accepts for one row.
 
-    Returns None if Scrubby isn't configured or there are no email
-    cells across the batch.
+    `source`: the table's source identifier. Trusted sources
+    (file uploads, Apollo, FullEnrich, Apify actors) short-circuit
+    here — their emails are upstream-trusted, so spending Scrubby
+    credits + ~1s/email of wall-clock to re-verify is wasted work.
+
+    Returns None if Scrubby isn't configured, the source is trusted,
+    or there are no email cells across the batch.
     """
     if not rows:
+        return None
+    if _is_trusted_source(source):
+        log.info(
+            "scrubby: skipping bulk verify — source %r is upstream-trusted",
+            source,
+        )
         return None
     email_cols = _email_columns_from_defs(columns)
     if not email_cols:

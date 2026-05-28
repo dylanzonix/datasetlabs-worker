@@ -2128,6 +2128,7 @@ def _commit_rows(
                 run_id=run_id,
                 rows=pending_verify,
                 columns=col_defs,
+                source=source,
             )
         except Exception:
             log.exception("email_verify_hook.schedule_bulk_for_rows raised in _commit_rows; suppressed")
