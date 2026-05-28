@@ -1140,6 +1140,25 @@ async def table_extend(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
 # ---------------------------------------------------------------------------
 
 
+def _sanitize_jsonb_str(s: Any) -> Any:
+    """Strip characters postgres jsonb refuses to store. The agent
+    sometimes echoes back column headers with a NUL prefix (corrupted
+    UTF-8 BOM from Excel-written CSVs), and any \\u0000 in the JSON
+    blow up CAST(... AS jsonb) with `unsupported Unicode escape
+    sequence`. Also strip a leading BOM as a belt — file.py reads with
+    utf-8-sig now, but old projects may have BOM-prefixed names
+    already persisted."""
+    if not isinstance(s, str):
+        return s
+    NUL = chr(0)
+    BOM = chr(0xFEFF)
+    if NUL in s:
+        s = s.replace(NUL, "")
+    if s.startswith(BOM):
+        s = s.lstrip(BOM)
+    return s
+
+
 async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
     table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
     raw_mapping = args.get("mapping")
@@ -1203,6 +1222,18 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
             columns_for_db.append(entry)
     else:
         return {"error": f"mapping must be dict or list; got {type(raw_mapping).__name__}"}, 0.0
+
+    # Defensive: strip NUL bytes + leading BOM from name + source_field.
+    # NUL in the JSON kills CAST(... AS jsonb) with "unsupported
+    # Unicode escape sequence"; BOM-prefixed names are the upstream
+    # cause (Excel-written CSVs). file.py reads with utf-8-sig now so
+    # this is a belt-and-suspenders against legacy data + any other
+    # path that injects either character.
+    for c in columns_for_db:
+        if "name" in c:
+            c["name"] = _sanitize_jsonb_str(c["name"])
+        if "source_field" in c:
+            c["source_field"] = _sanitize_jsonb_str(c["source_field"])
 
     # column_map_set rewrites the table's columns AND re-derives every
     # row's mapped cell values from the stored raw_row. The agent can

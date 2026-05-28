@@ -178,7 +178,13 @@ class FileAdapter(SourceAdapter):
 
         rows: List[Dict[str, Any]] = []
         if path.suffix.lower() == ".csv":
-            with path.open("r", encoding="utf-8", errors="replace") as f:
+            # utf-8-sig strips a leading BOM (﻿) from the file so it
+            # doesn't end up as a prefix on the first column header. Excel
+            # writes BOM by default; without -sig, the first header reads
+            # as "﻿Company" → ends up in source_field → and downstream
+            # JSON/postgres mangling can turn it into NUL which jsonb
+            # rejects.
+            with path.open("r", encoding="utf-8-sig", errors="replace") as f:
                 reader = csv.DictReader(f)
                 offset = int((prior_cursor or {}).get("offset", 0))
                 for i, row in enumerate(reader):
