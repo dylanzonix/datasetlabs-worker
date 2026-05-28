@@ -8,20 +8,30 @@ applies_to: [orchestrator, cell_agent]
 
 When the user wants companies *that run paid ads* (not just *enriched with ad info*), don't set up a per-row verification enrichment over a broad Apollo pool — that wastes ~$0.05/row to drop 90% of the table. Filter at the Apollo source instead.
 
-Apollo's `currently_using_any_of_technology_uids` accepts ad-tech UIDs and narrows total_entries in one call:
+Apollo's `currently_using_any_of_technology_uids` accepts ad-tech UIDs and narrows total_entries in one call. Verified working UIDs (probed against US + 100-1000-employee B2B baseline of ~48k companies):
 
 ```
-"currently_using_any_of_technology_uids": ["google_ads"]      → ~10% of base pool (the cleanest "running Google Ads" signal)
-"currently_using_any_of_technology_uids": ["doubleclick"]     → ~20% (Google's ad-tech backbone, broader)
-"currently_using_any_of_technology_uids": ["google_ads", "doubleclick", "facebook_pixel"]  → "any paid ads"
+google_ads      ~2% of base   "Running Google paid search" — cleanest signal
+doubleclick     ~13%          Google's ad-tech backbone, broader (overlaps google_ads)
+linkedin_ads    ~4%           Has LinkedIn Insight Tag installed
+bing_ads        ~6%           Microsoft Ads
+criteo          ~0.7%         Retargeting (DTC-heavy)
+adroll          ~0.5%         Retargeting (B2B SaaS-heavy)
 ```
 
-Empirical: US + 100-1000 employees + B2B + SDR jobs last 30d = **1,495 companies**. Add `["google_ads"]` → **149 companies** (90% drop, free). Skip this filter and you'd pay ~$3 per Apollo row × ~$0.05 verify = $75 to do the same drop downstream.
+For a "running paid search ads" filter, **`["google_ads"]` is the right primary** — narrowest, cleanest, no ambiguity.
+For "running ads on Google in any form," **`["google_ads", "doubleclick"]`** (OR semantics — Apollo dedupes overlap).
+For "running ads anywhere," **`["google_ads", "doubleclick", "linkedin_ads", "bing_ads"]`**.
+
+**Do NOT use**: `facebook_pixel` (real UID but only 22 hits across 48k — Apollo has very thin coverage of Meta-side ad-tech). `facebook_ads`, `meta_pixel`, `linkedin_insight_tag`, `tiktok_pixel`, `twitter_pixel`, `hubspot_ads` — all return 0 (not valid Apollo UIDs).
+
+Empirical narrowing on a real prompt: US + 100-1000 employees + B2B + SDR jobs last 30d = **1,495 companies**. Add `["google_ads"]` → **149 companies** (90% drop, free). Skip this filter and you'd pay ~$0.05 verify × 1495 rows = ~$75 to do the same drop downstream via per-row enrichment.
 
 When to fall back to the per-row enrichment below:
 - The user explicitly asked to *enrich* an existing table with ad info (column on a non-Apollo table)
-- Apollo returned 0 after applying the tech filter (rare — try `doubleclick` or `facebook_pixel`)
+- Apollo's tech filter returned 0 — try broadening from `google_ads` → `doubleclick`
 - The user wants the ad **platforms list** as an output column (per-row enrichment fills the list; the Apollo filter just gates membership)
+- The user wants Meta/Facebook ad detection — Apollo's coverage is too thin; per-row BuiltWith is the path (it has full Facebook Pixel coverage)
 
 ## Detecting paid-ad activity for a company
 
