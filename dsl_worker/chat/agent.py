@@ -227,6 +227,16 @@ async def run_turn(
         # the stream — the post-call response.output loop skips emit for
         # these (still bills + adds to history).
         streamed_search_ids: set[str] = set()
+        # IDs of function_call items we've already streamed a
+        # tool_call_start for — keyed by call_id (not item.id). The
+        # post-stream _dispatch_call skips the redundant tool_call_start
+        # emit for these, since the FE already has the chip rendered.
+        # Without this live emit, the chip didn't appear until after
+        # OpenAI's entire response stream completed — long-reasoning
+        # turns left the user staring at the assistant text with no
+        # tool chip for 30-60s+ even though the model had already
+        # decided on the call.
+        streamed_function_call_ids: set[str] = set()
         try:
             # Stream the Responses API so hosted web_search calls and
             # reasoning summaries flow to the FE live, instead of all
@@ -291,6 +301,27 @@ async def run_turn(
                                     "result_preview": f"native web_search: {q[:120]}" if q else "native web_search",
                                     "cost_usd": WEB_SEARCH_CALL_COST_USD,
                                     "duration_ms": 0,
+                                })
+                        elif done is not None and getattr(done, "type", None) == "function_call":
+                            # Live tool_call_start the moment the model
+                            # commits the function call, instead of
+                            # waiting for the entire response stream to
+                            # finish + the post-stream walk. Cuts the
+                            # "text appeared but tool chip didn't show
+                            # for 30-60s" gap on long-reasoning turns.
+                            fn_call_id = getattr(done, "call_id", None) or ""
+                            fn_name = getattr(done, "name", None) or "?"
+                            if fn_call_id and fn_call_id not in streamed_function_call_ids:
+                                try:
+                                    fn_args = json.loads(getattr(done, "arguments", "") or "{}")
+                                except Exception:
+                                    fn_args = {}
+                                streamed_function_call_ids.add(fn_call_id)
+                                await emit({
+                                    "type": "tool_call_start",
+                                    "tool_call_id": fn_call_id,
+                                    "name": fn_name,
+                                    "args": fn_args,
                                 })
                 response = await stream.get_final_response()
 
@@ -491,12 +522,17 @@ async def run_turn(
             except json.JSONDecodeError:
                 args = {}
 
-            await emit({
-                "type": "tool_call_start",
-                "tool_call_id": fc.call_id,
-                "name": name,
-                "args": args,
-            })
+            # Skip the redundant tool_call_start emit when the stream
+            # loop already fired one live for this call_id. The FE
+            # already painted the chip; double-emit would create a
+            # duplicate entry in the tool log.
+            if fc.call_id not in streamed_function_call_ids:
+                await emit({
+                    "type": "tool_call_start",
+                    "tool_call_id": fc.call_id,
+                    "name": name,
+                    "args": args,
+                })
 
             tool_started = time.perf_counter()
             handler = HANDLERS.get(name)
