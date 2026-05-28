@@ -76,6 +76,13 @@ def _default_n_for_source(source: Optional[str]) -> int:
     if not source:
         return 100
     kind = source.split(":", 1)[0]
+    # File uploads are bounded by the file's row count, not by n — the
+    # user already chose how many rows by what they uploaded. Capping at
+    # 100 silently truncated CSVs / XLSXs the agent imported without
+    # passing n explicitly (the agent prompt didn't tell it to). Mirror
+    # what routes_table_edit's from-file endpoint does (n=10_000_000).
+    if kind == "file":
+        return 10_000_000
     return 1000 if kind in _FREE_HIGH_N_SOURCES else 100
 
 
