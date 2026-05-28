@@ -87,7 +87,13 @@ FIXED_COST_TOOLS = {
 BU_MIN_BUDGET = 0.30
 
 # Same idea for apify — actor runs need time + a few CU to be worth it.
-APIFY_MIN_BUDGET = 0.50
+# USD-denominated to match BU_MIN_BUDGET and the tier_cfg.cap units.
+# Was 0.50 which is $0.50 floor — wildly over for cheap actors like
+# harvestapi/linkedin-company ($0.004/item). Project db529ab4 had every
+# call skipped with "needs at least 0.5 cr; 0.04 remaining" because
+# the floor was 12x typical per_row_credit_cap. 0.03 lets cheap actors
+# run while still blocking pointless apify attempts on near-empty budgets.
+APIFY_MIN_BUDGET = 0.03
 
 CAPPED_TOOLS = {"browser_use", "apify_call_actor"}
 
@@ -1979,7 +1985,7 @@ async def run_cell_agent(
                         if remaining < BU_MIN_BUDGET:
                             skip_reason = (
                                 f"skipped: browser_use needs at least "
-                                f"{BU_MIN_BUDGET} cr; {remaining:.2f} remaining"
+                                f"${BU_MIN_BUDGET} remaining; only ${remaining:.3f} left"
                             )
                         else:
                             args["__max_cost_usd"] = float(remaining)
@@ -1987,7 +1993,7 @@ async def run_cell_agent(
                         if remaining < APIFY_MIN_BUDGET:
                             skip_reason = (
                                 f"skipped: apify_call_actor needs at least "
-                                f"{APIFY_MIN_BUDGET} cr; {remaining:.2f} remaining"
+                                f"${APIFY_MIN_BUDGET} remaining; only ${remaining:.3f} left"
                             )
                         else:
                             args["__max_cost_usd"] = float(remaining)
