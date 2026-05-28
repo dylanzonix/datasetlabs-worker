@@ -171,6 +171,14 @@ async def enrichment_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
         )
         # Add the enrichment columns to the table's column list if not already present.
         _ensure_columns_on_table(db, table_id, columns, enrichment_id=enrichment_id)
+    # On REFINE too — without this, a user who deleted the enrichment's
+    # columns and then asked the chat to re-add them gets the enrichment
+    # row updated but no columns in tables.columns, so the FE shows
+    # nothing. _ensure_columns_on_table only adds missing columns; it
+    # never removes ones the new spec dropped, so it's safe to call on
+    # both new + refine.
+    if is_refinement:
+        _ensure_columns_on_table(db, table_id, columns, enrichment_id=enrichment_id)
     db.commit()
 
     # Seed an agent comment per column the enrichment fills. Only on first
