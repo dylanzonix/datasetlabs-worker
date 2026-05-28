@@ -24,8 +24,12 @@ The right pattern: scrape each company's LinkedIn About via `apify_call_actor(ha
 
 For 1000 companies:
 - Apify scrape: $0.004 × 1000 = **$4**
-- Classify-tier nano against scraped fields: ~$0.0005 × 1000 = **$0.50**
-- **Total: ~$4.50 vs ~$50-100 for per-row web_search**
+- Research-tier mini (one cell-agent pass scraping + classifying): ~$0.02-0.05 × 1000 = **$20-50**
+- **Total: ~$25-55 vs ~$50-100 for per-row web_search**
+
+## per_row_credit_cap: 3.0 ($0.30/row)
+
+Don't set this lower than 3.0. The research tier uses gpt-5.4-mini at medium reasoning, which routinely burns $0.05-0.15 in reasoning tokens on this prompt before the apify call fires. With per_row_credit_cap=1.0 ($0.10/row), the pre-tool budget gate skips apify ("only $0.018 left, need $0.03") and the cell falls through to the prompt's "classify from row fields alone, mark No when evidence is weak" fallback — producing a flood of false-negative Nos. 3.0 ($0.30/row) gives reasoning + the $0.004 apify call + a margin.
 
 ## Pattern: ONE enrichment, group every column
 
@@ -62,7 +66,7 @@ enrichment_set(
       "returns no items or an error, set every column to null."
     ),
     "depends_on": ["Company LinkedIn"],
-    "per_row_credit_cap": 1.0
+    "per_row_credit_cap": 3.0
   }
 )
 ```
