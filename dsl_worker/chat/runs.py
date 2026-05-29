@@ -789,7 +789,42 @@ async def _drive_agent(
                 ac: Dict[str, Any] = {
                     "segments": segments,
                     "tool_log": list(tool_meta.values()),
+                    # Live-only turn state. Persist it on every incremental
+                    # flush so a refresh / tab-switch mid-turn reconstructs
+                    # the coin + inline cards from the DB row instead of
+                    # depending on replaying every event — which freezes the
+                    # cost and drops early "table created" chips on a long
+                    # background fill (the fill emits cell_* + cost_update,
+                    # not text_segment/tool_result, so without this the DB
+                    # row's cost stuck at the last pre-fill value). Mirrors
+                    # the end-of-turn applied_changes build.
+                    "total_cost_usd": total_cost_ref["value"],
                 }
+                card_rows = (
+                    ldb_local.query(ChatRunEvent.type, ChatRunEvent.payload)
+                    .filter(
+                        ChatRunEvent.run_id == run_id,
+                        ChatRunEvent.type.in_(
+                            ["table_card_added", "enrichment_card_added", "suggestions"]
+                        ),
+                    )
+                    .order_by(ChatRunEvent.seq.asc())
+                    .all()
+                )
+                tcs = [p for (t, p) in card_rows if t == "table_card_added" and p]
+                if tcs:
+                    ac["table_cards"] = tcs
+                ecs = [p for (t, p) in card_rows if t == "enrichment_card_added" and p]
+                if ecs:
+                    ac["enrichment_cards"] = ecs
+                sg_items: List[Dict[str, Any]] = []
+                for (t, p) in card_rows:
+                    if t == "suggestions" and isinstance(p, dict):
+                        for it in (p.get("items") or []):
+                            if isinstance(it, dict) and it.get("label") and it.get("message"):
+                                sg_items.append(it)
+                if sg_items:
+                    ac["suggestions"] = {"items": sg_items}
                 ldb_local.query(ChatMessage).filter(ChatMessage.id == assistant_msg_id).update({
                     "content": content_str,
                     "applied_changes": ac,
@@ -995,6 +1030,13 @@ async def _drive_agent(
                     run_state.emit_event(ldb, lrun, "cost_update", {
                         "total_cost_usd": new_total,
                     })
+                    # Persist the running cost into the assistant row now.
+                    # During a background fill the only events are cell_* +
+                    # cost_update — none of which otherwise trigger an
+                    # incremental persist — so without this the DB row's
+                    # total_cost_usd froze at the last pre-fill value and a
+                    # refresh/reattach showed an undercounted coin.
+                    _persist_assistant_incremental(ldb)
                 elif etype == "turn_complete":
                     total_cost_ref["value"] = float(evt.get("total_cost_usd") or 0.0)
                 elif etype == "error":
