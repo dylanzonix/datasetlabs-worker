@@ -200,7 +200,19 @@ def schedule_bulk_for_rows(
     # binary assets so verifying them is wasted credits, and the FE
     # treats absence-of-verification as "no badge" (same as if the
     # feature were disabled), which is the right outcome for assets.
+    #
+    # Truncate to the first _MAX_PER_BATCH URL cells in row order.
+    # Above the cap, the OLD behavior skipped the entire batch (so an
+    # 800-row table got zero verification signal even though the user
+    # would happily pay to validate the first chunk). NEW behavior:
+    # verify the first N URLs as a sample — same cost ceiling, but the
+    # user sees verdicts on the leading rows. Iteration is row-major
+    # (sample-by-sample, then column-within-sample) so the verified
+    # set is deterministic + reproducible across runs.
     rows_by_column: Dict[str, List[Tuple[str, str, Dict[str, Any]]]] = {}
+    total_added = 0
+    total_seen = 0
+    cap_hit = False
     for sample_id, written in rows:
         if not isinstance(written, dict):
             continue
@@ -210,29 +222,31 @@ def schedule_bulk_for_rows(
                 continue
             if not _is_verifiable_url(val):
                 continue
+            total_seen += 1
+            if _MAX_PER_BATCH > 0 and total_added >= _MAX_PER_BATCH:
+                cap_hit = True
+                continue
             rows_by_column.setdefault(col, []).append(
                 (str(sample_id), val, written)
             )
+            total_added += 1
+        if _MAX_PER_BATCH > 0 and total_added >= _MAX_PER_BATCH and cap_hit:
+            # Finish the row we started, then break out of the outer
+            # row loop. Avoids the asymmetric "row's first 2 URL cols
+            # got verified, last 3 didn't" case.
+            break
     if not rows_by_column:
         return None
-
-    # Apply the per-batch cap. Each (col, sample, url) entry counts as
-    # one verification. If total > cap, skip verifying entirely — the
-    # cell agent does its own freshness check on writes; running a
-    # 100-minute background batch that blocks reload is worse than
-    # showing no badge on a few large tables.
-    total_urls = sum(len(v) for v in rows_by_column.values())
-    if _MAX_PER_BATCH > 0 and total_urls > _MAX_PER_BATCH:
-        log.warning(
-            "url_verify: skipping batch — %d URLs exceeds per-batch cap of %d",
-            total_urls, _MAX_PER_BATCH,
+    if cap_hit:
+        log.info(
+            "url_verify: truncating batch — verifying first %d of %d URLs (row-major sample)",
+            total_added, total_seen,
         )
-        return None
 
     progress_cb = _make_event_emitter(run_id)
     log.info(
         "url_verify: scheduling bulk verify — %d URL(s) across %d column(s) / %d row(s)",
-        total_urls, len(rows_by_column), len(rows),
+        total_added, len(rows_by_column), len(rows),
     )
     task = asyncio.create_task(
         url_verify.verify_batch(

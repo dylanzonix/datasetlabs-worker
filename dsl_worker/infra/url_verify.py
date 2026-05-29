@@ -146,6 +146,17 @@ async def _scrape_once(
                     return {"url": url, "status": "UNSUPPORTED", "error": "firecrawl_unsupported_site", "code": 403}
             except Exception:
                 pass
+        # OUR side failures (auth / billing / rate limit) are not the
+        # URL's fault. Mapping these to BROKEN → INVALID would null the
+        # cell value and hide the user's URL on the firecrawl outage —
+        # exactly the wrong outcome ("I ran out of credits and now my
+        # URLs disappeared"). Route through UNSUPPORTED → UNVERIFIED so
+        # the URL stays visible with no badge.
+        #   402 = out of credits
+        #   401 = invalid API key
+        #   429 = rate limited
+        if resp.status_code in (401, 402, 429):
+            return {"url": url, "status": "UNSUPPORTED", "error": f"firecrawl_http_{resp.status_code}", "code": resp.status_code}
         return {"url": url, "status": "BROKEN", "error": f"firecrawl_http_{resp.status_code}", "code": resp.status_code}
 
     try:
