@@ -42,14 +42,19 @@ log = logging.getLogger(__name__)
 # at a time so total concurrent cells stays bounded.
 GLOBAL_CONCURRENCY = 25
 
-# Classify-tier cells use a SEPARATE, much higher concurrency cap.
-# They run gpt-5.4-nano with no tools (180k RPM / 180M TPM headroom),
-# take ~3s wall-time, cost ~$0.0005/cell. The 25-slot global cap was
-# sized for research/deep tier cells that hit FullEnrich/Apollo/BU.
-# Putting classify in the same lane throttled it to research-cell
-# concurrency for no reason — classify could comfortably run 100+ in
-# parallel without tickling rate limits.
-CLASSIFY_CONCURRENCY = 100
+# Classify-tier cells use a SEPARATE, higher concurrency cap.
+# They run gpt-5.4-nano with no tools, take ~3s wall-time, cost
+# ~$0.0005/cell. The 25-slot global cap was sized for research/deep
+# cells that hit FullEnrich/Apollo/BU.
+#
+# Was 100 — but 100 concurrent streaming OpenAI calls saturate the
+# AsyncOpenAI httpx connection pool (default max 100) AND the single
+# event loop, so under a 1000-cell run every in-flight read stalls and
+# times out at once ("Request timed out" flood) while table/poll
+# requests can't get serviced. 40 stays well under the pool ceiling,
+# keeps the loop responsive, and still clears 1000 nano cells in a few
+# minutes. RPM/TPM is not the limit (tier 5); connection+loop pressure is.
+CLASSIFY_CONCURRENCY = 40
 
 # Coordinator claim loop: ask Postgres for up to this many queued tasks
 # in one round-trip. Keeps the loop responsive without thrashing the DB.

@@ -1776,6 +1776,7 @@ async def run_cell_agent(
 
     HARD_TURN_LIMIT = 40
     iteration = 0
+    llm_retries = 0  # transient-timeout retries (don't count toward turn limit)
     status = "error"  # default; flipped to "filled" or "hit_budget" on exit
     try:
         while iteration < HARD_TURN_LIMIT:
@@ -1801,6 +1802,7 @@ async def run_cell_agent(
             response = None
             streamed_search_ids: set[str] = set()
             aborted_over_cap = False
+            cost_before_call = total_cost
             try:
                 stream_kwargs = {
                     "model": tier_cfg["model"],
@@ -1849,6 +1851,21 @@ async def run_cell_agent(
                         response = await stream.get_final_response()
             except Exception as e:
                 error_str = f"LLM call failed: {e}"[:500]
+                # Transient timeouts spike when many cells run concurrently
+                # and the OpenAI connection pool / event loop is saturated.
+                # When nothing was billed mid-stream (always true for classify
+                # — no tools), retrying is safe and recovers the cell instead
+                # of leaving it blank. Up to 2 retries with backoff; retries
+                # don't count toward HARD_TURN_LIMIT.
+                transient = any(
+                    t in str(e).lower()
+                    for t in ("timed out", "timeout", "connection", "temporarily", "overloaded")
+                )
+                if transient and total_cost == cost_before_call and llm_retries < 2:
+                    llm_retries += 1
+                    iteration -= 1
+                    await asyncio.sleep(1.0 * llm_retries)
+                    continue
                 log.warning("cell agent LLM call failed (research=%s): %s", tier_cfg["name"], e)
                 return final_values, final_sources, total_cost, "error"
 

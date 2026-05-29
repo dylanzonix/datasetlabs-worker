@@ -701,7 +701,10 @@ async def _run_enrichment_on_rows(
     # FullEnrich/Apollo/BU and the rate limits / latencies make higher
     # concurrency pointless there.
     research_tier_local = (action.get("research") or action.get("tier") or "").lower()
-    sem_cap = 100 if research_tier_local == "classify" else 25
+    # 40 (not 100): 100 concurrent streaming nano calls saturate the OpenAI
+    # httpx pool + event loop and cause the mass "Request timed out" flood
+    # under big runs. Matches CLASSIFY_CONCURRENCY in the durable coordinator.
+    sem_cap = 40 if research_tier_local == "classify" else 25
     sem = asyncio.Semaphore(sem_cap)
 
     # Index assigned by start order — useful for the toolLog summary.
