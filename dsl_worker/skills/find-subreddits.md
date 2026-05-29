@@ -1,58 +1,59 @@
 ---
 name: find-subreddits
-description: Finding the subreddits where a topic/audience lives — "what subreddits should I post my <X> in", "where's my audience on Reddit". Scrapes posts on the audience's topics and surfaces the communities they actually post in.
+description: Finding the subreddits where a topic/audience lives — "what subreddits should I post my <X> in", "where's my audience on Reddit". Uses browser_use to read Reddit's own community directory (the only thing that reaches it).
 applies_to: [orchestrator]
 ---
 
 ## Finding subreddits for a topic / audience
 
-Trigger: "what subreddits should I post my B2B SaaS in", "find subreddits for <topic>", "where's my audience on Reddit". Uses the [[fetch-reddit]] actor.
+Trigger: "what subreddits should I post my B2B SaaS in", "find subreddits for <topic>", "where's my audience on Reddit".
 
-### Don't use solidcode/trudax community-search — it's dead
+### Use `browser_use` — it's the only thing that reaches Reddit's community directory
 
-The old recipe (`solidcode/reddit-scraper` with `searchCommunities: true`) now returns **0 rows** — verified across retries, proxy, and `trudax/reddit-scraper-lite`. Reddit community-search actors are broken. Do not use them.
+Empirically tested head-to-head:
 
-### The working method: scrape posts on the topic, the subreddits fall out
+- Reddit hard-blocks datacenter IPs (403) → direct JSON and Firecrawl both fail.
+- Community-search actors are **dead**: `solidcode/reddit-scraper` and `trudax/reddit-scraper-lite` with `searchCommunities` return 0 rows. Do NOT use them.
+- Aggregating posts from `clearpath` gives "subreddits where the topic gets posted" — broad and noisy (pulls r/AITAH, r/ProgrammerHumor), and **misses the purpose-built niche subs** that are the best post targets.
+- `browser_use` searches Reddit's actual **Communities** directory in a real browser, so it finds the targeted niche communities (r/SaaSSales, r/B2BSaaSGrowthTips, r/leadgeninsiders, r/leadgen, r/sales_intelligence) alongside the big ones (r/SaaS, r/startups, r/sales). For "where do I post," targeted wins. This is the method.
 
-The subreddits where a topic is *actively posted* ARE the answer to "where should I post" — better than a name-catalog because it's ranked by where the audience actually is, and dead/irrelevant subs self-filter. Use `clearpath/reddit-search-scraper` (the verified actor) over the audience's topics, map the **Subreddit** column, and the community distribution is right there.
+### The call
 
 ```
 table_create(
-  source="apify_actor:clearpath/reddit-search-scraper",
-  query_params={"input": {
-    "query": "(\"B2B SaaS\" OR \"saas founder\" OR \"lead generation\" OR \"cold outreach\" OR \"indie hacker\" OR \"startup marketing\")",
-    "contentType": "posts",
-    "sort": "top",              # top = established, high-signal posts → the real communities
-    "timeFilter": "year",       # wide window so you see durable subs, not just this week's
-    "autoDiscoverSubreddits": true,
-    "maxSubreddits": 50,
-    "maxResults": 400
-  }},
-  columns=[
-    {"name": "Subreddit", "source_field": "subreddit", "type": "text"},
-    {"name": "Title",     "source_field": "title",     "type": "text"},
-    {"name": "Score",     "source_field": "score",     "type": "number"},
-    {"name": "URL",       "source_field": "url",        "type": "url"},
-  ],
+  source="browser_use",
+  query_params={
+    "url": "https://www.reddit.com/search/?q=<primary topic, url-encoded>&type=communities",
+    "task": (
+      "Find subreddits where <PRODUCT>'s audience hangs out (<ICP, e.g. 'B2B SaaS founders, "
+      "startups, sales teams, lead-gen'>). On www.reddit.com search Communities for terms like "
+      "'<topic1>', '<topic2>', '<topic3>'. For EACH relevant community return these fields: "
+      "subreddit (the name WITHOUT the 'r/' prefix, e.g. 'SaaS'), "
+      "members (total member count as a plain integer; open the community to read the exact number; 0 if unavailable), "
+      "description (its one-line description), "
+      "url (full https URL). "
+      "Return the 20 most relevant distinct communities, most relevant first."
+    )
+  },
   name="Subreddits for <topic>"
 )
 ```
 
-Build the `query` from the **audience's topics**, not the product name — what your target users post about. For a B2B SaaS: "B2B SaaS", "saas founder", "lead generation", "indie hacker", "startup marketing". For a fitness app: "calorie counting", "weight loss", "running". Cast a few OR-terms wide.
+- **Do NOT pre-declare `columns`** — browser_use rejects it (row shape comes from the task). Map columns with `column_map_set` after the rows land if needed.
+- Build the topic terms from the **audience**, not the product name: a B2B SaaS → "B2B SaaS", "lead generation", "sales", "startups"; a fitness app → "calorie counting", "weight loss", "running".
+- `start_url` / `url` = Reddit's `type=communities` search so the agent lands on the directory, not posts.
 
-If it returns 0, **retry the same call** (clearpath flakes to 0 occasionally) — don't fall back to the dead community actors.
+### browser_use is intermittently flaky — RETRY, don't fall back
 
-### Surfacing the ranked communities
+BU cloud occasionally fails a session-start or returns a 502; you'll see 0 rows or an error. **Retry the same call once or twice** — it succeeds on retry (verified: ~1 in 3 attempts hiccups, the rest return a clean 20-row list in ~130s). Do NOT fall back to the dead community actors. The account/method are fine; the failure is transient cloud plumbing.
 
-Once the posts table lands, the **Subreddit** column's value frequency = the ranked community list (it shows in the filter panel's distinct-value counts; `sort_set` by Score for high-signal posts). Tell the user the top communities by post volume — e.g. a B2B-SaaS query surfaces r/SaasDevelopers, r/b2b_sales, r/AskMarketing, r/micro_saas, r/startup, r/SaaS, r/buildinpublic, r/Entrepreneurs. Those are where to post.
+### Data caveats (set expectations, don't post-process)
 
-### Quirks
-
-- **Some noise is normal.** Broad topic queries pull a few off-target subs (r/ProgrammerHumor, r/AITAH). The top ~10 by volume are the real targets; ignore the long tail.
-- **Read the subreddit rules before posting.** Many (r/SaaS, r/Entrepreneur) restrict self-promo — a human step, not something to scrape.
-- **For "subreddits like r/X":** extract the topics r/X is about and run the topic query — there's no built-in similarity lookup.
+- **Names + descriptions are reliable.** Member counts are best-effort — Reddit sometimes shows "weekly visitors" instead of total members, and a few come back 0/unknown. Don't promise exact subscriber numbers; the value is the right *list of communities*.
+- A couple of marginally-relevant subs slip in; the top of the list is solid.
+- Cost: ~$0.10-0.30 per run (one BU session) + ~2 min. Fine for a deliberate "find my subreddits" action; not for high-frequency use.
 
 ### Followups
 
-- Use the resulting subreddit list as the audience for [[find-reddit-leads]] (scrape those subs for buying-intent posts).
-- Filter the posts table by Score to see what content performs in each community before you post.
+- Read each subreddit's posting rules before promoting (many restrict self-promo) — a human step.
+- Feed the resulting subreddit list into [[find-reddit-leads]] (scrape those subs for buying-intent posts) or [[fetch-reddit]].
