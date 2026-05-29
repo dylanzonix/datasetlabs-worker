@@ -696,6 +696,43 @@ async def tail_events(
             yield ev
         return
 
+    # Subscribe to the live bus BEFORE the final catch-up read so no
+    # event slips through the gap between "replay saw no more rows" and
+    # "we started listening". emit_event commits to the DB *then*
+    # publishes to the bus, and — single-threaded asyncio — the
+    # subscribe + catch-up query below run with no await between them, so:
+    #   - anything published before we subscribed had already committed,
+    #     so the catch-up query picks it up;
+    #   - anything published after we subscribe lands in `q`;
+    #   - events that fall in both are dropped by the seq guard in the
+    #     tail loop (seq <= last_seq → skip).
+    # Net: exactly-once delivery across the replay→tail handoff.
+    #
+    # Previously the subscribe happened AFTER replay_complete, leaving a
+    # window where a tool_call / text_segment emitted mid-handoff was
+    # published to a not-yet-registered subscriber and only resurfaced
+    # when the run went terminal — the "live events don't show until the
+    # turn finishes, blank shimmer in between" bug.
+    q, content_snapshot = _BUS.subscribe_with_snapshot(run_id)
+
+    # Catch-up: drain events committed during the replay→subscribe gap.
+    db = SessionLocal()
+    try:
+        gap_rows = (
+            db.query(ChatRunEvent)
+            .filter(
+                ChatRunEvent.run_id == run_id,
+                ChatRunEvent.seq > last_seq,
+            )
+            .order_by(ChatRunEvent.seq.asc())
+            .all()
+        )
+    finally:
+        db.close()
+    for row in gap_rows:
+        last_seq = row.seq
+        yield {"type": row.type, "seq": row.seq, **(row.payload or {})}
+
     # Marker between Step 1 (DB replay) and Step 2 (live bus tail).
     # The FE uses this to discard replayed approval_required /
     # plan_options_required events whose pending state lives in the
@@ -707,13 +744,11 @@ async def tail_events(
     # live registry, not chat_run_events).
     yield {"type": "replay_complete"}
 
-    # Atomic subscribe + snapshot. The snapshot is the cumulative
-    # token content the bus has seen this run; yielding it as a
-    # `text_checkpoint` lets a reconnecting subscriber bootstrap the
-    # in-progress round's text without waiting for the next round
-    # boundary. Idempotent for live subscribers (their content already
-    # equals the snapshot — set is a no-op).
-    q, content_snapshot = _BUS.subscribe_with_snapshot(run_id)
+    # The snapshot is the cumulative token content the bus has seen this
+    # run; yielding it as a `text_checkpoint` lets a reconnecting
+    # subscriber bootstrap the in-progress round's text without waiting
+    # for the next round boundary. Idempotent for live subscribers
+    # (their content already equals the snapshot — set is a no-op).
     if content_snapshot:
         yield {"type": "text_checkpoint", "full_content": content_snapshot}
     try:
