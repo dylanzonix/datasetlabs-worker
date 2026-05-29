@@ -275,33 +275,63 @@ class BUClient:
             # timeout. SDK doesn't expose timeout via run(), so we set the
             # private attr directly.
             session_run._timeout = timeout
+            # The BU SDK populates session_run.session_id asynchronously
+            # after the first HTTP response from BU cloud. For parallel
+            # cancel: if cancel hits before the id lands, the except
+            # block below has nothing to stop and the cloud session
+            # keeps running. Poll for the id in a sibling task so it's
+            # captured as soon as BU assigns it — used by the cancel
+            # handler even when the main await never completed.
+            captured_sid: Dict[str, Optional[str]] = {"sid": None}
+
+            async def _capture_sid_loop() -> None:
+                while captured_sid["sid"] is None:
+                    sid_now = (
+                        getattr(session_run, "session_id", None)
+                        or getattr(session_run, "_session_id", None)
+                    )
+                    if sid_now:
+                        captured_sid["sid"] = str(sid_now)
+                        return
+                    await asyncio.sleep(0.2)
+
+            sid_task = asyncio.create_task(_capture_sid_loop())
             try:
-                result = await self._run_cancellable(session_run)
-            except asyncio.CancelledError:
-                # ALWAYS stop the cloud session on cancel so BU doesn't
-                # keep running on their servers after we've cancelled
-                # locally, AND capture the partial cost so the user's
-                # ledger reflects what they actually burned before the
-                # abort landed.
-                sid = (
-                    getattr(session_run, "session_id", None)
-                    or getattr(session_run, "_session_id", None)
-                )
-                if sid:
-                    try:
-                        await asyncio.shield(self._client.sessions.stop(sid))
-                        logger.info(f"[BUClient] stopped cloud session {str(sid)[:12]}... on CancelledError")
-                    except Exception:
-                        logger.warning(f"[BUClient] failed to stop session on cancel: {sid}", exc_info=True)
-                    if on_partial_cost is not None:
+                try:
+                    result = await self._run_cancellable(session_run)
+                except asyncio.CancelledError:
+                    # ALWAYS stop the cloud session on cancel so BU doesn't
+                    # keep running on their servers after we've cancelled
+                    # locally, AND capture the partial cost so the user's
+                    # ledger reflects what they actually burned before the
+                    # abort landed.
+                    sid = captured_sid["sid"] or (
+                        getattr(session_run, "session_id", None)
+                        or getattr(session_run, "_session_id", None)
+                    )
+                    if sid:
                         try:
-                            status = await asyncio.shield(self.get_session_status(sid))
-                            partial = float((status or {}).get("total_cost_usd", 0) or 0)
-                            if partial > 0:
-                                on_partial_cost(partial)
+                            await asyncio.shield(self._client.sessions.stop(sid))
+                            logger.info(f"[BUClient] stopped cloud session {str(sid)[:12]}... on CancelledError")
                         except Exception:
-                            logger.debug("[BUClient] partial-cost fetch failed", exc_info=True)
-                raise
+                            logger.warning(f"[BUClient] failed to stop session on cancel: {sid}", exc_info=True)
+                        if on_partial_cost is not None:
+                            try:
+                                status = await asyncio.shield(self.get_session_status(sid))
+                                partial = float((status or {}).get("total_cost_usd", 0) or 0)
+                                if partial > 0:
+                                    on_partial_cost(partial)
+                            except Exception:
+                                logger.debug("[BUClient] partial-cost fetch failed", exc_info=True)
+                    else:
+                        logger.warning(
+                            "[BUClient] cancelled before BU assigned a session_id — "
+                            "cloud session may keep running until BU's own timeout"
+                        )
+                    raise
+            finally:
+                if not sid_task.done():
+                    sid_task.cancel()
             cost = self._parse_cost(result)
             self._log_cost_breakdown(result, "extract")
             sid = self._get_session_id(result)
