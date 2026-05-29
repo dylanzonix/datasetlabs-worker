@@ -861,6 +861,11 @@ async def _drive_agent(
                 if etype == "reasoning":
                     # Stream as a thinking delta — FE appends to shimmer.
                     run_state.publish_thinking_delta(lrun.id, evt.get("text") or "")
+                elif etype == "thinking_reset":
+                    # Boundary between OpenAI reasoning summary parts —
+                    # FE clears thinkingText so the next part replaces
+                    # instead of stacking onto the previous one.
+                    run_state.publish_thinking_reset(lrun.id)
                 elif etype == "tool_call_start":
                     tc_id = evt.get("tool_call_id") or ""
                     name = evt.get("name") or "?"

@@ -368,6 +368,15 @@ def publish_thinking_delta(run_id: UUID, content: str) -> None:
     _BUS.publish_delta(run_id, "thinking", content)
 
 
+def publish_thinking_reset(run_id: UUID) -> None:
+    """Tell live FE subscribers to clear the thinking shimmer. Fires
+    when OpenAI starts a new reasoning summary part within the same
+    iteration — without this signal the FE concatenates parts into one
+    run-on string. Bus-only (ephemeral); refresh rebuilds the shimmer
+    from scratch off the current live stream."""
+    _BUS.publish(run_id, {"type": "thinking_reset"})
+
+
 def emit_text_checkpoint(db: Session, run: ChatRun) -> Dict[str, Any]:
     """Persist a `text_checkpoint` event with the full accumulated
     assistant content for this run. Called at round boundaries — gives

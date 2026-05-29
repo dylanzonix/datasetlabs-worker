@@ -259,6 +259,16 @@ async def run_turn(
                         delta = getattr(event, "delta", "") or ""
                         if delta:
                             await emit({"type": "reasoning", "text": delta})
+                    elif etype == "response.reasoning_summary_part.added":
+                        # OpenAI splits a reasoning summary into multiple
+                        # parts. Each part starts fresh, but the deltas
+                        # share the same event channel — without a
+                        # boundary signal the FE concatenates them into
+                        # one wall of text ("Gathering dataConsidering
+                        # web search..."). Emit a reset sentinel so the
+                        # FE clears thinkingText before the next part's
+                        # deltas land.
+                        await emit({"type": "thinking_reset"})
                     elif etype == "response.output_text.delta":
                         # Live assistant-text delta. Stream straight to
                         # subscribers as a `text_delta` event; the runs.py
