@@ -804,7 +804,7 @@ def _render_skills_section() -> str:
     lines = [
         "# Skills",
         "",
-        "A directory of documented playbooks for specific tasks. Not exhaustive — most tasks won't match. If what you're doing happens to match a skill, load it to learn the optimized way to do it.",
+        "Documented playbooks for specific tasks, each with the exact verified actor + input shape + steps. At the START of a turn, scan this list against what the user asked. If a skill matches, you MUST `load_skill(name)` and follow it BEFORE calling table_create / enrichment_set — loading is one cheap tool call. This is not optional: freelancing a task a skill covers (especially anything using an `apify_actor` source or scraping a platform like Reddit/Upwork/LinkedIn) reliably fails — wrong actor, wrong input shape, pre-declared columns, 0 rows — exactly the trial-and-error the skill exists to prevent. When in doubt whether one matches, load it; the cost of loading a near-miss is trivial next to the cost of a failed multi-step run.",
         "",
         "Available:",
     ]
@@ -818,7 +818,7 @@ def _render_skills_section() -> str:
             marker = "orchestrator"
         lines.append(f"- **{s['name']}** *({marker})* — {s.get('description') or ''}")
     lines.append("")
-    lines.append("Call `load_skill(name)` to read an `(orchestrator)` playbook when one applies to this turn. `(enrichment)` skills are used by the cell agent at enrichment time — listed here so you know which enrichment patterns are battle-tested when deciding what columns to set up.")
+    lines.append("Call `load_skill(name)` to read an `(orchestrator)` playbook the moment one applies to this turn — before you start building, not after a step fails. `(enrichment)` skills are used by the cell agent at enrichment time — listed here so you know which enrichment patterns are battle-tested when deciding what columns to set up.")
     return "\n".join(lines)
 
 
