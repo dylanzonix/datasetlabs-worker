@@ -230,11 +230,19 @@ def emit_event(
 
     payload = dict(payload or {})
     last_err: Optional[Exception] = None
+    # Capture the PK once, up front. db.commit() expires all attributes on
+    # `run` (expire_on_commit default), so a later `run.id` read fires a
+    # reload SELECT. That's a needless extra query after EVERY event (a
+    # flood under fast streaming) and turns a dropped DB connection into a
+    # hard failure mid-emit ("SSL connection has been closed unexpectedly"
+    # at the _BUS.publish(run.id, ...) line). The PK never changes, so read
+    # it once and use the local everywhere.
+    rid = run.id
     for attempt in range(5):
         seq = run.next_event_seq
         run.next_event_seq = seq + 1
         db.add(ChatRunEvent(
-            run_id=run.id,
+            run_id=rid,
             seq=seq,
             type=event_type,
             payload=payload,
@@ -256,16 +264,16 @@ def emit_event(
                 log.exception("refresh after seq conflict failed")
             log.warning(
                 "emit_event seq conflict for run %s (attempt %d, seq=%d) — retrying",
-                run.id, attempt + 1, seq,
+                rid, attempt + 1, seq,
             )
             continue
 
         full = {"type": event_type, "seq": seq, **payload}
-        _BUS.publish(run.id, full)
+        _BUS.publish(rid, full)
         return full
 
     # Out of retries — propagate the last error.
-    log.error("emit_event giving up after 5 seq-conflict retries for run %s", run.id)
+    log.error("emit_event giving up after 5 seq-conflict retries for run %s", rid)
     raise last_err if last_err else RuntimeError("emit_event failed")
 
 
@@ -291,6 +299,8 @@ def emit_events_batch(
     if not events:
         return []
 
+    # Capture the PK before commit expires it (see emit_event for why).
+    rid = run.id
     rows: List[ChatRunEvent] = []
     out: List[Dict[str, Any]] = []
     for event_type, raw_payload in events:
@@ -298,7 +308,7 @@ def emit_events_batch(
         seq = run.next_event_seq
         run.next_event_seq = seq + 1
         rows.append(ChatRunEvent(
-            run_id=run.id, seq=seq, type=event_type,
+            run_id=rid, seq=seq, type=event_type,
             payload=payload, mono_ns=perf_counter_ns(),
         ))
         out.append({"type": event_type, "seq": seq, **payload})
@@ -310,7 +320,7 @@ def emit_events_batch(
         # then fall back to per-event emit which already has its own
         # retry loop. We lose the batching speedup on this call but the
         # output stays correct.
-        log.warning("emit_events_batch seq conflict for run %s — falling back to per-event emit", run.id)
+        log.warning("emit_events_batch seq conflict for run %s — falling back to per-event emit", rid)
         try:
             db.rollback()
         except Exception:
@@ -322,7 +332,7 @@ def emit_events_batch(
         return [emit_event(db, run, t, p) for t, p in events]
 
     for full in out:
-        _BUS.publish(run.id, full)
+        _BUS.publish(rid, full)
     return out
 
 
