@@ -204,6 +204,32 @@ class ApifyActorAdapter(SourceAdapter):
             if isinstance(prop, dict) and "default" in prop:
                 actor_input[field] = prop["default"]
 
+    # Actors name their result-cap field differently: maxItems, maxResults,
+    # maxPosts, ... We always set `maxItems` (below), but an actor that reads
+    # a DIFFERENT field ignores it and falls back to ITS OWN default — which
+    # is often 100 (e.g. clearpath/reddit-search-scraper's maxResults=100).
+    # That silently capped large fetches at 100 even when n=1000. Detect the
+    # actor's real limit field from its schema and point it at max_items,
+    # unless the caller set it explicitly (then respect their choice).
+    _LIMIT_FIELDS = (
+        "maxResults", "maxPosts", "maxPostCount", "maxRecords",
+        "resultsLimit", "maxItems",
+    )
+
+    @staticmethod
+    def _inject_result_limit(actor_input: Dict[str, Any], input_schema: Dict[str, Any], max_items: int) -> None:
+        props = (input_schema or {}).get("properties") or {}
+        for name in ApifyActorAdapter._LIMIT_FIELDS:
+            prop = props.get(name)
+            if not isinstance(prop, dict) or prop.get("type") != "integer":
+                continue
+            # First recognized limit field the actor declares wins. If the
+            # caller already set it, respect that and stop (don't also set a
+            # lower-priority field).
+            if name not in actor_input:
+                actor_input[name] = max_items
+            return
+
     async def fetch(
         self,
         query_params: Dict[str, Any],
@@ -238,6 +264,7 @@ class ApifyActorAdapter(SourceAdapter):
             schema = await self._get_input_schema(client, actor_id)
             if schema:
                 self._autofill_plumbing(actor_input, schema)
+                self._inject_result_limit(actor_input, schema, max_items)
 
             aid = actor_id.replace("/", "~")
             # POST /runs starts the actor async, returning the run object
@@ -387,6 +414,7 @@ class ApifyActorAdapter(SourceAdapter):
             schema = await self._get_input_schema(client, actor_id)
             if schema:
                 self._autofill_plumbing(actor_input, schema)
+                self._inject_result_limit(actor_input, schema, max_items)
 
             # Start the run async.
             start = await client.post(

@@ -32,7 +32,7 @@ table_create(
   query_params={
     "input": {
       "query": "(\"lead list\" OR \"leads list\" OR \"looking for leads\") NOT survey NOT academic",
-      "maxResults": 200,
+      "maxResults": 1000,             # omit and it defaults to n (1000); set lower to trim
       "contentType": "both",          # posts | comments | both
       "sort": "new",                  # relevance | new | top | hot | comments
       "timeFilter": "month",          # '' | hour | day | week | month | year
