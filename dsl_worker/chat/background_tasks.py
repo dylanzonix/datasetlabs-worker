@@ -292,18 +292,40 @@ async def spawn(
                 # endpoint. _charge_run_credits is a no-op for spend<=0.
                 if cost_usd and cost_usd > 0:
                     try:
-                        from dsl_worker.chat.runs import _charge_run_credits
+                        from dsl_worker.chat.runs import (
+                            _charge_run_credits,
+                            update_run_coin,
+                        )
 
                         spend_cents = int(round(cost_usd * 100))
                         if spend_cents > 0:
+                            # Table-building background work (the turn waits
+                            # on it to finish) counts toward the turn's coin
+                            # — tag it with the run id. Enrichment fills are
+                            # left untagged: separate spend, not "what the
+                            # turn is spending".
+                            counts_toward_turn = kind in (
+                                "table_create", "table_extend",
+                            )
+                            tag_run_id = (
+                                str(ctx.run_id)
+                                if (counts_toward_turn and ctx.run_id)
+                                else None
+                            )
                             _charge_run_credits(
                                 settle_db,
                                 ctx.user_id,
                                 spend_cents,
                                 ctx.project_id,
                                 reason=f"bg_{kind}",
+                                run_id=tag_run_id,
                             )
                             settle_db.commit()
+                            # Settles after the agent loop's `done`, so fold
+                            # it into the turn coin here (reads the
+                            # just-committed charge).
+                            if tag_run_id:
+                                update_run_coin(settle_db, ctx.run_id)
                     except Exception:
                         log.exception(
                             "background task %s credit settle failed", task_id

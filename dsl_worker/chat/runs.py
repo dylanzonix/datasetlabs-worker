@@ -62,13 +62,16 @@ _active_tasks: Dict[UUID, asyncio.Task] = {}
 
 
 def _charge_run_credits(
-    db, user_id, spend_cents: int, project_id, reason: str
+    db, user_id, spend_cents: int, project_id, reason: str, run_id=None
 ) -> None:
     """Deduct credits via consume_credits — decrements Account pools AND
     writes the BalanceLedger entries. Doing only the ledger write (the
     historical mistake) leaves Account.subscription_credits / daily /
     rollover untouched, so the user's balance display stays flat while
     the audit log says they spent.
+
+    `run_id` tags the ledger entries with the originating run id so the
+    per-turn coin can sum them back out (see run_cost_usd_from_ledger).
     """
     if spend_cents <= 0:
         return
@@ -82,7 +85,64 @@ def _charge_run_credits(
         spend_cents / CENTS_PER_CREDIT,
         project_id=project_id,
         reason=reason,
+        run_id=run_id,
     )
+
+
+def run_cost_usd_from_ledger(db, run_id) -> float:
+    """Sum the BalanceLedger entries tagged with this run id → the turn's
+    true spend in USD. Only run-triggered work the turn waits on is tagged
+    (chat_run + the table scrape / apify drain); enrichment fills are
+    deliberately left untagged so they don't count toward the turn. Ledger
+    `amount` is negative cents, so cost_usd = -sum(amount) / 100.
+    """
+    from dsl_api.models import BalanceLedger
+    from sqlalchemy import func as _sqlfunc
+    total_cents = (
+        db.query(_sqlfunc.coalesce(_sqlfunc.sum(BalanceLedger.amount), 0))
+        .filter(BalanceLedger.run_id == run_id)
+        .scalar()
+    )
+    return round(-float(total_cents or 0) / 100.0, 6)
+
+
+def update_run_coin(db, run_id) -> None:
+    """Recompute the per-turn coin from the ledger and write it into the
+    run's assistant message + emit a cost_update. Background tasks (the
+    table scrape drain, the spawned table_create settle) call this AFTER
+    they charge — their cost lands after the agent loop's `done`, so
+    without it the persisted coin + live FE would miss the table-building
+    spend. Best-effort: any failure is logged and swallowed.
+    """
+    from dsl_worker.chat import run_state
+    try:
+        from dsl_api.models import ChatRun, ChatMessage
+        from sqlalchemy.orm.attributes import flag_modified
+        run = db.query(ChatRun).filter(ChatRun.id == run_id).first()
+        if run is None or run.assistant_message_id is None:
+            return
+        coin_usd = run_cost_usd_from_ledger(db, run_id)
+        msg = (
+            db.query(ChatMessage)
+            .filter(ChatMessage.id == run.assistant_message_id)
+            .first()
+        )
+        if msg is None:
+            return
+        ac = dict(msg.applied_changes or {})
+        ac["total_cost_usd"] = coin_usd
+        msg.applied_changes = ac
+        flag_modified(msg, "applied_changes")
+        db.commit()
+        # Live nudge so a tab watching the turn updates the coin without a
+        # refresh (FE seq-gate + reconcile handle reattach).
+        run_state.emit_event(db, run, "cost_update", {"total_cost_usd": coin_usd})
+    except Exception:
+        log.exception("update_run_coin failed for run %s", run_id)
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
 
 # Per-run queue of user messages injected via the inject endpoint while
@@ -539,7 +599,8 @@ def _force_persist_terminal(
         # session, so this fresh-session flush only owes the delta.
         residual_cents = spend_cents - charged_cents
         _charge_run_credits(
-            fresh, user_id, residual_cents, project_id, reason="chat_run"
+            fresh, user_id, residual_cents, project_id, reason="chat_run",
+            run_id=run_id,
         )
         fresh.commit()
         fresh.refresh(run)
@@ -797,8 +858,12 @@ async def _drive_agent(
                     # background fill (the fill emits cell_* + cost_update,
                     # not text_segment/tool_result, so without this the DB
                     # row's cost stuck at the last pre-fill value). Mirrors
-                    # the end-of-turn applied_changes build.
-                    "total_cost_usd": total_cost_ref["value"],
+                    # the end-of-turn applied_changes build. The coin is the
+                    # LEDGER sum for this run (chat_run + the table scrape /
+                    # apify drain we tag with the run id) — not
+                    # total_cost_ref, which only covers the agent loop and
+                    # misses the table-building background charges.
+                    "total_cost_usd": run_cost_usd_from_ledger(ldb_local, run_id),
                 }
                 card_rows = (
                     ldb_local.query(ChatRunEvent.type, ChatRunEvent.payload)
@@ -1011,7 +1076,7 @@ async def _drive_agent(
                         try:
                             _charge_run_credits(
                                 ldb, user_id, delta_cents, project_id,
-                                reason="chat_run",
+                                reason="chat_run", run_id=run_id,
                             )
                             ldb.commit()
                             charged_cents_ref["value"] = new_cumulative_cents
@@ -1027,8 +1092,14 @@ async def _drive_agent(
                             except Exception:
                                 pass
 
+                    # Emit the LEDGER coin (chat_run charged so far + any
+                    # table-building background charges) — NOT total_cost_ref,
+                    # which is agent-only. This keeps the live coin equal to
+                    # the persisted / reattach value, so it can't flicker
+                    # between agent-only and the full turn cost.
+                    coin_usd = run_cost_usd_from_ledger(ldb, run_id)
                     run_state.emit_event(ldb, lrun, "cost_update", {
-                        "total_cost_usd": new_total,
+                        "total_cost_usd": coin_usd,
                     })
                     # Persist the running cost into the assistant row now.
                     # During a background fill the only events are cell_* +
@@ -1275,6 +1346,32 @@ async def _drive_agent(
             terminal_payload["stop_reason"] = "cancel"
 
         try:
+            # Settle the residual chat_run charge FIRST so the ledger
+            # reflects the full turn cost before we read the coin back
+            # out of it (incremental cost_update charges already debited
+            # charged_cents_ref["value"] mid-turn).
+            residual_cents = spend_cents - charged_cents_ref["value"]
+            _charge_run_credits(
+                db, user_id, residual_cents, project_id, reason="chat_run",
+                run_id=run_id,
+            )
+            # SessionLocal is autoflush=False, so the residual charge above
+            # is staged but NOT yet visible to a query on this session.
+            # Flush it (within the still-open transaction) so the ledger SUM
+            # below counts it — otherwise the coin undercounts by exactly the
+            # residual. Rolls back with the rest if the commit fails.
+            db.flush()
+
+            # Turn coin = LEDGER sum for this run (chat_run + the table
+            # scrape / apify drain tagged with the run id) — the true
+            # per-turn spend. Write it into both the persisted row and the
+            # done event so the FE shows the same number live + on refresh.
+            # A long background fill/drain refreshes it again as its late
+            # charges land (update_run_coin).
+            coin_usd = run_cost_usd_from_ledger(db, run_id)
+            ac["total_cost_usd"] = coin_usd
+            terminal_payload["total_cost_usd"] = coin_usd
+
             # The assistant message row was created up front (right
             # after the "Thinking…" status event) and updated
             # incrementally as text_segment / tool_call / tool_result
@@ -1286,13 +1383,6 @@ async def _drive_agent(
                 "content": final_text,
                 "applied_changes": ac,
             })
-
-            # Settle the residual — incremental cost_update charges
-            # already debited charged_cents_ref["value"] mid-turn.
-            residual_cents = spend_cents - charged_cents_ref["value"]
-            _charge_run_credits(
-                db, user_id, residual_cents, project_id, reason="chat_run"
-            )
 
             db.commit()
             db.refresh(run)
