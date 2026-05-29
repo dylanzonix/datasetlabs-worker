@@ -492,7 +492,7 @@ async def post_filter(
     return result
 
 
-@router.delete("/projects/{project_id}/tables/{table_id}/filters/{column}")
+@router.delete("/projects/{project_id}/tables/{table_id}/filters/{column:path}")
 async def delete_filter(
     project_id: UUID,
     table_id: str,

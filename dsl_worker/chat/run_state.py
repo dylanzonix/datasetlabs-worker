@@ -57,6 +57,11 @@ log = logging.getLogger(__name__)
 # have to poll the DB. On process restart, subscribers reconnect and
 # replay from their last-seen cursor, bypassing the bus entirely.
 
+# Terminal event types that must never be dropped from a live subscriber
+# queue — dropping one leaves the FE's running indicator stuck.
+_CRITICAL_EVENT_TYPES = {"done", "paused", "cancelled", "error"}
+
+
 class _RunBus:
     def __init__(self) -> None:
         self._subs: Dict[str, List[asyncio.Queue]] = defaultdict(list)
@@ -104,10 +109,27 @@ class _RunBus:
         # Best-effort fanout. If a subscriber's queue is full the event
         # is dropped for that subscriber only — they'll see it on the
         # next DB replay (subscribers track their own cursor).
+        #
+        # EXCEPTION: terminal events (`done`/`paused`/`cancelled`/`error`)
+        # must reach every live subscriber, or the FE's running timer +
+        # stop button get stuck until a manual refresh. This happens when
+        # a backgrounded tab drains its queue slowly: 1024 token deltas
+        # pile up, the terminal event arrives to a full queue, and gets
+        # dropped. For terminal events, evict the oldest queued (cosmetic)
+        # event to make room so the terminal one always lands. Single-
+        # threaded asyncio guarantees no consumer runs between get/put.
+        critical = event.get("type") in _CRITICAL_EVENT_TYPES
         for q in list(self._subs.get(str(run_id), [])):
             try:
                 q.put_nowait(event)
             except asyncio.QueueFull:
+                if critical:
+                    try:
+                        q.get_nowait()
+                        q.put_nowait(event)
+                        continue
+                    except Exception:
+                        pass
                 log.warning("run %s subscriber queue full, dropping event", run_id)
 
     def publish_delta(self, run_id: UUID, kind: str, content: str) -> None:

@@ -83,6 +83,13 @@ def _default_n_for_source(source: Optional[str]) -> int:
     # what routes_table_edit's from-file endpoint does (n=10_000_000).
     if kind == "file":
         return 10_000_000
+    # Apify actors: default high. Free-tier credits now cover ~1000 items
+    # for nearly all actors. The actor returns what it has and reports
+    # `exhausted` when it has fewer, so 1000 behaves as "1000 or max,
+    # whichever is less". Was 100, which silently capped large scrapes
+    # (user asked for 1000 rows, got 100).
+    if kind == "apify_actor":
+        return 1000
     return 1000 if kind in _FREE_HIGH_N_SOURCES else 100
 
 
