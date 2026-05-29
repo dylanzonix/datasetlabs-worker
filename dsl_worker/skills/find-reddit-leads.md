@@ -1,6 +1,6 @@
 ---
 name: find-reddit-leads
-description: Load this whenever the user wants to find leads, prospects, customers, or potential users on Reddit for a company or website (e.g. 'find leads on reddit for stripe.com', 'reddit leads for my saas', 'who on reddit needs my product'). The proven flow - derive the ICP from the site, broad-scrape a month of Reddit on the customer pain, then classify every post to surface the people actually asking. More thorough and far cheaper than web_search.
+description: Find me leads on Reddit for <company/website> — derive the ICP from the site, broad-scrape a month of Reddit on the customer's pain, then classify every post to surface the people actually asking. Thorough, cheap (~$0.50/run), beats web_search.
 applies_to: [orchestrator]
 ---
 
