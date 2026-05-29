@@ -237,6 +237,16 @@ async def run_turn(
         # tool chip for 30-60s+ even though the model had already
         # decided on the call.
         streamed_function_call_ids: set[str] = set()
+        # Accumulate streamed assistant text so we can commit it as a
+        # text_segment the moment the FIRST function call appears — before
+        # that call's tool_call_start. Otherwise the text_segment (emitted
+        # post-stream) gets a LATER seq than the live tool_call_starts, and
+        # a refresh rebuilds the bubble as [tools, text] even though the
+        # model emitted the text first and the live stream showed
+        # [text, tools]. early_text_len marks how much was committed early
+        # so the post-stream emit below only adds the remainder.
+        live_text_buf = ""
+        early_text_len = 0
         try:
             # Stream the Responses API so hosted web_search calls and
             # reasoning summaries flow to the FE live, instead of all
@@ -278,6 +288,7 @@ async def run_turn(
                         # iteration also have function calls?).
                         delta = getattr(event, "delta", "") or ""
                         if delta:
+                            live_text_buf += delta
                             await emit({"type": "text_delta", "iteration": iteration, "text": delta})
                     elif etype == "response.output_item.added":
                         added = getattr(event, "item", None)
@@ -322,6 +333,20 @@ async def run_turn(
                             fn_call_id = getattr(done, "call_id", None) or ""
                             fn_name = getattr(done, "name", None) or "?"
                             if fn_call_id and fn_call_id not in streamed_function_call_ids:
+                                # Commit any narration text BEFORE this first
+                                # tool chip so the persisted seq order is
+                                # [text, tools] — matching what streamed live
+                                # — instead of [tools, text] on refresh. The
+                                # remainder (text the model emits AFTER the
+                                # tool calls, if it interleaves) is committed
+                                # post-stream below.
+                                if early_text_len == 0 and live_text_buf.strip():
+                                    await emit({
+                                        "type": "text_segment",
+                                        "iteration": iteration,
+                                        "text": live_text_buf,
+                                    })
+                                    early_text_len = len(live_text_buf)
                                 try:
                                     fn_args = json.loads(getattr(done, "arguments", "") or "{}")
                                 except Exception:
@@ -481,11 +506,24 @@ async def run_turn(
         # out of the bus accumulator — keeping the cumulative snapshot
         # equal to "what's in the FINAL text segment".
         mid_text_raw = "".join(text_parts)
-        if mid_text_raw.strip():
+        # Only emit the REMAINDER not already committed at the first
+        # function call above. Common case (all text, then the tool calls):
+        # early_text_len == len(mid_text_raw) → remainder empty → nothing
+        # to add. Interleaved (text → tool → more text): the trailing text
+        # lands here, after the tool chips, preserving order. Guard the
+        # slice in case post-stream text differs in length from the
+        # streamed deltas (don't risk duplicating or dropping).
+        if early_text_len and len(mid_text_raw) >= early_text_len:
+            remainder = mid_text_raw[early_text_len:]
+        elif early_text_len:
+            remainder = ""
+        else:
+            remainder = mid_text_raw
+        if remainder.strip():
             await emit({
                 "type": "text_segment",
                 "iteration": iteration,
-                "text": mid_text_raw,
+                "text": remainder,
             })
 
         # Dispatch all tool calls concurrently when the model emits a batch
