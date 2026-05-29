@@ -895,17 +895,8 @@ async def _drain_stream_into_table(
                             consume_credits(
                                 db, account, float(accumulated_cost_credits),
                                 project_id=project_id, reason="apify_stream_drain",
-                                # Tag with the run so this table-building
-                                # spend counts toward the turn's coin.
-                                external_ref=str(run_id) if run_id else None,
                             )
                             db.commit()
-                            # The drain lands after the agent loop's `done`,
-                            # so the run driver can't fold this in — refresh
-                            # the turn coin from the ledger ourselves.
-                            if run_id is not None:
-                                from dsl_worker.chat.runs import update_run_coin
-                                update_run_coin(db, run_id)
                 except Exception:
                     log.exception("apify drain: consume_credits failed (cost still recorded on table row)")
             if run_id is not None:
