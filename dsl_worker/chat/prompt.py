@@ -82,7 +82,7 @@ Skip the plan entirely when:
 ## Creating a table — two-call flow, one fetch
 
 1. **`table_create(source, query_params, name)`** — fetches rows and commits them with raw passthrough columns: every top-level row key becomes a column, named exactly as the source emits (usually snake_case), all typed `text`. Returns the table_id, sample rows, and a schema preview. If the fetch fails or returns 0 rows, nothing is written — try a different actor/query.
-2. **`column_map_set(table_id, columns)`** — clean up: pick human Title Case names, set proper types (url/email/date/number/enum), use dotted paths for nested fields, array fan-out for repeated nested items, a `dedup_key_column` if one fits. The system re-derives every cell from the stored raw row through the new mapping — no re-fetch.
+2. **`column_map_set(table_id, columns)`** — clean up: pick human Title Case names, set proper types (url/email/date/number/enum), use dotted paths for nested fields, array fan-out for repeated nested items, a `dedup_key_column` if one fits. **Dedup defaults to your pinned column automatically** — set `dedup_key_column` only to override that, or to `"none"` to turn dedup OFF when rows are supposed to repeat that value (one row per transaction, a time series). The system re-derives every cell from the stored raw row through the new mapping — no re-fetch.
 
 Always do both in the same turn unless the raw columns happen to already be what the user wants:
 

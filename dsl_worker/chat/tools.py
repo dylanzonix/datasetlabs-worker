@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import re
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -369,17 +370,48 @@ def _record_query_run(
 # ---------------------------------------------------------------------------
 
 
-def _initial_dedup_key_column(adapter, rows: List[Dict[str, Any]]) -> Optional[str]:
+def _pinned_text_column(columns: Optional[List[Dict[str, Any]]]) -> Optional[str]:
+    """The agent's pinned entity column, if it's text-typed — the natural
+    dedup key for generated/harvested tables that have no id/url/domain.
+    Returns its column NAME (the key in the materialized `row`). Only `text`
+    qualifies: number/enum/date/url/email are either non-identities or
+    identifiers where full-inclusion would mis-merge (acme.com ⊂ acme.com.au).
+    """
+    for c in columns or []:
+        if isinstance(c, dict) and c.get("pinned") and (c.get("type") or "text") == "text":
+            return c.get("name") or c.get("column_name")
+    return None
+
+
+# Sources whose rows the USER provides — file uploads (csv/xlsx) and
+# code_exec output both arrive as "file", plus pasted/manual data. We never
+# auto-dedup these: it would silently delete rows from someone's own dataset.
+# Dedup stays opt-in here (the agent sets dedup_key_column when asked). Note
+# this is a DIFFERENT set than the email/url verify "trusted" set, which also
+# includes apollo/apify/maps — exactly the fetched sources where dedup MUST run.
+_USER_PROVIDED_SOURCES = {"file", "manual"}
+
+
+def _initial_dedup_key_column(
+    adapter, rows: List[Dict[str, Any]], columns: Optional[List[Dict[str, Any]]] = None,
+    source: Optional[str] = None,
+) -> Optional[str]:
     """Pick the dedup_key_column to stamp on a freshly created table.
 
-    Prefers the adapter's class-level `default_dedup_key_column`, but most
-    apify_actor adapters don't override it (because the dedup key is per-
-    actor, not per-class). Falls back to scanning the first row for an
-    obvious unique key like "id" or "url" so multi-query Apify pulls don't
-    insert duplicates when the same item matches several searches.
+    Prefers the adapter's class-level `default_dedup_key_column`, then the
+    agent's pinned text column (the declared entity — e.g. "Event"), then
+    falls back to scanning the first row for an obvious unique key like "id"
+    or "url" so multi-query Apify pulls don't insert duplicates when the same
+    item matches several searches. User-provided sources (file/manual) get NO
+    auto-key — dedup there is opt-in.
     """
     if adapter.default_dedup_key_column:
         return adapter.default_dedup_key_column
+    if source in _USER_PROVIDED_SOURCES:
+        return None
+    pinned = _pinned_text_column(columns)
+    if pinned:
+        return pinned
     if not rows or not isinstance(rows[0], dict):
         return None
     keys = rows[0].keys()
@@ -388,6 +420,119 @@ def _initial_dedup_key_column(adapter, rows: List[Dict[str, Any]]) -> Optional[s
     if "url" in keys:
         return "url"
     return None
+
+
+# ---------------------------------------------------------------------------
+# Dedup matching (v1): normalized exact + full word-inclusion, keep-superset.
+#
+# Two values collide when — after normalization (casefold, punctuation→space,
+# whitespace collapsed) — they are EQUAL, or one's words are a *contiguous
+# sub-sequence* of the other's. On inclusion we keep the SUPERSET (the longer,
+# more-complete name) and drop the subset.
+#
+# Inclusion is gated by the caller to name-like keys only (the pinned text
+# column) — never id/url/domain, where "acme.com" ⊂ "acme.com.au" would merge
+# distinct entities. A ≥2-word floor on the subset stops a single generic word
+# ("The" ⊂ "The North Face", "Apple" ⊂ "Apple Bank") from eating a real short
+# entity. Known accepted miss: a 2-word entity that is a true prefix of a
+# different longer one ("New York" ⊂ "New York Times") still merges.
+# ---------------------------------------------------------------------------
+
+_DEDUP_PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
+_DEDUP_WS_RE = re.compile(r"\s+")
+_DEDUP_CAND_CAP = 200  # safety valve: skip inclusion for a value with too many candidates
+
+
+def _dedup_norm(value: Any) -> Optional[str]:
+    """Casefold → punctuation to space → collapse whitespace. None/empty → None."""
+    if value is None:
+        return None
+    s = unicodedata.normalize("NFKC", str(value)).casefold()
+    s = _DEDUP_WS_RE.sub(" ", _DEDUP_PUNCT_RE.sub(" ", s)).strip()
+    return s or None
+
+
+def _is_contiguous_subseq(a: Tuple[str, ...], b: Tuple[str, ...]) -> bool:
+    """True iff word-tuple `a` is a PROPER contiguous sub-sequence of `b`."""
+    la, lb = len(a), len(b)
+    if la == 0 or la >= lb:
+        return False
+    first = a[0]
+    for i in range(lb - la + 1):
+        if b[i] == first and b[i:i + la] == a:
+            return True
+    return False
+
+
+def _resolve_dedup(
+    existing: List[Tuple[str, Any]],
+    incoming: List[Any],
+    *,
+    inclusion: bool,
+) -> Tuple[set, set]:
+    """Decide which rows to drop so the table has no duplicate keys.
+
+    existing: [(sample_id, key_value)] already committed (not deleted).
+    incoming: [key_value] for the batch being committed (index = row index).
+    inclusion: enable full word-inclusion (keep-superset); else exact only.
+
+    Returns (skip_incoming_idxs, delete_existing_sample_ids).
+    Survivorship: prefer keeping an EXISTING row over an incoming one (less
+    churn); within the same origin, keep the longest raw value (most
+    complete). For inclusion, the superset always wins.
+    """
+    # rec = (norm, words, origin∈{'e','i'}, ref, rawlen)
+    recs: List[Tuple[str, Tuple[str, ...], str, Any, int]] = []
+    for sid, val in existing:
+        n = _dedup_norm(val)
+        if n:
+            recs.append((n, tuple(n.split()), "e", sid, len(str(val))))
+    for idx, val in enumerate(incoming):
+        n = _dedup_norm(val)
+        if n:
+            recs.append((n, tuple(n.split()), "i", idx, len(str(val))))
+
+    skip_incoming: set = set()
+    delete_existing: set = set()
+
+    # ---- exact: one survivor per normalized value ----
+    by_norm: Dict[str, list] = {}
+    for r in recs:
+        by_norm.setdefault(r[0], []).append(r)
+    survivor: Dict[str, Tuple] = {}
+    for norm, group in by_norm.items():
+        group.sort(key=lambda r: (r[2] != "e", -r[4]))  # existing first, then longest
+        survivor[norm] = group[0]
+        for r in group[1:]:
+            (skip_incoming if r[2] == "i" else delete_existing).add(r[3])
+
+    # ---- inclusion: drop a norm that is a proper subseq of another ----
+    if inclusion and len(survivor) > 1:
+        from collections import defaultdict
+        word_to_norms: Dict[str, set] = defaultdict(set)
+        for norm, rec in survivor.items():
+            for w in set(rec[1]):
+                word_to_norms[w].add(norm)
+        for norm, rec in survivor.items():
+            words = rec[1]
+            if len(words) < 2:  # single generic word is never a subset anchor
+                continue
+            uniq = sorted(set(words), key=lambda w: len(word_to_norms[w]))
+            cands = set(word_to_norms[uniq[0]])
+            for w in uniq[1:]:
+                cands &= word_to_norms[w]
+                if not cands:
+                    break
+            cands.discard(norm)
+            if len(cands) > _DEDUP_CAND_CAP:
+                log.warning("dedup: %d inclusion candidates for %r — skipping (capped)", len(cands), norm)
+                continue
+            for c in cands:
+                cw = survivor[c][1]
+                if len(cw) > len(words) and _is_contiguous_subseq(words, cw):
+                    (skip_incoming if rec[2] == "i" else delete_existing).add(rec[3])
+                    break
+    return skip_incoming, delete_existing
 
 
 async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
@@ -632,7 +777,7 @@ async def table_create(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str
             "source": source,
             "query_params": json.dumps(query_params),
             "cols": json.dumps(columns_for_db),
-            "dedup_key_column": _initial_dedup_key_column(adapter, res_rows),
+            "dedup_key_column": _initial_dedup_key_column(adapter, res_rows, columns_for_db, source),
             "fetch_status": initial_status,
             "rows_n": len(res_rows),
             "cost": res_cost,
@@ -1181,7 +1326,7 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
     raw_mapping = args.get("mapping")
     if raw_mapping is None:
         raw_mapping = args.get("columns")  # alias the agent reaches for
-    dedup_key_column = args.get("dedup_key_column")
+    raw_dedup_arg = args.get("dedup_key_column")
     if not table_id:
         return {"error": "table_id is required"}, 0.0
     if not raw_mapping:
@@ -1257,7 +1402,7 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
     # rename / add / drop columns and switch source_field paths (e.g.
     # flatten nested fields) without re-fetching the source.
     table_row = ctx.db.execute(
-        sa_text("SELECT columns FROM tables WHERE id=:id AND deleted_at IS NULL"),
+        sa_text("SELECT columns, dedup_key_column, source FROM tables WHERE id=:id AND deleted_at IS NULL"),
         {"id": table_id},
     ).fetchone()
     if not table_row:
@@ -1293,19 +1438,32 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
         if new_name and new_name != old_name:
             rename_map[old_name] = new_name
 
+    # Resolve the dedup key: an explicit "none"/"off" clears it (the agent's
+    # opt-out for legit-repeat grains); an explicit column name sets it;
+    # otherwise default to the pinned text column when none is set yet — but
+    # never override a key the agent (or table_create) already chose.
+    if isinstance(raw_dedup_arg, str) and raw_dedup_arg.strip().lower() in ("none", "off", "false", ""):
+        resolved_dedup = None
+    elif raw_dedup_arg:
+        resolved_dedup = raw_dedup_arg
+    elif table_row[2] in _USER_PROVIDED_SOURCES:
+        resolved_dedup = table_row[1]  # user-provided (file/manual): opt-in only, never auto-key
+    else:
+        resolved_dedup = table_row[1] or _pinned_text_column(columns_for_db)
+
     ctx.db.execute(
         sa_text(
             """
             UPDATE tables
             SET columns = CAST(:cols AS jsonb),
-                dedup_key_column = COALESCE(:dedup, dedup_key_column)
+                dedup_key_column = :dedup
             WHERE id = :id
             """
         ),
         {
             "id": table_id,
             "cols": json.dumps(columns_for_db),
-            "dedup": dedup_key_column,
+            "dedup": resolved_dedup,
         },
     )
 
@@ -1343,6 +1501,11 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
     # Without this signal the agent has no idea its mapping failed
     # until a downstream tool surfaces the empty cells.
     null_counts: Dict[str, int] = {c["name"]: 0 for c in columns_for_db}
+    # Stage (sample_id, row_json, tags_json) for ONE batched write after the
+    # loop. The previous per-row UPDATE issued a round-trip per sample, which
+    # is ~200s for 2.6k rows against a remote DB; batching collapses it to a
+    # handful of statements.
+    pending_updates: List[Tuple[str, str, str]] = []
     for sid, raw, tags, src in sample_rows:
         if not isinstance(raw, dict):
             continue
@@ -1408,18 +1571,37 @@ async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[s
                         "strategy": "firecrawl_verify" if "url" in bucket_name else "scrubby_verify",
                     })
                     next_tags["fill_status"] = fs
-        ctx.db.execute(
-            sa_text(
-                "UPDATE samples SET row=CAST(:row AS jsonb), tags=CAST(:tags AS jsonb) WHERE id=:id"
-            ),
-            {
-                "row": json.dumps(mapped, default=str),
-                "tags": json.dumps(next_tags, default=str),
-                "id": sid,
-            },
+        pending_updates.append(
+            (sid, json.dumps(mapped, default=str), json.dumps(next_tags, default=str))
         )
         rederived += 1
         rederived_rows.append((sid, mapped))
+
+    # Batched re-derive write. UPDATE ... FROM (VALUES ...) updates a whole
+    # chunk in a single statement (mirrors table_create's batched insert).
+    # Chunk size stays well under Postgres' 65535 bound-param ceiling
+    # (3 params/row) and keeps each statement snappy. Bind params carry every
+    # row value; only the auto-generated placeholder names are interpolated.
+    _UPDATE_CHUNK = 500
+    for i in range(0, len(pending_updates), _UPDATE_CHUNK):
+        chunk = pending_updates[i:i + _UPDATE_CHUNK]
+        values_clause = ", ".join(
+            f"(:id{j}, :row{j}, :tags{j})" for j in range(len(chunk))
+        )
+        params: Dict[str, Any] = {}
+        for j, (cid, crow, ctags) in enumerate(chunk):
+            params[f"id{j}"] = cid
+            params[f"row{j}"] = crow
+            params[f"tags{j}"] = ctags
+        ctx.db.execute(
+            sa_text(
+                f"UPDATE samples AS s "
+                f"SET row = v.new_row::jsonb, tags = v.new_tags::jsonb "
+                f"FROM (VALUES {values_clause}) AS v(id, new_row, new_tags) "
+                f"WHERE s.id = v.id::uuid"
+            ),
+            params,
+        )
     ctx.db.commit()
 
     # Return enough that the agent can verify the mapping worked without a
@@ -2004,20 +2186,65 @@ def _commit_rows(
     # dedup_key was set on the table but never enforced; this is the
     # missing enforcement.
     dedup_key_row = db.execute(
-        sa_text("SELECT dedup_key_column FROM tables WHERE id=:tid"),
+        sa_text("SELECT dedup_key_column, columns FROM tables WHERE id=:tid"),
         {"tid": table_id},
     ).fetchone()
     dedup_key = dedup_key_row[0] if dedup_key_row else None
-    existing_dedup_values: set[str] = set()
+    # Full-inclusion (keep-superset) applies ONLY when the dedup key is the
+    # pinned TEXT column — an entity name. For id/url/domain keys we stay
+    # exact-only ("acme.com" must not absorb "acme.com.au").
+    dedup_cols: List[Any] = []
+    if dedup_key_row and dedup_key_row[1]:
+        dedup_cols = (
+            dedup_key_row[1] if isinstance(dedup_key_row[1], list)
+            else json.loads(dedup_key_row[1])
+        )
+    inclusion_enabled = bool(dedup_key) and any(
+        isinstance(c, dict)
+        and (c.get("name") or c.get("column_name")) == dedup_key
+        and c.get("pinned") and (c.get("type") or "text") == "text"
+        for c in dedup_cols
+    )
+
+    # Map every row up front, then resolve dedup over (existing ∪ batch) so we
+    # can skip duplicate incoming rows AND keep-superset — superseding an
+    # existing row when the batch brings a more-complete name.
+    mapped_all: List[Dict[str, Any]] = [
+        {c["name"]: _extract_source_value(r, c["source_field"]) for c in normalized_map}
+        for r in rows
+    ]
+    skip_incoming: set = set()
+    deleted_existing_count = 0
+    skipped_values: List[Any] = []
+    superseded_values: List[Any] = []
     if dedup_key:
         existing = db.execute(
             sa_text(
-                "SELECT DISTINCT row->>:k FROM samples "
+                "SELECT id::text, row->>:k FROM samples "
                 "WHERE table_id=:tid AND deleted_at IS NULL AND row->>:k IS NOT NULL"
             ),
             {"k": dedup_key, "tid": table_id},
         ).fetchall()
-        existing_dedup_values = {x[0] for x in existing if x[0] is not None and x[0] != ""}
+        existing_pairs = [(row[0], row[1]) for row in existing]
+        incoming_vals = [m.get(dedup_key) for m in mapped_all]
+        skip_incoming, delete_existing = _resolve_dedup(
+            existing_pairs, incoming_vals, inclusion=inclusion_enabled
+        )
+        # Capture the actual values we drop, so dedup is never a black box:
+        # skipped = incoming rows we didn't insert; superseded = existing rows
+        # we soft-deleted in favor of a more-complete incoming row.
+        skipped_values = [incoming_vals[i] for i in sorted(skip_incoming) if incoming_vals[i]]
+        superseded_values = [v for sid, v in existing_pairs if sid in delete_existing]
+        if delete_existing:
+            del_ids = list(delete_existing)
+            for ci in range(0, len(del_ids), 500):
+                batch_ids = del_ids[ci:ci + 500]
+                ph = ", ".join(f":d{j}" for j in range(len(batch_ids)))
+                db.execute(
+                    sa_text(f"UPDATE samples SET deleted_at=now() WHERE id::text IN ({ph})"),
+                    {f"d{j}": batch_ids[j] for j in range(len(batch_ids))},
+                )
+            deleted_existing_count = len(delete_existing)
 
     # Generate sample_ids client-side so we can hand them to the verify
     # hook after commit (was using `gen_random_uuid()` server-side, which
@@ -2032,20 +2259,11 @@ def _commit_rows(
     # at 1000 to stay well under).
     pending_verify: List[Tuple[str, Dict[str, Any]]] = []
     insert_payloads: List[Dict[str, Any]] = []
-    skipped_dup_count = 0
-    for r in rows:
-        mapped: Dict[str, Any] = {}
-        for c in normalized_map:
-            mapped[c["name"]] = _extract_source_value(r, c["source_field"])
-
-        if dedup_key:
-            key_val = mapped.get(dedup_key)
-            if key_val not in (None, "") and str(key_val) in existing_dedup_values:
-                skipped_dup_count += 1
-                continue
-            if key_val not in (None, ""):
-                existing_dedup_values.add(str(key_val))
-
+    skipped_dup_count = len(skip_incoming)
+    for idx, r in enumerate(rows):
+        if idx in skip_incoming:
+            continue
+        mapped = mapped_all[idx]
         tags_payload = (
             {"sources": cell_sources_template} if cell_sources_template else None
         )
@@ -2095,10 +2313,18 @@ def _commit_rows(
     # BEFORE we schedule verification — the verify task opens its own
     # SessionLocal and won't see uncommitted rows.
     db.commit()
-    if skipped_dup_count:
+    if skipped_dup_count or deleted_existing_count:
+        def _cap(vals, n=25):
+            shown = [str(v) for v in vals[:n]]
+            if len(vals) > n:
+                shown.append(f"…(+{len(vals) - n} more)")
+            return shown
         log.info(
-            "_commit_rows: skipped %d duplicate rows on dedup_key=%s for table %s",
-            skipped_dup_count, dedup_key, table_id,
+            "dedup: key=%s inclusion=%s skipped_incoming=%d superseded_existing=%d inserted=%d table=%s\n"
+            "  skipped (incoming, not inserted): %s\n"
+            "  superseded (existing, soft-deleted): %s",
+            dedup_key, inclusion_enabled, skipped_dup_count, deleted_existing_count,
+            len(insert_payloads), table_id, _cap(skipped_values), _cap(superseded_values),
         )
     # Stash the dedup counts on a module-level dict keyed by table_id so
     # table_extend (and friends) can read them without changing every
@@ -2122,6 +2348,9 @@ def _commit_rows(
     _LAST_COMMIT_STATS[table_id] = {
         "inserted": len(pending_verify),
         "skipped_duplicates": skipped_dup_count,
+        "superseded": deleted_existing_count,
+        "skipped_values": [str(v) for v in skipped_values[:50]],
+        "superseded_values": [str(v) for v in superseded_values[:50]],
         "inserted_rows": inserted_rows_payload,
     }
 
