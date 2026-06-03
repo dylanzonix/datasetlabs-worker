@@ -917,23 +917,15 @@ async def _drive_agent(
         charged_cents_ref = {"value": 0}
         final_text_ref = {"value": ""}
 
-        async def on_event(evt: Dict[str, Any]) -> None:
+        def _persist_event_db(evt: Dict[str, Any]) -> None:
+            # Runs in asyncio.to_thread (dispatched from on_event below) so
+            # the per-event session open + ChatRun query + emit_event
+            # commits + incremental persist don't block the event loop —
+            # the dominant loop-saturator during an active turn. on_event is
+            # awaited serially per run, so this session + the closure refs
+            # (tool_log, *_ref) stay single-threaded; emit_event's bus
+            # fanout marshals back onto the loop via call_soon_threadsafe.
             etype = evt.get("type")
-            # Fast path for live token deltas: skip the DB session +
-            # ChatRun lookup (publish_token_delta only needs run_id) and
-            # yield to the event loop so SSE subscribers drain BEFORE
-            # the next delta lands. Without the explicit sleep(0) the
-            # OpenAI stream loop can fire dozens of output_text.delta
-            # events between scheduler ticks — the bus enqueues them
-            # all and the consumer flushes them in one burst at the
-            # end, making the FE see the full text "all at once" after
-            # the LLM call completes.
-            if etype == "text_delta":
-                delta = evt.get("text") or ""
-                if delta:
-                    run_state.publish_token_delta(run_id, delta)
-                    await asyncio.sleep(0)
-                return
             # Open a fresh session per emit since this callback may fire
             # while the outer `db` session is mid-statement on the LLM
             # call. Legacy emit_event needs a clean session.
@@ -958,15 +950,10 @@ async def _drive_agent(
                     lrun = ldb.query(ChatRun).filter(ChatRun.id == run_id).first()
                 if lrun is None:
                     return
-                if etype == "reasoning":
-                    # Stream as a thinking delta — FE appends to shimmer.
-                    run_state.publish_thinking_delta(lrun.id, evt.get("text") or "")
-                elif etype == "thinking_reset":
-                    # Boundary between OpenAI reasoning summary parts —
-                    # FE clears thinkingText so the next part replaces
-                    # instead of stacking onto the previous one.
-                    run_state.publish_thinking_reset(lrun.id)
-                elif etype == "tool_call_start":
+                # NOTE: text_delta / reasoning / thinking_reset / turn_complete
+                # are handled on the loop in on_event (they need no DB and the
+                # bus deltas must run on the loop) and never reach here.
+                if etype == "tool_call_start":
                     tc_id = evt.get("tool_call_id") or ""
                     name = evt.get("name") or "?"
                     # Suppress hidden tools entirely — no tool_log entry,
@@ -1108,8 +1095,6 @@ async def _drive_agent(
                     # total_cost_usd froze at the last pre-fill value and a
                     # refresh/reattach showed an undercounted coin.
                     _persist_assistant_incremental(ldb)
-                elif etype == "turn_complete":
-                    total_cost_ref["value"] = float(evt.get("total_cost_usd") or 0.0)
                 elif etype == "error":
                     run_state.emit_event(ldb, lrun, "error", {
                         "message": evt.get("message") or "unknown error",
@@ -1144,6 +1129,35 @@ async def _drive_agent(
                 log.exception("v2 on_event failed for %s", etype)
             finally:
                 ldb.close()
+
+        async def on_event(evt: Dict[str, Any]) -> None:
+            etype = evt.get("type")
+            # Loop-only fast paths — live deltas + cheap state updates that
+            # need no DB. publish_*_delta touch the in-memory bus + must run
+            # on the loop (they accumulate per-run content + fan out tokens).
+            #
+            # text_delta yields (sleep 0) so SSE subscribers drain BEFORE the
+            # next delta lands — otherwise dozens of deltas enqueue between
+            # scheduler ticks and the FE sees the text "all at once".
+            if etype == "text_delta":
+                delta = evt.get("text") or ""
+                if delta:
+                    run_state.publish_token_delta(run_id, delta)
+                    await asyncio.sleep(0)
+                return
+            if etype == "reasoning":
+                run_state.publish_thinking_delta(run_id, evt.get("text") or "")
+                return
+            if etype == "thinking_reset":
+                run_state.publish_thinking_reset(run_id)
+                return
+            if etype == "turn_complete":
+                total_cost_ref["value"] = float(evt.get("total_cost_usd") or 0.0)
+                return
+            # Everything else persists to the DB — offload off the loop so a
+            # busy turn (fast tool/text streaming) doesn't starve every other
+            # request (table rows, filter distincts, polls) on the loop.
+            await asyncio.to_thread(_persist_event_db, evt)
 
         cancelled = False
         try:

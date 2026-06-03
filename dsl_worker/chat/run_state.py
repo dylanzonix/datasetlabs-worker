@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 from collections import defaultdict
 from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional, Tuple
 from uuid import UUID
@@ -64,6 +65,20 @@ _CRITICAL_EVENT_TYPES = {"done", "paused", "cancelled", "error"}
 
 class _RunBus:
     def __init__(self) -> None:
+        # The main event loop, captured at app startup. Used to marshal
+        # fanout back onto the loop when publish() is called from a worker
+        # thread (asyncio.Queue is NOT thread-safe). Lets the DB-heavy event
+        # persistence run in asyncio.to_thread while the live SSE fanout
+        # still happens safely on the loop.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # Guards the _content / _thinking accumulators. Per-token deltas
+        # mutate them on the loop while the offloaded event persistence
+        # (text_segment / final_message branches in asyncio.to_thread)
+        # trim/replace them from a worker thread — a read-modify-write race
+        # without this. Uncontended Lock acquire is ~nanoseconds; fine on
+        # the per-token path. (The accumulators are a cosmetic mid-stream
+        # reconnect snapshot; the DB is truth — but correctness is cheap.)
+        self._buf_lock = threading.Lock()
         self._subs: Dict[str, List[asyncio.Queue]] = defaultdict(list)
         # Cumulative assistant `token` content per run. Built up as
         # the agent streams; used to bootstrap mid-stream reconnects
@@ -93,7 +108,8 @@ class _RunBus:
         """
         q: asyncio.Queue = asyncio.Queue(maxsize=1024)
         self._subs[str(run_id)].append(q)
-        snap = self._content.get(str(run_id), "")
+        with self._buf_lock:
+            snap = self._content.get(str(run_id), "")
         return q, snap
 
     def unsubscribe(self, run_id: UUID, q: asyncio.Queue) -> None:
@@ -105,7 +121,32 @@ class _RunBus:
         if not self._subs[key]:
             self._subs.pop(key, None)
 
+    def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Capture the main event loop (called once at app startup) so
+        publish() from a worker thread can marshal the fanout back."""
+        self._loop = loop
+
     def publish(self, run_id: UUID, event: Dict[str, Any]) -> None:
+        """Fan out a persisted event to live subscribers.
+
+        Thread-safe: when called from a worker thread (the DB persistence
+        now runs in asyncio.to_thread to keep the loop unblocked), the
+        actual queue puts are marshaled onto the event loop via
+        call_soon_threadsafe — asyncio.Queue.put_nowait is not safe to
+        call off-loop. On the loop, fans out directly.
+        """
+        loop = self._loop
+        if loop is not None:
+            try:
+                on_loop = asyncio.get_running_loop() is loop
+            except RuntimeError:
+                on_loop = False
+            if not on_loop:
+                loop.call_soon_threadsafe(self._fanout, str(run_id), event)
+                return
+        self._fanout(str(run_id), event)
+
+    def _fanout(self, run_key: str, event: Dict[str, Any]) -> None:
         # Best-effort fanout. If a subscriber's queue is full the event
         # is dropped for that subscriber only — they'll see it on the
         # next DB replay (subscribers track their own cursor).
@@ -116,10 +157,10 @@ class _RunBus:
         # a backgrounded tab drains its queue slowly: 1024 token deltas
         # pile up, the terminal event arrives to a full queue, and gets
         # dropped. For terminal events, evict the oldest queued (cosmetic)
-        # event to make room so the terminal one always lands. Single-
-        # threaded asyncio guarantees no consumer runs between get/put.
+        # event to make room so the terminal one always lands. Runs on the
+        # loop thread, so no consumer runs between get/put.
         critical = event.get("type") in _CRITICAL_EVENT_TYPES
-        for q in list(self._subs.get(str(run_id), [])):
+        for q in list(self._subs.get(run_key, [])):
             try:
                 q.put_nowait(event)
             except asyncio.QueueFull:
@@ -130,7 +171,7 @@ class _RunBus:
                         continue
                     except Exception:
                         pass
-                log.warning("run %s subscriber queue full, dropping event", run_id)
+                log.warning("run %s subscriber queue full, dropping event", run_key)
 
     def publish_delta(self, run_id: UUID, kind: str, content: str) -> None:
         """Live-only delta — fanout to subscribers, no DB write.
@@ -145,10 +186,11 @@ class _RunBus:
         """
         if not content:
             return
-        if kind == "token":
-            self._content[str(run_id)] += content
-        elif kind == "thinking":
-            self._thinking[str(run_id)] += content
+        with self._buf_lock:
+            if kind == "token":
+                self._content[str(run_id)] += content
+            elif kind == "thinking":
+                self._thinking[str(run_id)] += content
         ev = {"type": kind, "content": content}
         for q in list(self._subs.get(str(run_id), [])):
             try:
@@ -160,18 +202,27 @@ class _RunBus:
         """Pop and return the run's accumulated thinking text. Called
         at round boundaries — the popped string is persisted as a
         thinking_checkpoint, then the buffer is empty for next round."""
-        return self._thinking.pop(str(run_id), "")
+        with self._buf_lock:
+            return self._thinking.pop(str(run_id), "")
 
     def cleanup_run(self, run_id: UUID) -> None:
         """Drop in-memory state for a run. Called when the run reaches
         a terminal status."""
         key = str(run_id)
-        self._content.pop(key, None)
-        self._thinking.pop(key, None)
+        with self._buf_lock:
+            self._content.pop(key, None)
+            self._thinking.pop(key, None)
         # Subscribers' queues are cleaned up on unsubscribe in tail_events.
 
 
 _BUS = _RunBus()
+
+
+def set_event_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """Register the main event loop with the bus so off-loop publishers
+    (DB persistence running in asyncio.to_thread) marshal fanout safely.
+    Call once at app startup."""
+    _BUS.set_loop(loop)
 
 
 # ---- Per-project serialization lock --------------------------------------
@@ -384,7 +435,8 @@ def emit_text_checkpoint(db: Session, run: ChatRun) -> Dict[str, Any]:
     point. The FE handles `text_checkpoint` by REPLACING (not appending)
     the message content; idempotent for live subscribers (their content
     already matches) and rebuilding for reconnects."""
-    full = _BUS._content.get(str(run.id), "")
+    with _BUS._buf_lock:
+        full = _BUS._content.get(str(run.id), "")
     return emit_event(db, run, "text_checkpoint", {"full_content": full})
 
 
@@ -417,7 +469,8 @@ def replace_text_content(
     half-thought the model managed to emit before being cut off. The FE
     treats text_checkpoint as a replacement, so live subscribers see the
     new content overwrite whatever they had displayed."""
-    _BUS._content[str(run.id)] = content
+    with _BUS._buf_lock:
+        _BUS._content[str(run.id)] = content
     return emit_event(db, run, "text_checkpoint", {"full_content": content})
 
 
@@ -432,10 +485,11 @@ def trim_token_content(run_id: UUID, suffix: str) -> bool:
     is in the FINAL text segment" so reconnect snapshots don't double-
     render the mid-text alongside its durable text_segment event."""
     key = str(run_id)
-    current = _BUS._content.get(key, "")
-    if suffix and current.endswith(suffix):
-        _BUS._content[key] = current[: -len(suffix)]
-        return True
+    with _BUS._buf_lock:
+        current = _BUS._content.get(key, "")
+        if suffix and current.endswith(suffix):
+            _BUS._content[key] = current[: -len(suffix)]
+            return True
     return False
 
 

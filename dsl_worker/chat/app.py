@@ -108,6 +108,11 @@ app.include_router(enrichment_jobs_router)
 @app.on_event("startup")
 async def _on_startup() -> None:
     log.info("chat worker api starting; CORS allowed origins=%s", _allowed_origins())
+    # Register the running loop with the run bus so event persistence can
+    # run in asyncio.to_thread (off the loop) while live SSE fanout is
+    # marshaled safely back onto the loop.
+    import asyncio as _asyncio
+    run_state.set_event_loop(_asyncio.get_running_loop())
     log.info(
         "langfuse tracing %s",
         "ENABLED" if tracing.is_enabled() else "disabled (no LANGFUSE_SECRET_KEY)",
