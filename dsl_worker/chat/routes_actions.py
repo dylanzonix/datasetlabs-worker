@@ -322,6 +322,12 @@ class PromoteQueryColumnsBody(BaseModel):
     # Each scope produces its own ghost: a single-column ghost and the
     # all-columns ghost coexist; lookup matches on adopted column-set.
     column: Optional[str] = None
+    # Multi-column scope (block "Turn into enrichment & run"): adopt
+    # EXACTLY this set of query columns into one ghost. Lenient — names
+    # that are already promoted or absent are silently skipped, so the
+    # caller can pass a whole selection without pre-filtering. Takes
+    # precedence over `column` when both are present.
+    columns: Optional[List[str]] = None
 
 
 @router.post("/projects/{project_id}/tables/{table_id}/promote_query_columns")
@@ -366,15 +372,27 @@ async def post_promote_query_columns(
     cols = row[2] if isinstance(row[2], list) else (json.loads(row[2]) if row[2] else [])
 
     all_query_cols = [c for c in cols if isinstance(c, dict) and not c.get("enrichment_id")]
-    if not all_query_cols:
+
+    # Resolve the adopt scope from the request body.
+    if body.columns is not None:
+        # Multi-column (block run): adopt exactly the query columns named
+        # in the list. Lenient + idempotent — names that are already
+        # promoted or no longer query columns are silently skipped, so the
+        # caller can pass a raw selection without pre-filtering. Nothing
+        # left to adopt → empty result (the caller's other columns may
+        # already be enrichments), NOT an error.
+        requested = set(body.columns)
+        target_query_cols = [c for c in all_query_cols if c.get("name") in requested]
+        if not target_query_cols:
+            return {"enrichment_id": None, "short_id": None, "columns": []}
+    elif not all_query_cols:
         # Nothing to adopt — caller should just use the existing enrichment.
         raise HTTPException(400, "No query columns on this table to promote")
-
-    # Single-column scope: narrow the adopt set to just the requested
-    # column. Avoids the "click Run on URL → enrichment scopes in Name
-    # + Price too" surprise. The caller still gets a usable enrichment
-    # focused on the one field they're trying to backfill.
-    if body.column:
+    elif body.column:
+        # Single-column scope: narrow the adopt set to just the requested
+        # column. Avoids the "click Run on URL → enrichment scopes in Name
+        # + Price too" surprise. The caller still gets a usable enrichment
+        # focused on the one field they're trying to backfill.
         target_query_cols = [
             c for c in all_query_cols if c.get("name") == body.column
         ]
@@ -418,8 +436,11 @@ async def post_promote_query_columns(
         return {"enrichment_id": eid, "short_id": short_id, "columns": ghost_cols}
 
     # Fresh ghost. Synthesize an action prompt from the table's source +
-    # column list. Generic on purpose — the cell agent figures out
-    # retrieval from row context.
+    # column list. Steered toward a focused, budget-conscious lookup —
+    # these auto-promoted columns are almost always simple factual
+    # backfills (the user clicked "Turn into enrichment & run" on scraped
+    # columns), so the agent should resolve them in a search or two, not
+    # an open-ended research crawl that burns the whole per-row budget.
     col_names = [c["name"] for c in target_query_cols if c.get("name")]
     col_list_md = "\n".join(
         f"- **{c['name']}** ({c.get('type', 'text')})"
@@ -427,11 +448,16 @@ async def post_promote_query_columns(
     )
     source_hint = f" The table was originally populated from `{source}`." if source else ""
     prompt = (
-        f"For each row in '{table_name}', use the row's existing fields "
-        f"(URL, domain, name, identifier, etc.) to look up and fill these columns:\n\n"
+        f"For each row in '{table_name}', use the row's most identifying "
+        f"existing field (its name/title, or a URL/domain/identifier) to look "
+        f"up and fill these columns:\n\n"
         f"{col_list_md}\n\n"
-        f"Skip fields that are already populated; only fill what's missing. "
-        f"If a value isn't findable, leave it null — don't fabricate."
+        f"These are straightforward factual lookups. Do ONE focused web search "
+        f"keyed on the row's identifier — for well-known subjects the answer is "
+        f"usually right there in the top results. Don't browse exhaustively or "
+        f"chase obscure sources: if a value isn't found within a search or two, "
+        f"leave it null rather than spending the whole budget. Only fill what's "
+        f"missing; never fabricate."
         f"{source_hint}"
     )
 
