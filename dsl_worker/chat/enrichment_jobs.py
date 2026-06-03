@@ -768,10 +768,14 @@ class Coordinator:
         )
         charge_usd = float(cost or 0.0) if produced_value else float(cost or 0.0) * 0.10
 
-        await asyncio.to_thread(
-            self._mark_task_done,
-            task, float(cost or 0.0), charge_usd, status,
-        )
+        # Emit cell_done BEFORE marking the task done. _mark_task_done emits
+        # job_done once the LAST task is terminal; if it ran first, job_done
+        # would get a lower event id than this cell_done — and the SSE stream
+        # closes on job_done, dropping the trailing cell_done. The value
+        # lands in the DB but the FE never receives the event that clears the
+        # spinner + paints the value (spinner spins forever; value only shows
+        # on manual refresh). Ordering cell_done first keeps every per-cell
+        # terminal event strictly before the job terminal event.
         await asyncio.to_thread(
             self._emit_in_session,
             task["job_id"], "cell_done",
@@ -786,6 +790,10 @@ class Coordinator:
                 "row": final,
                 "tags": fresh_tags,
             },
+        )
+        await asyncio.to_thread(
+            self._mark_task_done,
+            task, float(cost or 0.0), charge_usd, status,
         )
         await CELL_RUNS.remove(
             task["project_id"], task["enrichment_id"],
