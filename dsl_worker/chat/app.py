@@ -112,7 +112,12 @@ async def _on_startup() -> None:
     # run in asyncio.to_thread (off the loop) while live SSE fanout is
     # marshaled safely back onto the loop.
     import asyncio as _asyncio
-    run_state.set_event_loop(_asyncio.get_running_loop())
+    _loop = _asyncio.get_running_loop()
+    run_state.set_event_loop(_loop)
+    # Same for the durable-job event bus — the coordinator persists events
+    # in to_thread, so its _publish must marshal fanout back onto the loop.
+    from dsl_worker.chat import enrichment_jobs as _ej
+    _ej.set_event_loop(_loop)
     log.info(
         "langfuse tracing %s",
         "ENABLED" if tracing.is_enabled() else "disabled (no LANGFUSE_SECRET_KEY)",

@@ -90,6 +90,27 @@ WORKER_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 
 _subscribers: Dict[str, "list[asyncio.Queue[dict]]"] = {}
 
+# Main event loop, captured at startup. emit_event runs in asyncio.to_thread
+# (the coordinator persists off the loop), so _publish is called from a
+# worker thread — asyncio.Queue.put_nowait is not thread-safe, so the fanout
+# is marshaled back onto the loop via call_soon_threadsafe.
+_event_loop: "Optional[asyncio.AbstractEventLoop]" = None
+
+# Terminal-ish events that must never be dropped from a subscriber queue —
+# dropping a cell_done / job_done leaves the FE cell spinner stuck until a
+# manual refresh (happens when a backgrounded tab drains its SSE queue slowly
+# and it fills). For these, evict the oldest queued event to make room.
+_CRITICAL_JOB_EVENTS = {
+    "cell_done", "cell_failed", "job_done", "job_failed", "job_cancelled",
+}
+
+
+def set_event_loop(loop: "asyncio.AbstractEventLoop") -> None:
+    """Register the main loop so off-loop publishers (the coordinator's
+    to_thread emits) marshal fanout safely. Call once at app startup."""
+    global _event_loop
+    _event_loop = loop
+
 
 def subscribe(job_id: str) -> "asyncio.Queue[dict]":
     q: "asyncio.Queue[dict]" = asyncio.Queue(maxsize=512)
@@ -108,11 +129,34 @@ def unsubscribe(job_id: str, q: "asyncio.Queue[dict]") -> None:
 
 
 def _publish(job_id: str, event: dict) -> None:
+    """Fan out a job event to live SSE subscribers. Thread-safe: when called
+    from a worker thread (coordinator persists in to_thread), marshals the
+    fanout onto the loop. Terminal events evict an old event rather than drop."""
+    loop = _event_loop
+    if loop is not None:
+        try:
+            on_loop = asyncio.get_running_loop() is loop
+        except RuntimeError:
+            on_loop = False
+        if not on_loop:
+            loop.call_soon_threadsafe(_fanout_job_event, job_id, event)
+            return
+    _fanout_job_event(job_id, event)
+
+
+def _fanout_job_event(job_id: str, event: dict) -> None:
+    critical = event.get("kind") in _CRITICAL_JOB_EVENTS
     for q in list(_subscribers.get(job_id) or []):
         try:
             q.put_nowait(event)
         except asyncio.QueueFull:
-            pass
+            if critical:
+                try:
+                    q.get_nowait()
+                    q.put_nowait(event)
+                    continue
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------------------
