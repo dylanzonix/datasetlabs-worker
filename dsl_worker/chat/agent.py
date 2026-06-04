@@ -262,8 +262,15 @@ async def run_turn(
             }
             raw = client.raw_client
             response = None
+            # Time-to-first-event vs total: if TTFT is small but the call
+            # still takes a long time, the loop was STARVED draining the
+            # stream (see [loop-lag] warnings) — not a slow model. Logged
+            # below so a slow turn is self-diagnosing without a re-run.
+            first_event_at: Optional[float] = None
             async with raw.responses.stream(**stream_kwargs) as stream:
                 async for event in stream:
+                    if first_event_at is None:
+                        first_event_at = time.perf_counter()
                     etype = getattr(event, "type", None)
                     if etype == "response.reasoning_summary_text.delta":
                         delta = getattr(event, "delta", "") or ""
@@ -383,9 +390,16 @@ async def run_turn(
             )
 
             llm_ms = int((time.perf_counter() - llm_started) * 1000)
+            ttft_ms = int(((first_event_at or llm_started) - llm_started) * 1000)
+            # drain_ms = stream-consumption time AFTER the first event. A large
+            # drain_ms with normal token output is the loop-starvation
+            # signature (the stream sat undrained while the loop was busy) —
+            # cross-reference the [loop-lag] warnings at the same timestamp.
+            drain_ms = llm_ms - ttft_ms
+            slow = " SLOW" if llm_ms >= 30000 else ""
             log.info(
-                "[chat timing] llm_call project=%s iter=%d duration_ms=%d cost_usd=%.6f",
-                project_id, iteration, llm_ms, cost.total_cost_usd,
+                "[chat timing] llm_call project=%s iter=%d duration_ms=%d ttft_ms=%d drain_ms=%d cost_usd=%.6f%s",
+                project_id, iteration, llm_ms, ttft_ms, drain_ms, cost.total_cost_usd, slow,
             )
             total_cost_usd += cost.total_cost_usd
             # Emit running total after each LLM call so the FE can show

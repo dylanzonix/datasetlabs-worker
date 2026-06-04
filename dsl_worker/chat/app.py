@@ -53,6 +53,7 @@ log = logging.getLogger(__name__)
 # up — that's what feels like "the server is laggy." Bump to 64.
 import concurrent.futures as _cf
 import asyncio as _asyncio
+import time as _time
 def _install_bigger_executor() -> None:
     try:
         loop = _asyncio.get_event_loop()
@@ -60,6 +61,47 @@ def _install_bigger_executor() -> None:
     except Exception:
         pass
 _install_bigger_executor()
+
+
+async def _loop_lag_watchdog(interval: float = 0.5, warn_threshold: float = 0.75) -> None:
+    """Logging-only background task: measure event-loop scheduling lag.
+
+    Sleeps `interval`; if the actual elapsed overshoots by more than
+    `warn_threshold`, the loop was STARVED — a coroutine hogged it, or the
+    thread pool saturated so to_thread callbacks backed up. This is the
+    signal behind "a 3s LLM call wall-clocked to 158s": the stream-drain
+    coroutine couldn't get scheduled. Logs the lag, the default-executor
+    queue depth, and the live task count so a stall is self-diagnosing in
+    the file log. Never raises; never touches request handling.
+    """
+    loop = _asyncio.get_running_loop()
+    while True:
+        t0 = _time.perf_counter()
+        try:
+            await _asyncio.sleep(interval)
+        except _asyncio.CancelledError:
+            return
+        lag = _time.perf_counter() - t0 - interval
+        if lag < warn_threshold:
+            continue
+        qdepth: object = "?"
+        ntasks: object = "?"
+        try:
+            ex = getattr(loop, "_default_executor", None)
+            wq = getattr(ex, "_work_queue", None)
+            if wq is not None:
+                qdepth = wq.qsize()
+        except Exception:
+            pass
+        try:
+            ntasks = len(_asyncio.all_tasks(loop))
+        except Exception:
+            pass
+        log.warning(
+            "[loop-lag] event loop stalled %.2fs — executor_queue=%s pending_tasks=%s "
+            "(concurrent chat streams starve here; correlate with nearby [chat timing] ... SLOW lines)",
+            lag, qdepth, ntasks,
+        )
 
 # Silence noisy third-party SDK INFO logs that flood the worker terminal:
 #   • azure.core http policy dumps full request/response headers per blob op
@@ -76,6 +118,26 @@ for noisy in (
     "httpcore",
 ):
     logging.getLogger(noisy).setLevel(logging.WARNING)
+
+# Persist worker logs to a rotating file so post-hoc diagnosis (slow turns,
+# loop stalls) doesn't depend on having caught the live terminal output.
+# Everything that goes to stdout (basicConfig) also lands here — the
+# [loop-lag] watchdog warnings and [chat timing] ... SLOW lines are the
+# ones worth keeping. Override the path with CHAT_WORKER_LOG_FILE.
+try:
+    from logging.handlers import RotatingFileHandler as _RotatingFileHandler
+    _worker_log_path = os.getenv("CHAT_WORKER_LOG_FILE", "logs/chat_worker.log")
+    _log_dir = os.path.dirname(_worker_log_path)
+    if _log_dir:
+        os.makedirs(_log_dir, exist_ok=True)
+    _file_handler = _RotatingFileHandler(_worker_log_path, maxBytes=50_000_000, backupCount=5)
+    _file_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    logging.getLogger().addHandler(_file_handler)
+    log.info("worker file logging enabled → %s", _worker_log_path)
+except Exception:
+    log.exception("file logging setup failed; continuing with stdout only")
 
 
 def _allowed_origins() -> list[str]:
@@ -139,6 +201,10 @@ async def _on_startup() -> None:
     # heartbeat going stale, instead of waiting for the next worker
     # restart (could be hours).
     asyncio.create_task(run_state.orphan_recovery_loop(), name="chat-orphan-reaper")
+    # Event-loop starvation detector. Logging-only — fires [loop-lag]
+    # warnings into the file log when the loop stalls (the root cause of
+    # chat LLM calls ballooning from ~3s to ~150s under concurrent load).
+    asyncio.create_task(_loop_lag_watchdog(), name="loop-lag-watchdog")
     # Durable enrichment job coordinator: claims queued tasks (FOR
     # UPDATE SKIP LOCKED), runs under Semaphore(25), publishes events.
     # Browser refresh / network drops survive because state lives in PG.

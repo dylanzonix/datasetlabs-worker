@@ -1322,6 +1322,21 @@ def _sanitize_jsonb_str(s: Any) -> Any:
 
 
 async def column_map_set(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
+    # Offload the whole (synchronous, blocking) re-derive onto a worker
+    # thread so it never runs on the event loop. The re-derive reads and
+    # rewrites every row against the REMOTE DB; done on the loop it parks
+    # the single worker thread on network I/O and freezes every OTHER
+    # project's live chat stream (a ~3s call wall-clocking to ~150s under
+    # concurrency). Each tool branch owns its own DB session (bctx.db),
+    # used by exactly one thread at a time, so this is thread-safe. The
+    # body is unchanged — same SQL, same result, same return value; it
+    # just no longer blocks the loop. (Established pattern: heartbeat,
+    # run-event persistence, and the enrichment coordinator already do
+    # their blocking DB work via asyncio.to_thread.)
+    return await asyncio.to_thread(_column_map_set_blocking, args, ctx)
+
+
+def _column_map_set_blocking(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
     table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
     raw_mapping = args.get("mapping")
     if raw_mapping is None:
