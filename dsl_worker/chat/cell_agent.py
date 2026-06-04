@@ -50,6 +50,45 @@ from dsl_worker.chat.tools import ToolContext
 log = logging.getLogger(__name__)
 
 
+class _FERateLimiter:
+    """Process-wide pacing gate for FullEnrich API calls.
+
+    FE limits a workspace to 60 API calls/min across ALL endpoints — and,
+    per FE support, the GET poll counts just like the submit. With ~25
+    concurrent cells each doing a 1-contact submit + a poll loop, we trip
+    the limiter constantly: the submit 429s, the cell falls back to
+    web_search and commits a null email even though FE would have found it.
+
+    This spaces every FE call (submit AND poll) to stay just under the
+    workspace limit, so calls queue and pace instead of failing. Strict
+    spacing: each caller reserves the next slot (min_interval apart) under a
+    short lock, then sleeps outside the lock until its slot — so concurrent
+    callers form an orderly FIFO at the target rate rather than bursting.
+
+    Configurable via FULLENRICH_RPM (default 55, safely under 60). When FE
+    raises us to 300/min, bump the env var — no code change. If we ever run
+    >1 chat-worker replica sharing one FE workspace, set RPM to 55/N since
+    the limit is per-workspace and each process keeps its own bucket.
+    """
+
+    def __init__(self, rpm: int) -> None:
+        self._min_interval = 60.0 / max(1, rpm)
+        self._lock = asyncio.Lock()
+        self._next_at = 0.0
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            scheduled = max(now, self._next_at)
+            self._next_at = scheduled + self._min_interval
+        delay = scheduled - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+
+_fe_limiter = _FERateLimiter(int(os.getenv("FULLENRICH_RPM", "55")))
+
+
 # Tools fall into three categories for budget enforcement:
 #
 #   FIXED_COST_TOOLS  — billing is deterministic per successful call.
@@ -191,7 +230,7 @@ async def _fullenrich_bulk_enrich(
     contact: Dict[str, Any],
     enrich_fields: list[str],
     timeout_s: int = 120,
-    poll_interval_s: int = 3,
+    poll_interval_s: int = 8,
 ) -> Tuple[Dict[str, Any], float]:
     """Shared FE waterfall path. Submits a 1-contact bulk job, polls until
     FINISHED (typical: 30-60s), returns the contact's enriched fields +
@@ -229,6 +268,7 @@ async def _fullenrich_bulk_enrich(
     last_err: Optional[Exception] = None
     for attempt in range(3):
         try:
+            await _fe_limiter.acquire()
             async with httpx.AsyncClient(timeout=60) as client:
                 r = await client.post(
                     f"{BASE}/api/v2/contact/enrich/bulk",
@@ -286,6 +326,7 @@ async def _fullenrich_bulk_enrich(
     while _time.monotonic() < deadline:
         await asyncio.sleep(poll_interval_s)
         try:
+            await _fe_limiter.acquire()
             async with httpx.AsyncClient(timeout=15) as client:
                 g = await client.get(f"{BASE}/api/v2/contact/enrich/bulk/{eid}", headers=headers)
         except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
@@ -338,7 +379,10 @@ async def _fullenrich_bulk_enrich(
     # per successful email match. We're measuring 18 credits/call on
     # calls that returned email=null — that's a contradiction worth
     # resolving. Remove this log once we know the answer.
-    log.warning(
+    # Confirmed: cost.credits == 1.0 on a successful email match (contact_info
+    # has work_emails / most_probable_work_email), 0.0 on a miss. Kept at
+    # debug so it stays available without flooding the worker log.
+    log.debug(
         "[FE_DIAG] cost.credits=%s contact_info_keys=%s top_level_keys=%s",
         raw_fe_credits,
         sorted((contact_info or {}).keys()),
