@@ -21,13 +21,13 @@ Provider is a runtime toggle for the tool-using tiers (research/deep), via
 the ENRICHMENT_LLM_PROVIDER env var:
 
   - "openai"    (default) → OpenAI Responses path (unchanged)
-  - "anthropic"           → Claude (Sonnet 4.6) via the Messages API
-                            (_anthropic_cell_loop): server-side web_search cap
-                            (max_uses), exact search-count billing, real
-                            citation URLs, prompt-cached system+tools.
+  - "anthropic"           → Claude via the Messages API (_anthropic_cell_loop):
+                            research = Haiku 4.5, deep = Sonnet 4.6. Server-side
+                            web_search cap (max_uses), exact search-count
+                            billing, real citation URLs, prompt-cached system.
 
-classify always stays on nano. Default is OpenAI, so nothing changes unless
-you opt in; flip back any time by unsetting the var.
+classify always stays on gpt-5.4-nano (OpenAI). Default is OpenAI, so nothing
+changes unless you opt in; flip back any time by unsetting the var.
 
 Legacy aliases cover every prior rename pass (none/low/medium/high,
 classify/lookup/search/investigate, fast/smart/expert, etc.) — all
@@ -185,16 +185,19 @@ RESEARCH_CONFIG = {
 # Provider toggle for the tool-using enrichment tiers (research/deep).
 #
 #   ENRICHMENT_LLM_PROVIDER = "openai"    (default) → unchanged OpenAI path
-#   ENRICHMENT_LLM_PROVIDER = "anthropic"           → Claude (Sonnet 4.6)
+#   ENRICHMENT_LLM_PROVIDER = "anthropic"           → Claude
 #
-# This is the ONLY switch. Default is "openai" so the app behaves EXACTLY as
-# before unless you opt in; flip it back any time by unsetting the var or
-# setting it to "openai". `classify` always stays on nano (it never web-
-# searches, so Claude would be pure overhead). If "anthropic" is selected but
-# ANTHROPIC_API_KEY is missing, we log and fall back to OpenAI rather than
-# failing every cell — see _resolve_research.
+# When "anthropic": research → ENRICHMENT_ANTHROPIC_MODEL (Haiku 4.5, the cheap
+# workhorse) and deep → ENRICHMENT_ANTHROPIC_DEEP_MODEL (Sonnet 4.6, the smarter
+# model for nuanced multi-step lookups). `classify` ALWAYS stays on gpt-5.4-nano
+# (OpenAI) — it never web-searches, so Claude would be pure overhead and nano is
+# ~20x cheaper per token. Default is "openai" so the app behaves EXACTLY as
+# before unless you opt in; flip back any time by unsetting the var. If
+# "anthropic" is selected but ANTHROPIC_API_KEY is missing, we log and fall back
+# to OpenAI rather than failing every cell — see _resolve_research.
 ENRICHMENT_LLM_PROVIDER = os.getenv("ENRICHMENT_LLM_PROVIDER", "openai").strip().lower()
 ENRICHMENT_ANTHROPIC_MODEL = os.getenv("ENRICHMENT_ANTHROPIC_MODEL", "claude-haiku-4-5").strip()
+ENRICHMENT_ANTHROPIC_DEEP_MODEL = os.getenv("ENRICHMENT_ANTHROPIC_DEEP_MODEL", "claude-sonnet-4-6").strip()
 
 # Every old name (across every prior rename pass + the latest collapse)
 # normalizes to one of the three canonical tiers. Old enrichment rows
@@ -243,7 +246,7 @@ def _resolve_research(action: Dict[str, Any], per_row_cap: Optional[float]) -> D
     if requested in ("research", "deep") and ENRICHMENT_LLM_PROVIDER == "anthropic":
         if os.getenv("ANTHROPIC_API_KEY"):
             cfg["provider"] = "anthropic"
-            cfg["model"] = ENRICHMENT_ANTHROPIC_MODEL
+            cfg["model"] = ENRICHMENT_ANTHROPIC_DEEP_MODEL if requested == "deep" else ENRICHMENT_ANTHROPIC_MODEL
         else:
             log.warning(
                 "ENRICHMENT_LLM_PROVIDER=anthropic but ANTHROPIC_API_KEY is "
