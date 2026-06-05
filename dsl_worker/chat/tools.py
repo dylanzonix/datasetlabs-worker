@@ -2123,6 +2123,19 @@ def _commit_rows(
     forget is fine there).
     """
     if not rows:
+        # Reset the sidecar so callers don't read a PREVIOUS fetch's counts.
+        # Bug seen in prod (project 83698b95): a table_extend whose source
+        # returned 0 rows reported rows_added=15/skipped=10 — the stale stats
+        # from the table_create on the same table_id — and the LLM told the
+        # user it "added 15 rows" when nothing landed. Always overwrite.
+        _LAST_COMMIT_STATS[table_id] = {
+            "inserted": 0,
+            "skipped_duplicates": 0,
+            "superseded": 0,
+            "skipped_values": [],
+            "superseded_values": [],
+            "inserted_rows": [],
+        }
         return []
 
     # Pull project_id and source in one shot. source feeds per-cell
