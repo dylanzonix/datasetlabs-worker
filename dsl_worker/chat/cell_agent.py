@@ -47,8 +47,10 @@ import logging
 import os
 import time
 import uuid
+from collections import OrderedDict
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
+import httpx
 from openai import AsyncOpenAI
 from sqlalchemy import text as sa_text
 
@@ -1051,6 +1053,103 @@ async def _load_skill_cell(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict
     return {"name": name, "body": body}, 0.0
 
 
+# ── fetch_url: open ONE already-known page via Firecrawl, returned paged ──
+# Deliberately narrow: a FALLBACK to read a specific URL the agent already has
+# (a row field, or a result URL web_search surfaced) when the search snippet
+# lacked the detail. NOT a search/discovery tool, NOT a default. ~50x cheaper
+# than browser_use. Content is returned in ~9k-token pages so a huge/binary
+# page can't dump millions of tokens into context.
+_FIRECRAWL_SCRAPE_URL = "https://api.firecrawl.dev/v1/scrape"
+FIRECRAWL_SCRAPE_COST_USD = float(os.getenv("FIRECRAWL_SCRAPE_COST_USD", "0.01"))
+_FETCH_TIMEOUT = 45.0
+_FETCH_PAGE_CHARS = 36_000        # ~9k tokens returned to the LLM per call
+_FETCH_MAX_CHARS = 1_500_000      # hard cap on stored markdown (defends huge/binary)
+# Cross-call scrape cache (url -> {markdown,title,truncated}): lets the agent
+# page through one scrape without re-billing, and dedupes the same URL across
+# cells. Bounded LRU so the long-lived worker doesn't leak.
+_SCRAPE_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_SCRAPE_CACHE_MAX = 256
+
+
+async def _fetch_url(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
+    """Open ONE already-known URL via Firecrawl and return its text, paged.
+
+    Bills the scrape once (on the real fetch); paging the same URL is free.
+    Returns an `error` (cost 0) for guessed/blank URLs, unsupported domains,
+    and HTTP/timeout failures so the agent falls back to web_search.
+    """
+    url = (args.get("url") or "").strip()
+    if not url.lower().startswith(("http://", "https://")):
+        return {"error": "fetch_url needs a full http(s) URL you already have "
+                "(a row field or a prior web_search result) — not a guess."}, 0.0
+    try:
+        page = max(1, int(args.get("page", 1)))
+    except Exception:
+        page = 1
+
+    cost = 0.0
+    entry = _SCRAPE_CACHE.get(url)
+    if entry is None:
+        key = os.getenv("FIRECRAWL_API_KEY")
+        if not key:
+            return {"error": "fetch_url unavailable (FIRECRAWL_API_KEY not set)"}, 0.0
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    _FIRECRAWL_SCRAPE_URL,
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                    json={"url": url, "formats": ["markdown"], "onlyMainContent": True,
+                          "timeout": int(_FETCH_TIMEOUT * 1000)},
+                    timeout=_FETCH_TIMEOUT + 5.0,
+                )
+        except Exception as e:
+            return {"error": f"fetch failed ({type(e).__name__}) — try web_search instead", "url": url}, 0.0
+        if resp.status_code == 403:
+            return {"error": "this domain can't be scraped (Firecrawl refuses it) — "
+                    "fall back to web_search or browser_use", "url": url}, 0.0
+        if resp.status_code >= 400:
+            return {"error": f"page fetch failed (HTTP {resp.status_code}) — try web_search", "url": url}, 0.0
+        try:
+            body = resp.json()
+        except Exception:
+            return {"error": "page returned no parseable content", "url": url}, 0.0
+        if not body.get("success"):
+            return {"error": (body.get("error") or "fetch_failed")[:160], "url": url}, 0.0
+        data = body.get("data") or {}
+        md = (data.get("markdown") or "").strip()
+        title = ((data.get("metadata") or {}).get("title") or "").strip()
+        if not md:
+            return {"error": "page has no readable text (image / binary / JS-only) — try web_search",
+                    "url": url, "title": title[:200]}, FIRECRAWL_SCRAPE_COST_USD
+        truncated = len(md) > _FETCH_MAX_CHARS
+        entry = {"markdown": md[:_FETCH_MAX_CHARS], "title": title, "truncated": truncated}
+        _SCRAPE_CACHE[url] = entry
+        _SCRAPE_CACHE.move_to_end(url)
+        while len(_SCRAPE_CACHE) > _SCRAPE_CACHE_MAX:
+            _SCRAPE_CACHE.popitem(last=False)
+        cost = FIRECRAWL_SCRAPE_COST_USD
+    else:
+        _SCRAPE_CACHE.move_to_end(url)
+
+    md = entry["markdown"]
+    total_pages = max(1, (len(md) + _FETCH_PAGE_CHARS - 1) // _FETCH_PAGE_CHARS)
+    page = min(page, total_pages)
+    chunk = md[(page - 1) * _FETCH_PAGE_CHARS: page * _FETCH_PAGE_CHARS]
+    out: Dict[str, Any] = {
+        "url": url,
+        "title": entry["title"][:200],
+        "page": page,
+        "total_pages": total_pages,
+        "has_more": page < total_pages,
+        "next_page": page + 1 if page < total_pages else None,
+        "approx_tokens": len(chunk) // 4,
+        "content": chunk,
+    }
+    if entry.get("truncated"):
+        out["note"] = "page was very long; content truncated at the cap"
+    return out, cost
+
+
 CELL_TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any], ToolContext], Awaitable[Tuple[Dict[str, Any], float]]]] = {
     "fullenrich_search_people": _fullenrich_search_people,
     "fullenrich_enrich_email": _fullenrich_enrich_email,
@@ -1065,6 +1164,7 @@ CELL_TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any], ToolContext], Awaitable[
     # server-side as part of its own Responses call. We don't dispatch
     # it ourselves; web_search_call items in the response output are
     # handled in the cell loop directly (billing + tool_calls_log).
+    "fetch_url": _fetch_url,
     "browser_use": _browser_use,
     "code_exec": _code_exec,
     "load_skill": _load_skill_cell,
@@ -1133,8 +1233,9 @@ You have several sources. Pick the one that BEST FITS what the column wants — 
 - **Posts / comments / listings on a specific platform** (Reddit, X, LinkedIn, Instagram, Hacker News, etc.) → `apify_call_actor` with a platform-specific actor. Discover via `apify_search_actors` → `apify_actor_details`. Bounded to `maxItems=5` at cell level.
 - **Computation / parsing / regex** on existing row data → `code_exec`. Python sandbox, no network.
 - **An arbitrary fact on a web page** not covered above (a one-off detail, news, an "About" page lookup) → `web_search`. Cheap and fast for static / server-rendered content. The catch-all when no structured source fits — not the default.
+- **The content of a SPECIFIC page whose URL you already have** (a Listing/source URL already in the row, or a result URL `web_search` just surfaced) when the snippet didn't include the detail → `fetch_url`. Opens that one page and returns its text in ~9k-token chunks (pass `page` to read further). A FALLBACK after web_search, only for a URL you already have — never to search/discover, never on a guessed or constructed URL.
 
-If the first-choice source returns empty or wrong, escalate: tighten / loosen the filter on the same source, then fall to `web_search`. `browser_use` is a true last resort ($0.50+ per session) — only after web_search and apify have failed, or for login walls / JS-only pages with no other access. Never pick `browser_use` predictively from the instruction text.
+If the first-choice source returns empty or wrong, escalate: tighten / loosen the filter on the same source, then fall to `web_search`. If web_search surfaced the right page — or the row already carries a Listing/source URL — but the snippet lacked the detail, `fetch_url` that exact page to read it directly (cheap; the right move for "open this known page and extract X"). `browser_use` is a true last resort ($0.50+ per session) — only after web_search and fetch_url have failed, or for login walls / JS-only / antibot pages with no other access. Never pick `browser_use` predictively, and never call `fetch_url` on a URL you haven't already obtained.
 """
 
 
@@ -1486,6 +1587,31 @@ _CELL_TOOL_DEFS: List[Dict[str, Any]] = [
                 },
             },
             "required": ["code"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "fetch_url",
+        "description": (
+            "Open ONE specific, already-known web page and read its text "
+            "(Firecrawl -> markdown). Use ONLY when you already have the exact URL "
+            "of a page that should hold the answer - a Listing/source URL in the "
+            "row, or a result URL a previous web_search surfaced - and the search "
+            "snippet didn't include the detail. FALLBACK after web_search, NOT a "
+            "search/discovery tool: never guess or construct a URL, never browse "
+            "for pages, never call it on a URL you haven't already obtained. "
+            "Returns the page in ~9k-token chunks; if the answer isn't in the chunk "
+            "and has_more is true, call again with next_page. Don't page past where "
+            "the answer would plausibly be."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Exact http(s) URL to open - one you already have (a row field or a prior web_search result), never guessed."},
+                "page": {"type": "integer", "description": "Which ~9k-token chunk to return (1-indexed, default 1). Use the returned next_page to read further."},
+            },
+            "required": ["url"],
             "additionalProperties": False,
         },
     },
