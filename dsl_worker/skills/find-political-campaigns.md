@@ -1,6 +1,6 @@
 ---
 name: find-political-campaigns
-description: Building lists of political campaigns and the people/vendors around them — candidates, their committees, treasurers, contact emails, financials, and (via enrichment) campaign staff and consultants. Covers federal (FEC, full API) and notes the state/local long tail.
+description: Building lists of political campaigns and the people/vendors around them — candidates, their committees, treasurers, contact emails, financials, and (via enrichment) campaign staff and consultants. Covers federal (FEC) and notes the state/local long tail.
 applies_to: [orchestrator]
 ---
 
@@ -8,94 +8,105 @@ applies_to: [orchestrator]
 
 Use this when the user wants campaigns as leads — "Arizona 2026 campaign leads,"
 "funded House challengers in swing districts," "campaign managers to sell our
-tool to," "political consultants / media firms working 2026 races." The lead
-can be the **campaign** (candidate + committee + treasurer), the **staff**
-(campaign manager, finance/data director — via enrichment), or the **vendors**
-(media, canvassing, fundraising, data firms — via disbursements).
+tool to," "political consultants working 2026 races." The lead can be the
+**campaign** (candidate + committee + treasurer email), the **staff** (campaign
+manager, finance/data director — via enrichment), or the **vendors** (media,
+fundraising, data firms — via disbursements).
 
-### Do NOT web_harvest this. It is a free API.
+### The trick: FEC has a free JSON API. Read it with `browser_use`.
 
-The single most important rule. `web_harvest` / browser on campaign data fails
-(real example: a "Arizona Campaign Leads" extend ran 4.4 min, cost $0.61, and
-returned **0 rows**). Federal campaign finance is a clean, complete, free REST
-API. Always use the `fec_candidates` source.
+Federal campaign finance is a complete, free REST API at `api.open.fec.gov`.
+Do NOT `web_harvest` campaign lists (it fails — one real attempt ran 4.4 min,
+cost $0.61, returned 0 rows). Instead, point a `browser_use` session straight
+at an FEC **API URL** — the page renders as JSON and Browser Use parses it
+cleanly. Verified: one session reads a 100-candidate page in ~30s for ~$0.17.
 
-### TAM (so you can sanity-check coverage)
+The API key goes **in the URL** (`api_key=...`). Use `DEMO_KEY` for light pulls
+(it works from Browser Use's cloud IP), or a free api.data.gov key for heavy use.
+
+### TAM (sanity-check coverage)
 
 Federal, per 2-year cycle (`cycle=2026` = the 2025–2026 cycle):
-- ~8,000 candidates file; ~7,900 "active."
-- **~1,700 are seriously funded (>=$25k receipts)** — that's the real
-  addressable federal list. Filter with `min_receipts` so you get campaigns,
-  not 6,000 paper filings.
-- Per state it scales down: AZ 2026 had 180 candidates → **33 funded** active.
-- Plus thousands of PACs, party committees, leadership PACs, super PACs (not
-  candidate campaigns — different universe, ask before pulling).
+- ~8,000 candidates file; **~1,700 are seriously funded (>=$25k receipts)** —
+  that's the real addressable list. Always filter with `min_receipts` so you
+  get campaigns, not 6,000 paper filings.
+- Per state it scales down: AZ 2026 = 180 candidates → **33 funded**.
+- PACs / party committees / super PACs are a *separate* universe — ask first.
 
-State + local (governor, AG, state-leg, county, municipal) is a *much larger*
-long tail but has **no unified API** — each of the 50 states runs its own
-disclosure portal (AZ "See The Money", CA Cal-Access, TX TEC, NY BOE…). Out of
-scope for the `fec_candidates` source. If the user explicitly wants state/local,
-say so plainly and treat it as a per-state browser job, one portal at a time.
+State + local (governor, AG, state-leg, county, municipal) is a much larger
+long tail but has **no unified API** — 50 separate state portals (AZ "See The
+Money", CA Cal-Access, TX TEC…). Not covered here. If the user wants state/local,
+say so and treat it as a per-state browser job, one portal at a time.
 
-### Setup
+### Step 1 — fetch the campaign spine (`browser_use` on the FEC API URL)
 
-Needs `FEC_API_KEY` (a free api.data.gov key, 1,000 calls/hour) in the worker
-env. Without it the adapter falls back to `DEMO_KEY` (40 calls/hour) — only
-enough for a tiny preview. If pulls come back empty with rate-limit warnings,
-that's a missing key, not a bad query.
+Build the API URL from the user's filters, then `table_create`:
 
-### The source: `fec_candidates`
+```
+source = "browser_use"
+url    = "https://api.open.fec.gov/v1/candidates/totals/?api_key=DEMO_KEY"
+         "&cycle=2026&state=AZ&office=H&min_receipts=25000"
+         "&is_active_candidate=true&election_full=true"
+         "&sort=-receipts&per_page=100"
+task   = "This page is a JSON API response from the FEC. Read results[]. "
+         "Return one row per candidate with fields: name, office_full, party, "
+         "incumbent_challenge_full, receipts, disbursements, "
+         "last_cash_on_hand_end_period, district, candidate_id. "
+         "Just parse the JSON shown on the page; do not click anything."
+```
 
-`table_create(source="fec_candidates", query_params={...})`. Predictable
-schema — rows commit immediately, no `column_map_set` round-trip.
+URL filters (all optional except `cycle`):
+- `cycle` — even election year (required), e.g. `2026`
+- `state` — two-letter, e.g. `AZ`. Omit for national.
+- `office` — `H` House / `S` Senate / `P` President (repeat the param for several)
+- `party` — `DEM` / `REP` / `IND` …
+- `min_receipts` — **use this**, the viability floor (e.g. `25000`)
+- `incumbent_challenge` — `I` incumbent / `C` challenger / `O` open-seat
+- `q` — name search
+- always add `is_active_candidate=true&election_full=true&sort=-receipts&per_page=100`
 
-Each row already includes: **Candidate, Office, District, Party, Status
-(incumbent/challenger/open), Receipts, Disbursements, Cash on Hand, Committee,
-Treasurer, Committee Email, Website, City, State, FEC Profile, FEC Candidate
-ID.** Sorted by receipts (biggest campaigns first). The Committee Email is the
-treasurer/compliance contact — a real reachable address (often a compliance
-firm, not the candidate). The Website is the campaign site — the seed for
-finding staff.
+Each `browser_use` session is **one-shot = one page**. For >100 results,
+`table_extend` with the same URL but `&page=2`, `&page=3`, … Stop when a page
+returns fewer than 100 rows. (National funded ≈ 1,700 = ~18 pages ≈ ~$3.)
 
-Query params (all optional except `cycle`):
+The keys above are the exact JSON field names — name them in the task so the
+returned columns are predictable, then `column_map_set` to friendly labels
+(Candidate, Office, Party, Status, Receipts, Cash on Hand, District, FEC ID).
+Set the dedup key to `candidate_id`.
 
-| param | example | notes |
-|---|---|---|
-| `cycle` | `2026` | **required.** Even election year. |
-| `state` | `"AZ"` | two-letter. Omit for national. |
-| `office` | `"H"` / `"S"` / `"P"` | House / Senate / President. List ok. |
-| `party` | `"DEM"` / `"REP"` | list ok. |
-| `min_receipts` | `25000` | **use this** — the viability floor that turns 8k filings into real campaigns. |
-| `incumbent_challenge` | `"C"` | `I` incumbent, `C` challenger, `O` open-seat. |
-| `q` | `"Ansari"` | name search. |
-| `include_contact` | `false` | default true. Set false for a fast spine-only pull (skips the per-candidate committee lookup). |
+### Step 2 — funnel, THEN enrich the survivors
 
-Example call shapes:
-- "Funded AZ 2026 House campaigns" → `{cycle:2026, state:"AZ", office:"H", min_receipts:25000}`
-- "Democratic Senate challengers nationally, 2026" → `{cycle:2026, office:"S", party:"DEM", incumbent_challenge:"C", min_receipts:50000}`
+The spine is cheap; contact/staff lookups are per-row, so filter first (by
+Receipts / Status — see the funnel discipline in the main prompt) and only
+enrich the rows that matter.
 
-### Funnel: cheap fetch → enrich the survivors
+**Committee contact (treasurer + email + website).** A per-row `browser_use`
+enrichment keyed on `candidate_id`. One session, two hops, ~$0.08/row:
+```
+task = "Navigate to https://api.open.fec.gov/v1/candidate/{candidate_id}/"
+       "committees/?api_key=DEMO_KEY&designation=P — from results[0] read "
+       "committee_id. Then navigate to https://api.open.fec.gov/v1/committee/"
+       "{committee_id}/?api_key=DEMO_KEY and return treasurer_name, email, "
+       "website, city, state from results[0]. Parse JSON only."
+```
+Verified output: treasurer name, a real contact email, the campaign website.
+(The email is often the treasurer/compliance firm — still reachable.)
 
-The fetch is the spine. Layer enrichments only on the rows that matter (filter
-by Receipts / Status first — see the funnel discipline in the main prompt):
+**Campaign staff (manager, finance/data director, comms).** FEC payroll is
+inconsistent, so get people from the **Website** (from the contact step): a
+`fetch_url` enrichment on the campaign site's Team/About/Contact page, then
+extract names + roles. Fall back to a LinkedIn enrichment ("campaign manager
+at {Committee}"). Then run the email enrichment (FullEnrich) on
+`{first} {last} @ {campaign domain}`.
 
-1. **Campaign staff (manager, finance/data director, comms).** FEC payroll is
-   inconsistent, so get people from the **Website**: a `fetch_url` enrichment on
-   the campaign site's "Team"/"About"/"Contact" page, then a classify/extract to
-   pull names + roles. Fall back to a LinkedIn enrichment ("campaign manager at
-   {Committee}").
-2. **Staff emails.** Once you have a name + the campaign domain, run the email
-   enrichment (FullEnrich) on `{first} {last} @ {campaign domain}`.
-3. **Vendors / consultants** (media, canvassing, fundraising, digital, data,
-   legal firms). These are themselves a B2B lead universe. They come from the
-   committee's itemized disbursements:
-   `GET /schedules/schedule_b/?committee_id={id}&sort=-disbursement_amount` —
-   each record has `recipient_name` + `disbursement_description` + amount. If the
-   user wants vendors, pull schedule_b per committee (code_exec against the FEC
-   API) and dedup recipients by category keyword (MEDIA, CONSULT, FUNDRAIS,
-   DIGITAL, DATA, CANVASS).
+**Vendors / consultants** (media, canvassing, fundraising, digital, data, legal
+firms — themselves a B2B lead pool). A per-row `browser_use` enrichment on
+`https://api.open.fec.gov/v1/schedules/schedule_b/?api_key=DEMO_KEY&committee_id={committee_id}&sort=-disbursement_amount&per_page=100`
+— each record has `recipient_name` + `disbursement_description` + amount. Dedup
+recipients by category keyword (MEDIA, CONSULT, FUNDRAIS, DIGITAL, DATA,
+CANVASS). Only do this if the user wants vendors.
 
 ### Honesty
 
-If a fetch or extend adds 0 rows, **say so** — don't report a count you didn't
-add. (The adapter and table_extend now report true counts; relay them as-is.)
+If a fetch or extend adds 0 rows, **say so** — relay the true count the tool
+returns, never a number you didn't add.

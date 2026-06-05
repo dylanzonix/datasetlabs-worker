@@ -27,7 +27,6 @@ from dsl_worker.sources import web_harvest  # noqa: F401
 from dsl_worker.sources import browser_use  # noqa: F401
 from dsl_worker.sources import file as file_source  # noqa: F401
 from dsl_worker.sources import llm  # noqa: F401
-from dsl_worker.sources import fec_candidates  # noqa: F401
 
 
 __all__ = [
