@@ -7,17 +7,27 @@ Spawned per row for every enrichment. Each cell agent gets:
   - A toolset (depends on research level)
   - A credit budget per row (enforced programmatically; NOT shown to the LLM)
 
-Research levels — two values, picked per enrichment:
+Research levels — picked per enrichment:
 
   - "classify"  gpt-5.4-nano  | no tools — decide a label from row text
   - "research"  gpt-5.4-mini  | all tools — go find more data (web /
                                 FE / Apollo / browser_use / etc.)
+  - "deep"      gpt-5.5       | all tools — harder multi-step lookups
 
 The split is binary: does the cell agent need to look OUTSIDE this row's
-data? If yes → research. If no → classify. mini is the workhorse: the
-long system prompt + tool defs repeat across every cell so the cache hit
-rate is high, input cost is 70% lower than gpt-5.5, and for paid
-integrations the LLM cost is a rounding error vs the tool fee anyway.
+data? If yes → research/deep. If no → classify.
+
+Provider is a runtime toggle for the tool-using tiers (research/deep), via
+the ENRICHMENT_LLM_PROVIDER env var:
+
+  - "openai"    (default) → OpenAI Responses path (unchanged)
+  - "anthropic"           → Claude (Sonnet 4.6) via the Messages API
+                            (_anthropic_cell_loop): server-side web_search cap
+                            (max_uses), exact search-count billing, real
+                            citation URLs, prompt-cached system+tools.
+
+classify always stays on nano. Default is OpenAI, so nothing changes unless
+you opt in; flip back any time by unsetting the var.
 
 Legacy aliases cover every prior rename pass (none/low/medium/high,
 classify/lookup/search/investigate, fast/smart/expert, etc.) — all
@@ -45,6 +55,11 @@ from sqlalchemy import text as sa_text
 from dsl_worker.billing.pricing import get_pricing_config
 from dsl_worker.billing.tracked_client import TrackedOpenAIClient
 from dsl_worker.chat.tools import ToolContext
+
+# NOTE: the Anthropic SDK + Claude helpers are imported LAZILY inside the
+# anthropic-only functions below (not at module top), so the default OpenAI
+# enrichment path carries zero new import dependencies — a broken Claude path
+# can never break normal enrichments.
 
 
 log = logging.getLogger(__name__)
@@ -162,10 +177,24 @@ RESEARCH_CONFIG = {
     # we convert to USD at the boundary in _resolve_research so all
     # internal math uses USD (matches total_cost). Per-enrichment caps
     # passed at action time override these defaults.
-    "classify": {"model": "gpt-5.4-nano", "effort": "medium", "default_cap": 0.05, "tools": []},
-    "research": {"model": "gpt-5.4-mini", "effort": "medium", "default_cap": 2.0, "tools": "all"},
-    "deep":     {"model": "gpt-5.5",      "effort": "medium", "default_cap": 5.0, "tools": "all"},
+    "classify": {"model": "gpt-5.4-nano", "provider": "openai", "effort": "medium", "default_cap": 0.05, "tools": []},
+    "research": {"model": "gpt-5.4-mini", "provider": "openai", "effort": "medium", "default_cap": 2.0, "tools": "all"},
+    "deep":     {"model": "gpt-5.5",      "provider": "openai", "effort": "medium", "default_cap": 5.0, "tools": "all"},
 }
+
+# Provider toggle for the tool-using enrichment tiers (research/deep).
+#
+#   ENRICHMENT_LLM_PROVIDER = "openai"    (default) → unchanged OpenAI path
+#   ENRICHMENT_LLM_PROVIDER = "anthropic"           → Claude (Sonnet 4.6)
+#
+# This is the ONLY switch. Default is "openai" so the app behaves EXACTLY as
+# before unless you opt in; flip it back any time by unsetting the var or
+# setting it to "openai". `classify` always stays on nano (it never web-
+# searches, so Claude would be pure overhead). If "anthropic" is selected but
+# ANTHROPIC_API_KEY is missing, we log and fall back to OpenAI rather than
+# failing every cell — see _resolve_research.
+ENRICHMENT_LLM_PROVIDER = os.getenv("ENRICHMENT_LLM_PROVIDER", "openai").strip().lower()
+ENRICHMENT_ANTHROPIC_MODEL = os.getenv("ENRICHMENT_ANTHROPIC_MODEL", "claude-haiku-4-5").strip()
 
 # Every old name (across every prior rename pass + the latest collapse)
 # normalizes to one of the three canonical tiers. Old enrichment rows
@@ -208,6 +237,18 @@ def _resolve_research(action: Dict[str, Any], per_row_cap: Optional[float]) -> D
         log.warning("cell_agent: unknown research %r, defaulting to research", requested)
         requested = "research"
     cfg = RESEARCH_CONFIG[requested].copy()
+    # Opt-in provider switch for the tool-using tiers (research/deep). classify
+    # always stays on nano/OpenAI. Falls back to OpenAI when the key is absent
+    # so a misset toggle can't break every research cell.
+    if requested in ("research", "deep") and ENRICHMENT_LLM_PROVIDER == "anthropic":
+        if os.getenv("ANTHROPIC_API_KEY"):
+            cfg["provider"] = "anthropic"
+            cfg["model"] = ENRICHMENT_ANTHROPIC_MODEL
+        else:
+            log.warning(
+                "ENRICHMENT_LLM_PROVIDER=anthropic but ANTHROPIC_API_KEY is "
+                "unset — using OpenAI for the %s tier", requested,
+            )
     cap_credits = float(per_row_cap) if per_row_cap and per_row_cap > 0 else cfg["default_cap"]
     cfg["cap_credits"] = cap_credits
     cfg["cap"] = cap_credits * 0.10
@@ -1716,6 +1757,312 @@ def _persist_cell_trace(
         log.warning("cell trace persist failed: %s", e)
 
 
+# ---------------------------------------------------------------------------
+# Anthropic (Claude) cell-agent path — used by the research/deep tiers.
+# ---------------------------------------------------------------------------
+#
+# Reuses everything provider-agnostic (CELL_TOOL_HANDLERS, budget gates,
+# value/source coercion, cell_traces). Only the model loop differs. Wins over
+# the OpenAI hosted web_search the rest of this module used to use:
+#   - max_uses caps web searches SERVER-SIDE — no mid-stream abort hack, and
+#     the "model reformulates the same query 7x into the cap" failure mode is
+#     structurally impossible.
+#   - usage.server_tool_use.web_search_requests is the EXACT search count, so
+#     we bill the real number ($0.01/search) instead of a calibrated estimate.
+#   - Claude returns real citation URLs (better source attribution).
+#   - The static system+tools prefix is prompt-cached, so cell 2..N of a job
+#     read it from cache (~10x cheaper input) instead of re-billing it.
+
+# Anthropic hosted web_search fee: $10 / 1k searches. The exact count comes
+# back in usage, so this is the real rate (no sub-search multiplier guess).
+ANTHROPIC_WEB_SEARCH_COST_USD = 0.01
+# Pin the SIMPLE hosted web_search tool. translate_tools() emits the newer
+# agentic web_search_20260209, which bundles server-side code_execution — it
+# spins up a container that must be threaded via container_id across turns, and
+# replaying those blocks on a follow-up call otherwise 400s. Factual cell fills
+# only need plain search, so we pin the simpler (and cheaper) version.
+ANTHROPIC_WEB_SEARCH_TOOL = "web_search_20250305"
+# Hard ceiling on web searches per cell, enforced server-side via the tool's
+# max_uses. Derived from the per-row cap but clamped to this so one hard-to-
+# find value can't burn the whole budget on search reformulations.
+ANTHROPIC_MAX_WEB_SEARCHES = 5
+
+_cell_anthropic_client = None  # lazily-built TrackedAnthropicClient
+
+
+def _get_anthropic_client():
+    global _cell_anthropic_client
+    if _cell_anthropic_client is None:
+        from anthropic import AsyncAnthropic
+        from dsl_worker.billing.tracked_anthropic_client import TrackedAnthropicClient
+        raw = AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        _cell_anthropic_client = TrackedAnthropicClient(raw)
+    return _cell_anthropic_client
+
+
+async def _dispatch_cell_tool(
+    name: str,
+    args: Dict[str, Any],
+    ctx: ToolContext,
+    tier_cfg: Dict[str, Any],
+    total_cost: float,
+) -> Tuple[Dict[str, Any], float]:
+    """Client-tool dispatch with the same pre-call budget gate the OpenAI path
+    uses (FIXED_COST_TOOLS / browser_use / apify). web_search is NOT here — on
+    Claude it's a server tool that runs inline, billed via usage."""
+    handler = CELL_TOOL_HANDLERS.get(name)
+    if not handler:
+        return {"error": f"unknown tool {name}"}, 0.0
+    remaining = tier_cfg["cap"] - total_cost
+    skip_reason: Optional[str] = None
+    if name in FIXED_COST_TOOLS:
+        est = FIXED_COST_TOOLS[name]
+        if remaining < est:
+            skip_reason = (
+                f"skipped: {name} costs ~${est} but only ${remaining:.3f} "
+                f"remaining of per-row cap"
+            )
+    elif name == "browser_use":
+        if remaining < BU_MIN_BUDGET:
+            skip_reason = (
+                f"skipped: browser_use needs at least ${BU_MIN_BUDGET} "
+                f"remaining; only ${remaining:.3f} left"
+            )
+        else:
+            args["__max_cost_usd"] = float(remaining)
+    elif name == "apify_call_actor":
+        if remaining < APIFY_MIN_BUDGET:
+            skip_reason = (
+                f"skipped: apify_call_actor needs at least ${APIFY_MIN_BUDGET} "
+                f"remaining; only ${remaining:.3f} left"
+            )
+        else:
+            args["__max_cost_usd"] = float(remaining)
+    if skip_reason is not None:
+        log.info("cell agent pre-tool skip: %s", skip_reason)
+        return {"error": "budget", "message": skip_reason}, 0.0
+    try:
+        return await handler(args, ctx)
+    except Exception as e:
+        log.exception("cell tool %s raised: %s", name, e)
+        return {"error": str(e)[:300]}, 0.0
+
+
+def _anthropic_web_search_count(response: Any) -> int:
+    """Exact number of hosted web searches Claude ran this turn (from usage)."""
+    usage = getattr(response, "usage", None)
+    stu = getattr(usage, "server_tool_use", None) if usage else None
+    if not stu:
+        return 0
+    return int(getattr(stu, "web_search_requests", 0) or 0)
+
+
+def _log_anthropic_web_searches(response: Any, tool_calls_log: List[Dict[str, Any]]) -> None:
+    """Record each Claude web_search (query + result URLs) into tool_calls_log
+    so source inference and the cell_traces row see them — same shape the
+    OpenAI path logged."""
+    pending_idx: Optional[int] = None
+    for b in getattr(response, "content", []) or []:
+        bt = getattr(b, "type", None)
+        if bt == "server_tool_use" and getattr(b, "name", None) == "web_search":
+            inp = getattr(b, "input", None) or {}
+            query = inp.get("query", "") if isinstance(inp, dict) else ""
+            tool_calls_log.append({
+                "name": "web_search",
+                "args": {"query": query},
+                "result_preview": "anthropic web_search",
+                "cost": ANTHROPIC_WEB_SEARCH_COST_USD,
+            })
+            pending_idx = len(tool_calls_log) - 1
+        elif bt == "web_search_tool_result" and pending_idx is not None:
+            urls: List[str] = []
+            rc = getattr(b, "content", None)
+            if isinstance(rc, list):
+                for r in rc:
+                    u = getattr(r, "url", None)
+                    if u:
+                        urls.append(u)
+            if urls:
+                tool_calls_log[pending_idx]["result_preview"] = json.dumps(
+                    {"urls": urls[:5]}, default=str
+                )[:400]
+            pending_idx = None
+
+
+def _serialize_blocks_for_history(content: List[Any]) -> List[Dict[str, Any]]:
+    """Dump Claude response content blocks to dicts so they replay verbatim as
+    assistant history (and stay JSON-serializable for caching)."""
+    out: List[Dict[str, Any]] = []
+    for b in content or []:
+        try:
+            out.append(b.model_dump(exclude_none=True))
+        except Exception:
+            if getattr(b, "type", None) == "text":
+                out.append({"type": "text", "text": getattr(b, "text", "")})
+    return out
+
+
+# Caching policy: cache ONLY the static tools+system prefix — one breakpoint on
+# the system block (see _anthropic_cell_loop). That prefix is identical for every
+# cell of a tier, so it's written once and read by all subsequent cells within
+# the 5-min TTL. We deliberately do NOT put cache breakpoints on the per-cell
+# content (row data, web-search results, conversation): it's unique per cell and
+# never reused, so caching it would only pay the 1.25x write premium for nothing.
+# (Anthropic's hosted web_search may still auto-cache its own result blocks
+# server-side — that's outside our control and unaffected by this.)
+
+
+async def _anthropic_cell_loop(
+    tier_cfg: Dict[str, Any],
+    system_prompt: str,
+    user_payload: Dict[str, Any],
+    columns_to_fill: List[str],
+    openai_tool_defs: List[Dict[str, Any]],
+    ctx: ToolContext,
+    tool_calls_log: List[Dict[str, Any]],
+    build_sources_fn: Callable[..., Dict[str, List[Dict[str, Any]]]],
+) -> Tuple[Dict[str, Any], Dict[str, List[Dict[str, Any]]], float, str, Optional[str]]:
+    """Claude (Messages API) equivalent of the OpenAI cell loop.
+
+    Returns (final_values, final_sources, total_cost_usd, status, error_str).
+    status ∈ {"filled","hit_budget","error"} — same contract as the OpenAI path.
+    Extended thinking is intentionally off: keeps caching simple (no thinking-
+    signature round-trip) and Sonnet 4.6 is strong enough for factual fills.
+    """
+    from dsl_worker.agents.anthropic_base import translate_tools
+
+    client = _get_anthropic_client()
+    cap_usd = tier_cfg["cap"]
+
+    claude_tools, _mcp = translate_tools(openai_tool_defs)
+    # Cap hosted web searches server-side. Derived from the per-row budget,
+    # clamped to ANTHROPIC_MAX_WEB_SEARCHES.
+    max_uses = max(1, min(ANTHROPIC_MAX_WEB_SEARCHES, int(cap_usd / ANTHROPIC_WEB_SEARCH_COST_USD)))
+    for t in claude_tools:
+        if isinstance(t, dict) and str(t.get("type", "")).startswith("web_search"):
+            t["type"] = ANTHROPIC_WEB_SEARCH_TOOL
+            t["max_uses"] = max_uses
+
+    # Cache the static prefix (tools + system). A breakpoint on the system
+    # block caches everything before it too (Anthropic order: tools → system →
+    # messages). Identical across every cell of this tier → cell 2..N read it
+    # from cache. Per-cell user data sits AFTER the breakpoint, so it varies
+    # freely without busting the cache.
+    system_blocks = [{
+        "type": "text",
+        "text": system_prompt,
+        "cache_control": {"type": "ephemeral"},
+    }]
+
+    messages: List[Dict[str, Any]] = [
+        {"role": "user", "content": json.dumps(user_payload, default=str)},
+    ]
+
+    final_values: Dict[str, Any] = {}
+    final_sources: Dict[str, List[Dict[str, Any]]] = {}
+    total_cost = 0.0
+    HARD_TURN_LIMIT = 40
+
+    for _turn in range(HARD_TURN_LIMIT):
+        if total_cost >= cap_usd:
+            return final_values, final_sources, total_cost, "hit_budget", "budget cap reached"
+
+        try:
+            response, usage_cost = await client.messages_create(
+                model=tier_cfg["model"],
+                system=system_blocks,
+                messages=messages,
+                tools=claude_tools,
+                max_tokens=8000,
+            )
+        except Exception as e:
+            log.warning("anthropic cell agent call failed (tier=%s): %s", tier_cfg["name"], e)
+            return final_values, final_sources, total_cost, "error", f"LLM call failed: {e}"[:500]
+
+        # Token cost (incl. cache read/write) from the tracked client; add the
+        # hosted web_search fee using the exact count Anthropic reports.
+        total_cost += usage_cost.total_cost_usd
+        n_ws = _anthropic_web_search_count(response)
+        if n_ws:
+            total_cost += n_ws * ANTHROPIC_WEB_SEARCH_COST_USD
+            _log_anthropic_web_searches(response, tool_calls_log)
+
+        messages.append({
+            "role": "assistant",
+            "content": _serialize_blocks_for_history(response.content),
+        })
+
+        tool_use_blocks = [b for b in response.content if getattr(b, "type", None) == "tool_use"]
+        if not tool_use_blocks:
+            # Web search can pause a long turn (stop_reason="pause_turn"); resume
+            # it with no extra user message so the model can finish, rather than
+            # treating the pause as a (premature) final answer.
+            if getattr(response, "stop_reason", None) == "pause_turn":
+                continue
+            # No client tool call — the model answered in text. Mirror the
+            # OpenAI fallback: parse a JSON object/{"values":...} out of it.
+            text = "".join(
+                getattr(b, "text", "") for b in response.content
+                if getattr(b, "type", None) == "text"
+            ).strip()
+            if text:
+                try:
+                    data = json.loads(text)
+                except json.JSONDecodeError:
+                    data = None
+                if isinstance(data, dict) and "values" in data:
+                    final_values = data["values"]
+                    final_sources = build_sources_fn(
+                        _coerce_sources_keys(data.get("sources"), list(final_values.keys()), tool_calls_log),
+                        final_values,
+                    )
+                    return final_values, final_sources, total_cost, "filled", None
+                if isinstance(data, dict):
+                    final_values = data
+                    final_sources = build_sources_fn({}, final_values)
+                    return final_values, final_sources, total_cost, "filled", None
+            return final_values, final_sources, total_cost, "error", "no tool_use and no parseable message"
+
+        tool_result_blocks: List[Dict[str, Any]] = []
+        for tu in tool_use_blocks:
+            name = tu.name
+            args = tu.input if isinstance(tu.input, dict) else {}
+
+            if name == "final_result":
+                raw_values = args.get("values") if isinstance(args.get("values"), dict) else (args if isinstance(args, dict) else {})
+                final_values = _coerce_value_keys(raw_values, columns_to_fill)
+                declared = _coerce_sources_keys(args.get("sources"), list(final_values.keys()), tool_calls_log)
+                final_sources = build_sources_fn(declared, final_values)
+                tool_calls_log.append({
+                    "name": "final_result",
+                    "args": args,
+                    "coerced_values": final_values,
+                    "coerced_sources": final_sources,
+                    "cost": 0.0,
+                })
+                return final_values, final_sources, total_cost, "filled", None
+
+            tool_result, tool_cost = await _dispatch_cell_tool(name, args, ctx, tier_cfg, total_cost)
+            total_cost += tool_cost
+            tool_calls_log.append({
+                "name": name,
+                "args": args,
+                "result_preview": json.dumps(tool_result, default=str)[:400],
+                "cost": tool_cost,
+            })
+            tool_result_blocks.append({
+                "type": "tool_result",
+                "tool_use_id": tu.id,
+                "content": json.dumps(tool_result, default=str)[:8000],
+            })
+            if total_cost >= cap_usd:
+                return final_values, final_sources, total_cost, "hit_budget", "budget cap reached before final_result"
+
+        messages.append({"role": "user", "content": tool_result_blocks})
+
+    return final_values, final_sources, total_cost, "error", f"hit HARD_TURN_LIMIT={HARD_TURN_LIMIT}"
+
+
 async def run_cell_agent(
     action: Dict[str, Any],
     row_data: Dict[str, Any],
@@ -1823,6 +2170,15 @@ async def run_cell_agent(
     llm_retries = 0  # transient-timeout retries (don't count toward turn limit)
     status = "error"  # default; flipped to "filled" or "hit_budget" on exit
     try:
+        # Research/deep tiers run on Claude (Messages API); classify stays on
+        # OpenAI nano. The Claude loop reuses tool_calls_log + the sources
+        # closure, and reassigns the locals the finally block traces on.
+        if tier_cfg.get("provider") == "anthropic":
+            final_values, final_sources, total_cost, status, error_str = await _anthropic_cell_loop(
+                tier_cfg, system_prompt, user_payload, columns_to_fill,
+                tool_defs, ctx, tool_calls_log, _build_sources_with_fallback,
+            )
+            return final_values, final_sources, total_cost, status
         while iteration < HARD_TURN_LIMIT:
             iteration += 1
 
