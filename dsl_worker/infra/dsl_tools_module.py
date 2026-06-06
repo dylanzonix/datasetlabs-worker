@@ -122,6 +122,23 @@ def read_jsonl(path: str) -> List[Dict]:
     return items
 
 
+def read_rows() -> List[Dict]:
+    """Read the current table's rows (available when code_exec was called with
+    a table_id). Each row is a dict of column-name -> value, plus '_id' (the
+    row's stable id). Returns [] if no table is attached.
+
+    Read-only — this is how you compute over the table: aggregates
+    (max/min/sum/argmax), group-by, dedup, etc. To write back, use add_rows().
+
+        rows = dsl_tools.read_rows()
+        top = max(rows, key=lambda r: float(r.get("Receipts") or 0))
+    """
+    for p in ("table_rows.jsonl", "/workspace/table_rows.jsonl"):
+        if os.path.exists(p):
+            return read_jsonl(p)
+    return []
+
+
 def write_jsonl(path: str, data: List[Dict]) -> int:
     """Write a list of dicts to a JSONL file.
 

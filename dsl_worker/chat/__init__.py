@@ -401,8 +401,13 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
             "Args: {code, files?, table_id?}. "
             "files: list of file_id UUIDs (from project uploads) or candidate filenames to inject — "
             "each file is placed in /workspace/ under its original filename. "
-            "table_id: when set, `import dsl_tools; dsl_tools.add_rows([...])` in the code "
-            "bulk-inserts parsed rows into that table after execution finishes."
+            "table_id: when set, the code can (a) READ that table's rows with "
+            "`import dsl_tools; rows = dsl_tools.read_rows()` — each row is a dict of "
+            "column->value plus '_id' — for deterministic compute the agent can't do "
+            "otherwise: aggregates (max/min/sum/argmax), group-by, dedup, counts; and "
+            "(b) WRITE new rows with `dsl_tools.add_rows([...])` (committed after exec). "
+            "Use this for superlatives ('most expensive X') and group-by instead of "
+            "eyeballing a sample or trusting sort."
         ),
         # web_search is the OpenAI hosted tool — added directly to the
         # Responses `tools` array in agent.py as {"type": "web_search"},

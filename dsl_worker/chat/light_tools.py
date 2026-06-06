@@ -369,6 +369,41 @@ async def code_exec(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, A
                     except Exception as e:
                         log.warning("code_exec file upload %s failed: %s", fn, e)
 
+            # If a table_id is in scope, export its rows into the sandbox as
+            # table_rows.jsonl so sandbox code can READ existing table data —
+            # compute aggregates (max/min/sum/argmax), group-by, dedup, etc.
+            # The sandbox has no DB access, so without this the agent can see
+            # its own table only by guessing. READ-ONLY: this never mutates the
+            # table; writes still go through the normal tools. Each line is the
+            # row dict plus "_id" (the row's stable id).
+            if table_id and ctx.project_id:
+                try:
+                    import json
+                    from dsl_api.db import SessionLocal as _SL
+                    from sqlalchemy import text as _sa_text
+                    _rdb = _SL()
+                    try:
+                        _table_rows = _rdb.execute(
+                            _sa_text(
+                                "SELECT id::text, row FROM samples "
+                                "WHERE table_id=:tid AND deleted_at IS NULL "
+                                "ORDER BY created_at LIMIT 50000"
+                            ),
+                            {"tid": table_id},
+                        ).fetchall()
+                    finally:
+                        _rdb.close()
+                    _lines = []
+                    for _sid, _row in _table_rows:
+                        _rec = dict(_row) if isinstance(_row, dict) else {}
+                        _rec["_id"] = _sid
+                        _lines.append(json.dumps(_rec, default=str))
+                    await session.upload_content(
+                        ("\n".join(_lines)).encode("utf-8"), "table_rows.jsonl",
+                    )
+                except Exception as e:
+                    log.warning("code_exec table export failed: %s", e)
+
             result = await session.exec_python(code, timeout=60)
 
             # Capture newly-written files and stash them in the candidate
