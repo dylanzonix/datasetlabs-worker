@@ -1,12 +1,14 @@
 ---
 name: find-reddit-leads
-description: Find me leads on Reddit for <company/website> — derive the ICP from the site, broad-scrape a month of Reddit on the customer's pain, then classify every post to surface the people actually asking. Thorough, cheap (~$0.50/run), beats web_search.
+description: "Finding leads ON REDDIT for a company/website. ONLY use when the user EXPLICITLY names Reddit (\"find leads on Reddit for X\", \"who on Reddit needs X\", \"reddit leads for <url>\"). Do NOT use for a bare \"find leads for <company>\" — that implies the best-fit source, NOT Reddit; pick the right source for the ICP instead. When triggered: derive ICP from the site, broad-scrape a month of Reddit on the customer's pain, classify to surface the people actually asking. ~$0.50/run."
 applies_to: [orchestrator]
 ---
 
 ## Finding leads on Reddit for a company
 
-Trigger: "find leads on reddit for stripe.com", "who on reddit needs <product>", "reddit leads for my SaaS <url>". The user often gives **just a website** — derive everything from it.
+Trigger — **only when the user explicitly names Reddit**: "find leads on reddit for stripe.com", "who on reddit needs <product>", "reddit leads for my SaaS <url>". The user often gives **just a website alongside Reddit** — derive everything from it.
+
+**Do NOT fire on a bare "find me leads for <company>".** That is NOT a Reddit request — it asks for the best-fit source, and Reddit is rarely it. Defaulting a generic lead ask to Reddit (e.g. scraping r/* for an SMS-marketing SaaS) produces mostly noise and is wrong. If the user hasn't said "Reddit," ignore this skill and choose the source that fits the ICP.
 
 This uses the [[fetch-reddit]] actor for the scrape; this skill is the **lead-gen strategy** on top of it.
 
