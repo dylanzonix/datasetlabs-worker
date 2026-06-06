@@ -1976,7 +1976,10 @@ async def row_inspect(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str,
     include_raw = bool(args.get("include_raw") or args.get("with_raw"))
     if not table_id:
         return {"error": "table_id is required"}, 0.0
-    select_cols = "row, raw_row" if include_raw else "row"
+    # Always return id — the agent needs it to target a row it just looked at
+    # (row_delete row_ids, enrichment scope.row_ids, cell_set). Without it the
+    # agent has to reverse-engineer a uniquely-matching filter.
+    select_cols = "id::text, row, raw_row" if include_raw else "id::text, row"
     rows = ctx.db.execute(
         sa_text(
             f"SELECT {select_cols} FROM samples WHERE table_id=:tid AND deleted_at IS NULL "
@@ -2002,16 +2005,16 @@ async def row_inspect(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str,
                     mapped_source_fields.add(sf.split(".")[0].split("[]")[0])
         unmapped_raw_fields: set[str] = set()
         for r in rows:
-            raw = r[1] if isinstance(r[1], dict) else {}
+            raw = r[2] if isinstance(r[2], dict) else {}
             if isinstance(raw, dict):
                 for k in raw.keys():
                     if k not in mapped_source_fields and not k.startswith("_"):
                         unmapped_raw_fields.add(k)
         return {
-            "rows": [{"row": r[0], "raw_row": r[1]} for r in rows],
+            "rows": [{"id": r[0], "row": r[1], "raw_row": r[2]} for r in rows],
             "unmapped_raw_fields": sorted(unmapped_raw_fields),
         }, 0.0
-    return {"rows": [r[0] for r in rows]}, 0.0
+    return {"rows": [{"id": r[0], "row": r[1]} for r in rows]}, 0.0
 
 
 async def row_delete(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
