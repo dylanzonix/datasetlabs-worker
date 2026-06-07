@@ -613,35 +613,62 @@ async def run_turn(
                 # Skipping the mid-turn await + emit is what unblocks
                 # the agent loop and prevents the "worker hangs on user
                 # decision" wedge that caused the earlier crash.
-                est_cost, summary = estimate_enrichment_run_cost(
-                    args, bctx.db, bctx.project_id
-                )
-                pending = await APPROVALS.request(
-                    project_id=bctx.project_id,
-                    tool=name,
-                    args=args,
-                    estimated_cost_credits=est_cost,
-                    summary=summary,
-                )
-                pending_enrichment_chips.append({
-                    "approval_id": pending.id,
-                    "tool": name,
-                    "args": args,
-                    "estimated_cost_credits": est_cost,
-                    "summary": summary,
-                })
-                tool_result = {
-                    "scheduled": True,
-                    "approval_id": pending.id,
-                    "estimated_cost_credits": est_cost,
-                    "summary": summary,
-                    "note": (
-                        "Enrichment queued — pending user approval. It "
-                        "will NOT run during this turn. Don't claim "
-                        "results; phrase your reply as 'I've queued X — "
-                        "approve below to run.'"
-                    ),
-                }
+                #
+                # Dedup: if an approval for the SAME enrichment is already
+                # pending, do NOT drop a second card. The agent sometimes
+                # proposes overlapping batches in one turn — without this the
+                # user gets multiple cards to approve for one logical run.
+                from dsl_worker.chat.tools import resolve_enrichment_id as _rid
+                _new_eid = _rid(bctx.db, bctx.project_id, args.get("enrichment_id")) or str(args.get("enrichment_id") or "")
+                _dup = None
+                for _p in await APPROVALS.list_for_project(bctx.project_id):
+                    if _p.get("tool") != "enrichment_run":
+                        continue
+                    _peid = _rid(bctx.db, bctx.project_id, (_p.get("args") or {}).get("enrichment_id")) or ""
+                    if _peid and _peid == _new_eid:
+                        _dup = _p
+                        break
+                if _dup is not None:
+                    tool_result = {
+                        "scheduled": True,
+                        "approval_id": _dup["id"],
+                        "duplicate": True,
+                        "note": (
+                            "An approval for THIS enrichment is already pending — "
+                            "not queuing another. Do NOT propose more runs for it; "
+                            "tell the user to approve the single existing card."
+                        ),
+                    }
+                else:
+                    est_cost, summary = estimate_enrichment_run_cost(
+                        args, bctx.db, bctx.project_id
+                    )
+                    pending = await APPROVALS.request(
+                        project_id=bctx.project_id,
+                        tool=name,
+                        args=args,
+                        estimated_cost_credits=est_cost,
+                        summary=summary,
+                    )
+                    pending_enrichment_chips.append({
+                        "approval_id": pending.id,
+                        "tool": name,
+                        "args": args,
+                        "estimated_cost_credits": est_cost,
+                        "summary": summary,
+                    })
+                    tool_result = {
+                        "scheduled": True,
+                        "approval_id": pending.id,
+                        "estimated_cost_credits": est_cost,
+                        "summary": summary,
+                        "note": (
+                            "Enrichment queued — pending user approval. It "
+                            "will NOT run during this turn. Don't claim "
+                            "results; phrase your reply as 'I've queued X — "
+                            "approve below to run.'"
+                        ),
+                    }
             elif name in APPROVAL_REQUIRED:
                 # Blocking approval for the rest of APPROVAL_REQUIRED
                 # (table_delete / row_delete). These are fast yes/no
