@@ -2430,18 +2430,49 @@ def _commit_rows(
     return []
 
 
+def _norm_source_key(s: Any) -> str:
+    """Lowercase + strip non-alphanumerics — collapses Company/company/COMPANY
+    and founder_email/Founder Email/founderEmail to one canonical form."""
+    return "".join(ch for ch in str(s).lower() if ch.isalnum())
+
+
+def _dict_get_tolerant(d: Dict[str, Any], key: str) -> Any:
+    """Exact-key lookup with a case/punctuation-insensitive fallback.
+
+    The fallback fires ONLY when the exact key is absent AND exactly one key
+    normalizes to the target (unambiguous). Exact match always wins, so every
+    mapping that already resolves is byte-for-byte unchanged — this purely
+    recovers a value that would otherwise be silently dropped to null.
+
+    Motivation: LLM sources routinely emit Title-Case keys ("Company") while
+    the column's source_field is snake_case ("company"). A strict lookup turns
+    that minor casing skew into an entirely blank column — a silent, critical
+    data-loss UX bug. See _extract_source_value callers (projection sites).
+    """
+    if not isinstance(d, dict):
+        return None
+    if key in d:
+        return d[key]
+    target = _norm_source_key(key)
+    if not target:
+        return None
+    matches = [v for k, v in d.items() if _norm_source_key(k) == target]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _extract_source_value(row: Dict[str, Any], path: str) -> Any:
     """Resolve a source_field path against a row.
 
     Supports plain keys (`name`), dotted paths (`founder.email`), and
     array fan-out (`founders[].name` → list of names). Returns None if
-    any step is missing.
+    any step is missing. Key lookups are case/punctuation-tolerant on an
+    exact miss (unambiguous only) — see _dict_get_tolerant.
     """
     if not path:
         return None
     # Plain key fast path.
     if "." not in path and "[]" not in path:
-        return row.get(path)
+        return _dict_get_tolerant(row, path)
 
     segments = path.split(".")
     current: Any = row
@@ -2451,7 +2482,7 @@ def _extract_source_value(row: Dict[str, Any], path: str) -> Any:
         if seg.endswith("[]"):
             key = seg[:-2]
             if isinstance(current, dict):
-                current = current.get(key)
+                current = _dict_get_tolerant(current, key)
             if not isinstance(current, list):
                 return None
             # The remaining segments apply to each element. Recurse.
@@ -2460,7 +2491,7 @@ def _extract_source_value(row: Dict[str, Any], path: str) -> Any:
                 return current
             return [_extract_source_value(item, remaining) if isinstance(item, dict) else item for item in current]
         if isinstance(current, dict):
-            current = current.get(seg)
+            current = _dict_get_tolerant(current, seg)
         else:
             return None
     return current
