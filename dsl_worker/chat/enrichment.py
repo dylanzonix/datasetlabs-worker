@@ -1165,6 +1165,26 @@ async def _run_enrichment_on_rows(
     }
 
 
+_SETTLED_CELL_STATES = {"not_found", "hit_budget"}
+
+
+def _row_needs_work(row_data: Dict[str, Any], target_cols: List[str]) -> bool:
+    """True iff the row has a target column that is empty AND not already
+    attempted. A column that came back empty-but-marked (not_found / hit_budget)
+    counts as DONE — otherwise `all_unfilled` re-runs N/A rows forever (e.g. a
+    'No' row whose detail columns are legitimately blank), so "run more" re-does
+    the same rows instead of advancing to fresh ones.
+    """
+    if not isinstance(row_data, dict):
+        return True
+    status = row_data.get("__cell_status__")
+    status = status if isinstance(status, dict) else {}
+    for c in target_cols:
+        if row_data.get(c) in (None, "") and status.get(c) not in _SETTLED_CELL_STATES:
+            return True
+    return False
+
+
 def _resolve_scope_rows(
     db: Session,
     table_id: str,
@@ -1270,10 +1290,12 @@ def _resolve_scope_rows(
         raw_row = _scrub_failed_values(raw_row, tags)
         if overwrite:
             out.append((sid, row_data, raw_row))
-        else:
-            any_unfilled = any(not row_data.get(c) for c in target_cols)
-            if any_unfilled:
-                out.append((sid, row_data, raw_row))
+        elif _row_needs_work(row_data, target_cols):
+            # "needs work" = has an empty column we haven't attempted yet.
+            # Rows whose empty columns are already marked not_found/hit_budget
+            # are DONE — so all_unfilled advances to fresh rows instead of
+            # re-running the same N/A rows.
+            out.append((sid, row_data, raw_row))
 
     # Apply first_n cap if the scope carried one. Honored on filtered +
     # all_unfilled so the agent can express "10 more empty rows" by

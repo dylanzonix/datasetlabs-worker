@@ -756,7 +756,7 @@ class Coordinator:
         the failed cell.
         """
         from dsl_worker.chat.tools import ToolContext
-        from dsl_worker.chat.enrichment import _execute_action, _scrub_failed_values, compose_row_action
+        from dsl_worker.chat.enrichment import _execute_action, _scrub_failed_values, compose_row_action, _row_needs_work
         from dsl_worker.chat.cell_runs import REGISTRY as CELL_RUNS
 
         # Load job + enrichment + row state in a short transaction. We
@@ -808,9 +808,7 @@ class Coordinator:
         # endpoint may have queued the task before another run filled it.
         if not overwrite:
             row_data = sample["row"]
-            if isinstance(row_data, dict) and all(
-                row_data.get(c) not in (None, "") for c in target_cols
-            ):
+            if isinstance(row_data, dict) and not _row_needs_work(row_data, target_cols):
                 await asyncio.to_thread(
                     self._mark_task_skipped, task, "already filled"
                 )
