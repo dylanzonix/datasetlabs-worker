@@ -521,15 +521,45 @@ async def stream_job_events(
             finally:
                 db2.close()
 
-            # Tail live events. Time out periodically with a heartbeat
-            # so dead connections get noticed.
+            # Tail live events. The in-memory pub/sub (q) is the low-latency
+            # fast path, but it's fragile — off-loop emits, --reload restarts,
+            # multi-worker — so on every idle tick we ALSO poll the durable
+            # event log past the cursor. The DB always has every event, so
+            # live delivery never stalls regardless of what the fanout did.
+            # (This is what makes the counter/cells update live instead of
+            # only on a manual refresh.)
             while True:
                 if await request.is_disconnected():
                     break
                 try:
-                    event = await asyncio.wait_for(q.get(), timeout=20)
+                    event = await asyncio.wait_for(q.get(), timeout=1.5)
                 except asyncio.TimeoutError:
-                    yield ": heartbeat\n\n"
+                    # Backstop: drain anything past the cursor straight from
+                    # the durable log, then heartbeat if there was nothing.
+                    db3 = SessionLocal()
+                    try:
+                        rows = db3.execute(
+                            sa_text(
+                                "SELECT id, kind, payload FROM enrichment_events "
+                                "WHERE job_id=CAST(:jid AS uuid) AND id > :cursor "
+                                "ORDER BY id LIMIT 500"
+                            ),
+                            {"jid": job_id_str, "cursor": cursor},
+                        ).fetchall()
+                    finally:
+                        db3.close()
+                    if not rows:
+                        yield ": heartbeat\n\n"
+                        continue
+                    terminal = False
+                    for r in rows:
+                        payload = r[2] if isinstance(r[2], dict) else json.loads(r[2] or "{}")
+                        yield _sse({"id": int(r[0]), "kind": r[1], "payload": payload})
+                        cursor = int(r[0])
+                        if r[1] in ("job_done", "job_failed", "job_cancelled"):
+                            terminal = True
+                    if terminal:
+                        break
                     continue
                 if int(event["id"]) <= cursor:
                     continue
