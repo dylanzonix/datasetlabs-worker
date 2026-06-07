@@ -671,7 +671,14 @@ class Coordinator:
         enrichment = state["enrichment"]
         sample = state["sample"]
 
-        target_cols = [c["name"] for c in enrichment["columns"]]
+        all_cols = [c["name"] for c in enrichment["columns"]]
+        # Column-scoped run (e.g. retry ONE cell): job scope may carry a subset
+        # of column names. Narrow target_cols so the cell agent fills only those
+        # and never re-researches or overwrites already-filled siblings.
+        scope_cols = job["scope"].get("columns") if isinstance(job.get("scope"), dict) else None
+        target_cols = [c for c in all_cols if c in scope_cols] if scope_cols else all_cols
+        if not target_cols:
+            target_cols = all_cols
         overwrite = bool(job["scope"].get("overwrite", False))
 
         # Already-filled check (only when overwrite=false). The job-create
@@ -717,10 +724,16 @@ class Coordinator:
         )
 
         raw_row = _scrub_failed_values(sample["raw_row"] or {}, sample["tags"])
+        # When column-scoped, force the cell agent's columns_to_fill to the
+        # subset. Everything downstream (commit, status, cost, events) already
+        # keys off target_cols, so siblings stay exactly as they were.
+        eff_action = enrichment["action"]
+        if scope_cols:
+            eff_action = {**eff_action, "columns_to_fill": target_cols}
         try:
             new_fields, new_sources, cost, status = await asyncio.wait_for(
                 _execute_action(
-                    enrichment["action"],
+                    eff_action,
                     sample["row"] or {},
                     enrichment["per_row_credit_cap"],
                     enrichment["columns"],

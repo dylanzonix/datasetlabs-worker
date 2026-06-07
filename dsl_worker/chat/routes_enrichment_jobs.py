@@ -76,6 +76,10 @@ class CreateJobBody(BaseModel):
     row_ids: Optional[List[str]] = None
     filters: Optional[List[Dict[str, Any]]] = None
     overwrite: bool = False
+    # Column-scoped run: subset of the enrichment's column NAMES to fill.
+    # None/empty = fill all columns (legacy behavior). Used for single-cell
+    # retries so we re-research ONLY the missing column, not the whole group.
+    columns: Optional[List[str]] = None
 
 
 @router.post("/projects/{project_id}/enrichments/{enrichment_id}/jobs")
@@ -126,6 +130,14 @@ async def create_job(
         scope["row_ids"] = body.row_ids
     if body.filters is not None:
         scope["filters"] = body.filters
+    # Validate the requested column subset against the enrichment's real
+    # columns (ignore unknown names). Persist on the job so _execute_task
+    # narrows columns_to_fill to exactly these — siblings are left untouched.
+    if body.columns:
+        _valid = {c["name"] for c in columns if isinstance(c, dict) and c.get("name")}
+        _subset = [c for c in body.columns if c in _valid]
+        if _subset:
+            scope["columns"] = _subset
 
     sample_rows = _resolve_scope_rows(
         db, table_id, scope, columns, overwrite=body.overwrite,
@@ -185,7 +197,7 @@ async def create_job(
             "enrichment_id": canonical_eid,
             "total_tasks": len(sample_rows),
             "row_ids": [str(sid) for sid, _, _ in sample_rows],
-            "columns": [c["name"] for c in columns],
+            "columns": scope.get("columns") or [c["name"] for c in columns],
         },
     )
 
