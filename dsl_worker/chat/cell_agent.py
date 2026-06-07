@@ -1282,9 +1282,14 @@ def _tool_defs_for_tier(tier_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     so the model invokes it server-side as part of its own Responses
     call (no sidecar round-trip).
     """
-    defs: List[Dict[str, Any]] = [_final_result_tool_def()]
+    fr = _final_result_tool_def()
+    defs: List[Dict[str, Any]] = [fr]
     if tier_cfg["tools"] != "all":
         return defs
+    # Dossier (opt-in): let tool-tier cells record durable non-column data
+    # points discovered for this row, replayed to later runs as `known`.
+    if _dossier_enabled():
+        fr["parameters"]["properties"]["notes"] = _DOSSIER_NOTES_PROP
     # web_search first in the list — reinforces the STEP-1 escalation
     # framing in the system prompt at the tool-picker.
     defs.append({"type": "web_search"})
@@ -2192,6 +2197,233 @@ async def _anthropic_cell_loop(
     return final_values, final_sources, total_cost, "error", f"hit HARD_TURN_LIMIT={HARD_TURN_LIMIT}"
 
 
+# ---------------------------------------------------------------------------
+# Row dossier — persistent, per-row research memory (verbatim, no summaries).
+# ---------------------------------------------------------------------------
+#
+# Every cell run for a row appends what it LEARNED (facts: filled column values
+# + agent-declared intermediate data points, each with provenance) and what it
+# TRIED-AND-FAILED (dead-ends: search queries / tool calls that found nothing)
+# into samples.tags.dossier. The next run for that row reads it back VERBATIM as
+#   `known`         — reuse, don't re-research
+#   `already_tried` — don't repeat a losing approach
+# Nothing is LLM-summarized: values are stored and replayed exactly as found, so
+# there is no path from the dossier to a hallucinated value.
+#
+# Toggle: ENRICHMENT_ROW_DOSSIER (default OFF → behavior is exactly as before).
+# Storage: samples.tags->'dossier' JSONB — no migration (mirrors tags->'sources').
+
+_DOSSIER_MAX_TRIED = 40  # cap dead-end list growth; keep the most recent
+
+_DOSSIER_NOTES_PROP: Dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "Optional. Durable data points you discovered about THIS row that "
+        "aren't target columns but are worth remembering for a future fill of "
+        "this same row — e.g. {\"company_domain\": \"acme.com\", "
+        "\"founder_linkedin\": \"https://linkedin.com/in/...\"}. Stored verbatim "
+        "and shown to later runs of this row as `known`, so they skip "
+        "re-researching it. Keys are short snake_case labels; values are the "
+        "literal data."
+    ),
+}
+
+_DOSSIER_SYSTEM_SECTION = """# Row memory
+This row may include two extra fields:
+- `known` — facts already established for THIS row on earlier runs (filled column values AND intermediate data points like a discovered domain), each with its source. Trust and REUSE them: if a value you need is already in `known`, return it directly instead of searching again.
+- `already_tried` — searches/tools that already failed for this row. Do NOT repeat them; take a different angle, or conclude the data isn't available.
+When you find a durable data point that isn't a target column but could help a future fill of this row (a domain, an HQ city, a LinkedIn URL, an external id), pass it in final_result `notes` as {short_label: value}, verbatim."""
+
+
+def _dossier_enabled() -> bool:
+    return os.getenv("ENRICHMENT_ROW_DOSSIER", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _load_row_dossier(ctx: ToolContext, sample_id: Optional[str]) -> Dict[str, Any]:
+    """Read samples.tags->'dossier' for one row. Best-effort → {} on any miss.
+
+    Does not commit/rollback the caller's session: in the chat path ctx.db may
+    carry the orchestrator's pending writes, so we only read within whatever
+    transaction is already open (same as every other cell-path DB read).
+    """
+    if not (sample_id and getattr(ctx, "db", None)):
+        return {}
+    try:
+        cur = ctx.db.execute(
+            sa_text("SELECT tags->'dossier' FROM samples WHERE id=:sid"),
+            {"sid": sample_id},
+        ).fetchone()
+    except Exception as e:
+        log.warning("dossier load failed (sample %s): %s", sample_id, e)
+        return {}
+    d = cur[0] if cur else None
+    if isinstance(d, str):
+        try:
+            d = json.loads(d)
+        except json.JSONDecodeError:
+            d = None
+    return d if isinstance(d, dict) else {}
+
+
+def _dossier_payload_views(
+    dossier: Dict[str, Any],
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Build the verbatim views injected into the cell agent's user payload.
+
+    `known`        — {key: {value, source?}} of facts already established for
+                     this row (column values AND intermediate data points).
+    `already_tried`— short strings describing approaches that already failed,
+                     so the agent doesn't burn budget repeating them.
+    """
+    facts = dossier.get("facts") if isinstance(dossier.get("facts"), dict) else {}
+    known: Dict[str, Any] = {}
+    for key, rec in facts.items():
+        if not isinstance(rec, dict):
+            continue
+        val = rec.get("value")
+        if val in (None, ""):
+            continue
+        view: Dict[str, Any] = {"value": val}
+        if rec.get("source"):
+            view["source"] = rec["source"]
+        known[key] = view
+    tried_raw = dossier.get("tried") if isinstance(dossier.get("tried"), list) else []
+    already_tried: List[str] = []
+    for t in tried_raw:
+        if isinstance(t, dict) and t.get("q"):
+            label = str(t["q"])
+            if t.get("outcome"):
+                label = f"{label} → {t['outcome']}"
+            already_tried.append(label)
+        elif isinstance(t, str) and t:
+            already_tried.append(t)
+    return known, already_tried
+
+
+def _persist_cell_dossier(
+    ctx: ToolContext,
+    sample_id: Optional[str],
+    columns_to_fill: List[str],
+    final_values: Dict[str, Any],
+    final_sources: Dict[str, List[Dict[str, Any]]],
+    tool_calls_log: List[Dict[str, Any]],
+) -> None:
+    """Append this run's findings + dead-ends to samples.tags.dossier.
+
+    Best-effort — never raises (mirrors _persist_cell_trace). Read-modify-write
+    under the per-sample advisory lock so two enrichments on the same row don't
+    clobber each other's dossier. Values stored verbatim; nothing summarized.
+    """
+    if not (sample_id and getattr(ctx, "db", None)):
+        return
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Facts: filled column values (with provenance) + agent-declared notes.
+    new_facts: Dict[str, Any] = {}
+    if isinstance(final_values, dict):
+        for col, val in final_values.items():
+            if val in (None, ""):
+                continue
+            cites = final_sources.get(col) if isinstance(final_sources, dict) else None
+            src = cites[0] if isinstance(cites, list) and cites else None
+            new_facts[col] = {"value": val, "source": src, "at": now_iso}
+    for entry in reversed(tool_calls_log):
+        if entry.get("name") == "final_result":
+            notes = (entry.get("args") or {}).get("notes")
+            if isinstance(notes, dict):
+                for k, v in notes.items():
+                    if isinstance(k, str) and v not in (None, ""):
+                        new_facts.setdefault(k, {"value": v, "source": None, "at": now_iso})
+            break
+
+    # Dead-ends: only when the run left target columns unfilled. Record the
+    # search queries / clearly-failed tool calls so a retry won't repeat them.
+    unfilled = [
+        c for c in (columns_to_fill or [])
+        if not (isinstance(final_values, dict) and final_values.get(c) not in (None, ""))
+    ]
+    new_tried: List[Dict[str, Any]] = []
+    if unfilled:
+        for entry in tool_calls_log:
+            name = entry.get("name")
+            args = entry.get("args") or {}
+            if name == "web_search":
+                q = args.get("query")
+                if q:
+                    new_tried.append({"q": f"web_search: {q}", "at": now_iso})
+            elif name in ("final_result", "load_skill", "code_exec", None):
+                continue
+            else:
+                preview = str(entry.get("result_preview") or "")
+                failed = (
+                    '"error"' in preview
+                    or "not_found" in preview
+                    or preview.strip() in ("", "[]", "{}", "null")
+                )
+                if failed:
+                    hint = args.get("url") or args.get("actor_id") or args.get("domain") or ""
+                    new_tried.append(
+                        {"q": f"{name} {hint}".strip(), "outcome": "no_result", "at": now_iso}
+                    )
+
+    if not (new_facts or new_tried):
+        return
+
+    try:
+        ctx.db.execute(
+            sa_text("SELECT pg_advisory_xact_lock(hashtextextended(:sid, 0))"),
+            {"sid": str(sample_id)},
+        )
+        cur = ctx.db.execute(
+            sa_text("SELECT tags->'dossier' FROM samples WHERE id=:sid"),
+            {"sid": sample_id},
+        ).fetchone()
+        existing = cur[0] if cur else None
+        if isinstance(existing, str):
+            try:
+                existing = json.loads(existing or "{}")
+            except json.JSONDecodeError:
+                existing = {}
+        if not isinstance(existing, dict):
+            existing = {}
+
+        facts = dict(existing["facts"]) if isinstance(existing.get("facts"), dict) else {}
+        facts.update(new_facts)  # latest non-null value wins
+
+        prior_tried = existing.get("tried") if isinstance(existing.get("tried"), list) else []
+        combined = [t for t in prior_tried if isinstance(t, dict)] + new_tried
+        seen: set = set()
+        deduped: List[Dict[str, Any]] = []
+        for t in reversed(combined):  # newest first → keep the most-recent dup
+            q = t.get("q")
+            if not q or q in seen:
+                continue
+            seen.add(q)
+            deduped.append(t)
+        deduped.reverse()
+        tried_final = deduped[-_DOSSIER_MAX_TRIED:]
+
+        dossier = {"facts": facts, "tried": tried_final, "updated_at": now_iso}
+        ctx.db.execute(
+            sa_text(
+                "UPDATE samples "
+                "SET tags = jsonb_set(COALESCE(tags, '{}'::jsonb), "
+                "'{dossier}', CAST(:d AS jsonb)) WHERE id=:sid"
+            ),
+            {"d": json.dumps(dossier, default=str), "sid": sample_id},
+        )
+        ctx.db.commit()
+    except Exception as e:
+        try:
+            ctx.db.rollback()
+        except Exception:
+            pass
+        log.warning("dossier persist failed (sample %s): %s", sample_id, e)
+
+
 async def run_cell_agent(
     action: Dict[str, Any],
     row_data: Dict[str, Any],
@@ -2232,6 +2464,8 @@ async def run_cell_agent(
         skills_section = _render_enrichment_skills_section()
         if skills_section:
             system_prompt = CELL_SYSTEM_PROMPT + "\n\n" + skills_section
+        if _dossier_enabled():
+            system_prompt = system_prompt + "\n\n" + _DOSSIER_SYSTEM_SECTION
 
     # Build a hidden-fields view: source data that isn't currently shown
     # as a visible column. The cell agent gets to see everything the
@@ -2258,6 +2492,16 @@ async def run_cell_agent(
             "as additional context for reasoning, but you can't return them "
             "as values without the orchestrator adding columns."
         )
+
+    # Row dossier (opt-in): replay this row's prior findings + dead-ends so the
+    # agent reuses known facts and never repeats a search that already failed.
+    if _dossier_enabled() and tier_cfg["tools"] == "all" and sample_id:
+        _dossier = _load_row_dossier(ctx, sample_id)
+        _known, _already_tried = _dossier_payload_views(_dossier)
+        if _known:
+            user_payload["known"] = _known
+        if _already_tried:
+            user_payload["already_tried"] = _already_tried
 
     input_items: List[Dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
@@ -2597,3 +2841,12 @@ async def run_cell_agent(
             total_cost * 10.0,
             duration_ms,
         )
+        if _dossier_enabled():
+            _persist_cell_dossier(
+                ctx,
+                sample_id,
+                columns_to_fill,
+                final_values if isinstance(final_values, dict) else {},
+                final_sources if isinstance(final_sources, dict) else {},
+                tool_calls_log,
+            )
