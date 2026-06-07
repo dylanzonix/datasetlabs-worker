@@ -36,17 +36,18 @@ log = logging.getLogger(__name__)
 
 def _row_centric_enabled() -> bool:
     """Phase 4 row-centric execution: one agent per row across ALL the table's
-    enrichments under a single summed budget. Default OFF — when off, jobs run
-    the unchanged per-enrichment path."""
-    return os.getenv("ENRICHMENT_ROW_CENTRIC", "").strip().lower() in ("1", "true", "yes", "on")
+    enrichments under a single summed budget. On by default; optional kill
+    switch ENRICHMENT_ROW_CENTRIC=off (only affects scope.row_centric jobs)."""
+    return os.getenv("ENRICHMENT_ROW_CENTRIC", "on").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _approval_via_jobs_enabled() -> bool:
     """Route chat-APPROVED enrichments through the durable jobs path instead of
     the inline (silent, run_id=None) runner — gives spinners, a progress
     counter, per-cell charging and refresh-survival, and returns the HTTP
-    request immediately instead of blocking for the whole run. Default OFF."""
-    return os.getenv("ENRICHMENT_APPROVAL_VIA_JOBS", "").strip().lower() in ("1", "true", "yes", "on")
+    request immediately instead of blocking for the whole run. On by default;
+    optional kill switch ENRICHMENT_APPROVAL_VIA_JOBS=off."""
+    return os.getenv("ENRICHMENT_APPROVAL_VIA_JOBS", "on").strip().lower() in ("1", "true", "yes", "on")
 
 
 def create_job_for_enrichment(

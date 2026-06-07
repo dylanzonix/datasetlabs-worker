@@ -2236,7 +2236,8 @@ When you find a durable data point that isn't a target column but could help a f
 
 
 def _dossier_enabled() -> bool:
-    return os.getenv("ENRICHMENT_ROW_DOSSIER", "").strip().lower() in (
+    # On by default. Optional kill switch: ENRICHMENT_ROW_DOSSIER=off.
+    return os.getenv("ENRICHMENT_ROW_DOSSIER", "on").strip().lower() in (
         "1", "true", "yes", "on",
     )
 
