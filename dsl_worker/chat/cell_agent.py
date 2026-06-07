@@ -2241,23 +2241,26 @@ def _dossier_enabled() -> bool:
     )
 
 
-def _load_row_dossier(ctx: ToolContext, sample_id: Optional[str]) -> Dict[str, Any]:
-    """Read samples.tags->'dossier' for one row. Best-effort → {} on any miss.
-
-    Does not commit/rollback the caller's session: in the chat path ctx.db may
-    carry the orchestrator's pending writes, so we only read within whatever
-    transaction is already open (same as every other cell-path DB read).
+def _load_row_dossier(sample_id: Optional[str]) -> Dict[str, Any]:
+    """Read samples.tags->'dossier' for one row on its OWN short-lived session,
+    so it never touches the caller's transaction (the inline /run path shares a
+    single request session across rows; the jobs path has its own). Best-effort
+    → {} on any miss.
     """
-    if not (sample_id and getattr(ctx, "db", None)):
+    if not sample_id:
         return {}
+    from dsl_api.db import SessionLocal
+    db = SessionLocal()
     try:
-        cur = ctx.db.execute(
+        cur = db.execute(
             sa_text("SELECT tags->'dossier' FROM samples WHERE id=:sid"),
             {"sid": sample_id},
         ).fetchone()
     except Exception as e:
         log.warning("dossier load failed (sample %s): %s", sample_id, e)
         return {}
+    finally:
+        db.close()
     d = cur[0] if cur else None
     if isinstance(d, str):
         try:
@@ -2303,20 +2306,19 @@ def _dossier_payload_views(
 
 
 def _persist_cell_dossier(
-    ctx: ToolContext,
     sample_id: Optional[str],
     columns_to_fill: List[str],
     final_values: Dict[str, Any],
     final_sources: Dict[str, List[Dict[str, Any]]],
     tool_calls_log: List[Dict[str, Any]],
 ) -> None:
-    """Append this run's findings + dead-ends to samples.tags.dossier.
-
-    Best-effort — never raises (mirrors _persist_cell_trace). Read-modify-write
-    under the per-sample advisory lock so two enrichments on the same row don't
-    clobber each other's dossier. Values stored verbatim; nothing summarized.
+    """Append this run's findings + dead-ends to samples.tags.dossier on its OWN
+    short-lived session — never touches the caller's transaction (the inline
+    /run path shares one request session across rows). Best-effort, never
+    raises. Read-modify-write under the per-sample advisory lock so two runs on
+    the same row don't clobber each other. Values stored verbatim.
     """
-    if not (sample_id and getattr(ctx, "db", None)):
+    if not sample_id:
         return
     from datetime import datetime, timezone
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -2372,12 +2374,14 @@ def _persist_cell_dossier(
     if not (new_facts or new_tried):
         return
 
+    from dsl_api.db import SessionLocal
+    db = SessionLocal()
     try:
-        ctx.db.execute(
+        db.execute(
             sa_text("SELECT pg_advisory_xact_lock(hashtextextended(:sid, 0))"),
             {"sid": str(sample_id)},
         )
-        cur = ctx.db.execute(
+        cur = db.execute(
             sa_text("SELECT tags->'dossier' FROM samples WHERE id=:sid"),
             {"sid": sample_id},
         ).fetchone()
@@ -2407,7 +2411,7 @@ def _persist_cell_dossier(
         tried_final = deduped[-_DOSSIER_MAX_TRIED:]
 
         dossier = {"facts": facts, "tried": tried_final, "updated_at": now_iso}
-        ctx.db.execute(
+        db.execute(
             sa_text(
                 "UPDATE samples "
                 "SET tags = jsonb_set(COALESCE(tags, '{}'::jsonb), "
@@ -2415,13 +2419,15 @@ def _persist_cell_dossier(
             ),
             {"d": json.dumps(dossier, default=str), "sid": sample_id},
         )
-        ctx.db.commit()
+        db.commit()
     except Exception as e:
         try:
-            ctx.db.rollback()
+            db.rollback()
         except Exception:
             pass
         log.warning("dossier persist failed (sample %s): %s", sample_id, e)
+    finally:
+        db.close()
 
 
 async def run_cell_agent(
@@ -2496,7 +2502,7 @@ async def run_cell_agent(
     # Row dossier (opt-in): replay this row's prior findings + dead-ends so the
     # agent reuses known facts and never repeats a search that already failed.
     if _dossier_enabled() and tier_cfg["tools"] == "all" and sample_id:
-        _dossier = _load_row_dossier(ctx, sample_id)
+        _dossier = _load_row_dossier(sample_id)
         _known, _already_tried = _dossier_payload_views(_dossier)
         if _known:
             user_payload["known"] = _known
@@ -2843,7 +2849,6 @@ async def run_cell_agent(
         )
         if _dossier_enabled():
             _persist_cell_dossier(
-                ctx,
                 sample_id,
                 columns_to_fill,
                 final_values if isinstance(final_values, dict) else {},
