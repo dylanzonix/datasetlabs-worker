@@ -1350,6 +1350,74 @@ def _scrub_failed_values(raw_row: Dict[str, Any], tags: Any) -> Dict[str, Any]:
     return cleaned
 
 
+# ---------------------------------------------------------------------------
+# Row-centric execution (Phase 4): one row = one project.
+# ---------------------------------------------------------------------------
+# Instead of N independent cell agents per row (one per enrichment, each with
+# its own stacking budget), compose a row's enrichments into ONE agent pass:
+# one budget, the dossier shared for free, research done once across columns.
+_TIER_RANK = {"classify": 0, "research": 1, "deep": 2}
+_RANK_TIER = {0: "classify", 1: "research", 2: "deep"}
+
+
+def compose_row_action(
+    enrichments: List[Dict[str, Any]],
+    row_data: Dict[str, Any],
+    overwrite: bool = False,
+) -> Optional[Tuple[Dict[str, Any], List[Dict[str, Any]]]]:
+    """Compose multiple enrichments into ONE row-agent action for this row.
+
+    Returns (action, columns) or None when the row has nothing to fill.
+      columns_to_fill    = union of target columns (unfilled, or ALL if overwrite)
+      prompt             = per-enrichment instructions, scoped to those columns
+      research           = MAX tier across involved enrichments (tools the
+                           hardest column needs)
+      per_row_credit_cap = SUM of involved caps = the single ROW BUDGET
+
+    This is the row-as-project unit: one agent, one budget, dossier shared
+    across what used to be separate enrichments.
+    """
+    sections: List[str] = []
+    cols_by_name: Dict[str, Dict[str, Any]] = {}
+    cap_sum = 0.0
+    have_cap = False
+    tier_rank = 0
+    for e in enrichments:
+        ecols = e.get("columns") or []
+        names = [c.get("name") for c in ecols if isinstance(c, dict) and c.get("name")]
+        targets = names if overwrite else [n for n in names if row_data.get(n) in (None, "")]
+        if not targets:
+            continue
+        for c in ecols:
+            if isinstance(c, dict) and c.get("name") in targets and c["name"] not in cols_by_name:
+                cols_by_name[c["name"]] = c
+        instr = ((e.get("action") or {}).get("prompt") or "").strip()
+        sections.append(f"- Columns {targets}:\n  {instr}" if instr else f"- Columns {targets}")
+        cap = e.get("per_row_credit_cap")
+        if cap is not None:
+            cap_sum += float(cap)
+            have_cap = True
+        tier = (e.get("action") or {}).get("research") or (e.get("action") or {}).get("tier") or "research"
+        tier_rank = max(tier_rank, _TIER_RANK.get(str(tier), 1))
+    if not cols_by_name:
+        return None
+    columns = list(cols_by_name.values())
+    prompt = (
+        "Fill the columns below for this ONE row. They may share research — do "
+        "the shared lookups once and reuse them across columns. Reuse anything "
+        "already in `known`; never repeat anything in `already_tried`.\n\n"
+        + "\n".join(sections)
+    )
+    action: Dict[str, Any] = {
+        "prompt": prompt,
+        "research": _RANK_TIER[tier_rank],
+        "columns_to_fill": [c["name"] for c in columns],
+    }
+    if have_cap:
+        action["per_row_credit_cap"] = cap_sum
+    return action, columns
+
+
 async def _execute_action(
     action: Dict[str, Any],
     row_data: Dict[str, Any],

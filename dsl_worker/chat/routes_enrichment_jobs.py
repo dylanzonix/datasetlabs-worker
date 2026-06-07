@@ -218,6 +218,129 @@ async def create_job(
 
 
 # ---------------------------------------------------------------------------
+# Create row-centric job (Phase 4): one agent per row fills EVERY enrichment's
+# unfilled columns in a single pass, under one summed budget.
+# ---------------------------------------------------------------------------
+
+
+@router.post("/projects/{project_id}/tables/{table_id}/enrich-rows")
+async def create_row_job(
+    project_id: UUID,
+    table_id: str,
+    body: CreateJobBody,
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Row-centric run: ONE agent per row fills every unfilled enrichment column
+    on the table, under a single summed budget (the row-as-project model).
+    Reuses the per-enrichment coordinator with scope.row_centric=True; gated by
+    the ENRICHMENT_ROW_CENTRIC env toggle at execution time."""
+    _verify_project(project_id, user.user_id, db)
+    from dsl_worker.chat.enrichment_jobs import _row_centric_enabled
+    if not _row_centric_enabled():
+        raise HTTPException(
+            409, "Row-centric execution is disabled. Set ENRICHMENT_ROW_CENTRIC=on to enable."
+        )
+    from dsl_worker.chat.tools import resolve_table_id
+    from dsl_worker.chat.enrichment import _resolve_scope_rows, _ensure_columns_on_table
+
+    tid = resolve_table_id(db, str(project_id), table_id)
+    if not tid:
+        raise HTTPException(404, f"Table {table_id!r} not found")
+
+    enr = db.execute(
+        sa_text(
+            "SELECT id::text, columns FROM enrichments "
+            "WHERE table_id=CAST(:tid AS uuid) AND deleted_at IS NULL "
+            "ORDER BY position, created_at"
+        ),
+        {"tid": tid},
+    ).fetchall()
+    if not enr:
+        raise HTTPException(400, "No enrichments on this table to run.")
+    anchor_eid = enr[0][0]
+
+    # Union of all enrichment columns — drives the all_unfilled scope check
+    # (a row is in scope if ANY enrichment column is empty) and ensures every
+    # column is attached to the table before rows start filling.
+    union_columns: List[Dict[str, Any]] = []
+    seen_names: set = set()
+    for eid, cols in enr:
+        cols = cols if isinstance(cols, list) else json.loads(cols or "[]")
+        _ensure_columns_on_table(db, tid, cols, enrichment_id=eid)
+        for c in cols:
+            if isinstance(c, dict) and c.get("name") and c["name"] not in seen_names:
+                seen_names.add(c["name"])
+                union_columns.append(c)
+    db.commit()
+
+    scope: Dict[str, Any] = {
+        "type": body.scope_type, "overwrite": body.overwrite, "row_centric": True,
+    }
+    if body.first_n is not None:
+        scope["first_n"] = body.first_n
+    if body.row_ids is not None:
+        scope["row_ids"] = body.row_ids
+    if body.filters is not None:
+        scope["filters"] = body.filters
+
+    sample_rows = _resolve_scope_rows(db, tid, scope, union_columns, overwrite=body.overwrite)
+    if not sample_rows:
+        return {
+            "job_id": None,
+            "total_tasks": 0,
+            "message": "No rows to enrich (all targets already filled or scope empty)",
+        }
+
+    job_id = str(uuid.uuid4())
+    db.execute(
+        sa_text(
+            "INSERT INTO enrichment_jobs "
+            "(id, project_id, enrichment_id, user_id, status, scope, total_tasks) "
+            "VALUES (CAST(:id AS uuid), CAST(:pid AS uuid), CAST(:eid AS uuid), "
+            "CAST(:uid AS uuid), 'queued', CAST(:scope AS jsonb), :n)"
+        ),
+        {
+            "id": job_id, "pid": str(project_id), "eid": anchor_eid,
+            "uid": str(user.user_id), "scope": json.dumps(scope), "n": len(sample_rows),
+        },
+    )
+    task_values = [
+        {"id": str(uuid.uuid4()), "jid": job_id, "pid": str(project_id),
+         "eid": anchor_eid, "sid": str(sid)}
+        for sid, _, _ in sample_rows
+    ]
+    db.execute(
+        sa_text(
+            "INSERT INTO enrichment_tasks "
+            "(id, job_id, project_id, enrichment_id, sample_id, status) "
+            "VALUES (CAST(:id AS uuid), CAST(:jid AS uuid), CAST(:pid AS uuid), "
+            "CAST(:eid AS uuid), CAST(:sid AS uuid), 'queued')"
+        ),
+        task_values,
+    )
+    db.commit()
+
+    emit_event(
+        db, job_id, "job_started",
+        {
+            "enrichment_id": anchor_eid,
+            "total_tasks": len(sample_rows),
+            "row_ids": [str(sid) for sid, _, _ in sample_rows],
+            "columns": [c["name"] for c in union_columns],
+            "row_centric": True,
+        },
+    )
+    notify_new_work(db)
+    try:
+        get_coordinator().wake()
+    except Exception:
+        pass
+
+    return {"job_id": job_id, "total_tasks": len(sample_rows), "row_centric": True}
+
+
+# ---------------------------------------------------------------------------
 # Cancel job
 # ---------------------------------------------------------------------------
 

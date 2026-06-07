@@ -34,6 +34,13 @@ from dsl_api.db import SessionLocal
 log = logging.getLogger(__name__)
 
 
+def _row_centric_enabled() -> bool:
+    """Phase 4 row-centric execution: one agent per row across ALL the table's
+    enrichments under a single summed budget. Default OFF — when off, jobs run
+    the unchanged per-enrichment path."""
+    return os.getenv("ENRICHMENT_ROW_CENTRIC", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 # Tuning knobs ---------------------------------------------------------------
 
 # Max in-flight cells per coordinator process. Cells beyond this wait at
@@ -654,7 +661,7 @@ class Coordinator:
         the failed cell.
         """
         from dsl_worker.chat.tools import ToolContext
-        from dsl_worker.chat.enrichment import _execute_action, _scrub_failed_values
+        from dsl_worker.chat.enrichment import _execute_action, _scrub_failed_values, compose_row_action
         from dsl_worker.chat.cell_runs import REGISTRY as CELL_RUNS
 
         # Load job + enrichment + row state in a short transaction. We
@@ -671,15 +678,36 @@ class Coordinator:
         enrichment = state["enrichment"]
         sample = state["sample"]
 
-        all_cols = [c["name"] for c in enrichment["columns"]]
-        # Column-scoped run (e.g. retry ONE cell): job scope may carry a subset
-        # of column names. Narrow target_cols so the cell agent fills only those
-        # and never re-researches or overwrites already-filled siblings.
-        scope_cols = job["scope"].get("columns") if isinstance(job.get("scope"), dict) else None
-        target_cols = [c for c in all_cols if c in scope_cols] if scope_cols else all_cols
-        if not target_cols:
-            target_cols = all_cols
-        overwrite = bool(job["scope"].get("overwrite", False))
+        scope = job["scope"] if isinstance(job.get("scope"), dict) else {}
+        overwrite = bool(scope.get("overwrite", False))
+        scope_cols = scope.get("columns")
+
+        # Row-centric (Phase 4): compose ALL the table's enrichments into ONE
+        # agent pass for this row, under a single summed budget. Toggle-gated;
+        # default off keeps the per-enrichment path below byte-for-byte.
+        row_centric = (
+            bool(scope.get("row_centric"))
+            and _row_centric_enabled()
+            and bool(state.get("all_enrichments"))
+        )
+        composed_action = None
+        composed_columns = None
+        if row_centric:
+            composed = compose_row_action(
+                state["all_enrichments"], sample["row"] or {}, overwrite=overwrite
+            )
+            if composed is None:
+                await asyncio.to_thread(self._mark_task_skipped, task, "already filled (row-centric)")
+                return
+            composed_action, composed_columns = composed
+            target_cols = [c["name"] for c in composed_columns]
+        else:
+            all_cols = [c["name"] for c in enrichment["columns"]]
+            # Column-scoped run (e.g. retry ONE cell): narrow to the subset so
+            # we fill only those and never overwrite already-filled siblings.
+            target_cols = [c for c in all_cols if c in scope_cols] if scope_cols else all_cols
+            if not target_cols:
+                target_cols = all_cols
 
         # Already-filled check (only when overwrite=false). The job-create
         # endpoint may have queued the task before another run filled it.
@@ -724,19 +752,27 @@ class Coordinator:
         )
 
         raw_row = _scrub_failed_values(sample["raw_row"] or {}, sample["tags"])
-        # When column-scoped, force the cell agent's columns_to_fill to the
-        # subset. Everything downstream (commit, status, cost, events) already
-        # keys off target_cols, so siblings stay exactly as they were.
-        eff_action = enrichment["action"]
-        if scope_cols:
-            eff_action = {**eff_action, "columns_to_fill": target_cols}
+        # Resolve effective action/columns/cap. Row-centric uses the composed
+        # multi-enrichment action + summed row budget; column-scoped narrows
+        # columns_to_fill; otherwise the enrichment as-is. Everything downstream
+        # keys off target_cols, so non-targeted siblings stay untouched.
+        if row_centric:
+            eff_action = composed_action
+            eff_columns = composed_columns
+            eff_cap = composed_action.get("per_row_credit_cap") or enrichment["per_row_credit_cap"]
+        else:
+            eff_action = enrichment["action"]
+            eff_columns = enrichment["columns"]
+            eff_cap = enrichment["per_row_credit_cap"]
+            if scope_cols:
+                eff_action = {**eff_action, "columns_to_fill": target_cols}
         try:
             new_fields, new_sources, cost, status = await asyncio.wait_for(
                 _execute_action(
                     eff_action,
                     sample["row"] or {},
-                    enrichment["per_row_credit_cap"],
-                    enrichment["columns"],
+                    eff_cap,
+                    eff_columns,
                     ctx,
                     enrichment_id=task["enrichment_id"],
                     sample_id=task["sample_id"],
@@ -868,7 +904,7 @@ class Coordinator:
                     run_id=None,
                     sample_id=task["sample_id"],
                     written_values=new_fields,
-                    columns=enrichment["columns"],
+                    columns=eff_columns,
                 )
             except Exception:
                 log.exception("email_verify_hook.schedule_for_row raised; suppressed")
@@ -912,6 +948,27 @@ class Coordinator:
             action = enrichment[2] if isinstance(enrichment[2], dict) else json.loads(enrichment[2] or "{}")
             scope = job[1] if isinstance(job[1], dict) else json.loads(job[1] or "{}")
 
+            # Row-centric jobs (Phase 4) fill a row across ALL the table's
+            # enrichments in one agent — load them so _execute_task can compose.
+            all_enrichments = None
+            if scope.get("row_centric"):
+                er = db.execute(
+                    sa_text(
+                        "SELECT columns, action, per_row_credit_cap FROM enrichments "
+                        "WHERE table_id=CAST(:tid AS uuid) AND deleted_at IS NULL "
+                        "ORDER BY position, created_at"
+                    ),
+                    {"tid": enrichment[0]},
+                ).fetchall()
+                all_enrichments = [
+                    {
+                        "columns": r[0] if isinstance(r[0], list) else json.loads(r[0] or "[]"),
+                        "action": r[1] if isinstance(r[1], dict) else json.loads(r[1] or "{}"),
+                        "per_row_credit_cap": r[2],
+                    }
+                    for r in er
+                ]
+
             return {
                 "job": {"user_id": job[0], "scope": scope},
                 "enrichment": {
@@ -920,6 +977,7 @@ class Coordinator:
                     "action": action,
                     "per_row_credit_cap": enrichment[3],
                 },
+                "all_enrichments": all_enrichments,
                 "sample": {
                     "row": sample[0] if isinstance(sample[0], dict) else json.loads(sample[0] or "{}"),
                     "raw_row": sample[1] if isinstance(sample[1], dict) else (json.loads(sample[1]) if sample[1] else {}),
