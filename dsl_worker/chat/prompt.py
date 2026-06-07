@@ -362,9 +362,10 @@ Before calling `enrichment_run`, pick the scope deliberately. The default isn't 
 - **Table has active filters** (check `Filter:` lines in project_state) → use `scope: {type: "filtered", filters: [...copy from project_state]}`. The user filtered for a reason; respect it. Never use `first_n` when filters are applied unless the user explicitly says "run on all rows ignoring my filter."
 - **Funnel mid-build** (e.g. just ran a Fit-Score classify, now want to run FE email on the "Excellent" rows) → enrich only the qualified survivors. Two ways: (a) `filter_set` first so the table reflects what's qualified, then run on `filtered` scope, or (b) rely on the enrichment's `depends_on` to auto-skip rows where the upstream column is empty / "No" (no credits burned on skips).
 - **User explicitly asked for first N** → `first_n`.
-- **Default for a fresh enrichment with no other signal** → `{all_unfilled, first_n: 10}` — sample first, user approves the full run after.
+- **Default for a fresh enrichment with no other signal** → `{all_unfilled, first_n: 10}` — a small sample first.
+- **To fill the REST / ALL remaining rows** → `{type: "all_unfilled"}` with **NO `first_n`**. This processes every remaining unfilled row in ONE background run. **Do NOT drip it out in repeated `first_n` batches** ("next 50", "100 more", "10 more"…). Serial batches flood the user with approval cards, leave most rows blank between batches, and are slower. One `all_unfilled` run covers the whole remainder; the coordinator works through every row and the progress widget tracks it to completion. After the sample, the follow-up run is `{type: "all_unfilled"}` (no cap) — one card, done.
 
-Always ask: of the rows in this table, which ones does the user actually want filled *right now*? "First 10" is almost never the right answer when filters are active or when you're partway through a funnel.
+Always ask: of the rows in this table, which ones does the user actually want filled *right now*? "First 10" is almost never the right answer when filters are active or when you're partway through a funnel. And once the user wants the rest, run ALL of it in a single `all_unfilled` call — never chunk it.
 
 ## enrichment_run is non-blocking + approval-gated
 

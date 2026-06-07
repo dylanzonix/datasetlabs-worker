@@ -619,6 +619,7 @@ async def run_turn(
                 # proposes overlapping batches in one turn — without this the
                 # user gets multiple cards to approve for one logical run.
                 from dsl_worker.chat.tools import resolve_enrichment_id as _rid
+                from sqlalchemy import text as _sql_text
                 _new_eid = _rid(bctx.db, bctx.project_id, args.get("enrichment_id")) or str(args.get("enrichment_id") or "")
                 _dup = None
                 for _p in await APPROVALS.list_for_project(bctx.project_id):
@@ -628,6 +629,22 @@ async def run_turn(
                     if _peid and _peid == _new_eid:
                         _dup = _p
                         break
+                # Also block if a background job for this enrichment is already
+                # queued/running — don't stack a second run on top of an active
+                # one (the active run covers the rows; stacking floods approvals).
+                _active_job = False
+                if _dup is None and _new_eid:
+                    try:
+                        _active_job = bool(bctx.db.execute(
+                            _sql_text(
+                                "SELECT 1 FROM enrichment_jobs "
+                                "WHERE enrichment_id=CAST(:eid AS uuid) "
+                                "AND status IN ('queued','running') LIMIT 1"
+                            ),
+                            {"eid": _new_eid},
+                        ).fetchone())
+                    except Exception:
+                        _active_job = False
                 if _dup is not None:
                     tool_result = {
                         "scheduled": True,
@@ -637,6 +654,15 @@ async def run_turn(
                             "An approval for THIS enrichment is already pending — "
                             "not queuing another. Do NOT propose more runs for it; "
                             "tell the user to approve the single existing card."
+                        ),
+                    }
+                elif _active_job:
+                    tool_result = {
+                        "scheduled": False,
+                        "note": (
+                            "A run for THIS enrichment is already in progress in the "
+                            "background — NOT queuing another. It covers the remaining "
+                            "rows; tell the user it's still running and to wait."
                         ),
                     }
                 else:
