@@ -621,19 +621,11 @@ async def run_turn(
                 from dsl_worker.chat.tools import resolve_enrichment_id as _rid
                 from sqlalchemy import text as _sql_text
                 _new_eid = _rid(bctx.db, bctx.project_id, args.get("enrichment_id")) or str(args.get("enrichment_id") or "")
-                _dup = None
-                for _p in await APPROVALS.list_for_project(bctx.project_id):
-                    if _p.get("tool") != "enrichment_run":
-                        continue
-                    _peid = _rid(bctx.db, bctx.project_id, (_p.get("args") or {}).get("enrichment_id")) or ""
-                    if _peid and _peid == _new_eid:
-                        _dup = _p
-                        break
-                # Also block if a background job for this enrichment is already
+                # Block if a background job for this enrichment is already
                 # queued/running — don't stack a second run on top of an active
                 # one (the active run covers the rows; stacking floods approvals).
                 _active_job = False
-                if _dup is None and _new_eid:
+                if _new_eid:
                     try:
                         _active_job = bool(bctx.db.execute(
                             _sql_text(
@@ -645,18 +637,7 @@ async def run_turn(
                         ).fetchone())
                     except Exception:
                         _active_job = False
-                if _dup is not None:
-                    tool_result = {
-                        "scheduled": True,
-                        "approval_id": _dup["id"],
-                        "duplicate": True,
-                        "note": (
-                            "An approval for THIS enrichment is already pending — "
-                            "not queuing another. Do NOT propose more runs for it; "
-                            "tell the user to approve the single existing card."
-                        ),
-                    }
-                elif _active_job:
+                if _active_job:
                     tool_result = {
                         "scheduled": False,
                         "note": (
@@ -669,52 +650,76 @@ async def run_turn(
                     est_cost, summary = estimate_enrichment_run_cost(
                         args, bctx.db, bctx.project_id
                     )
-                    pending = await APPROVALS.request(
+                    # ATOMIC dedup: one pending approval per enrichment. The
+                    # registry collapses concurrent requests with the same key
+                    # to a single card under its own lock — so two
+                    # enrichment_run calls dispatched in one model response
+                    # (asyncio.gather) can never both create a card (the old
+                    # check-then-create loop here raced and produced the "1 / 2"
+                    # double approval card).
+                    _dkey = f"enrichment_run:{_new_eid}" if _new_eid else None
+                    pending, _created = await APPROVALS.request(
                         project_id=bctx.project_id,
                         tool=name,
                         args=args,
                         estimated_cost_credits=est_cost,
                         summary=summary,
+                        dedup_key=_dkey,
                     )
-                    pending_enrichment_chips.append({
-                        "approval_id": pending.id,
-                        "tool": name,
-                        "args": args,
-                        "estimated_cost_credits": est_cost,
-                        "summary": summary,
-                    })
-                    # Emit the approval card IMMEDIATELY (mid-turn) so it renders
-                    # the instant we decide to ask — not after the rest of the
-                    # turn streams (the ~10s delay). Non-blocking: we don't await
-                    # the user. End-of-turn re-emits for reconnect rehydration;
-                    # the FE dedups by approval_id.
-                    await emit({
-                        "type": "approval_required",
-                        "approval_id": pending.id,
-                        "tool": name,
-                        "args": args,
-                        "estimated_cost_credits": est_cost,
-                        "summary": summary,
-                    })
-                    tool_result = {
-                        "scheduled": True,
-                        "approval_id": pending.id,
-                        "estimated_cost_credits": est_cost,
-                        "summary": summary,
-                        "note": (
-                            "Enrichment queued — pending user approval. It "
-                            "will NOT run during this turn. Don't claim "
-                            "results; phrase your reply as 'I've queued X — "
-                            "approve below to run.'"
-                        ),
-                    }
+                    if not _created:
+                        # Already-pending approval for this enrichment — its
+                        # card was emitted when the first call created it; do
+                        # NOT emit a second one.
+                        tool_result = {
+                            "scheduled": True,
+                            "approval_id": pending.id,
+                            "duplicate": True,
+                            "note": (
+                                "An approval for THIS enrichment is already pending — "
+                                "not queuing another. Do NOT propose more runs for it; "
+                                "tell the user to approve the single existing card."
+                            ),
+                        }
+                    else:
+                        pending_enrichment_chips.append({
+                            "approval_id": pending.id,
+                            "tool": name,
+                            "args": args,
+                            "estimated_cost_credits": est_cost,
+                            "summary": summary,
+                        })
+                        # Emit the approval card ONCE, immediately (mid-turn), so
+                        # it renders the instant we decide to ask. Non-blocking:
+                        # we don't await the user. NOT re-emitted at end-of-turn
+                        # (that sent a duplicate of the same approval_id);
+                        # reconnect rehydration is handled by listApprovals.
+                        await emit({
+                            "type": "approval_required",
+                            "approval_id": pending.id,
+                            "tool": name,
+                            "args": args,
+                            "estimated_cost_credits": est_cost,
+                            "summary": summary,
+                        })
+                        tool_result = {
+                            "scheduled": True,
+                            "approval_id": pending.id,
+                            "estimated_cost_credits": est_cost,
+                            "summary": summary,
+                            "note": (
+                                "Enrichment queued — pending user approval. It "
+                                "will NOT run during this turn. Don't claim "
+                                "results; phrase your reply as 'I've queued X — "
+                                "approve below to run.'"
+                            ),
+                        }
             elif name in APPROVAL_REQUIRED:
                 # Blocking approval for the rest of APPROVAL_REQUIRED
                 # (table_delete / row_delete). These are fast yes/no
                 # decisions, so awaiting the future is fine.
                 async with approval_lock:
                     est_cost, summary = 0.0, f"Run {name}"
-                    pending = await APPROVALS.request(
+                    pending, _ = await APPROVALS.request(
                         project_id=bctx.project_id,
                         tool=name,
                         args=args,
@@ -887,27 +892,16 @@ async def run_turn(
             MAX_TURN_ITERATIONS, project_id,
         )
 
-    # Emit deferred enrichment approval chips at end-of-turn. The agent
-    # already saw `{scheduled: true}` for each one and shaped its reply
-    # around that; now the FE renders the chips as a turn summary so the
-    # user can approve / decline without the worker holding a Future
-    # open across the user's decision window.
-    for chip in pending_enrichment_chips:
-        # Skip any the user already resolved mid-turn. The card is emitted
-        # immediately when enrichment_run is called, so the user can approve
-        # before the turn ends; re-emitting a now-resolved approval makes a
-        # phantom "second" card pop up right after they approved (the FE
-        # removed it on resolve, so its dedup doesn't catch the re-add).
-        if await APPROVALS.peek(chip["approval_id"]) is None:
-            continue
-        await emit({
-            "type": "approval_required",
-            "approval_id": chip["approval_id"],
-            "tool": chip["tool"],
-            "args": chip["args"],
-            "estimated_cost_credits": chip["estimated_cost_credits"],
-            "summary": chip["summary"],
-        })
+    # NOTE: enrichment approval cards are emitted ONCE, mid-turn, the instant
+    # enrichment_run is called (see the `approval_required` emit above). We do
+    # NOT re-emit them here at end-of-turn. The old re-emit sent the SAME
+    # approval_id a second time (DB-confirmed: seq 7 + seq 15 in one run),
+    # which is redundant on the live stream and a latent duplicate-card source.
+    # Reconnect/refresh rehydration is handled by the FE's listApprovals call
+    # against the in-process registry — it does NOT depend on a replayed
+    # approval_required event (those are skipped during replay anyway). The
+    # `pending_enrichment_chips` list is retained for potential persistence
+    # but is intentionally not re-emitted.
 
     await emit({
         "type": "turn_complete",

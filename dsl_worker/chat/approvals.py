@@ -54,6 +54,12 @@ class PendingApproval:
     # Human description ("Run enrichment 'Verified Email' on 47 rows").
     summary: str
     future: asyncio.Future = field(default_factory=asyncio.Future)
+    # Optional idempotency key. Two requests with the same dedup_key (e.g.
+    # "enrichment_run:<eid>") collapse to ONE pending approval — the registry
+    # returns the existing one instead of creating a second. This is the
+    # atomic guard against duplicate approval cards for the same enrichment
+    # when the agent dispatches multiple tool calls concurrently (gather).
+    dedup_key: Optional[str] = None
 
 
 class ApprovalRegistry:
@@ -71,24 +77,44 @@ class ApprovalRegistry:
         *,
         estimated_cost_credits: float,
         summary: str,
-    ) -> PendingApproval:
-        """Register a pending approval and return it. Caller is expected
-        to emit an SSE event with the approval_id, then await pending.future
-        to block on the user's decision."""
+        dedup_key: Optional[str] = None,
+    ) -> tuple[PendingApproval, bool]:
+        """Register a pending approval. Returns (approval, created).
+
+        If `dedup_key` is given and a still-pending approval with the same
+        key already exists for this project, returns that EXISTING approval
+        with created=False — the caller must NOT emit a second card. The
+        whole check-then-create runs under the registry lock, so concurrent
+        callers (the agent dispatches tool calls via asyncio.gather) can
+        never both pass the "already pending?" check and create two cards
+        for one enrichment. created=True means a fresh approval was made;
+        the caller should emit the approval_required event for it."""
         loop = asyncio.get_running_loop()
-        pending = PendingApproval(
-            id=str(uuid.uuid4()),
-            project_id=project_id,
-            tool=tool,
-            args=args,
-            estimated_cost_credits=estimated_cost_credits,
-            summary=summary,
-            future=loop.create_future(),
-        )
         async with self._lock:
+            if dedup_key is not None:
+                for p in self._pending.values():
+                    if (
+                        p.project_id == project_id
+                        and p.dedup_key == dedup_key
+                        and not p.future.done()
+                    ):
+                        log.info(
+                            "approval dedup hit: reusing %s for key=%s", p.id, dedup_key
+                        )
+                        return p, False
+            pending = PendingApproval(
+                id=str(uuid.uuid4()),
+                project_id=project_id,
+                tool=tool,
+                args=args,
+                estimated_cost_credits=estimated_cost_credits,
+                summary=summary,
+                future=loop.create_future(),
+                dedup_key=dedup_key,
+            )
             self._pending[pending.id] = pending
         log.info("approval requested: %s tool=%s cost~%.2f", pending.id, tool, estimated_cost_credits)
-        return pending
+        return pending, True
 
     async def peek(self, approval_id: str) -> Optional[PendingApproval]:
         """Look up a pending approval without resolving it. Caller needs
