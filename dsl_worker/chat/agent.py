@@ -867,6 +867,13 @@ async def run_turn(
     # user can approve / decline without the worker holding a Future
     # open across the user's decision window.
     for chip in pending_enrichment_chips:
+        # Skip any the user already resolved mid-turn. The card is emitted
+        # immediately when enrichment_run is called, so the user can approve
+        # before the turn ends; re-emitting a now-resolved approval makes a
+        # phantom "second" card pop up right after they approved (the FE
+        # removed it on resolve, so its dedup doesn't catch the re-add).
+        if await APPROVALS.peek(chip["approval_id"]) is None:
+            continue
         await emit({
             "type": "approval_required",
             "approval_id": chip["approval_id"],
