@@ -657,6 +657,19 @@ async def run_turn(
                         "estimated_cost_credits": est_cost,
                         "summary": summary,
                     })
+                    # Emit the approval card IMMEDIATELY (mid-turn) so it renders
+                    # the instant we decide to ask — not after the rest of the
+                    # turn streams (the ~10s delay). Non-blocking: we don't await
+                    # the user. End-of-turn re-emits for reconnect rehydration;
+                    # the FE dedups by approval_id.
+                    await emit({
+                        "type": "approval_required",
+                        "approval_id": pending.id,
+                        "tool": name,
+                        "args": args,
+                        "estimated_cost_credits": est_cost,
+                        "summary": summary,
+                    })
                     tool_result = {
                         "scheduled": True,
                         "approval_id": pending.id,
