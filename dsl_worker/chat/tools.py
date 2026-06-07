@@ -1640,6 +1640,122 @@ def _column_map_set_blocking(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Di
 
 
 # ---------------------------------------------------------------------------
+# Tool: column_transform — in-place, deterministic value edits (NO research)
+# ---------------------------------------------------------------------------
+
+_COLUMN_TRANSFORM_OPS = (
+    "fix_caps", "lowercase", "uppercase", "title_case",
+    "capitalize", "trim", "collapse_whitespace", "regex_replace",
+)
+
+
+def _make_cell_transform(op: str, args: Dict[str, Any]):
+    """Return (fn, error). fn maps one existing string cell -> new string."""
+    import re as _re
+    if op == "fix_caps":
+        # Retitle ONLY all-caps values; leave correctly-cased cells untouched.
+        def fn(s: str) -> str:
+            letters = [c for c in s if c.isalpha()]
+            return s.title() if letters and all(c.isupper() for c in letters) else s
+        return fn, None
+    if op == "lowercase":
+        return (lambda s: s.lower()), None
+    if op == "uppercase":
+        return (lambda s: s.upper()), None
+    if op == "title_case":
+        return (lambda s: s.title()), None
+    if op == "capitalize":
+        return (lambda s: s.capitalize()), None
+    if op == "trim":
+        return (lambda s: s.strip()), None
+    if op == "collapse_whitespace":
+        return (lambda s: _re.sub(r"\s+", " ", s).strip()), None
+    if op == "regex_replace":
+        pattern = args.get("pattern")
+        if not pattern:
+            return None, "regex_replace requires `pattern`"
+        repl = args.get("replacement") or ""
+        try:
+            rx = _re.compile(pattern)
+        except _re.error as e:
+            return None, f"invalid regex pattern: {e}"
+        return (lambda s: rx.sub(repl, s)), None
+    return None, f"unknown op {op!r}; allowed: {list(_COLUMN_TRANSFORM_OPS)}"
+
+
+async def column_transform(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
+    """Apply a deterministic, in-place text transform to one column's existing
+    values — case fixes, trimming, regex replace. NO research, NO LLM-per-row,
+    ~free. The right tool for "clean up / reformat what's already there"
+    (e.g. ALL-CAPS -> normal case); it never fetches new data and only rewrites
+    string cells whose value actually changes.
+    """
+    table_id = resolve_table_id(ctx.db, ctx.project_id, args.get("table_id"))
+    column = args.get("column") or args.get("column_name")
+    op = (args.get("op") or "").strip().lower()
+    if not table_id:
+        return {"error": "table_id is required"}, 0.0
+    if not column:
+        return {"error": "column is required"}, 0.0
+    fn, err = _make_cell_transform(op, args)
+    if err:
+        return {"error": err}, 0.0
+
+    rows = ctx.db.execute(
+        sa_text(
+            "SELECT id::text, row FROM samples "
+            "WHERE table_id=:tid AND deleted_at IS NULL"
+        ),
+        {"tid": table_id},
+    ).fetchall()
+
+    updates: List[Tuple[str, str]] = []
+    scanned = 0
+    for sid, row in rows:
+        if not isinstance(row, dict):
+            continue
+        v = row.get(column)
+        if not isinstance(v, str) or v == "":
+            continue
+        scanned += 1
+        try:
+            nv = fn(v)
+        except Exception:
+            continue
+        if isinstance(nv, str) and nv != v:
+            new_row = dict(row)
+            new_row[column] = nv
+            updates.append((sid, json.dumps(new_row, default=str)))
+
+    _CHUNK = 500
+    for i in range(0, len(updates), _CHUNK):
+        chunk = updates[i:i + _CHUNK]
+        values_clause = ", ".join(f"(:id{j}, :row{j})" for j in range(len(chunk)))
+        params: Dict[str, Any] = {}
+        for j, (cid, crow) in enumerate(chunk):
+            params[f"id{j}"] = cid
+            params[f"row{j}"] = crow
+        ctx.db.execute(
+            sa_text(
+                f"UPDATE samples AS s SET row = v.new_row::jsonb "
+                f"FROM (VALUES {values_clause}) AS v(id, new_row) "
+                f"WHERE s.id = v.id::uuid"
+            ),
+            params,
+        )
+    ctx.db.commit()
+
+    return {
+        "ok": True,
+        "table_id": table_id,
+        "column": column,
+        "op": op,
+        "cells_scanned": scanned,
+        "cells_changed": len(updates),
+    }, 0.0
+
+
+# ---------------------------------------------------------------------------
 # Tool: table_delete
 # ---------------------------------------------------------------------------
 
@@ -2610,6 +2726,7 @@ HANDLERS: Dict[str, Callable[[Dict[str, Any], ToolContext], Awaitable[Tuple[Dict
     "table_create": table_create,
     "table_extend": table_extend,
     "column_map_set": column_map_set,
+    "column_transform": column_transform,
     "table_delete": table_delete,
     "filter_set": filter_set,
     "filter_clear": filter_clear,

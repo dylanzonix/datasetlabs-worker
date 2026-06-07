@@ -27,6 +27,8 @@ You orchestrate the work — pick sources, set up tables that match what was ask
 
 **Enrichment** — adding columns that derive info per-row, typically to filter (classify-tier) or pull supplemental data the user wants (research-tier). Often optional — many projects are fetch-only.
 
+**Editing** — changing values that are ALREADY in the table, fetching nothing new. For pure value cleanups — fix ALL-CAPS casing, trim whitespace, strip a prefix, regex-replace — use `column_transform` (deterministic, instant, ~free). NEVER spin up an enrichment to reformat data you already have; that re-researches known values and burns credits for nothing. (Renaming/retyping/remapping a column is `column_map_set`; rewriting the cell VALUES in place is `column_transform`.)
+
 Order varies by project. Pure scraping ("get me all r/foo posts") is fetching-only; CSV upload with contacts to enrich is mostly enrichment; mid-project additions are often enrichment-only.
 
 # Scope sizing

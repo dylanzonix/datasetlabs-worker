@@ -279,6 +279,28 @@ def _filter_set_schema() -> Dict[str, Any]:
     }
 
 
+def _column_transform_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "table_id": {"type": "string"},
+            "column": {"type": "string", "description": "Name of the existing column to rewrite in place."},
+            "op": {
+                "type": "string",
+                "enum": [
+                    "fix_caps", "lowercase", "uppercase", "title_case",
+                    "capitalize", "trim", "collapse_whitespace", "regex_replace",
+                ],
+                "description": "fix_caps retitles ONLY all-caps cells (safe default for casing cleanup); others apply to every non-empty string cell.",
+            },
+            "pattern": {"type": "string", "description": "Regex pattern (op=regex_replace only)."},
+            "replacement": {"type": "string", "description": "Replacement string (op=regex_replace only; default empty)."},
+        },
+        "required": ["table_id", "column", "op"],
+        "additionalProperties": True,
+    }
+
+
 def _build_tool_defs() -> List[Dict[str, Any]]:
     """OpenAI function tool definitions for the orchestrator surface."""
     tool_descriptions = {
@@ -313,6 +335,17 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
         "apify_actor_details": "Read an actor's full input_schema, output preview, and pricing.",
         # Columns/enrichments
         "column_map_set": "Edit columns on an existing table — rename a column, add one mapped from another source field, drop one. Args: table_id, columns ([{name, source_field, type}]). table_create already commits with its own columns; only use this to revise after the fact.",
+        "column_transform": (
+            "Rewrite an EXISTING column's values IN PLACE with a deterministic text "
+            "transform — case fixes, trimming, regex replace. NO research, NO new data, "
+            "~free, instant. This is the correct tool when the user wants to CLEAN UP or "
+            "REFORMAT values that are already in the table (e.g. fix ALL-CAPS to normal "
+            "case, trim whitespace, strip a prefix). Do NOT create an enrichment for "
+            "pure value cleanups — that re-researches data you already have. "
+            "Args: {table_id, column, op, pattern?, replacement?}. op ∈ fix_caps "
+            "(retitle only all-caps cells), lowercase, uppercase, title_case, capitalize, "
+            "trim, collapse_whitespace, regex_replace."
+        ),
         "enrichment_set": "Define or refine an enrichment. Does NOT auto-run — call enrichment_run after to fill cells. Args: table_id, columns, action: {research, prompt, per_row_credit_cap?}.",
         "enrichment_run": (
             "Run an enrichment over a scope of rows. Approval-gated — user sees an "
@@ -442,6 +475,7 @@ def _build_tool_defs() -> List[Dict[str, Any]]:
     schema_for = {
         "table_create": _table_create_schema(),
         "column_map_set": _column_map_set_schema(),
+        "column_transform": _column_transform_schema(),
         "enrichment_set": _enrichment_set_schema(),
         "filter_set": _filter_set_schema(),
     }
