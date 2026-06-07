@@ -41,6 +41,100 @@ def _row_centric_enabled() -> bool:
     return os.getenv("ENRICHMENT_ROW_CENTRIC", "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _approval_via_jobs_enabled() -> bool:
+    """Route chat-APPROVED enrichments through the durable jobs path instead of
+    the inline (silent, run_id=None) runner — gives spinners, a progress
+    counter, per-cell charging and refresh-survival, and returns the HTTP
+    request immediately instead of blocking for the whole run. Default OFF."""
+    return os.getenv("ENRICHMENT_APPROVAL_VIA_JOBS", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def create_job_for_enrichment(
+    db: Session,
+    *,
+    project_id: str,
+    enrichment_id: str,
+    scope: Dict[str, Any],
+    user_id: str,
+) -> Dict[str, Any]:
+    """Create a durable enrichment job + one task per scoped row, emit
+    job_started, and wake the coordinator. Returns {job_id, total_tasks}
+    (job_id None when nothing is in scope). Mirrors the REST create_job route;
+    shared so the chat-approval path can run on the same durable, live-tracked
+    path. `enrichment_id` must already be the canonical UUID.
+    """
+    from dsl_worker.chat.enrichment import _resolve_scope_rows, _ensure_columns_on_table
+
+    row = db.execute(
+        sa_text(
+            "SELECT table_id::text, columns FROM enrichments "
+            "WHERE id=CAST(:eid AS uuid) AND deleted_at IS NULL"
+        ),
+        {"eid": enrichment_id},
+    ).fetchone()
+    if not row:
+        return {"job_id": None, "total_tasks": 0, "error": "enrichment not found"}
+    table_id = row[0]
+    columns = row[1] if isinstance(row[1], list) else json.loads(row[1] or "[]")
+
+    _ensure_columns_on_table(db, table_id, columns, enrichment_id=enrichment_id)
+    db.commit()
+
+    overwrite = bool(scope.get("overwrite", False)) if isinstance(scope, dict) else False
+    sample_rows = _resolve_scope_rows(db, table_id, scope, columns, overwrite=overwrite)
+    if not sample_rows:
+        return {"job_id": None, "total_tasks": 0}
+
+    job_id = str(uuid.uuid4())
+    db.execute(
+        sa_text(
+            "INSERT INTO enrichment_jobs "
+            "(id, project_id, enrichment_id, user_id, status, scope, total_tasks) "
+            "VALUES (CAST(:id AS uuid), CAST(:pid AS uuid), CAST(:eid AS uuid), "
+            "CAST(:uid AS uuid), 'queued', CAST(:scope AS jsonb), :n)"
+        ),
+        {
+            "id": job_id, "pid": project_id, "eid": enrichment_id,
+            "uid": user_id, "scope": json.dumps(scope), "n": len(sample_rows),
+        },
+    )
+    db.execute(
+        sa_text(
+            "INSERT INTO enrichment_tasks "
+            "(id, job_id, project_id, enrichment_id, sample_id, status) "
+            "VALUES (CAST(:id AS uuid), CAST(:jid AS uuid), CAST(:pid AS uuid), "
+            "CAST(:eid AS uuid), CAST(:sid AS uuid), 'queued')"
+        ),
+        [
+            {"id": str(uuid.uuid4()), "jid": job_id, "pid": project_id,
+             "eid": enrichment_id, "sid": str(sid)}
+            for sid, _, _ in sample_rows
+        ],
+    )
+    db.commit()
+
+    emit_event(
+        db, job_id, "job_started",
+        {
+            "enrichment_id": enrichment_id,
+            "total_tasks": len(sample_rows),
+            "row_ids": [str(sid) for sid, _, _ in sample_rows],
+            "columns": [c["name"] for c in columns],
+        },
+    )
+    notify_new_work(db)
+    try:
+        get_coordinator().wake()
+    except Exception:
+        pass
+    return {
+        "job_id": job_id,
+        "total_tasks": len(sample_rows),
+        "enrichment_id": enrichment_id,
+        "columns": [c["name"] for c in columns],
+    }
+
+
 # Tuning knobs ---------------------------------------------------------------
 
 # Max in-flight cells per coordinator process. Cells beyond this wait at

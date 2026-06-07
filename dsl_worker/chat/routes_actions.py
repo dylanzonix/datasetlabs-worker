@@ -699,6 +699,28 @@ async def respond_to_approval(
             )
             or str(eid)
         )
+
+        # Durable-jobs path (opt-in): create a background job + tasks and return
+        # immediately. The coordinator streams cell_start/cell_done over the
+        # enrichment_events SSE → live spinners + progress widget + per-cell
+        # charging + refresh-survival, instead of blocking this request for the
+        # whole run with zero events (the inline path below). Default off.
+        from dsl_worker.chat.enrichment_jobs import (
+            _approval_via_jobs_enabled,
+            create_job_for_enrichment,
+        )
+        if _approval_via_jobs_enabled():
+            job_scope = dict(scope) if isinstance(scope, dict) else {"type": "all_unfilled"}
+            job_scope["overwrite"] = bool(args.get("overwrite", False))
+            created = create_job_for_enrichment(
+                db,
+                project_id=str(project_id),
+                enrichment_id=canonical_eid,
+                scope=job_scope,
+                user_id=str(user.user_id),
+            )
+            return {"ok": True, "approved": True, "found": True, **created}
+
         import asyncio as _asyncio
         task: _asyncio.Task = _asyncio.create_task(
             enrichment_run(
