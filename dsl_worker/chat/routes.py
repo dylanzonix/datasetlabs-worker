@@ -834,14 +834,26 @@ def table_column_distinct_batch(
     if not col_list:
         return {"columns": {}}
     materialized = _distinct_from_materialized(db, tid, col_list, limit)
-    if materialized is not None:
-        return {"columns": materialized}
-    # Fallback: live-scan each column. Slower but still single round-trip
-    # to the FE — the per-column queries run sequentially in this handler.
-    out: Dict[str, Dict[str, Any]] = {}
-    for col in col_list:
-        out[col] = _distinct_live_scan(db, tid, col, limit)
-    return {"columns": out}
+    if materialized is None:
+        # No materialized rows AND no samples → live-scan each column. Slower
+        # but still a single round-trip to the FE.
+        out: Dict[str, Dict[str, Any]] = {}
+        for col in col_list:
+            out[col] = _distinct_live_scan(db, tid, col, limit)
+        return {"columns": out}
+    # Materialized gives accurate empty_count/total per column, but a column can
+    # come back with an EMPTY values list when its values were never written to
+    # table_column_value — e.g. tables built via browser_use -> column_map_set,
+    # which bypass materialize-on-write. That left the filter panel stuck on
+    # "No values yet" for fully-populated columns (e.g. Party = REP/DEM on an
+    # FEC table). Live-scan just those: columns that HAVE non-empty values
+    # (empty_count < total) but returned none. Genuinely-empty columns
+    # (empty_count == total, e.g. an enrichment not run yet) are skipped, so we
+    # don't pay for a scan that can't find anything.
+    for col, info in materialized.items():
+        if not info.get("values") and int(info.get("empty_count", 0)) < int(info.get("total", 0)):
+            info["values"] = _distinct_live_scan(db, tid, col, limit).get("values", [])
+    return {"columns": materialized}
 
 
 @router.get("/projects/{project_id}/samples/{sample_id}/source-record")
