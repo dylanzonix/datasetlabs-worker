@@ -1487,7 +1487,7 @@ def _column_map_set_blocking(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Di
     # every column — `id` exists on both samples and tables.
     sample_rows = ctx.db.execute(
         sa_text(
-            "SELECT s.id::text, s.raw_row, s.tags, t.source FROM samples s "
+            "SELECT s.id::text, s.raw_row, s.row, s.tags, t.source FROM samples s "
             "JOIN tables t ON t.id = s.table_id "
             "WHERE s.table_id=:tid AND s.deleted_at IS NULL AND s.raw_row IS NOT NULL"
         ),
@@ -1521,17 +1521,32 @@ def _column_map_set_blocking(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Di
     # is ~200s for 2.6k rows against a remote DB; batching collapses it to a
     # handful of statements.
     pending_updates: List[Tuple[str, str, str]] = []
-    for sid, raw, tags, src in sample_rows:
+    for sid, raw, current_row, tags, src in sample_rows:
         if not isinstance(raw, dict):
             continue
-        mapped = {
-            c["name"]: _extract_source_value(raw, c["source_field"])
-            for c in columns_for_db
-        }
+        # Re-derive each mapped column from the scraped source — but NEVER
+        # blank a cell that already holds a value. raw_row contains ONLY the
+        # original scraped fields, so a source re-derive yields nothing for
+        # any column produced by enrichment (or by an in-place edit / manual
+        # entry). The old code overwrote the whole row with the source
+        # projection, so those derived values were silently destroyed — this
+        # is exactly how a "fix one URL column" call wiped every email draft.
+        # Rule: the source value wins when it HAS one; otherwise keep what the
+        # cell already holds. Re-derive can fill/refresh, never destroy.
+        existing = current_row if isinstance(current_row, dict) else {}
+        mapped: Dict[str, Any] = {}
         for c in columns_for_db:
-            v = mapped.get(c["name"])
+            v = _extract_source_value(raw, c["source_field"])
             if v in (None, "", [], {}):
-                null_counts[c["name"]] += 1
+                prior = existing.get(c["name"])
+                # Count a genuine null only when the cell is empty in BOTH
+                # the source AND the current row — so the agent's "bad
+                # source_field" signal still fires, without flagging values
+                # we deliberately preserved.
+                if prior in (None, "", [], {}):
+                    null_counts[c["name"]] += 1
+                v = prior
+            mapped[c["name"]] = v
         cell_sources = {
             name: [{**entry, "source": src} for entry in entries]
             for name, entries in new_cell_sources.items()
