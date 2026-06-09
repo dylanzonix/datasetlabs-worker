@@ -441,17 +441,28 @@ def commit_cell_result(
 
     status_set: Dict[str, str] = {}
     status_clear: List[str] = []
-    if status == "hit_budget":
+    # Map a column the agent could NOT fill to a badge, by run outcome:
+    #   filled     → "not_found"   (it searched; nothing was there)
+    #   hit_budget → "hit_budget"  (ran out of the per-row budget first)
+    #   error      → "error"       (the run FAILED — overload/timeout/turn
+    #                               limit; retryable, NOT "nothing found")
+    # A column that DID get a value clears any stale badge from a prior run.
+    # Before "error" was handled here, a status="error" cell (e.g. an
+    # Anthropic 429 under a concurrent batch) wrote NOTHING — no value, no
+    # badge — so the user saw a permanently-blank cell with zero signal.
+    # On project 1a3f68bc that silently blanked 145/246 enrichment cells.
+    if status in ("filled", "hit_budget", "error"):
+        miss_badge = {
+            "filled": "not_found",
+            "hit_budget": "hit_budget",
+            "error": "error",
+        }[status]
         for cn in target_cols:
-            if not (isinstance(new_fields, dict) and new_fields.get(cn)):
-                status_set[cn] = "hit_budget"
-    elif status == "filled" and isinstance(new_fields, dict):
-        for cn in target_cols:
-            v = new_fields.get(cn)
+            v = new_fields.get(cn) if isinstance(new_fields, dict) else None
             if v not in (None, ""):
                 status_clear.append(cn)
             else:
-                status_set[cn] = "not_found"
+                status_set[cn] = miss_badge
 
     cost_delta: Dict[str, float] = {}
     if cost_usd > 0:

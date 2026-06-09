@@ -63,6 +63,11 @@ class ToolContext:
     # the turn even though the handler never returned its tuple. Reset
     # to 0 by agent.py before each handler invocation.
     partial_cost_usd: float = 0.0
+    # Cell agent only: full values of row fields that were shown TRUNCATED in
+    # the payload (large free-text like a job Description). The `inspect_cell`
+    # tool reads from here to return a field's full value on demand, so the
+    # heavy text doesn't ride every turn. {field_name: full_value}.
+    cell_full_fields: Optional[Dict[str, Any]] = None
 
 
 # Sources where pulling 1000 rows is effectively free (covered by the

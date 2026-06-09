@@ -45,6 +45,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import time
 import uuid
 from collections import OrderedDict
@@ -184,20 +185,20 @@ RESEARCH_CONFIG = {
     "deep":     {"model": "gpt-5.5",      "provider": "openai", "effort": "medium", "default_cap": 5.0, "tools": "all"},
 }
 
-# Provider toggle for the tool-using enrichment tiers (research/deep).
+# Provider for the tool-using enrichment tiers (research/deep).
 #
-#   ENRICHMENT_LLM_PROVIDER = "openai"    (default) → unchanged OpenAI path
-#   ENRICHMENT_LLM_PROVIDER = "anthropic"           → Claude
+#   ENRICHMENT_LLM_PROVIDER unset / anything ≠ "openai" → Claude (DEFAULT)
+#   ENRICHMENT_LLM_PROVIDER = "openai"                  → OpenAI path
 #
-# When "anthropic": research → ENRICHMENT_ANTHROPIC_MODEL (Haiku 4.5, the cheap
-# workhorse) and deep → ENRICHMENT_ANTHROPIC_DEEP_MODEL (Sonnet 4.6, the smarter
-# model for nuanced multi-step lookups). `classify` ALWAYS stays on gpt-5.4-nano
+# Anthropic is the default: research → ENRICHMENT_ANTHROPIC_MODEL (Haiku 4.5, the
+# cheap workhorse) and deep → ENRICHMENT_ANTHROPIC_DEEP_MODEL (Sonnet 4.6, the
+# smarter model for nuanced multi-step lookups). Set the var to "openai" to opt
+# OUT and run the OpenAI path instead. `classify` ALWAYS stays on gpt-5.4-nano
 # (OpenAI) — it never web-searches, so Claude would be pure overhead and nano is
-# ~20x cheaper per token. Default is "openai" so the app behaves EXACTLY as
-# before unless you opt in; flip back any time by unsetting the var. If
-# "anthropic" is selected but ANTHROPIC_API_KEY is missing, we log and fall back
-# to OpenAI rather than failing every cell — see _resolve_research.
-ENRICHMENT_LLM_PROVIDER = os.getenv("ENRICHMENT_LLM_PROVIDER", "openai").strip().lower()
+# ~20x cheaper per token. If Anthropic is selected but ANTHROPIC_API_KEY is
+# missing, we log and fall back to OpenAI rather than failing every cell —
+# see _resolve_research.
+ENRICHMENT_LLM_PROVIDER = os.getenv("ENRICHMENT_LLM_PROVIDER", "anthropic").strip().lower()
 ENRICHMENT_ANTHROPIC_MODEL = os.getenv("ENRICHMENT_ANTHROPIC_MODEL", "claude-haiku-4-5").strip()
 ENRICHMENT_ANTHROPIC_DEEP_MODEL = os.getenv("ENRICHMENT_ANTHROPIC_DEEP_MODEL", "claude-sonnet-4-6").strip()
 
@@ -242,17 +243,18 @@ def _resolve_research(action: Dict[str, Any], per_row_cap: Optional[float]) -> D
         log.warning("cell_agent: unknown research %r, defaulting to research", requested)
         requested = "research"
     cfg = RESEARCH_CONFIG[requested].copy()
-    # Opt-in provider switch for the tool-using tiers (research/deep). classify
+    # Provider for the tool-using tiers (research/deep): Anthropic by default,
+    # OpenAI only when ENRICHMENT_LLM_PROVIDER is explicitly "openai". classify
     # always stays on nano/OpenAI. Falls back to OpenAI when the key is absent
-    # so a misset toggle can't break every research cell.
-    if requested in ("research", "deep") and ENRICHMENT_LLM_PROVIDER == "anthropic":
+    # so a missing key can't break every research cell.
+    if requested in ("research", "deep") and ENRICHMENT_LLM_PROVIDER != "openai":
         if os.getenv("ANTHROPIC_API_KEY"):
             cfg["provider"] = "anthropic"
             cfg["model"] = ENRICHMENT_ANTHROPIC_DEEP_MODEL if requested == "deep" else ENRICHMENT_ANTHROPIC_MODEL
         else:
             log.warning(
-                "ENRICHMENT_LLM_PROVIDER=anthropic but ANTHROPIC_API_KEY is "
-                "unset — using OpenAI for the %s tier", requested,
+                "ENRICHMENT_LLM_PROVIDER defaults to anthropic but ANTHROPIC_API_KEY "
+                "is unset — using OpenAI for the %s tier", requested,
             )
     cap_credits = float(per_row_cap) if per_row_cap and per_row_cap > 0 else cfg["default_cap"]
     cfg["cap_credits"] = cap_credits
@@ -1150,7 +1152,116 @@ async def _fetch_url(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, 
     return out, cost
 
 
+# ---------------------------------------------------------------------------
+# Field-preview composition — "row agent scales across projects/use-cases"
+# ---------------------------------------------------------------------------
+# Tool-tier cells (research/deep) get a PREVIEW of each row field (first N
+# chars) instead of the full value, plus an `inspect_cell` tool to pull a
+# field's full value on demand. This stops a 25k-char job Description from
+# riding EVERY turn of a contact lookup that never needs it — the bloat that
+# blew the 450k input-tokens/min cap. Lean rows (every field under the cap)
+# are untouched: nothing is truncated, the tool isn't even offered.
+#
+# Default preview length ≈ a couple hundred chars (a few dozen words). Tunable
+# via env; not a behavior toggle, just a knob.
+def _preview_cap_chars() -> int:
+    try:
+        return max(40, int(os.getenv("ENRICHMENT_CELL_PREVIEW_CHARS", "280")))
+    except (TypeError, ValueError):
+        return 280
+
+
+# Cap on what inspect_cell hands back in one call. The cell loop already
+# clamps any tool result to 8k chars when feeding it to the model, so we
+# mirror that here and label it, rather than letting the value get silently
+# chopped mid-string.
+_INSPECT_CELL_MAX_CHARS = 8000
+
+
+def _compose_preview_fields(
+    fields: Dict[str, Any], cap: int, store: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Return a copy of `fields` with any over-cap value replaced by a preview
+    string that names its column + full length; the full value is saved into
+    `store` (keyed by field name) for inspect_cell. Never mutates the input.
+    Small values (and non-string scalars under cap) pass through unchanged."""
+    out: Dict[str, Any] = {}
+    for k, v in fields.items():
+        s = v if isinstance(v, str) else None
+        if s is None:
+            try:
+                serialized = json.dumps(v, default=str)
+            except Exception:
+                serialized = str(v)
+            # Only preview non-strings if they're genuinely large; keep small
+            # scalars/objects typed so the agent can use them directly.
+            if len(serialized) <= cap:
+                out[k] = v
+                continue
+            s = serialized
+        elif len(s) <= cap:
+            out[k] = v
+            continue
+        # Over cap → store full, emit a marked preview.
+        store[k] = v
+        out[k] = (
+            s[:cap].rstrip()
+            + f"… [truncated — {len(s)} chars total; call inspect_cell(column=\"{k}\") for the full value]"
+        )
+    return out
+
+
+async def _inspect_cell(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
+    """Return the FULL value of a row field that was shown truncated in the
+    payload. Free — reads values already in memory (ctx.cell_full_fields)."""
+    store = getattr(ctx, "cell_full_fields", None) or {}
+    col = args.get("column") or args.get("field") or args.get("name")
+    if not col or not isinstance(col, str):
+        return {"error": "pass column=<exact field name shown with a [truncated] marker>"}, 0.0
+    if col not in store:
+        return {
+            "error": f"no truncated field named {col!r} in this row",
+            "available": sorted(store.keys()),
+        }, 0.0
+    val = store[col]
+    s = val if isinstance(val, str) else json.dumps(val, default=str)
+    if isinstance(s, str) and len(s) > _INSPECT_CELL_MAX_CHARS:
+        return {
+            "column": col,
+            "value": s[:_INSPECT_CELL_MAX_CHARS],
+            "truncated": True,
+            "note": f"showing first {_INSPECT_CELL_MAX_CHARS} of {len(s)} chars",
+        }, 0.0
+    return {"column": col, "value": val}, 0.0
+
+
+_INSPECT_CELL_TOOL_DEF: Dict[str, Any] = {
+    "type": "function",
+    "name": "inspect_cell",
+    "description": (
+        "Read the FULL value of a row field shown TRUNCATED in "
+        "row_visible_to_user / row_hidden_source_fields (look for a "
+        "'… [truncated …]' marker). Pass the exact field/column name. Free, "
+        "instant. Use ONLY when the preview isn't enough to answer — most "
+        "lookups (e.g. finding a contact for a company) never need the full "
+        "long text of a description."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "column": {
+                "type": "string",
+                "description": "Exact field/column name to expand, as shown in the payload.",
+            },
+        },
+        "required": ["column"],
+        "additionalProperties": False,
+    },
+}
+
+
 CELL_TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any], ToolContext], Awaitable[Tuple[Dict[str, Any], float]]]] = {
+    "inspect_cell": _inspect_cell,
     "fullenrich_search_people": _fullenrich_search_people,
     "fullenrich_enrich_email": _fullenrich_enrich_email,
     "fullenrich_enrich_phone": _fullenrich_enrich_phone,
@@ -1194,6 +1305,8 @@ Stopping without `final_result` means the cell stays blank in the user's table, 
 - `row_hidden_source_fields` (optional) — fields the source returned but the orchestrator didn't surface as columns. Use as extra context when reasoning. If the value you need is hiding here, return it via `final_result` for the column in `columns_to_fill`.
 - `columns_to_fill` — column names you must produce values for.
 - `instruction` — what to find or compute.
+
+Long field values are shown as PREVIEWS that end with `… [truncated — N chars total; call inspect_cell(column="X") for the full value]`. The preview is usually all you need. If (and only if) the full text matters for your task, call `inspect_cell(column="<exact field name>")` to get it — it's free and instant. Don't expand fields you don't need.
 
 # Finishing
 
@@ -1920,6 +2033,16 @@ ANTHROPIC_WEB_SEARCH_TOOL = "web_search_20250305"
 # max_uses. Derived from the per-row cap but clamped to this so one hard-to-
 # find value can't burn the whole budget on search reformulations.
 ANTHROPIC_MAX_WEB_SEARCHES = 5
+# Transient-failure retries for the per-cell Messages call. A concurrent
+# enrichment batch (25 research agents) on heavy job-board rows blows the org
+# ITPM cap (450k input tok/min) — a SUSTAINED throttle, not a momentary 529 —
+# so we retry generously and honor Retry-After to ride the burst out instead
+# of giving up (a blank cell is the worst outcome). A retrying cell holds its
+# semaphore slot while it backs off, which self-throttles the batch — fewer
+# new calls fire, so the limit clears. Retries wrap ONE messages_create call,
+# so they don't consume a reasoning turn; the 900s per-cell hard timeout is
+# the real ceiling.
+ANTHROPIC_CELL_MAX_RETRIES = 8
 
 _cell_anthropic_client = None  # lazily-built TrackedAnthropicClient
 
@@ -2101,17 +2224,65 @@ async def _anthropic_cell_loop(
         if total_cost >= cap_usd:
             return final_values, final_sources, total_cost, "hit_budget", "budget cap reached"
 
-        try:
-            response, usage_cost = await client.messages_create(
-                model=tier_cfg["model"],
-                system=system_blocks,
-                messages=messages,
-                tools=claude_tools,
-                max_tokens=8000,
-            )
-        except Exception as e:
-            log.warning("anthropic cell agent call failed (tier=%s): %s", tier_cfg["name"], e)
-            return final_values, final_sources, total_cost, "error", f"LLM call failed: {e}"[:500]
+        # Retry transient overload/rate-limit/timeout before giving up. A
+        # concurrent contact batch 429'd Anthropic within ~7s and, with no
+        # retry here, blanked 145/246 cells on proj 1a3f68bc. Backoff +
+        # jitter de-correlates the herd so the batch drains instead of
+        # collapsing. Wraps a single call → does NOT consume a turn.
+        response = None
+        usage_cost = None
+        llm_retries = 0
+        while True:
+            try:
+                response, usage_cost = await client.messages_create(
+                    model=tier_cfg["model"],
+                    system=system_blocks,
+                    messages=messages,
+                    tools=claude_tools,
+                    max_tokens=8000,
+                )
+                break
+            except Exception as e:
+                msg = str(e).lower()
+                code = getattr(e, "status_code", None) or getattr(
+                    getattr(e, "response", None), "status_code", None
+                )
+                transient = code in (408, 409, 425, 429, 500, 502, 503, 529) or any(
+                    t in msg for t in (
+                        "overloaded", "rate limit", "rate_limit", "429",
+                        "503", "529", "timed out", "timeout", "connection",
+                        "temporarily", "service unavailable",
+                    )
+                )
+                if transient and llm_retries < ANTHROPIC_CELL_MAX_RETRIES:
+                    llm_retries += 1
+                    backoff = min(8.0, 0.75 * (2 ** llm_retries)) + random.uniform(0, 0.75)
+                    # The observed failure is a 429 org ITPM cap (450k input
+                    # tokens/min on the research model), not a momentary 529.
+                    # That's a sustained throttle — honor Anthropic's
+                    # Retry-After (seconds) so we wait for the bucket to
+                    # refill instead of undershooting with exp-backoff (cap 60s
+                    # below; the 900s per-cell hard timeout is the real ceiling).
+                    resp = getattr(e, "response", None)
+                    hdrs = getattr(resp, "headers", None)
+                    if hdrs:
+                        try:
+                            ra = hdrs.get("retry-after")
+                            if ra is not None:
+                                # Cap at 60s: ITPM windows are per-minute, so a
+                                # full-minute wait is the most that ever helps,
+                                # and it stays well under the 900s cell timeout.
+                                backoff = min(60.0, max(backoff, float(ra) + random.uniform(0, 1.0)))
+                        except (TypeError, ValueError):
+                            pass
+                    log.info(
+                        "anthropic cell call transient err (tier=%s retry %d/%d in %.1fs): %s",
+                        tier_cfg["name"], llm_retries, ANTHROPIC_CELL_MAX_RETRIES, backoff, e,
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                log.warning("anthropic cell agent call failed (tier=%s): %s", tier_cfg["name"], e)
+                return final_values, final_sources, total_cost, "error", f"LLM call failed: {e}"[:500]
 
         # Token cost (incl. cache read/write) from the tracked client; add the
         # hosted web_search fee using the exact count Anthropic reports.
@@ -2485,19 +2656,42 @@ async def run_cell_agent(
             if k not in visible_keys:
                 hidden_fields[k] = v
 
+    # Field-preview composition (research/deep only — the looping "row agent").
+    # Replace over-cap field values with previews + stash full values for
+    # inspect_cell, so heavy free-text (e.g. a 25k-char job Description) is
+    # fetched on demand instead of re-sent every turn (that bloat blew the org
+    # ITPM cap). classify keeps the FULL row: it's one-shot, has no tools, and
+    # needs the text to label. Lean rows truncate nothing → no behavior change.
+    cell_full_fields: Dict[str, Any] = {}
+    visible_view: Dict[str, Any] = row_data if isinstance(row_data, dict) else {}
+    hidden_view: Dict[str, Any] = hidden_fields
+    if tier_cfg["tools"] == "all":
+        cap = _preview_cap_chars()
+        visible_view = _compose_preview_fields(visible_view, cap, cell_full_fields)
+        hidden_view = _compose_preview_fields(hidden_fields, cap, cell_full_fields)
+        ctx.cell_full_fields = cell_full_fields
+
     user_payload: Dict[str, Any] = {
-        "row_visible_to_user": row_data,
+        "row_visible_to_user": visible_view,
         "columns_to_fill": columns_to_fill,
         "instruction": prompt,
     }
-    if hidden_fields:
-        user_payload["row_hidden_source_fields"] = hidden_fields
+    if hidden_view:
+        user_payload["row_hidden_source_fields"] = hidden_view
         user_payload["note"] = (
             "row_visible_to_user is what's shown in the user's table. "
             "row_hidden_source_fields are extra fields the source returned "
             "that aren't currently mapped to a column — you can read these "
             "as additional context for reasoning, but you can't return them "
             "as values without the orchestrator adding columns."
+        )
+    if cell_full_fields:
+        user_payload["truncated_fields"] = sorted(cell_full_fields.keys())
+        user_payload["truncation_note"] = (
+            "Long field values are shown as PREVIEWS ending with a "
+            "'[truncated …]' marker. Call inspect_cell(column=\"<name>\") to read "
+            "the full value — but only when the preview isn't enough; most "
+            "lookups never need it."
         )
 
     # Row dossier (opt-in): replay this row's prior findings + dead-ends so the
@@ -2515,6 +2709,12 @@ async def run_cell_agent(
         {"role": "user", "content": json.dumps(user_payload, default=str)},
     ]
     tool_defs = _tool_defs_for_tier(tier_cfg)
+    # Offer inspect_cell only when at least one field was actually truncated —
+    # no point advertising it on lean rows. Works in both loops: the Anthropic
+    # path translates tool_defs via translate_tools; both dispatch by looking
+    # the name up in CELL_TOOL_HANDLERS.
+    if cell_full_fields:
+        tool_defs = tool_defs + [_INSPECT_CELL_TOOL_DEF]
     total_cost = 0.0
     final_values: Dict[str, Any] = {}
     final_sources: Dict[str, List[Dict[str, Any]]] = {}

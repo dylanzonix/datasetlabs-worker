@@ -875,6 +875,11 @@ async def _run_enrichment_on_rows(
                 sample_filled_row = {cn: new_fields.get(cn) for cn in target_cols}
         if status == "hit_budget":
             hit_budget_count += 1
+        elif status == "error" and not has_real_value:
+            # Graceful agent failure (LLM call failed / turn limit) — count it
+            # as errored, NOT not_found, so rows_errored in the summary is
+            # honest. (A RAISED task is counted at the except branch above.)
+            errored_count += 1
         elif status == "filled" and not has_real_value:
             not_found_count += 1
             if sample_not_found_row is None:
@@ -895,17 +900,24 @@ async def _run_enrichment_on_rows(
         # legitimately unblocks).
         status_set: Dict[str, str] = {}
         status_clear: List[str] = []
-        if status == "hit_budget":
+        # Same rationale as commit_cell_result (jobs path): map an unfillable
+        # column to a badge by outcome so a FAILED run shows "Error — retry"
+        # instead of a silently-blank cell. status="error" used to fall
+        # through here and write no badge at all. A graceful status="error"
+        # (the cell agent's LLM call failed / hit the turn limit) is distinct
+        # from the task RAISING — that's handled above (err_status_delta).
+        if status in ("filled", "hit_budget", "error"):
+            miss_badge = {
+                "filled": "not_found",
+                "hit_budget": "hit_budget",
+                "error": "error",
+            }[status]
             for cn in target_cols:
-                if not (isinstance(new_fields, dict) and new_fields.get(cn)):
-                    status_set[cn] = "hit_budget"
-        elif status == "filled" and isinstance(new_fields, dict):
-            for cn in target_cols:
-                v = new_fields.get(cn)
+                v = new_fields.get(cn) if isinstance(new_fields, dict) else None
                 if v not in (None, ""):
                     status_clear.append(cn)
                 else:
-                    status_set[cn] = "not_found"
+                    status_set[cn] = miss_badge
         if isinstance(new_fields, dict) and new_fields and downstream_unblocks:
             for cn, v in new_fields.items():
                 if v in (None, ""):
