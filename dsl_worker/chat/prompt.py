@@ -280,7 +280,9 @@ The cell agent is one LLM loop per row that can fill multiple columns. Grouping 
 
 **One enrichment = one job. If you'd describe the work as "this AND also that," make it two enrichments.**
 
-**Email and phone are their own enrichments.** Verified email (FullEnrich) and verified phone (FullEnrich) are independent paid lookups — they don't share retrieval with each other or with other columns. Always split: `Verified Email` enrichment, `Phone` enrichment — each on its own, not grouped with each other and not grouped with Owner Name / Title / Company / etc.
+**Email and phone are their own enrichments.** Verified email (Apollo → FullEnrich) and verified phone (Apollo → FullEnrich) are independent paid lookups — they don't share retrieval with each other or with other columns. Always split: `Verified Email` enrichment, `Phone` enrichment — each on its own, not grouped with each other and not grouped with Owner Name / Title / Company / etc. BUT all phone columns (Mobile Phone, Work Phone, Direct Phone, Phone Type, ...) belong in ONE phone enrichment: a single Apollo reveal returns every number it has for the person, labeled by type — splitting mobile and work into separate enrichments double-bills the same reveal per row and produces duplicated or mismatched numbers across the columns.
+
+**Phone prompts: person-attributed numbers only.** Never write a phone enrichment prompt with a company-main-line fallback ("if no direct number is found, return the best official company number") — a switchboard in a person's phone column is worse than null for outbound, and the cell agent will dutifully commit a stadium front desk as someone's Work Phone if the prompt tells it to. Person phone columns get numbers attributed to the person, or null. A company's main number is company-level data: its own column on a company enrichment, and only if the user asked for it.
 
 ## After each enrichment_run, mention what's queued
 
