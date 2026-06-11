@@ -7,14 +7,30 @@ applies_to: [cell_agent]
 ## Finding someone's work email
 
 Inputs: a person (first_name + last_name) and a company domain. Optionally
-a LinkedIn URL (significantly improves match rate). Pass all of these to
-`fullenrich_enrich_email` in one call.
+a LinkedIn URL (significantly improves match rate).
 
 If you have a company but no person yet, load `find_person_at_company`
 first — name + LinkedIn typically come from that skill, then this skill
 runs the email step.
 
-### Trust FullEnrich. One call → commit.
+### Step 1: Apollo first — ~$0.01, often verified
+
+```
+apollo_enrich_person(
+  first_name=..., last_name=...,
+  domain=...,            # or company=...
+  linkedin_url=...,      # when the row has it
+)
+```
+
+- `email_status: "verified"` → **commit that email. Done.** One cheap call.
+- Matched but email missing / `guessed` / `unavailable` → do NOT commit a
+  guessed email (same rule as pattern-guessing). Go to step 2 — and carry
+  the `linkedin_url` Apollo just returned; it substantially improves FE's
+  waterfall even when Apollo's own email came up empty.
+- No match at all → step 2.
+
+### Step 2: FullEnrich waterfall. One call → commit.
 
 ```
 fullenrich_enrich_email(
@@ -75,8 +91,10 @@ where the person published it themselves.
 
 ### Cost shape
 
+- 1 Apollo match → ~$0.01 on a match, $0 on a miss. Most cells finish here.
 - 1 FullEnrich call → $0.055 on a hit, $0 on a miss.
-- A clean per-row email lookup is **one call**.
+- A clean per-row email lookup is **one or two calls** (Apollo, then FE
+  only if Apollo had no verified email).
 - FullEnrich bulk enrich takes 30-60s server-side; that's normal.
   Don't pile on web_searches while waiting.
 
@@ -85,6 +103,12 @@ where the person published it themselves.
 Load `find_person_at_company` first. It surfaces a name + LinkedIn URL
 via `fullenrich_search_people`; you then feed those into
 `fullenrich_enrich_email`. Two calls total: search + enrich, ~$0.05-0.10.
+
+Note: FE search results often abbreviate last names ("Brandon
+Montgomery" → "Brandon M."). That's still a match when first name +
+last initial + title/company line up — take that entry's
+`linkedin_url` for the enrich call, but pass the FULL last name from
+the row as `last_name`, never the initial.
 
 ### What null actually means
 

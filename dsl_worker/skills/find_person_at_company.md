@@ -62,8 +62,46 @@ seniority is FE's structured classification, doesn't depend on the string match.
 
 **Specific named person** (column wants something about a person already named on the row)
 
-Skip search entirely — go straight to `fullenrich_enrich_email`
-with first_name + last_name + domain.
+If the goal is their *email*, skip search entirely — `apollo_enrich_person`
+first (~$0.01, often returns a verified email + linkedin_url in one
+call), then `fullenrich_enrich_email` if Apollo had no verified email
+(see `find_emails`).
+
+`apollo_enrich_person` is also the cheapest way to confirm a named
+person + get their title/LinkedIn in one shot — it stores full last
+names, so it dodges the "Arman M." abbreviation problem below. Use FE
+search when Apollo misses or when you need to browse a roster.
+
+If you need their roster entry first (LinkedIn URL for a phone/email
+enrich, title confirmation, etc.): pass the name in `person_names`
+plus the company.
+
+```
+fullenrich_search_people(
+  person_names=["<First Last>"],
+  company_names=["<company>"],
+  limit=3,
+)
+```
+
+**Never put the person's name in `titles`** — titles string-matches
+against JOB titles, so a name there returns 0 and wastes the call.
+
+A full-name search returning 0 does NOT mean they're absent: FE stores
+some people with abbreviated last names, and full-name search misses
+those (verified live — `person_names=["Arman Medar"]` returns 0 while
+the entry "Arman M." exists). Retry with first name only:
+
+```
+fullenrich_search_people(
+  person_names=["<First>"],
+  company_names=["<company>"],
+  limit=5,
+)
+```
+
+then match the last name OR last initial yourself in the results (see
+the abbreviated-names section below).
 
 ### Read the results — the wrapper post-filters but you still pick
 
@@ -80,6 +118,22 @@ You still pick from the filtered list:
 - If results look reasonable, commit the first qualifying one. Don't
   web_search to "verify" — FE returned the linkedin URL and title; that
   IS the verification.
+
+### FE abbreviates last names — match on first name + initial
+
+FE roster entries often store the last name as an initial: "Arman Medar"
+appears as `{first_name: "Arman", last_name: "M.", linkedin_url:
+".../in/arman-m-986331177"}`. When you're scanning for a NAMED person,
+an exact-string miss does NOT mean they're absent:
+
+- Same first name + last initial matches the row's last name, AND
+- title / seniority / location are consistent with the row
+
+→ that IS your person. Use that entry's `linkedin_url` in follow-up
+`fullenrich_enrich_email` / `fullenrich_enrich_phone` calls (keep the
+row's FULL last name in the enrich args, not the "M."). The linkedin
+slug usually echoes the abbreviation (`/in/arman-m-…`) — consistent
+slug + title + company is confirmation, not a guess.
 
 ### When the first call comes back empty (or wrong)
 

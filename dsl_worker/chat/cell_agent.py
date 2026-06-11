@@ -128,10 +128,23 @@ _fe_limiter = _FERateLimiter(int(os.getenv("FULLENRICH_RPM", "55")))
 # Pre-2026-05-21 we observed FE billing 18 credits per email call (~$1)
 # but that appears to have been an FE-side billing bug they fixed; if it
 # recurs, raise these estimates back up + audit cell_traces.cost_credits.
+# Apollo people/match consumes ~1 export credit per MATCHED person
+# (no charge on miss). Paid plans price an export credit at roughly a
+# cent; tune via env if the plan changes.
+APOLLO_MATCH_COST_USD = float(os.getenv("APOLLO_MATCH_COST_USD", "0.01"))
+
+# Apollo phone reveals consume credits per delivered number, reported back
+# in the webhook payload (observed live: 8 credits per mobile, 0 on a
+# failed reveal). Billed dynamically at credits_consumed × this rate; the
+# FIXED_COST_TOOLS entry is only the pre-call budget gate's estimate.
+APOLLO_CREDIT_COST_USD = float(os.getenv("APOLLO_CREDIT_COST_USD", "0.0125"))
+
 FIXED_COST_TOOLS = {
     "fullenrich_enrich_email":  0.07,
     "fullenrich_enrich_phone":  0.60,
     "fullenrich_enrich_company": 0.07,
+    "apollo_enrich_person": APOLLO_MATCH_COST_USD,
+    "apollo_reveal_phone": 8 * APOLLO_CREDIT_COST_USD,
     # apollo_org_enrich removed — organizations/enrich is request-quota
     # limited (Apollo's response headers confirm: x-rate-limit-* not
     # credit-* ). Treat as free; pre-call budget gate doesn't refuse it.
@@ -401,11 +414,19 @@ async def _fullenrich_bulk_enrich(
         if status in ("CANCELED", "CREDITS_INSUFFICIENT", "RATE_LIMIT"):
             return {"error": f"FE {status}"}, 0.0
     else:
-        return {"error": f"FE timed out after {timeout_s}s", "enrichment_id": eid}, 0.0
+        return {
+            "error": (
+                f"FE timed out after {timeout_s}s — FullEnrich is stuck on this "
+                f"contact and a retry will hang the same way. Do NOT call this "
+                f"tool again for this row; fall back to another source or commit "
+                f"null."
+            ),
+            "enrichment_id": eid,
+        }, 0.0
 
     items = last_result.get("data") or []
     if not items:
-        return {"contact_info": {}}, 0.0
+        return {"contact_info": {}, "_raw_payload": last_result}, 0.0
     item = items[0]
     # FE's response nests results under `contact_info`, not `contact`.
     # Was reading the wrong key; every successful lookup looked empty.
@@ -436,7 +457,10 @@ async def _fullenrich_bulk_enrich(
         sorted((contact_info or {}).keys()),
         sorted(last_result.keys()),
     )
-    return {"contact_info": contact_info}, cost_usd
+    # _raw_payload = FE's complete poll response (full contact_info with
+    # every email/phone candidate, social profiles, cost meta). Popped at
+    # the capture site for the source-chip payload; never sent to the LLM.
+    return {"contact_info": contact_info, "_raw_payload": last_result}, cost_usd
 
 
 async def _fullenrich_enrich_email(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
@@ -455,11 +479,19 @@ async def _fullenrich_enrich_email(args: Dict[str, Any], ctx: ToolContext) -> Tu
     linkedin_url = args.get("linkedin_url") or args.get("professional_network_url")
     if linkedin_url:
         contact["linkedin_url"] = linkedin_url
+    # Cap each email lookup at 120s. FE's waterfall "typically finishes in
+    # 30-60s" (and p90 here was ~90s), so 120s covers virtually every real
+    # match while killing the dead-wait on stuck calls — the old 600s ceiling
+    # let ONE hung lookup block 10 minutes, and a cell does ~3 of these
+    # serially, which is how a single row stretched into hours. A lookup that
+    # legitimately needs >120s now returns empty for that contact (rare tail);
+    # successful sub-120s lookups are completely unaffected.
     result, credits = await _fullenrich_bulk_enrich(
-        api_key, contact, ["contact.emails"], timeout_s=600,
+        api_key, contact, ["contact.emails"], timeout_s=120,
     )
     if "error" in result:
         return result, credits
+    raw_payload = result.pop("_raw_payload", None)
     ci = result.get("contact_info") or {}
     # Prefer the highest-confidence single answer FullEnrich picked,
     # fall back to the first entry in work_emails[].
@@ -497,6 +529,7 @@ async def _fullenrich_enrich_email(args: Dict[str, Any], ctx: ToolContext) -> Tu
         "email": email,
         "verification_status": status,
         "commit": should_commit,
+        "_raw_payload": raw_payload,
     }, credits
 
 
@@ -515,11 +548,16 @@ async def _fullenrich_enrich_phone(args: Dict[str, Any], ctx: ToolContext) -> Tu
     linkedin_url = args.get("linkedin_url") or args.get("professional_network_url")
     if linkedin_url:
         contact["linkedin_url"] = linkedin_url
+    # 300s ceiling: healthy FE phone lookups finish in 1-5 min; ones that
+    # haven't by then are stuck and observed to never produce data (user
+    # watched runs sit 30+ min and fail). Was 600s — that just doubled the
+    # wall-clock of every doomed lookup.
     result, credits = await _fullenrich_bulk_enrich(
-        api_key, contact, ["contact.phones"], timeout_s=600,
+        api_key, contact, ["contact.phones"], timeout_s=300,
     )
     if "error" in result:
         return result, credits
+    raw_payload = result.pop("_raw_payload", None)
     ci = result.get("contact_info") or {}
     # FE's actual response shape:
     #   most_probable_phone: {"number": "+33...", "region": "FR"}
@@ -537,7 +575,7 @@ async def _fullenrich_enrich_phone(args: Dict[str, Any], ctx: ToolContext) -> Tu
                 phone = p.get("number")
                 region = p.get("region")
                 break
-    return {"phone": phone, "region": region}, credits
+    return {"phone": phone, "region": region, "_raw_payload": raw_payload}, credits
 
 
 async def _fullenrich_enrich_company(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
@@ -594,6 +632,7 @@ async def _fullenrich_enrich_company(args: Dict[str, Any], ctx: ToolContext) -> 
         "hq_country": hq.get("country"),
         "hq_address": hq.get("line1"),
         "linkedin_url": linkedin,
+        "_raw_payload": data,
     }, 0.25 * 0.055
 
 
@@ -632,6 +671,7 @@ async def _fullenrich_search_people(args: Dict[str, Any], ctx: ToolContext) -> T
     for arg_key, api_key_name in [
         ("company_names", "current_company_names"),
         ("company_domains", "current_company_domains"),
+        ("person_names", "person_names"),
         ("titles", "current_position_titles"),
         ("locations", "person_locations"),
         ("seniority", "current_position_seniority_level"),
@@ -735,6 +775,9 @@ async def _fullenrich_search_people(args: Dict[str, Any], ctx: ToolContext) -> T
         "count": len(compact),
         "total_in_db": meta.get("total"),
         "credits_used": credits_used,
+        # Raw response is pre-post-filter — the payload chip shows every
+        # person FE billed for, including ones the employer filter dropped.
+        "_raw_payload": data,
     }, cost_usd
 
 
@@ -804,6 +847,255 @@ async def _apollo_org_enrich(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Di
         "retail_location_count": org.get("retail_location_count"),
         "alexa_ranking": org.get("alexa_ranking"),
     }, 0.0  # organizations/enrich is request-quota-limited, not credit-billed
+
+
+async def _apollo_enrich_person(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
+    """Apollo people/match — person enrichment by name + company/domain.
+
+    Returns the matched person's title, WORK email (+ verification
+    status), LinkedIn URL, and location in one synchronous call.
+    Deliberately never sets reveal_personal_emails (GDPR/personal data).
+    Phone reveals live in the separate apollo_reveal_phone tool
+    (webhook-async, ~8 credits per number) so a cheap email match can
+    never accidentally trigger a phone charge.
+
+    Billing: ~1 export credit per MATCHED person (env
+    APOLLO_MATCH_COST_USD, default $0.01); $0 on a miss.
+    """
+    import httpx
+    api_key = os.getenv("APOLLO_API_KEY")
+    if not api_key:
+        return {"error": "APOLLO_API_KEY not configured"}, 0.0
+    body: Dict[str, Any] = {}
+    for k_in, k_out in [
+        ("first_name", "first_name"),
+        ("last_name", "last_name"),
+        ("name", "name"),
+        ("company", "organization_name"),
+        ("organization_name", "organization_name"),
+        ("domain", "domain"),
+        ("linkedin_url", "linkedin_url"),
+        ("email", "email"),
+    ]:
+        v = args.get(k_in)
+        if v and str(v).strip():
+            body[k_out] = str(v).strip()
+    if not body:
+        return {"error": "pass a name + company/domain, or a linkedin_url, or an email"}, 0.0
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                "https://api.apollo.io/api/v1/people/match",
+                json=body,
+                headers={"X-Api-Key": api_key},
+            )
+    except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+        return {"error": f"Apollo people/match timeout: {e}"}, 0.0
+    if r.status_code != 200:
+        return {"error": f"Apollo HTTP {r.status_code}: {r.text[:160]}"}, 0.0
+    p = (r.json() or {}).get("person") or {}
+    if not p:
+        return {"matched": False}, 0.0
+    email = p.get("email")
+    # Plan out of export credits → Apollo returns a placeholder address
+    # instead of null. Never surface it as a value.
+    if email and "email_not_unlocked" in email:
+        email = None
+    # No-match comes back as an ECHO of the input (a stub person with the
+    # name you sent and every enrichment field null), not as an empty
+    # response. No signal beyond the echo = a miss: report it as one and
+    # charge nothing.
+    if not any([p.get("title"), email, p.get("linkedin_url"), p.get("headline")]):
+        return {"matched": False, "note": "Apollo has no data on this person"}, 0.0
+    org = p.get("organization") or {}
+    return {
+        "matched": True,
+        "name": p.get("name"),
+        "first_name": p.get("first_name"),
+        "last_name": p.get("last_name"),
+        "title": p.get("title"),
+        "headline": p.get("headline"),
+        "email": email,
+        "email_status": p.get("email_status"),
+        "linkedin_url": p.get("linkedin_url"),
+        "city": p.get("city"),
+        "state": p.get("state"),
+        "country": p.get("country"),
+        "organization": {
+            "name": org.get("name"),
+            "website_url": org.get("website_url"),
+            "phone": org.get("sanitized_phone") or org.get("phone"),
+        },
+        "_raw_payload": p,
+    }, APOLLO_MATCH_COST_USD
+
+
+# Poll ceiling for Apollo's webhook-delivered phone reveals. Observed
+# delivery: 9-11s after the match call; 90s is a generous ceiling that
+# still fails fast enough for the agent to fall back to FullEnrich.
+APOLLO_PHONE_POLL_TIMEOUT_S = float(os.getenv("APOLLO_PHONE_POLL_TIMEOUT_S", "90"))
+
+
+async def _apollo_reveal_phone(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
+    """Apollo mobile/direct-dial phone reveal — webhook-async, polled via DB.
+
+    Apollo never returns phone numbers synchronously: people/match with
+    reveal_phone_number=true REQUIRES a public webhook_url and delivers
+    the numbers there ~10s later (verified live 2026-06-10; a re-match
+    does NOT surface the revealed number afterward, so the webhook body
+    is the only copy). Instead of running a public receiver, webhook_url
+    points at Supabase's REST endpoint — PostgREST inserts the payload
+    into apollo_webhook_events (apikey + columns as query params; the
+    columns filter makes PostgREST ignore unknown payload keys, so new
+    Apollo fields can't break the insert). This handler polls that table
+    for the matched person's id — works from any worker sharing the DB,
+    local dev included.
+
+    Billing: the webhook reports credits_consumed (observed: 8 per
+    mobile, 0 on a failed reveal) → billed at credits_consumed ×
+    APOLLO_CREDIT_COST_USD. Timeout/miss = $0.
+    """
+    import httpx
+    api_key = os.getenv("APOLLO_API_KEY")
+    if not api_key:
+        return {"error": "APOLLO_API_KEY not configured"}, 0.0
+    supabase_url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+    anon_key = os.getenv("SUPABASE_ANON_KEY")
+    if not (supabase_url and anon_key):
+        return {
+            "error": (
+                "SUPABASE_URL/SUPABASE_ANON_KEY not configured — phone reveal "
+                "has no webhook landing table here; use fullenrich_enrich_phone"
+            ),
+        }, 0.0
+    body: Dict[str, Any] = {}
+    for k_in, k_out in [
+        ("first_name", "first_name"),
+        ("last_name", "last_name"),
+        ("name", "name"),
+        ("company", "organization_name"),
+        ("organization_name", "organization_name"),
+        ("domain", "domain"),
+        ("linkedin_url", "linkedin_url"),
+        ("email", "email"),
+    ]:
+        v = args.get(k_in)
+        if v and str(v).strip():
+            body[k_out] = str(v).strip()
+    if not body:
+        return {"error": "pass a name + company/domain, or a linkedin_url, or an email"}, 0.0
+    body["reveal_phone_number"] = True
+    body["webhook_url"] = (
+        f"{supabase_url}/rest/v1/apollo_webhook_events"
+        f"?apikey={anon_key}"
+        "&columns=status,unique_enriched_records,credits_consumed,people"
+    )
+
+    from dsl_api.db import SessionLocal
+
+    # High-water mark BEFORE the reveal: only accept events newer than
+    # this, so a re-reveal of the same person never re-bills off a stale
+    # event (bigserial beats timestamps — no clock-skew games).
+    db = SessionLocal()
+    try:
+        min_id = db.execute(
+            sa_text("SELECT COALESCE(MAX(id), 0) FROM apollo_webhook_events")
+        ).scalar() or 0
+    except Exception as e:
+        log.warning("apollo_webhook_events high-water read failed: %s", e)
+        min_id = 0
+    finally:
+        db.close()
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                "https://api.apollo.io/api/v1/people/match",
+                json=body,
+                headers={"X-Api-Key": api_key},
+            )
+    except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+        return {"error": f"Apollo people/match timeout: {e}"}, 0.0
+    if r.status_code != 200:
+        return {"error": f"Apollo HTTP {r.status_code}: {r.text[:160]}"}, 0.0
+    p = (r.json() or {}).get("person") or {}
+    pid = p.get("id")
+    if not pid:
+        return {"matched": False, "note": "Apollo has no record of this person"}, 0.0
+
+    event: Optional[Dict[str, Any]] = None
+    deadline = time.monotonic() + APOLLO_PHONE_POLL_TIMEOUT_S
+    while time.monotonic() < deadline:
+        await asyncio.sleep(3)
+        db = SessionLocal()
+        try:
+            row = db.execute(
+                sa_text(
+                    "SELECT status, credits_consumed, people "
+                    "FROM apollo_webhook_events "
+                    "WHERE id > :min_id AND people @> CAST(:pid AS jsonb) "
+                    "ORDER BY id DESC LIMIT 1"
+                ),
+                {"min_id": min_id, "pid": json.dumps([{"id": pid}])},
+            ).fetchone()
+        except Exception as e:
+            log.warning("apollo webhook poll failed: %s", e)
+            row = None
+        finally:
+            db.close()
+        if row:
+            event = {
+                "status": row[0],
+                "credits_consumed": float(row[1] or 0),
+                "people": row[2],
+            }
+            break
+    if event is None:
+        return {
+            "error": (
+                f"Apollo accepted the reveal but no result arrived within "
+                f"{int(APOLLO_PHONE_POLL_TIMEOUT_S)}s. Do NOT retry this tool "
+                f"for this row; fall back to fullenrich_enrich_phone."
+            ),
+        }, 0.0
+
+    people = event.get("people") or []
+    if isinstance(people, str):
+        try:
+            people = json.loads(people)
+        except json.JSONDecodeError:
+            people = []
+    entry = next(
+        (e for e in people if isinstance(e, dict) and e.get("id") == pid), {},
+    )
+    cost_usd = event["credits_consumed"] * APOLLO_CREDIT_COST_USD
+    phones: List[Dict[str, Any]] = []
+    for ph in (entry.get("phone_numbers") or []):
+        if not (isinstance(ph, dict) and (ph.get("sanitized_number") or ph.get("raw_number"))):
+            continue
+        phones.append({
+            "number": ph.get("sanitized_number") or ph.get("raw_number"),
+            "type": ph.get("type_cd"),
+            "confidence": ph.get("confidence_cd"),
+            "status": ph.get("status_cd"),
+            "dnc_status": ph.get("dnc_status_cd"),
+        })
+    if not phones:
+        return {
+            "matched": True,
+            "found": False,
+            "note": (
+                "Apollo matched the person but has no phone number — fall "
+                "back to fullenrich_enrich_phone"
+            ),
+        }, cost_usd
+    return {
+        "matched": True,
+        "found": True,
+        "person": {"name": p.get("name"), "title": p.get("title")},
+        "phones": phones,
+        "_raw_payload": event,
+    }, cost_usd
 
 
 async def _google_maps_place_details(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
@@ -1267,6 +1559,8 @@ CELL_TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any], ToolContext], Awaitable[
     "fullenrich_enrich_phone": _fullenrich_enrich_phone,
     "fullenrich_enrich_company": _fullenrich_enrich_company,
     "apollo_org_enrich": _apollo_org_enrich,
+    "apollo_enrich_person": _apollo_enrich_person,
+    "apollo_reveal_phone": _apollo_reveal_phone,
     "google_maps_place_details": _google_maps_place_details,
     "apify_search_actors": _apify_search_actors,
     "apify_actor_details": _apify_actor_details,
@@ -1314,6 +1608,8 @@ End with `final_result({values: {col_name: value, ...}})` where `col_name` is th
 
 Set a column to `null` when the value genuinely doesn't exist. Null is fine. Don't fabricate.
 
+For any URL / website / link value, return the FULL URL with its scheme — `https://example.com`, not `example.com` or `www.example.com`. A URL without `https://` won't render as a clickable link. Prepend `https://` if you only have a bare domain or a `www.` address.
+
 When you used an external tool to find a value, also pass `sources`: `final_result({values: {...}, sources: {col_name: [citation, ...]}})`.
 
 Two citation shapes — pick the one that matches the tool:
@@ -1338,14 +1634,14 @@ You have several sources. Pick the one that BEST FITS what the column wants — 
 
 ## Sources by what the column wants
 
-- **A person at a company** (founder, owner, decision-maker, manager) → `fullenrich_search_people`. LinkedIn-derived people DB — one call (limit=3, with a `titles=[...]` filter for the role you want) returns name + title + LinkedIn URL. See `find_person_at_company` skill for the filter recipe.
-- **A verified email** for a known person (you have first_name + last_name + domain) → `fullenrich_enrich_email`. Pass `linkedin_url` when the row has it — gates a deeper waterfall. If FullEnrich returns null, commit null — never pattern-guess `firstname@domain` as the answer. See `find_emails` skill.
-- **A verified phone** → `fullenrich_enrich_phone`. ~5 cr, only when the column explicitly asks for phone.
+- **A person at a company** (founder, owner, decision-maker, manager) → `fullenrich_search_people`. LinkedIn-derived people DB — one call (limit=3, with a `titles=[...]` filter for the role you want) returns name + title + LinkedIn URL. See `find_person_at_company` skill for the filter recipe. For a person the row already NAMES, `apollo_enrich_person` (name + company/domain) is the one-call alternative — title + LinkedIn + often a verified email.
+- **A verified email** for a known person (you have first_name + last_name + domain) → `apollo_enrich_person` FIRST (~$0.01; commit when `email_status='verified'`), then `fullenrich_enrich_email` when Apollo has no verified email — pass the `linkedin_url` Apollo returned (or the row's) to gate FE's deeper waterfall. If both return null, commit null — never pattern-guess `firstname@domain` as the answer. See `find_emails` skill.
+- **A verified phone** → `apollo_reveal_phone` FIRST (~1 cr on success, $0 on miss; returns mobile + work numbers with confidence and do-not-call flags, ~10-30s). Fall back to `fullenrich_enrich_phone` (~6 cr) only when Apollo has no number. Both only when the column explicitly asks for phone.
 - **Company data** (revenue, headcount, funding, tech stack, location) → `apollo_org_enrich` (free on our plan) or `fullenrich_enrich_company`.
 - **A local-business detail** (the row has a `place_id` from a prior Google Maps pull) → `google_maps_place_details`.
 - **Posts / comments / listings on a specific platform** (Reddit, X, LinkedIn, Instagram, Hacker News, etc.) → `apify_call_actor` with a platform-specific actor. Discover via `apify_search_actors` → `apify_actor_details`. Bounded to `maxItems=5` at cell level.
 - **Computation / parsing / regex** on existing row data → `code_exec`. Python sandbox, no network.
-- **An arbitrary fact on a web page** not covered above (a one-off detail, news, an "About" page lookup) → `web_search`. Cheap and fast for static / server-rendered content. The catch-all when no structured source fits — not the default.
+- **An arbitrary fact on a web page** not covered above (a one-off detail, news, an "About" page lookup) → `web_search`. Cheap and fast for static / server-rendered content. The catch-all when no structured source fits — not the default. Every call is billed: never issue an empty query, and never re-run a query (or a trivial rewording of one) that already returned nothing — change the angle or move on.
 - **The content of a SPECIFIC page whose URL you already have** (a Listing/source URL already in the row, or a result URL `web_search` just surfaced) when the snippet didn't include the detail → `fetch_url`. Opens that one page and returns its text in ~9k-token chunks (pass `page` to read further). A FALLBACK after web_search, only for a URL you already have — never to search/discover, never on a guessed or constructed URL.
 
 If the first-choice source returns empty or wrong, escalate: tighten / loosen the filter on the same source, then fall to `web_search`. If web_search surfaced the right page — or the row already carries a Listing/source URL — but the snippet lacked the detail, `fetch_url` that exact page to read it directly (cheap; the right move for "open this known page and extract X"). `browser_use` is a true last resort ($0.50+ per session) — only after web_search and fetch_url have failed, or for login walls / JS-only / antibot pages with no other access. Never pick `browser_use` predictively, and never call `fetch_url` on a URL you haven't already obtained.
@@ -1538,7 +1834,20 @@ _CELL_TOOL_DEFS: List[Dict[str, Any]] = [
             "corporate suffixes (Inc, LLC, Corp, Companies, Group) before passing "
             "company_names. Returns 0 → try `company_domains`. Both 0 → company "
             "not in FE's LinkedIn index (typically local businesses); fall to "
-            "web_search."
+            "web_search.\n\n"
+            "**Looking for a NAMED person** (the row already names them)? Pass the "
+            "name in `person_names` plus a company filter. NEVER put a name in "
+            "`titles` — `titles` means JOB titles only ('CEO', 'Director of "
+            "Security'); a name there string-matches against job titles, returns "
+            "0, and wastes the call.\n\n"
+            "**FE often abbreviates last names** ('Arman Medar' is stored as "
+            "'Arman M.', linkedin slug /in/arman-m-986331177), and a FULL-name "
+            "`person_names` search does NOT match the abbreviated form (verified "
+            "live). Recipe: full name + company first; on 0 results retry with "
+            "FIRST NAME ONLY + company, then match the last name or last INITIAL "
+            "yourself — same first name + matching initial + consistent "
+            "title/location IS your person; use that entry's linkedin_url in "
+            "enrich calls. Don't conclude 'not in FE' from a full-name miss."
         ),
         "parameters": {
             "type": "object",
@@ -1553,10 +1862,15 @@ _CELL_TOOL_DEFS: List[Dict[str, Any]] = [
                     "items": {"type": "string"},
                     "description": "Optional. Domain fallback when company_names returns 0.",
                 },
+                "person_names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "The person's name when looking for a specific NAMED person (fuzzy; combine with a company filter). Full name misses people FE stores with abbreviated last names ('Arman M.') — if full name returns 0, retry with FIRST NAME ONLY and match the last name/initial yourself in the results.",
+                },
                 "titles": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional. ONLY add as a second-call narrowing pass after a no-titles search returned >10.",
+                    "description": "Optional. JOB titles only ('CEO', 'VP Sales') — NEVER a person's name. ONLY add as a second-call narrowing pass after a no-titles search returned >10.",
                 },
                 "locations": {
                     "type": "array",
@@ -1620,10 +1934,11 @@ _CELL_TOOL_DEFS: List[Dict[str, Any]] = [
         "type": "function",
         "name": "fullenrich_enrich_phone",
         "description": (
-            "Verified phone lookup via FullEnrich. EXPENSIVE — ~5 cr per "
-            "successful match. Only use when the column explicitly asks for "
-            "a phone number. Same inputs as email; pass linkedin_url when the "
-            "row has it for a better hit rate."
+            "Verified phone lookup via FullEnrich. EXPENSIVE — ~6 cr per "
+            "successful match; the FALLBACK after apollo_reveal_phone found "
+            "nothing. Only use when the column explicitly asks for a phone "
+            "number. Same inputs as email; pass linkedin_url when the row "
+            "has it for a better hit rate."
         ),
         "parameters": {
             "type": "object",
@@ -1666,6 +1981,64 @@ _CELL_TOOL_DEFS: List[Dict[str, Any]] = [
                 "domain": {"type": "string"},
             },
             "required": ["domain"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "apollo_enrich_person",
+        "description": (
+            "Apollo person match: name + company/domain in → title, WORK email "
+            "(with verification status), LinkedIn URL, location out — one cheap "
+            "synchronous call (~$0.01 on match, $0 on miss; ~270M-contact DB).\n\n"
+            "**FIRST CHOICE for emails**: commit the email when "
+            "`email_status='verified'`. Anything else (guessed / unavailable / "
+            "missing) → fall to `fullenrich_enrich_email`, passing the "
+            "linkedin_url Apollo returned (a match without a verified email "
+            "still usually has the linkedin_url, which gates FE's deeper "
+            "waterfall).\n\n"
+            "Also a strong NAMED-person finder (alternative to "
+            "fullenrich_search_people): one call confirms the person + title + "
+            "LinkedIn. Stores full last names (no 'Arman M.' abbreviation "
+            "problem). NO phones here — use apollo_reveal_phone for numbers."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "first_name": {"type": "string"},
+                "last_name": {"type": "string"},
+                "company": {"type": "string", "description": "Company/organization name."},
+                "domain": {"type": "string", "description": "Company domain like 'anthropic.com'. Name + domain matches best."},
+                "linkedin_url": {"type": "string", "description": "Person's LinkedIn URL — strongest single identifier when the row has it."},
+                "email": {"type": "string", "description": "Reverse lookup: enrich a person from a known email."},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "apollo_reveal_phone",
+        "description": (
+            "Direct/mobile phone lookup via Apollo — FIRST CHOICE for phone "
+            "columns (~1 cr when numbers come back, $0 on miss — vs ~6 cr "
+            "for FullEnrich). Same inputs as apollo_enrich_person; also pass "
+            "linkedin_url or email when the row has one for the strongest "
+            "match. Blocks ~10-30s while Apollo's async reveal lands, then "
+            "returns numbers with type (mobile / work_hq...), confidence, "
+            "and do-not-call status. Prefer type='mobile' for direct-dial "
+            "columns; treat any number with a non-null dnc_status as "
+            "uncommittable. No numbers → fall back to fullenrich_enrich_phone."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "first_name": {"type": "string"},
+                "last_name": {"type": "string"},
+                "company": {"type": "string", "description": "Company/organization name."},
+                "domain": {"type": "string", "description": "Company domain like 'anthropic.com'. Name + domain matches best."},
+                "linkedin_url": {"type": "string", "description": "Person's LinkedIn URL — strongest single identifier when the row has it."},
+                "email": {"type": "string", "description": "Known email — exact-match identifier when the row has one."},
+            },
             "additionalProperties": False,
         },
     },
@@ -1750,7 +2123,53 @@ def _get_client() -> TrackedOpenAIClient:
 _GENERIC_VALUE_KEYS = {"value", "label", "answer", "result", "output", "v"}
 
 
+# --- URL formatting: make scheme-less URLs clickable in the FE -------------
+# The table FE only linkifies values matching ^https?://… (that's what shows
+# the open-in-new-tab icon). An agent that returns "www.example.com" (no
+# scheme) renders as plain, non-clickable text. Normalize the agent's output
+# so those become real links — WITHOUT risking non-URL cells.
+def _normalize_url_value(v: Any) -> Any:
+    """Prepend https:// to an unambiguous scheme-less URL. CONSERVATIVE BY
+    DESIGN: only touches a value that (case-insensitively) starts with 'www.',
+    has a dot after it, no scheme, and no whitespace — nothing but a web
+    address looks like that. Everything else is returned UNCHANGED:
+    already-schemed URLs, mailto:/tel:, bare words, 'N/A', numbers, multi-word
+    text, domains WITHOUT 'www.', and non-strings. So it cannot corrupt a
+    non-URL value. Bare domains (example.com) are intentionally left to the
+    system-prompt nudge — auto-detecting them risks false positives on things
+    like 'v3.2' or 'Node.js'."""
+    if not isinstance(v, str):
+        return v
+    s = v.strip()
+    if not s or any(ws in s for ws in (" ", "\t", "\n", "\r")):
+        return v
+    low = s.lower()
+    if "://" in s or low.startswith("mailto:") or low.startswith("tel:"):
+        return v
+    if low.startswith("www.") and "." in s[4:]:
+        return "https://" + s
+    return v
+
+
+def _normalize_url_values(d: Any) -> Any:
+    """Map _normalize_url_value over a final_result values dict (no-op for
+    non-dicts)."""
+    if not isinstance(d, dict):
+        return d
+    return {k: _normalize_url_value(v) for k, v in d.items()}
+
+
 def _coerce_value_keys(
+    raw: Dict[str, Any],
+    columns_to_fill: List[str],
+) -> Dict[str, Any]:
+    """Remap final_result keys onto columns_to_fill, THEN normalize URL values
+    so scheme-less links (www.x.com) render clickable. Thin wrapper over
+    _coerce_value_keys_inner so every final_result path gets both."""
+    return _normalize_url_values(_coerce_value_keys_inner(raw, columns_to_fill))
+
+
+def _coerce_value_keys_inner(
     raw: Dict[str, Any],
     columns_to_fill: List[str],
 ) -> Dict[str, Any]:
@@ -1828,6 +2247,8 @@ _TOOL_TO_SOURCE_KIND: Dict[str, str] = {
     "fullenrich_enrich_email": "fullenrich_people",
     "fullenrich_enrich_company": "fullenrich_people",
     "apollo_org_enrich": "apollo_companies",
+    "apollo_enrich_person": "apollo_people",
+    "apollo_reveal_phone": "apollo_people",
     "google_maps_place_details": "google_maps",
     "browser_use": "browser_use",
     "apify_call_actor": "apify_actor",
@@ -1838,6 +2259,60 @@ _TOOL_TO_SOURCE_KIND: Dict[str, str] = {
 def _normalize_tool_to_kind(tool_name: str) -> str:
     """Map a cell-agent tool name to a canonical sources kind for FE display."""
     return _TOOL_TO_SOURCE_KIND.get(tool_name, tool_name)
+
+
+# Paid-provider tools whose FULL response payload is worth surfacing to the
+# user (they paid for it): captured on the tool_calls_log entry as
+# `result_full`, attached to source_record citations as `payload`, and
+# rendered by the FE behind the source chip. Handlers attach the provider's
+# RAW response under `_raw_payload` (popped at the capture site BEFORE the
+# result is serialized for the model) — so the chip shows everything the
+# provider returned, not the slimmed dict the agent saw. Bounded responses
+# only — apify and browser_use can return megabytes, so they stay
+# preview-only.
+PROVIDER_PAYLOAD_TOOLS = {
+    "apollo_enrich_person",
+    "apollo_reveal_phone",
+    "apollo_org_enrich",
+    "fullenrich_enrich_email",
+    "fullenrich_enrich_phone",
+    "fullenrich_enrich_company",
+    "fullenrich_search_people",
+    "google_maps_place_details",
+}
+
+# Hard cap on a captured payload's serialized size — protects samples.tags
+# from pathological provider responses. Generous because raw provider
+# payloads (full Apollo person objects with employment history, FE
+# contact_info with all candidates) are the point of the feature; typical
+# responses are 2-30KB.
+_PAYLOAD_CAP_CHARS = 50_000
+
+
+def _capture_payload(tool_result: Any) -> Any:
+    """Size-capped copy of a provider response for citation attachment."""
+    try:
+        s = json.dumps(tool_result, default=str)
+    except Exception:
+        return None
+    if len(s) <= _PAYLOAD_CAP_CHARS:
+        return tool_result
+    return {"_truncated": True, "preview": s[:_PAYLOAD_CAP_CHARS]}
+
+
+def _last_payload_for(
+    tool_calls_log: Optional[List[Dict[str, Any]]],
+    src_name: str,
+    kind: str,
+) -> Any:
+    """Most recent captured payload for a cited tool (by raw name or kind)."""
+    for entry in reversed(tool_calls_log or []):
+        if entry.get("result_full") is None:
+            continue
+        name = entry.get("name") or ""
+        if name == src_name or _normalize_tool_to_kind(name) == kind:
+            return entry["result_full"]
+    return None
 
 
 def _looks_like_url(s: Any) -> bool:
@@ -1873,7 +2348,10 @@ def _infer_source_from_tool_calls(
             actor_id = (entry.get("args") or {}).get("actor_id")
             if isinstance(actor_id, str) and actor_id:
                 kind = f"apify_actor:{actor_id}"
-        return {"type": "source_record", "source": kind}
+        citation: Dict[str, Any] = {"type": "source_record", "source": kind}
+        if entry.get("result_full") is not None:
+            citation["payload"] = entry["result_full"]
+        return citation
     return None
 
 
@@ -1950,10 +2428,16 @@ def _coerce_sources_keys(
                     aid = explicit_aid or last_apify_actor_id
                     if aid:
                         kind = f"apify_actor:{aid}"
-                normalized.append({
+                citation: Dict[str, Any] = {
                     "type": "source_record",
                     "source": kind,
-                })
+                }
+                # Attach the provider's full response so the FE can show
+                # the raw payload behind the chip — the user paid for it.
+                payload = _last_payload_for(tool_calls_log, str(src), kind)
+                if payload is not None:
+                    citation["payload"] = payload
+                normalized.append(citation)
         if normalized:
             out[col] = normalized
     return out
@@ -2055,6 +2539,51 @@ def _get_anthropic_client():
         raw = AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         _cell_anthropic_client = TrackedAnthropicClient(raw)
     return _cell_anthropic_client
+
+
+# Block types that accept a cache_control marker. Server-injected blocks
+# (web_search_tool_result, server_tool_use, thinking) don't — skip them and
+# mark the nearest earlier cacheable block instead.
+_CACHEABLE_BLOCK_TYPES = {"text", "tool_result", "tool_use", "image", "document"}
+
+
+def _slide_cache_breakpoint(messages: List[Dict[str, Any]]) -> None:
+    """Move the conversation cache breakpoint to the newest message.
+
+    Anthropic caches longest-matching PREFIXES up to a cache_control
+    marker. The static prefix (tools + system) has its own permanent
+    breakpoint; this one slides along the conversation so turn N reads
+    turns 1..N-1 from cache and only the newest delta counts toward
+    ITPM (cache reads are ITPM-free on the 4.x models and bill at 10%;
+    writes bill at 125% once). Without it, every turn re-sends the whole
+    accumulated history — payload + every tool result — as fresh input:
+    a 25-agent research batch sustains >450k ITPM and 429-kills cells
+    (proj 274174f9, 2026-06-10: 13 cells dead after 8 retries each).
+
+    Mutates `messages` in place: strips any previous marker, then marks
+    the last cacheable block of the last message. String content is
+    converted to a single text block so it can carry the marker.
+    """
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict):
+                    b.pop("cache_control", None)
+    for m in reversed(messages):
+        c = m.get("content")
+        if isinstance(c, str):
+            if not c:
+                continue
+            m["content"] = [{"type": "text", "text": c}]
+            c = m["content"]
+        if not isinstance(c, list):
+            continue
+        for b in reversed(c):
+            if isinstance(b, dict) and b.get("type") in _CACHEABLE_BLOCK_TYPES:
+                b["cache_control"] = {"type": "ephemeral"}
+                return
+    # No cacheable block anywhere — leave unmarked; the request is still valid.
 
 
 async def _dispatch_cell_tool(
@@ -2224,6 +2753,12 @@ async def _anthropic_cell_loop(
         if total_cost >= cap_usd:
             return final_values, final_sources, total_cost, "hit_budget", "budget cap reached"
 
+        # Slide the conversation cache breakpoint onto the newest message
+        # so this turn reads the prior history from cache instead of
+        # re-paying it as fresh ITPM. Once per turn — retries below resend
+        # the identical request, so the marker stays put.
+        _slide_cache_breakpoint(messages)
+
         # Retry transient overload/rate-limit/timeout before giving up. A
         # concurrent contact batch 429'd Anthropic within ~7s and, with no
         # retry here, blanked 145/246 cells on proj 1a3f68bc. Backoff +
@@ -2349,12 +2884,19 @@ async def _anthropic_cell_loop(
 
             tool_result, tool_cost = await _dispatch_cell_tool(name, args, ctx, tier_cfg, total_cost)
             total_cost += tool_cost
-            tool_calls_log.append({
+            # Raw provider response rides out of handlers under _raw_payload —
+            # pop it BEFORE preview/model serialization so only the payload
+            # capture (never the LLM) sees the full blob.
+            raw_payload = tool_result.pop("_raw_payload", None) if isinstance(tool_result, dict) else None
+            _log_entry: Dict[str, Any] = {
                 "name": name,
                 "args": args,
                 "result_preview": json.dumps(tool_result, default=str)[:400],
                 "cost": tool_cost,
-            })
+            }
+            if name in PROVIDER_PAYLOAD_TOOLS and isinstance(tool_result, dict) and "error" not in tool_result:
+                _log_entry["result_full"] = _capture_payload(raw_payload if raw_payload is not None else tool_result)
+            tool_calls_log.append(_log_entry)
             tool_result_blocks.append({
                 "type": "tool_result",
                 "tool_use_id": tu.id,
@@ -2503,6 +3045,11 @@ def _persist_cell_dossier(
                 continue
             cites = final_sources.get(col) if isinstance(final_sources, dict) else None
             src = cites[0] if isinstance(cites, list) and cites else None
+            # Strip the raw provider payload from the dossier copy — facts get
+            # replayed verbatim into future agent prompts, and a multi-KB
+            # payload there would bloat every later run's input.
+            if isinstance(src, dict) and "payload" in src:
+                src = {k: v for k, v in src.items() if k != "payload"}
             new_facts[col] = {"value": val, "source": src, "at": now_iso}
     for entry in reversed(tool_calls_log):
         if entry.get("name") == "final_result":
@@ -3008,12 +3555,18 @@ async def run_cell_agent(
                             tool_cost = 0.0
 
                 total_cost += tool_cost
-                tool_calls_log.append({
+                # Same _raw_payload pop as the Anthropic loop: capture the raw
+                # provider response, never send it to the model.
+                raw_payload = tool_result.pop("_raw_payload", None) if isinstance(tool_result, dict) else None
+                _log_entry: Dict[str, Any] = {
                     "name": name,
                     "args": args,
                     "result_preview": json.dumps(tool_result, default=str)[:400],
                     "cost": tool_cost,
-                })
+                }
+                if name in PROVIDER_PAYLOAD_TOOLS and isinstance(tool_result, dict) and "error" not in tool_result:
+                    _log_entry["result_full"] = _capture_payload(raw_payload if raw_payload is not None else tool_result)
+                tool_calls_log.append(_log_entry)
                 input_items.append({
                     "type": "function_call_output",
                     "call_id": fc.call_id,

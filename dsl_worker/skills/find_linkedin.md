@@ -28,9 +28,20 @@ can use FullEnrich/Apollo first.
 
 **Tool order:**
 1. **FullEnrich** (`fullenrich_search_people` or `fullenrich_enrich_contacts`)
-   when you have name + company. Cheapest verified path.
-2. **Apollo** (`apollo_enrich_person`) as fallback for B2B people, especially
-   if FE returned nothing.
+   when you have name + company. Cheapest verified path. Pass
+   `person_names=["<First Last>"]` + `company_names` — never the
+   person's name in `titles` (that's a job-title filter and returns 0).
+   Full name returning 0 ≠ not in FE: rosters store abbreviated last
+   names ("Arman Medar" → "Arman M.", slug `/in/arman-m-986331177`)
+   and full-name search misses those — retry `person_names=["<First>"]`
+   + company and match the last name or last INITIAL yourself. First
+   name + initial + matching title/company IS the person, and that
+   entry's `linkedin_url` is exactly the answer this column wants.
+2. **Apollo** (`apollo_enrich_person`) — name + company/domain in, person +
+   `linkedin_url` out, ~$0.01 on match / $0 on miss. Stores FULL last
+   names (no "Arman M." abbreviation problem), so it often hits where
+   FE's name search missed. Verify the returned person's company/title
+   against the row before committing the URL.
 3. **web_search** with `"Full Name" company linkedin.com/in`. The URL pattern
    `linkedin.com/in/<slug>` shows up in result snippets even when the
    profile itself isn't crawled.
