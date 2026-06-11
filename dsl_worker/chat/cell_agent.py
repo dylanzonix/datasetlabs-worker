@@ -849,6 +849,42 @@ async def _apollo_org_enrich(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Di
     }, 0.0  # organizations/enrich is request-quota-limited, not credit-billed
 
 
+def _apollo_employer_alignment(args: Dict[str, Any], person: Dict[str, Any]) -> Tuple[Optional[bool], str]:
+    """Does Apollo's matched person currently work where the caller said?
+
+    Returns (aligned, evidence): True/False when the match carries employer
+    signals to compare against the requested company/domain, None when it
+    doesn't (or none was requested). Catches Apollo's classic same-name
+    different-company mismatch — asked for Eric Gonzalez @ San Diego Padres,
+    got the Cincinnati Reds one (observed live: the wrong man's mobile was
+    revealed and committed) — BEFORE any phone credits burn.
+    """
+    requested_co = str(args.get("company") or args.get("organization_name") or "").strip().lower()
+    requested_dom = str(args.get("domain") or "").strip().lower().removeprefix("www.")
+    if not (requested_co or requested_dom):
+        return None, ""
+    org = person.get("organization") or {}
+    org_name = (org.get("name") or "").strip()
+    org_site = (org.get("website_url") or "").lower()
+    headline = (person.get("headline") or "")
+    if org_name:
+        n = org_name.lower()
+        if requested_co and (requested_co in n or n in requested_co):
+            return True, org_name
+        if requested_dom and requested_dom in org_site:
+            return True, org_name
+        return False, org_name
+    if requested_dom and org_site:
+        return (requested_dom in org_site), org_site
+    # No org object on the match — fall back to the headline's "<title> at
+    # <Company>" convention when present.
+    if headline and " at " in headline.lower():
+        if requested_co and requested_co in headline.lower():
+            return True, headline
+        return False, headline
+    return None, ""
+
+
 async def _apollo_enrich_person(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
     """Apollo people/match — person enrichment by name + company/domain.
 
@@ -908,7 +944,7 @@ async def _apollo_enrich_person(args: Dict[str, Any], ctx: ToolContext) -> Tuple
     if not any([p.get("title"), email, p.get("linkedin_url"), p.get("headline")]):
         return {"matched": False, "note": "Apollo has no data on this person"}, 0.0
     org = p.get("organization") or {}
-    return {
+    out = {
         "matched": True,
         "name": p.get("name"),
         "first_name": p.get("first_name"),
@@ -924,10 +960,21 @@ async def _apollo_enrich_person(args: Dict[str, Any], ctx: ToolContext) -> Tuple
         "organization": {
             "name": org.get("name"),
             "website_url": org.get("website_url"),
-            "phone": org.get("sanitized_phone") or org.get("phone"),
+            # Self-describing key: this is the company's MAIN line, never a
+            # person-level number (agents were committing it as "Work Phone").
+            "switchboard_phone": org.get("sanitized_phone") or org.get("phone"),
         },
         "_raw_payload": p,
-    }, APOLLO_MATCH_COST_USD
+    }
+    aligned, evidence = _apollo_employer_alignment(args, p)
+    if aligned is False:
+        out["warning"] = (
+            f"Apollo's match currently works at '{evidence}', NOT the company "
+            f"you asked about — likely a same-name different person (or a job "
+            f"change). Do not commit this contact info for the row without "
+            f"independent corroboration."
+        )
+    return out, APOLLO_MATCH_COST_USD
 
 
 # Poll ceiling for Apollo's webhook-delivered phone reveals. Observed
@@ -984,6 +1031,52 @@ async def _apollo_reveal_phone(args: Dict[str, Any], ctx: ToolContext) -> Tuple[
             body[k_out] = str(v).strip()
     if not body:
         return {"error": "pass a name + company/domain, or a linkedin_url, or an email"}, 0.0
+
+    # Phase 1 — VALIDATE the match before any phone credits burn: a plain
+    # match (1 export credit ≈ $0.01) tells us WHO Apollo would reveal. A
+    # reveal on a same-name wrong-person match costs 8 credits and poisons
+    # the row with a real-but-wrong mobile (observed live: asked for Eric
+    # Gonzalez @ Padres, Apollo revealed the Cincinnati Reds one).
+    async def _match(payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(
+                    "https://api.apollo.io/api/v1/people/match",
+                    json=payload,
+                    headers={"X-Api-Key": api_key},
+                )
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+            return None, f"Apollo people/match timeout: {e}"
+        if r.status_code != 200:
+            return None, f"Apollo HTTP {r.status_code}: {r.text[:160]}"
+        return (r.json() or {}).get("person") or {}, None
+
+    p, err = await _match(body)
+    if err:
+        return {"error": err}, 0.0
+    pid = p.get("id")
+    if not pid:
+        return {"matched": False, "note": "Apollo has no record of this person"}, 0.0
+    aligned, evidence = _apollo_employer_alignment(args, p)
+    if aligned is False:
+        return {
+            "found": False,
+            "wrong_person": True,
+            "matched_person": {
+                "name": p.get("name"),
+                "title": p.get("title"),
+                "employer": evidence,
+            },
+            "note": (
+                f"Apollo's best match for this name currently works at "
+                f"'{evidence}', NOT the company you asked about — revealing "
+                f"would return a real mobile belonging to the wrong person, "
+                f"so nothing was revealed. If this IS the right person (job "
+                f"change), re-call with their linkedin_url or email only."
+            ),
+        }, APOLLO_MATCH_COST_USD
+
+    # Phase 2 — fire the reveal.
     body["reveal_phone_number"] = True
     body["webhook_url"] = (
         f"{supabase_url}/rest/v1/apollo_webhook_events"
@@ -1007,21 +1100,10 @@ async def _apollo_reveal_phone(args: Dict[str, Any], ctx: ToolContext) -> Tuple[
     finally:
         db.close()
 
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(
-                "https://api.apollo.io/api/v1/people/match",
-                json=body,
-                headers={"X-Api-Key": api_key},
-            )
-    except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
-        return {"error": f"Apollo people/match timeout: {e}"}, 0.0
-    if r.status_code != 200:
-        return {"error": f"Apollo HTTP {r.status_code}: {r.text[:160]}"}, 0.0
-    p = (r.json() or {}).get("person") or {}
-    pid = p.get("id")
-    if not pid:
-        return {"matched": False, "note": "Apollo has no record of this person"}, 0.0
+    p2, err = await _match(body)
+    if err:
+        return {"error": err}, APOLLO_MATCH_COST_USD
+    pid = (p2 or {}).get("id") or pid
 
     event: Optional[Dict[str, Any]] = None
     deadline = time.monotonic() + APOLLO_PHONE_POLL_TIMEOUT_S
@@ -1057,7 +1139,7 @@ async def _apollo_reveal_phone(args: Dict[str, Any], ctx: ToolContext) -> Tuple[
                 f"{int(APOLLO_PHONE_POLL_TIMEOUT_S)}s. Do NOT retry this tool "
                 f"for this row; fall back to fullenrich_enrich_phone."
             ),
-        }, 0.0
+        }, APOLLO_MATCH_COST_USD
 
     people = event.get("people") or []
     if isinstance(people, str):
@@ -1068,7 +1150,8 @@ async def _apollo_reveal_phone(args: Dict[str, Any], ctx: ToolContext) -> Tuple[
     entry = next(
         (e for e in people if isinstance(e, dict) and e.get("id") == pid), {},
     )
-    cost_usd = event["credits_consumed"] * APOLLO_CREDIT_COST_USD
+    # The validation match (phase 1) consumed an export credit too.
+    cost_usd = APOLLO_MATCH_COST_USD + event["credits_consumed"] * APOLLO_CREDIT_COST_USD
     phones: List[Dict[str, Any]] = []
     for ph in (entry.get("phone_numbers") or []):
         if not (isinstance(ph, dict) and (ph.get("sanitized_number") or ph.get("raw_number"))):
@@ -1092,7 +1175,12 @@ async def _apollo_reveal_phone(args: Dict[str, Any], ctx: ToolContext) -> Tuple[
     return {
         "matched": True,
         "found": True,
-        "person": {"name": p.get("name"), "title": p.get("title")},
+        "person": {
+            "name": p.get("name"),
+            "title": p.get("title"),
+            "organization": evidence or ((p.get("organization") or {}).get("name")),
+        },
+        "employer_check": "verified" if aligned else "unverifiable",
         "phones": phones,
         "_raw_payload": event,
     }, cost_usd
@@ -1636,7 +1724,7 @@ You have several sources. Pick the one that BEST FITS what the column wants — 
 
 - **A person at a company** (founder, owner, decision-maker, manager) → `fullenrich_search_people`. LinkedIn-derived people DB — one call (limit=3, with a `titles=[...]` filter for the role you want) returns name + title + LinkedIn URL. See `find_person_at_company` skill for the filter recipe. For a person the row already NAMES, `apollo_enrich_person` (name + company/domain) is the one-call alternative — title + LinkedIn + often a verified email.
 - **A verified email** for a known person (you have first_name + last_name + domain) → `apollo_enrich_person` FIRST (~$0.01; commit when `email_status='verified'`), then `fullenrich_enrich_email` when Apollo has no verified email — pass the `linkedin_url` Apollo returned (or the row's) to gate FE's deeper waterfall. If both return null, commit null — never pattern-guess `firstname@domain` as the answer. See `find_emails` skill.
-- **A verified phone** → `apollo_reveal_phone` FIRST (~1 cr on success, $0 on miss; returns mobile + work numbers with confidence and do-not-call flags, ~10-30s). Fall back to `fullenrich_enrich_phone` (~6 cr) only when Apollo has no number. Both only when the column explicitly asks for phone.
+- **A verified phone** → `apollo_reveal_phone` FIRST (~1 cr on success, $0 on miss; returns mobile + work numbers with confidence and do-not-call flags, ~10-30s). Fall back to `fullenrich_enrich_phone` (~6 cr) only when Apollo has no number. Both only when the column explicitly asks for phone. A company switchboard / toll-free main line is NEVER a person's phone — never commit one to a person-level phone column (org numbers belong only in explicitly company-level columns), and never commit a second mobile as someone's "work phone".
 - **Company data** (revenue, headcount, funding, tech stack, location) → `apollo_org_enrich` (free on our plan) or `fullenrich_enrich_company`.
 - **A local-business detail** (the row has a `place_id` from a prior Google Maps pull) → `google_maps_place_details`.
 - **Posts / comments / listings on a specific platform** (Reddit, X, LinkedIn, Instagram, Hacker News, etc.) → `apify_call_actor` with a platform-specific actor. Discover via `apify_search_actors` → `apify_actor_details`. Bounded to `maxItems=5` at cell level.
@@ -2027,7 +2115,13 @@ _CELL_TOOL_DEFS: List[Dict[str, Any]] = [
             "returns numbers with type (mobile / work_hq...), confidence, "
             "and do-not-call status. Prefer type='mobile' for direct-dial "
             "columns; treat any number with a non-null dnc_status as "
-            "uncommittable. No numbers → fall back to fullenrich_enrich_phone."
+            "uncommittable. Multiple returned numbers are ALL candidates for "
+            "the SAME person — never file an extra mobile as the person's "
+            "work phone. Validates employer BEFORE revealing: wrong_person=true "
+            "means Apollo's match works elsewhere and nothing was revealed — "
+            "re-call with linkedin_url/email only if it's genuinely the same "
+            "person after a job change. No numbers → fall back to "
+            "fullenrich_enrich_phone."
         ),
         "parameters": {
             "type": "object",
