@@ -575,7 +575,22 @@ async def _fullenrich_enrich_phone(args: Dict[str, Any], ctx: ToolContext) -> Tu
                 phone = p.get("number")
                 region = p.get("region")
                 break
-    return {"phone": phone, "region": region, "_raw_payload": raw_payload}, credits
+    # Same lesson as the email handler's explicit status map: without a
+    # commit signal the model holds provider numbers to an impossible
+    # "independently verify it" bar and silently returns null (observed:
+    # 4 runs in a row discarded the same FE-returned number as
+    # "unverified"). FE only returns person-attributed numbers; the type
+    # (mobile vs landline) is simply unlabeled.
+    return {
+        "phone": phone,
+        "region": region,
+        "commit": phone is not None,
+        "reliability": (
+            "provider-verified for this person — counts as 'reliably found'; "
+            "type (mobile vs landline) unlabeled, usually a direct mobile"
+        ) if phone else None,
+        "_raw_payload": raw_payload,
+    }, credits
 
 
 async def _fullenrich_enrich_company(args: Dict[str, Any], ctx: ToolContext) -> Tuple[Dict[str, Any], float]:
@@ -1724,7 +1739,7 @@ You have several sources. Pick the one that BEST FITS what the column wants — 
 
 - **A person at a company** (founder, owner, decision-maker, manager) → `fullenrich_search_people`. LinkedIn-derived people DB — one call (limit=3, with a `titles=[...]` filter for the role you want) returns name + title + LinkedIn URL. See `find_person_at_company` skill for the filter recipe. For a person the row already NAMES, `apollo_enrich_person` (name + company/domain) is the one-call alternative — title + LinkedIn + often a verified email.
 - **A verified email** for a known person (you have first_name + last_name + domain) → `apollo_enrich_person` FIRST (~$0.01; commit when `email_status='verified'`), then `fullenrich_enrich_email` when Apollo has no verified email — pass the `linkedin_url` Apollo returned (or the row's) to gate FE's deeper waterfall. If both return null, commit null — never pattern-guess `firstname@domain` as the answer. See `find_emails` skill.
-- **A verified phone** → `apollo_reveal_phone` FIRST (~1 cr on success, $0 on miss; returns mobile + work numbers with confidence and do-not-call flags, ~10-30s). Fall back to `fullenrich_enrich_phone` (~6 cr) only when Apollo has no number. Both only when the column explicitly asks for phone. A company switchboard / toll-free main line is NEVER a person's phone — never commit one to a person-level phone column (org numbers belong only in explicitly company-level columns), and never commit a second mobile as someone's "work phone". A number these providers RETURN is the deliverable — commit it citing the provider. Personal numbers are essentially never corroborable on the open web, and an area code that doesn't match the person's current city is normal (mobiles move with people) — neither is a reason to reject a provider's number. FullEnrich numbers come untyped: file one under the best-fitting column with a "type unconfirmed" note in the companion/source column rather than committing null.
+- **A verified phone** → `apollo_reveal_phone` FIRST (~1 cr on success, $0 on miss; returns mobile + work numbers with confidence and do-not-call flags, ~10-30s). Fall back to `fullenrich_enrich_phone` (~6 cr) only when Apollo has no number. Both only when the column explicitly asks for phone. A company switchboard / toll-free main line is NEVER a person's phone — never commit one to a person-level phone column (org numbers belong only in explicitly company-level columns), and never commit a second mobile as someone's "work phone". A number these providers RETURN is the deliverable — commit it citing the provider. Provider attribution IS the verification: a column prompt asking for a "reliable"/"verified" phone is SATISFIED by a provider-returned number. Personal numbers are essentially never corroborable on the open web, and an area code that doesn't match the person's current city is normal (mobiles move with people) — neither is a reason to null out a provider's number. FullEnrich numbers come unlabeled but are predominantly direct mobiles: default one to the mobile/direct column (with a "type unconfirmed" note in a companion column when one exists) rather than committing null.
 - **Company data** (revenue, headcount, funding, tech stack, location) → `apollo_org_enrich` (free on our plan) or `fullenrich_enrich_company`.
 - **A local-business detail** (the row has a `place_id` from a prior Google Maps pull) → `google_maps_place_details`.
 - **Posts / comments / listings on a specific platform** (Reddit, X, LinkedIn, Instagram, Hacker News, etc.) → `apify_call_actor` with a platform-specific actor. Discover via `apify_search_actors` → `apify_actor_details`. Bounded to `maxItems=5` at cell level.
@@ -3034,9 +3049,19 @@ _DOSSIER_NOTES_PROP: Dict[str, Any] = {
         "\"founder_linkedin\": \"https://linkedin.com/in/...\"}. Stored verbatim "
         "and shown to later runs of this row as `known`, so they skip "
         "re-researching it. Keys are short snake_case labels; values are the "
-        "literal data."
+        "literal data. ONLY concrete reusable data points (IDs, URLs, domains, "
+        "emails, numbers) — NEVER conclusions, statuses, or judgments like "
+        "'no phone found' or 'unverified': a stored conclusion gets replayed "
+        "to future runs as established fact and locks them into repeating it."
     ),
 }
+
+# Note keys that smell like conclusions/run-status rather than data points.
+# A prior run's "phone_search_status: ...no reliable number available" was
+# persisted as a fact, replayed as `known` (which the agent is told to
+# trust), and locked every subsequent run into committing null while
+# parroting the old rationale. Data points only; judgments never.
+_DOSSIER_NOTE_KEY_BLOCKLIST = ("status", "search", "summary", "conclusion", "attempt", "note")
 
 _DOSSIER_SYSTEM_SECTION = """# Row memory
 This row may include two extra fields:
@@ -3153,8 +3178,11 @@ def _persist_cell_dossier(
             notes = (entry.get("args") or {}).get("notes")
             if isinstance(notes, dict):
                 for k, v in notes.items():
-                    if isinstance(k, str) and v not in (None, ""):
-                        new_facts.setdefault(k, {"value": v, "source": None, "at": now_iso})
+                    if not (isinstance(k, str) and v not in (None, "")):
+                        continue
+                    if any(b in k.lower() for b in _DOSSIER_NOTE_KEY_BLOCKLIST):
+                        continue
+                    new_facts.setdefault(k, {"value": v, "source": None, "at": now_iso})
             break
 
     # Dead-ends: only when the run left target columns unfilled. Record the
@@ -3219,7 +3247,7 @@ def _persist_cell_dossier(
                     num = None
                 if num:
                     new_facts.setdefault(
-                        "fullenrich_phone_type_unconfirmed",
+                        "fullenrich_phone",
                         {"value": num,
                          "source": {"type": "source_record", "source": "fullenrich_people"},
                          "at": now_iso},
