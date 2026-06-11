@@ -759,6 +759,36 @@ def delete_column(
         sa_text("UPDATE tables SET columns=CAST(:cols AS jsonb) WHERE id=:tid"),
         {"cols": json.dumps(cols), "tid": tid},
     )
+    # Prune the column from every enrichment that owns it — the enrichment
+    # definition is the source of truth at run time, and _ensure_columns_on_table
+    # re-adds (and the cell agent refills) any column still listed there, so a
+    # deleted column would resurrect on the next run (observed: proj 1ac793db).
+    # An enrichment left with zero columns is soft-deleted — nothing to fill.
+    enr_rows = db.execute(
+        sa_text(
+            "SELECT id::text, columns FROM enrichments "
+            "WHERE table_id=:tid AND deleted_at IS NULL"
+        ),
+        {"tid": tid},
+    ).fetchall()
+    for eid, ecols_raw in enr_rows:
+        ecols = ecols_raw if isinstance(ecols_raw, list) else (json.loads(ecols_raw) if ecols_raw else [])
+        kept = [c for c in ecols if not (isinstance(c, dict) and c.get("name") == column_name)]
+        if len(kept) == len(ecols):
+            continue
+        if kept:
+            db.execute(
+                sa_text("UPDATE enrichments SET columns=CAST(:cols AS jsonb) WHERE id=:id"),
+                {"cols": json.dumps(kept), "id": eid},
+            )
+        else:
+            db.execute(
+                sa_text(
+                    "UPDATE enrichments SET columns=CAST(:cols AS jsonb), deleted_at=now() "
+                    "WHERE id=:id"
+                ),
+                {"cols": json.dumps(kept), "id": eid},
+            )
     # Strip the column key from every sample row + tags subkeys. Cheap
     # for small tables; for huge tables this should move to a job.
     rows = db.execute(
