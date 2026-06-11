@@ -1724,7 +1724,7 @@ You have several sources. Pick the one that BEST FITS what the column wants — 
 
 - **A person at a company** (founder, owner, decision-maker, manager) → `fullenrich_search_people`. LinkedIn-derived people DB — one call (limit=3, with a `titles=[...]` filter for the role you want) returns name + title + LinkedIn URL. See `find_person_at_company` skill for the filter recipe. For a person the row already NAMES, `apollo_enrich_person` (name + company/domain) is the one-call alternative — title + LinkedIn + often a verified email.
 - **A verified email** for a known person (you have first_name + last_name + domain) → `apollo_enrich_person` FIRST (~$0.01; commit when `email_status='verified'`), then `fullenrich_enrich_email` when Apollo has no verified email — pass the `linkedin_url` Apollo returned (or the row's) to gate FE's deeper waterfall. If both return null, commit null — never pattern-guess `firstname@domain` as the answer. See `find_emails` skill.
-- **A verified phone** → `apollo_reveal_phone` FIRST (~1 cr on success, $0 on miss; returns mobile + work numbers with confidence and do-not-call flags, ~10-30s). Fall back to `fullenrich_enrich_phone` (~6 cr) only when Apollo has no number. Both only when the column explicitly asks for phone. A company switchboard / toll-free main line is NEVER a person's phone — never commit one to a person-level phone column (org numbers belong only in explicitly company-level columns), and never commit a second mobile as someone's "work phone".
+- **A verified phone** → `apollo_reveal_phone` FIRST (~1 cr on success, $0 on miss; returns mobile + work numbers with confidence and do-not-call flags, ~10-30s). Fall back to `fullenrich_enrich_phone` (~6 cr) only when Apollo has no number. Both only when the column explicitly asks for phone. A company switchboard / toll-free main line is NEVER a person's phone — never commit one to a person-level phone column (org numbers belong only in explicitly company-level columns), and never commit a second mobile as someone's "work phone". A number these providers RETURN is the deliverable — commit it citing the provider. Personal numbers are essentially never corroborable on the open web, and an area code that doesn't match the person's current city is normal (mobiles move with people) — neither is a reason to reject a provider's number. FullEnrich numbers come untyped: file one under the best-fitting column with a "type unconfirmed" note in the companion/source column rather than committing null.
 - **Company data** (revenue, headcount, funding, tech stack, location) → `apollo_org_enrich` (free on our plan) or `fullenrich_enrich_company`.
 - **A local-business detail** (the row has a `place_id` from a prior Google Maps pull) → `google_maps_place_details`.
 - **Posts / comments / listings on a specific platform** (Reddit, X, LinkedIn, Instagram, Hacker News, etc.) → `apify_call_actor` with a platform-specific actor. Discover via `apify_search_actors` → `apify_actor_details`. Bounded to `maxItems=5` at cell level.
@@ -2026,7 +2026,10 @@ _CELL_TOOL_DEFS: List[Dict[str, Any]] = [
             "successful match; the FALLBACK after apollo_reveal_phone found "
             "nothing. Only use when the column explicitly asks for a phone "
             "number. Same inputs as email; pass linkedin_url when the row "
-            "has it for a better hit rate."
+            "has it for a better hit rate. A returned number is FE's "
+            "verified answer for this person — COMMIT it (it comes untyped: "
+            "note 'type unconfirmed' in a companion column when the "
+            "mobile/work split matters, instead of discarding the number)."
         ),
         "parameters": {
             "type": "object",
@@ -3176,13 +3179,70 @@ def _persist_cell_dossier(
                 failed = (
                     '"error"' in preview
                     or "not_found" in preview
+                    # Provider soft-misses (apollo matched-but-no-phone /
+                    # no-match) serialize as found/matched: false — without
+                    # these patterns the miss was never recorded and every
+                    # re-run re-bought the same Apollo reveal (observed: 4
+                    # identical reveals for one row across re-runs).
+                    or '"found": false' in preview
+                    or '"matched": false' in preview
                     or preview.strip() in ("", "[]", "{}", "null")
                 )
                 if failed:
                     hint = args.get("url") or args.get("actor_id") or args.get("domain") or ""
+                    outcome = "no_result"
+                    if '"wrong_person": true' in preview:
+                        outcome = (
+                            "apollo's match works at a DIFFERENT company — "
+                            "wrong person; only retry with linkedin_url/email"
+                        )
+                    elif name == "apollo_reveal_phone" and '"found": false' in preview:
+                        outcome = (
+                            "apollo matched the person but has NO phone on "
+                            "file — do not re-reveal; use fullenrich"
+                        )
                     new_tried.append(
-                        {"q": f"{name} {hint}".strip(), "outcome": "no_result", "at": now_iso}
+                        {"q": f"{name} {hint}".strip(), "outcome": outcome, "at": now_iso}
                     )
+
+        # A provider RETURNED a number this run but the agent left the phone
+        # column(s) unfilled (e.g. judged it unverifiable). Park the number in
+        # facts verbatim, with provenance, so the next run starts from the
+        # number instead of re-buying the whole search.
+        for entry in tool_calls_log:
+            name = entry.get("name")
+            preview = str(entry.get("result_preview") or "")
+            if name == "fullenrich_enrich_phone" and '"phone": "+' in preview:
+                try:
+                    num = json.loads(preview).get("phone")
+                except Exception:
+                    num = None
+                if num:
+                    new_facts.setdefault(
+                        "fullenrich_phone_type_unconfirmed",
+                        {"value": num,
+                         "source": {"type": "source_record", "source": "fullenrich_people"},
+                         "at": now_iso},
+                    )
+            elif name == "apollo_reveal_phone" and '"found": true' in preview:
+                # result_full holds the untruncated webhook event (the
+                # 400-char preview can cut mid-JSON on multi-number reveals).
+                rf = entry.get("result_full")
+                people = rf.get("people") if isinstance(rf, dict) else None
+                for pp in (people or []):
+                    if not isinstance(pp, dict):
+                        continue
+                    for ph in (pp.get("phone_numbers") or []):
+                        if not isinstance(ph, dict):
+                            continue
+                        number = ph.get("sanitized_number") or ph.get("raw_number")
+                        if number:
+                            new_facts.setdefault(
+                                f"apollo_{ph.get('type_cd') or 'phone'}",
+                                {"value": number,
+                                 "source": {"type": "source_record", "source": "apollo_people"},
+                                 "at": now_iso},
+                            )
 
     if not (new_facts or new_tried):
         return
