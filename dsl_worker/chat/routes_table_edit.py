@@ -789,36 +789,31 @@ def delete_column(
                 ),
                 {"cols": json.dumps(kept), "id": eid},
             )
-    # Strip the column key from every sample row + tags subkeys. Cheap
-    # for small tables; for huge tables this should move to a job.
-    rows = db.execute(
+    # Strip the column key from every sample row + per-column tag buckets in
+    # ONE bulk UPDATE per JSONB field — the prior implementation issued one
+    # round-trip per row (990 rows × ~90ms = 88s over the Supabase pooler),
+    # which exceeded typical browser/proxy timeouts and silently rolled the
+    # delete back when the user refreshed mid-strip. Postgres' `jsonb - text`
+    # removes a key in place; jsonb_set on each per-column bucket nukes the
+    # subkey if present. All four UPDATEs together take one round trip.
+    db.execute(
         sa_text(
-            "SELECT id::text, row, tags FROM samples "
-            "WHERE table_id=:tid AND deleted_at IS NULL"
+            "UPDATE samples SET row = row - :col "
+            "WHERE table_id=:tid AND deleted_at IS NULL AND row ? :col"
         ),
-        {"tid": tid},
-    ).fetchall()
-    for rid, row_data, tags_data in rows:
-        rd = row_data if isinstance(row_data, dict) else (json.loads(row_data) if row_data else {})
-        if column_name in rd:
-            del rd[column_name]
-            db.execute(
-                sa_text("UPDATE samples SET row=CAST(:row AS jsonb) WHERE id=:id"),
-                {"row": json.dumps(rd), "id": rid},
-            )
-        if tags_data:
-            td = tags_data if isinstance(tags_data, dict) else json.loads(tags_data)
-            changed = False
-            for key in ("sources", "fill_status", "email_verification"):
-                bucket = td.get(key) if isinstance(td, dict) else None
-                if isinstance(bucket, dict) and column_name in bucket:
-                    del bucket[column_name]
-                    changed = True
-            if changed:
-                db.execute(
-                    sa_text("UPDATE samples SET tags=CAST(:tags AS jsonb) WHERE id=:id"),
-                    {"tags": json.dumps(td), "id": rid},
-                )
+        {"tid": tid, "col": column_name},
+    )
+    for bucket in ("sources", "fill_status", "email_verification"):
+        db.execute(
+            sa_text(
+                f"UPDATE samples "
+                f"SET tags = jsonb_set(tags, '{{{bucket}}}', (tags->'{bucket}') - :col) "
+                f"WHERE table_id=:tid AND deleted_at IS NULL "
+                f"  AND jsonb_typeof(tags->'{bucket}') = 'object' "
+                f"  AND (tags->'{bucket}') ? :col"
+            ),
+            {"tid": tid, "col": column_name},
+        )
     db.commit()
     return {"columns": cols}
 
