@@ -2860,6 +2860,14 @@ async def _anthropic_cell_loop(
     final_sources: Dict[str, List[Dict[str, Any]]] = {}
     total_cost = 0.0
     HARD_TURN_LIMIT = 40
+    # Track consecutive turns where every tool the LLM tried got refused by
+    # the pre-call budget gate. Without this backstop, once remaining falls
+    # below the cheapest tool's cost the agent text-loops to HARD_TURN_LIMIT
+    # (~8 min wall-clock) producing nothing — we observed this on a row
+    # whose budget was exhausted 7 minutes before the task ended. One turn
+    # of all-skipped is allowed (gives the LLM a chance to react and call
+    # final_result); a second confirms there's no useful work left.
+    budget_skip_streak = 0
 
     for _turn in range(HARD_TURN_LIMIT):
         if total_cost >= cap_usd:
@@ -2976,6 +2984,7 @@ async def _anthropic_cell_loop(
             return final_values, final_sources, total_cost, "error", "no tool_use and no parseable message"
 
         tool_result_blocks: List[Dict[str, Any]] = []
+        all_budget_skipped = True
         for tu in tool_use_blocks:
             name = tu.name
             args = tu.input if isinstance(tu.input, dict) else {}
@@ -3009,6 +3018,11 @@ async def _anthropic_cell_loop(
             if name in PROVIDER_PAYLOAD_TOOLS and isinstance(tool_result, dict) and "error" not in tool_result:
                 _log_entry["result_full"] = _capture_payload(raw_payload if raw_payload is not None else tool_result)
             tool_calls_log.append(_log_entry)
+            # Any non-skip outcome (success, free tool, non-budget error)
+            # resets the streak — only the pre-call budget gate's exact
+            # "error: budget" sentinel counts as a skip.
+            if not (isinstance(tool_result, dict) and tool_result.get("error") == "budget"):
+                all_budget_skipped = False
             tool_result_blocks.append({
                 "type": "tool_result",
                 "tool_use_id": tu.id,
@@ -3016,6 +3030,17 @@ async def _anthropic_cell_loop(
             })
             if total_cost >= cap_usd:
                 return final_values, final_sources, total_cost, "hit_budget", "budget cap reached before final_result"
+
+        # Budget-skip backstop: see HARD_TURN_LIMIT comment above. Only fires
+        # when the turn made tool calls AND every one was refused as too
+        # expensive for the remaining budget. Reset when any tool ran (or
+        # returned a non-budget error).
+        if all_budget_skipped:
+            budget_skip_streak += 1
+            if budget_skip_streak >= 2:
+                return final_values, final_sources, total_cost, "hit_budget", "budget cap reached (no affordable tools remaining)"
+        else:
+            budget_skip_streak = 0
 
         messages.append({"role": "user", "content": tool_result_blocks})
 
