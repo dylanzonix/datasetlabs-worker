@@ -386,16 +386,18 @@ You also can't sequence on enrichment results in the same turn. Don't call `enri
 Four scope types; pick the one that matches what the user asked for:
 
 ```
-{type: "first_n",    first_n: 10}                           # first 10 by seq
+{type: "first_n",    first_n: 10}                           # first 10 in the table's active sort order
 {type: "row_ids",    row_ids: ["<uuid>", "<uuid>"]}         # exactly these rows
 {type: "filtered",   filters: [{column, op, value}, ...],
                      first_n?: 10}                          # rows matching filters, optionally capped
 {type: "all_unfilled", first_n?: 10}                        # every row missing a target column, optionally capped
 ```
 
+All non-`row_ids` scopes are ordered by the table's active sort (set via `sort_set`; falls back to seq when no sort is set) — so "first N" matches the order the user sees on screen, not raw insertion order.
+
 `first_n` on `filtered` and `all_unfilled` is a CAP, not a target count. Use it whenever the user says "do 10 more", "next 20", "another batch of 5", etc.
 
-**"10 more" → `{type: "all_unfilled", first_n: 10}`.** The server picks the first 10 rows missing any of the enrichment's target columns by seq — exactly "10 more rows where this enrichment's output is still missing." For filtering by something other than the enrichment's target columns (e.g. "do 10 more where Country = US"), use `{type: "filtered", filters: [...], first_n: 10}` with one of the canonical filter ops.
+**"10 more" → `{type: "all_unfilled", first_n: 10}`.** The server picks the first 10 rows missing any of the enrichment's target columns in the active sort order — exactly "10 more rows where this enrichment's output is still missing." For filtering by something other than the enrichment's target columns (e.g. "do 10 more where Country = US"), use `{type: "filtered", filters: [...], first_n: 10}` with one of the canonical filter ops.
 
 DO NOT call `enrichment_run` without `first_n` when the user said a specific count. The `all_unfilled` and `filtered` scopes without a cap will process every matching row — a 100-row hit runs all 100 even if the user asked for 10.
 

@@ -1197,6 +1197,53 @@ def _row_needs_work(row_data: Dict[str, Any], target_cols: List[str]) -> bool:
     return False
 
 
+def _active_table_sort(db: Session, table_id: str) -> Tuple[Optional[str], Optional[str]]:
+    """Return the table's stored (sort_column, sort_direction), or (None, None)
+    when no sort is set. Same source list_table_rows reads — keeps the agent's
+    scope resolution aligned with the order the user sees in the UI."""
+    row = db.execute(
+        sa_text("SELECT sort_column, sort_direction FROM tables WHERE id=:tid"),
+        {"tid": table_id},
+    ).fetchone()
+    if not row or not row[0]:
+        return None, None
+    return row[0], (row[1] or "desc")
+
+
+def _sort_rows_by_active(
+    rows: List[Tuple[Any, Any, Any, Any]],
+    sort_col: Optional[str],
+    sort_dir: Optional[str],
+) -> List[Tuple[Any, Any, Any, Any]]:
+    """Reorder fetched (sid, row, raw_row, tags) tuples by the table's active
+    sort. Numeric-aware with text fallback, nulls last in both directions —
+    matches the JSONB ORDER BY in list_table_rows so the scope resolver picks
+    rows in the order they're rendered on screen."""
+    if not sort_col:
+        return rows
+    import re
+    desc = (sort_dir or "desc").lower() != "asc"
+
+    def _key(t):
+        row_data = t[1] if isinstance(t[1], dict) else {}
+        v = row_data.get(sort_col)
+        if v is None or v == "":
+            return None
+        try:
+            stripped = re.sub(r"[^0-9.\-]", "", str(v))
+            if stripped:
+                return ("num", float(stripped))
+        except (TypeError, ValueError):
+            pass
+        return ("txt", str(v).lower())
+
+    keyed = [(t, _key(t)) for t in rows]
+    non_null = [(t, k) for t, k in keyed if k is not None]
+    null_part = [t for t, k in keyed if k is None]
+    non_null.sort(key=lambda x: x[1], reverse=desc)
+    return [t for t, _ in non_null] + null_part
+
+
 def _resolve_scope_rows(
     db: Session,
     table_id: str,
@@ -1210,19 +1257,26 @@ def _resolve_scope_rows(
     has the same context the orchestrator had at column_map_set time.
 
     Scope types:
-      row_ids:      {type, row_ids: [...]}
-      first_n:      {type, first_n: 10}
+      row_ids:      {type, row_ids: [...]} — input order is preserved (the
+                    FE sends ids in the user's currently visible order).
+      first_n:      {type, first_n: 10} — first N rows in the table's
+                    active sort order, falling back to seq when no sort.
       filtered:     {type, filters: [{column, op, value}, ...], first_n?: N}
                     same {column, op, value} shape as filter_set. Filters
                     are AND'd together, evaluated in Python via the same
                     _match semantics used everywhere else. Optional
                     `first_n` caps the result to the first N rows (after
-                    seq-ordering) — used for "do 10 more empty rows" style
+                    sort-ordering) — used for "do 10 more empty rows" style
                     asks where the agent expresses BOTH a filter AND a
                     batch size.
       all_unfilled: {type, first_n?: N} — every row missing at least one
                     target column. Optional `first_n` caps the result so
                     "run 10 more unfilled" is expressible directly.
+
+    For every non-row_ids scope, the table's active sort (set via sort_set
+    and read from tables.sort_column/sort_direction) is applied so the
+    agent's "first 10" matches the user's view — not the raw insertion
+    order.
     """
     # `tags` carries failed_urls / failed_emails — values previously
     # verified as broken. We strip those from raw_row before handing
@@ -1231,6 +1285,7 @@ def _resolve_scope_rows(
     base_sql = "SELECT id::text, row, raw_row, tags FROM samples WHERE table_id=:tid AND deleted_at IS NULL"
     params: Dict[str, Any] = {"tid": table_id}
     scope_type = scope.get("type", "all_unfilled")
+    sort_col, sort_dir = _active_table_sort(db, table_id)
 
     if scope_type == "row_ids":
         ids = scope.get("row_ids") or []
@@ -1240,12 +1295,29 @@ def _resolve_scope_rows(
             sa_text(base_sql + " AND id::text = ANY(:ids)"),
             {**params, "ids": ids},
         ).fetchall()
+        # Caller-supplied order wins: the FE builds row_ids by iterating
+        # the rendered rows in display order (sort + filter applied), so
+        # the per-row jobs need to dispatch in that exact order. PG's
+        # `id::text = ANY(:ids)` returns rows in physical/seq order — sort
+        # them back to match the input array.
+        pos = {rid: i for i, rid in enumerate(ids)}
+        rows = sorted(rows, key=lambda r: pos.get(r[0], len(ids)))
     elif scope_type == "first_n":
         n = int(scope.get("first_n") or 10)
-        rows = db.execute(
-            sa_text(base_sql + " ORDER BY seq LIMIT :n"),
-            {**params, "n": n},
-        ).fetchall()
+        if sort_col:
+            # Active sort present — can't apply LIMIT at the SQL level
+            # because the seq-ordered LIMIT would pick the wrong rows.
+            # Fetch all + sort in Python (matches list_table_rows), then
+            # cap below in the shared first_n logic.
+            rows = _sort_rows_by_active(
+                db.execute(sa_text(base_sql + " ORDER BY seq"), params).fetchall(),
+                sort_col, sort_dir,
+            )[:n]
+        else:
+            rows = db.execute(
+                sa_text(base_sql + " ORDER BY seq LIMIT :n"),
+                {**params, "n": n},
+            ).fetchall()
     elif scope_type == "filtered":
         # Explicit-filter scope. Read the table, apply each {column, op,
         # value} in Python via _match. We could push this to SQL via
@@ -1258,7 +1330,10 @@ def _resolve_scope_rows(
             # Empty filters → match every row (caller intended "filtered
             # but no constraints"); still better than silently falling
             # through to all_unfilled.
-            rows = db.execute(sa_text(base_sql + " ORDER BY seq"), params).fetchall()
+            rows = _sort_rows_by_active(
+                db.execute(sa_text(base_sql + " ORDER BY seq"), params).fetchall(),
+                sort_col, sort_dir,
+            )
         else:
             # Normalize each filter into the canonical (op, value) pair
             # so we evaluate the SAME way filter_set's preview does.
@@ -1274,7 +1349,10 @@ def _resolve_scope_rows(
                     continue
                 op, value = normalized
                 norm_filters.append((col, op, value))
-            all_rows = db.execute(sa_text(base_sql + " ORDER BY seq"), params).fetchall()
+            all_rows = _sort_rows_by_active(
+                db.execute(sa_text(base_sql + " ORDER BY seq"), params).fetchall(),
+                sort_col, sort_dir,
+            )
             rows = []
             for sid, row_data, raw_row, tags in all_rows:
                 if not isinstance(row_data, dict):
@@ -1285,10 +1363,10 @@ def _resolve_scope_rows(
                 if keep:
                     rows.append((sid, row_data, raw_row, tags))
     else:  # all_unfilled
-        rows = db.execute(
-            sa_text(base_sql + " ORDER BY seq"),
-            params,
-        ).fetchall()
+        rows = _sort_rows_by_active(
+            db.execute(sa_text(base_sql + " ORDER BY seq"), params).fetchall(),
+            sort_col, sort_dir,
+        )
 
     # Filter to unfilled (unless overwrite) — a row is "unfilled" if any of the
     # enrichment's target columns has no value.
@@ -1315,7 +1393,7 @@ def _resolve_scope_rows(
     # this was silently dropped: the agent passed first_n=10 with a
     # filtered scope and got the full 86-row match instead. Skip for
     # row_ids (caller named the rows explicitly) and the bare first_n
-    # branch (already applied a SQL LIMIT).
+    # branch (already capped to N during fetch/sort above).
     if scope_type in ("filtered", "all_unfilled"):
         cap_raw = scope.get("first_n")
         if cap_raw is not None:
